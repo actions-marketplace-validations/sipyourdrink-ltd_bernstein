@@ -57,11 +57,11 @@ def postmortem_cmd(
 
     \b
     Examples:
-      bernstein postmortem                        # latest run, markdown to stdout
-      bernstein postmortem abc123                 # specific run
-      bernstein postmortem --format html --save   # HTML, also saved to .sdd/reports/
-      bernstein postmortem --format pdf -o r.pdf  # PDF (requires weasyprint or wkhtmltopdf)
-      bernstein postmortem -o report.md           # write markdown to file
+      bernstein report postmortem                        # latest run, markdown to stdout
+      bernstein report postmortem abc123                 # specific run
+      bernstein report postmortem --format html --save   # HTML, also saved to .sdd/reports/
+      bernstein report postmortem --format pdf -o r.pdf  # PDF (requires weasyprint or wkhtmltopdf)
+      bernstein report postmortem -o report.md           # write markdown to file
     """
     from bernstein.core.postmortem import PostMortemGenerator
 
@@ -78,7 +78,7 @@ def postmortem_cmd(
         return
 
     if fmt == "pdf":
-        # PDF always writes to a file — print path and return.
+        # PDF always writes to a file - print path and return.
         out_path = Path(output) if output else None
         saved = generator.to_pdf(report, path=out_path)
         console.print(f"[green]PDF report saved to {saved}[/green]")

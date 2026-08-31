@@ -71,7 +71,7 @@ def _write_contract(contracts_dir: Path, payload: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ContractSpec.load — schema parsing
+# ContractSpec.load - schema parsing
 # ---------------------------------------------------------------------------
 
 
@@ -252,6 +252,67 @@ def test_capability_subcommand_not_substring_match() -> None:
     assert len(failures) == 1
 
 
+def _flag_spec(*flags: str) -> _contract.ContractSpec:
+    """Minimal spec carrying only required flags."""
+    return _contract.ContractSpec(
+        adapter="x",
+        binary="x",
+        install_method="",
+        install_spec="",
+        auth_required_for_help=False,
+        auth_required_for_models=False,
+        auth_secret_env="",
+        required_flags=flags,
+        required_subcommands=(),
+        help_command=(),
+        models_command=(),
+        models_required_present=(),
+    )
+
+
+def test_capability_flag_not_satisfied_by_longer_flag() -> None:
+    """``--instruction`` must not be satisfied by ``--instructions``.
+
+    Upstream Goose renamed its inline-prompt flag to the plural, file-taking
+    ``--instructions``.  A substring match reports the singular flag present,
+    so the nightly probe stays green while every spawned worker aborts at
+    argument parsing.
+    """
+    help_text = "Options:\n  -i, --instructions <FILE>\n  -t, --text <TEXT>\n"
+    failures = _capability_failures_for(help_text, "--instruction")
+    assert len(failures) == 1
+    assert "--instruction" in failures[0]
+
+
+def test_capability_short_flag_not_satisfied_by_long_flag() -> None:
+    """``-m`` must not be satisfied by the ``--model`` that contains it."""
+    failures = _capability_failures_for("Options:\n      --model <MODEL>\n", "-m")
+    assert len(failures) == 1
+
+
+def test_capability_short_flag_matches_its_own_listing() -> None:
+    """``-m`` is present when the CLI lists it as an alias of ``--model``."""
+    assert _capability_failures_for("Options:\n  -m, --model <MODEL>\n", "-m") == []
+
+
+def test_capability_flag_matches_when_followed_by_punctuation() -> None:
+    """A flag stays present when trailed by ``=``, ``,``, ``<`` or end of line."""
+    help_text = "Options:\n  --text=<TEXT>\n  --model, alias\n  --sandbox <MODE>\n  --yolo\n"
+    assert _capability_failures_for(help_text, "--text", "--model", "--sandbox", "--yolo") == []
+
+
+def test_capability_flag_prefix_and_longer_sibling_both_required() -> None:
+    """``--print`` and ``--print-timeout`` are matched independently."""
+    only_long = "Options:\n  --print-timeout <SECS>\n"
+    assert len(_capability_failures_for(only_long, "--print")) == 1
+    both = "Options:\n  --print\n  --print-timeout <SECS>\n"
+    assert _capability_failures_for(both, "--print", "--print-timeout") == []
+
+
+def _capability_failures_for(help_text: str, *flags: str) -> list[str]:
+    return _contract._capability_failures(_flag_spec(*flags), help_text)
+
+
 def test_capability_match_is_case_insensitive() -> None:
     spec = _contract.ContractSpec(
         adapter="x",
@@ -291,7 +352,7 @@ def test_ansi_stripped_before_match() -> None:
 
 
 # ---------------------------------------------------------------------------
-# check_contract — full pass/fail paths
+# check_contract - full pass/fail paths
 # ---------------------------------------------------------------------------
 
 
@@ -474,6 +535,82 @@ def test_check_contract_help_nonzero_with_output_still_checks_flags(
     assert result.capability_failures == []
 
 
+def test_check_contract_help_zero_exit_all_flags_missing_is_runtime_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A *zero* exit whose output lacks ALL required tokens is still a runtime
+    failure, not drift.
+
+    Regression for issue #2488: some CLIs ship a redesigned or paginated
+    --help that advertises none of the required flags yet still exits 0.
+    Gating the broken-probe guard on a non-zero exit misclassified that as
+    six-flag drift and paged an operator with a misleading "every flag
+    removed" finding. The guard now fires regardless of exit code once every
+    required token is absent.
+    """
+    spec = _contract.ContractSpec(
+        adapter="redesigned",
+        binary="redesigned",
+        install_method="",
+        install_spec="",
+        auth_required_for_help=False,
+        auth_required_for_models=False,
+        auth_secret_env="",
+        required_flags=("--alpha", "--beta", "--gamma"),
+        required_subcommands=(),
+        help_command=(),
+        models_command=(),
+        models_required_present=(),
+    )
+    monkeypatch.setattr(_contract.shutil, "which", lambda _name: "/fake/bin/redesigned")
+    monkeypatch.setattr(
+        _contract,
+        "_run_capture",
+        _make_run_capture({("redesigned", "--help"): (0, "redesigned 3.13 - see docs for the new surface.\n")}),
+    )
+    result = _contract.check_contract(spec)
+    assert result.passed is False
+    assert result.capability_failures == []
+    assert "runtime failure" in result.runtime_failure
+    assert "no required tokens advertised" in result.runtime_failure
+
+
+def test_check_contract_help_zero_exit_partial_miss_is_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero exit with *some* required tokens present is genuine drift.
+
+    The broken-probe guard must only swallow a wholesale surface loss; a
+    partial miss (at least one required token still advertised) is a real
+    contract regression and must keep reporting per-flag drift.
+    """
+    spec = _contract.ContractSpec(
+        adapter="partial",
+        binary="partial",
+        install_method="",
+        install_spec="",
+        auth_required_for_help=False,
+        auth_required_for_models=False,
+        auth_secret_env="",
+        required_flags=("--alpha", "--beta", "--gamma"),
+        required_subcommands=(),
+        help_command=(),
+        models_command=(),
+        models_required_present=(),
+    )
+    monkeypatch.setattr(_contract.shutil, "which", lambda _name: "/fake/bin/partial")
+    monkeypatch.setattr(
+        _contract,
+        "_run_capture",
+        _make_run_capture({("partial", "--help"): (0, "usage: partial [--alpha A] [--beta B]\n")}),
+    )
+    result = _contract.check_contract(spec)
+    assert result.passed is False
+    assert result.runtime_failure == ""
+    assert len(result.capability_failures) == 1
+    assert "--gamma" in result.capability_failures[0]
+
+
 def test_check_contract_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     spec = _contract.ContractSpec(
         adapter="ghost",
@@ -622,7 +759,7 @@ def test_check_contract_help_requires_auth_and_secret_missing(
 
 
 # ---------------------------------------------------------------------------
-# list_contracts — repo-shipped contracts
+# list_contracts - repo-shipped contracts
 # ---------------------------------------------------------------------------
 
 

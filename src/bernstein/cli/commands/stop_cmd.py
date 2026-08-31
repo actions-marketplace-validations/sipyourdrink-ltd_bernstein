@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import csv
+import io
 import json
 import os
 import shutil
@@ -12,7 +14,10 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 import click
 
@@ -30,7 +35,7 @@ from bernstein.cli.helpers import (
     sigkill_pid,
 )
 from bernstein.core.observability.icons import get_icons
-from bernstein.core.process_utils import process_cwd
+from bernstein.core.process_utils import cmdline_matches, process_cwd
 from bernstein.core.runtime_state import read_supervisor_state
 
 _LABEL_TASK_SERVER = "Task server"
@@ -58,7 +63,7 @@ def stop_active_tunnels() -> int:
     for handle in reg.list_active():
         if handle.pid > 0:
             with contextlib.suppress(OSError, ProcessLookupError):
-                # PID comes from our own tunnels.json — target is always
+                # PID comes from our own tunnels.json - target is always
                 # a tunnel process we started (Sonar python:S4828).
                 os.kill(handle.pid, signal.SIGTERM)  # NOSONAR python:S4828
         reg.destroy(handle.name)
@@ -87,8 +92,16 @@ def _unregister_mcp_discovery(workdir: Path) -> None:
         data = json.loads(mcp_path.read_text())
     except (ValueError, OSError):
         return
-    servers = data.get("mcpServers", {})
-    if "bernstein" not in servers:
+    # A valid JSON document need not be an object, and mcpServers need not be
+    # a map: null, lists, strings and scalars all decode cleanly and would then
+    # raise from .get(), the membership test, or .pop() - outside the
+    # suppress(OSError) below. Shutdown has nothing to clean up in any of those
+    # shapes, so treat them as a no-op and leave the file untouched rather than
+    # rewriting something this command did not create.
+    if not isinstance(data, dict):
+        return
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict) or "bernstein" not in servers:
         return
     servers.pop("bernstein")
     data["mcpServers"] = servers
@@ -190,19 +203,25 @@ def save_session_on_stop(workdir: Path) -> None:
         resp = _httpx.get(f"{SERVER_URL}/tasks", timeout=3.0, headers=auth_headers())
         resp.raise_for_status()
         body = resp.json()
+        task_list: list[dict[str, Any]]
         if isinstance(body, dict) and "tasks" in body:
             task_list = cast("list[dict[str, Any]]", body["tasks"])
         elif isinstance(body, list):
             task_list = cast("list[dict[str, Any]]", body)
         else:
-            task_list: list[dict[str, Any]] = []
+            task_list = []
         done_ids = [t["id"] for t in task_list if t.get("status") == "done"]
         pending_ids = [t["id"] for t in task_list if t.get("status") in ("claimed", "in_progress")]
+        # Persist still-open tasks too (issue #2798): they were dropped
+        # entirely before, so a resumed run had no record of the work queued
+        # when the operator stopped it and could self-declare complete.
+        open_ids = [t["id"] for t in task_list if t.get("status") == "open"]
         state = SessionState(
             saved_at=time.time(),
             goal="",
             completed_task_ids=done_ids,
             pending_task_ids=pending_ids,
+            open_task_ids=open_ids,
             cost_spent=0.0,
         )
         save_session(workdir, state)
@@ -449,17 +468,52 @@ def _list_process_snapshots() -> list[_ProcessSnapshot]:
     return _list_process_snapshots_unix()
 
 
-def _list_process_snapshots_windows() -> list[_ProcessSnapshot]:
-    """Windows: use WMIC or PowerShell to list processes."""
+def _parse_windows_process_csv(csv_text: str) -> list[_ProcessSnapshot]:
+    """Parse ``ConvertTo-Csv`` output of ``ProcessId, ParentProcessId, CommandLine``.
+
+    Uses the stdlib ``csv`` reader rather than a manual ``split('","')`` because
+    ``CommandLine`` routinely contains commas and quotes (paths, flag values)
+    that a naive split mis-parses; ``ConvertTo-Csv`` emits RFC4180-style
+    quoting (embedded quotes doubled) that ``csv`` decodes correctly.
+    """
+    reader = csv.reader(io.StringIO(csv_text))
+    rows = list(reader)
+    if len(rows) < 2:
+        return []
     snapshots: list[_ProcessSnapshot] = []
+    for row in rows[1:]:  # header: ProcessId,ParentProcessId,CommandLine
+        if len(row) < 3:
+            continue
+        try:
+            pid = int(row[0])
+            ppid = int(row[1]) if row[1] else 0
+        except ValueError:
+            continue
+        snapshots.append(_ProcessSnapshot(pid=pid, ppid=ppid, pgid=0, command=row[2] or ""))
+    return snapshots
+
+
+def _list_process_snapshots_windows() -> list[_ProcessSnapshot]:
+    """Windows: use PowerShell/CIM to list processes with their full command line.
+
+    Queries ``Win32_Process`` directly for ``ProcessId``, ``ParentProcessId``,
+    and ``CommandLine``. An earlier version of this probe selected ``Path``
+    (just the executable, e.g. ``python.exe``) from ``Get-Process`` instead of
+    the actual command line, so none of the argv markers
+    ``_classify_repo_process`` matches on (``--watchdog``, the heartbeat/
+    worktree path prefixes, ...) were ever present in ``command`` -- the
+    process-scan fallback could not identify a repo-owned watchdog,
+    orchestrator, or task server on Windows at all (issue #3312).
+    """
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        # Use PowerShell for better reliability
         result = subprocess.run(
             [
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                "Get-Process | Select-Object Id, @{N='ParentId';E={(Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.Id)\").ParentProcessId}}, Path | ConvertTo-Csv -NoTypeInformation",  # noqa: E501
+                "Get-CimInstance -ClassName Win32_Process | "
+                "Select-Object ProcessId, ParentProcessId, CommandLine | "
+                "ConvertTo-Csv -NoTypeInformation",
             ],
             capture_output=True,
             text=True,
@@ -470,22 +524,8 @@ def _list_process_snapshots_windows() -> list[_ProcessSnapshot]:
         )
         if result.returncode != 0:
             return []
-        lines = result.stdout.strip().splitlines()
-        if len(lines) < 2:
-            return []
-        # Skip header: "Id","ParentId","Path"
-        for line in lines[1:]:
-            # Parse CSV: "1234","5678","C:\path\to\exe"
-            parts = line.strip().strip('"').split('","')
-            if len(parts) >= 3:
-                try:
-                    pid = int(parts[0])
-                    ppid = int(parts[1]) if parts[1] else 0
-                    command = parts[2]
-                    snapshots.append(_ProcessSnapshot(pid=pid, ppid=ppid, pgid=0, command=command))
-                except (ValueError, IndexError):
-                    continue
-    return snapshots
+        return _parse_windows_process_csv(result.stdout)
+    return []
 
 
 def _list_process_snapshots_unix() -> list[_ProcessSnapshot]:
@@ -524,6 +564,65 @@ def _list_process_snapshots_unix() -> list[_ProcessSnapshot]:
     return snapshots
 
 
+def _watchdog_names_workdir(command: str, workdir: Path) -> bool:
+    """Whether *command* embeds *workdir* via the watchdog's own ``--workdir`` marker.
+
+    ``process_cwd()`` has no working implementation on Windows - it shells out
+    to ``lsof``, which does not exist there - so the live-cwd cross-check the
+    other infra kinds fall back on can never positively confirm anything on
+    that platform, and an orphaned watchdog (its pidfile overwritten by a
+    later run, or never written) was unreachable by the process-scan fallback
+    (issue #3312). ``_start_watchdog`` now writes ``--workdir <path>`` into its
+    own launch argv, so ownership can be read straight off the command line -
+    the same technique already used for heartbeat/worktree orphans - with no
+    cwd probe needed at all.
+    """
+    return cmdline_matches(command, (str(workdir),))
+
+
+def _classify_repo_process(
+    snapshot: Any,
+    workdir: Path,
+    heartbeat_prefix: str,
+    worktree_prefix: str,
+) -> tuple[str, str] | None:
+    """Return ``(kind, label)`` for a repo-owned process, else ``None``.
+
+    ``kind`` is ``"agent"`` for orphaned worktree/heartbeat processes (matched
+    purely by command-line marker, no cwd probe) or ``"infra"`` for the
+    orchestrator/server/watchdog - which must additionally run with a cwd
+    inside this project, so a sibling checkout's server is never touched.  The
+    watchdog gets one extra, cwd-probe-free path first (see
+    :func:`_watchdog_names_workdir`) because it is the only infra kind whose
+    launch argv self-declares its workdir.
+    """
+    command = snapshot.command
+
+    if heartbeat_prefix in command or worktree_prefix in command:
+        return "agent", f"orphan-{snapshot.pid}"
+
+    # Matches the launcher argv in ``_start_watchdog`` (issue #2795): the watchdog
+    # runs as ``python -m bernstein.core.orchestration.bootstrap --watchdog``.
+    is_watchdog = "bernstein.core.orchestration.bootstrap" in command and "--watchdog" in command
+    is_orchestrator = "bernstein.core.orchestrator" in command
+    is_server = "uvicorn bernstein.core.server:app" in command
+
+    if not (is_watchdog or is_orchestrator or is_server):
+        return None
+
+    if is_watchdog and _watchdog_names_workdir(command, workdir):
+        return "infra", "Watchdog"
+
+    if process_cwd(snapshot.pid) != workdir:
+        return None
+
+    if is_watchdog:
+        return "infra", "Watchdog"
+    if is_orchestrator:
+        return "infra", "Spawner"
+    return "infra", _LABEL_TASK_SERVER
+
+
 def _classify_and_kill_process(
     snapshot: Any,
     workdir: Path,
@@ -532,28 +631,64 @@ def _classify_and_kill_process(
     killed: set[int],
 ) -> None:
     """Classify a process snapshot and kill it if it belongs to this repo."""
-    command = snapshot.command
-
-    if heartbeat_prefix in command or worktree_prefix in command:
-        _kill_agent_pid(snapshot.pid, f"orphan-{snapshot.pid}", killed)
+    classified = _classify_repo_process(snapshot, workdir, heartbeat_prefix, worktree_prefix)
+    if classified is None:
         return
-
-    is_watchdog = "bernstein.core.bootstrap" in command and "--watchdog" in command
-    is_orchestrator = "bernstein.core.orchestrator" in command
-    is_server = "uvicorn bernstein.core.server:app" in command
-
-    if not (is_watchdog or is_orchestrator or is_server):
-        return
-
-    if process_cwd(snapshot.pid) != workdir:
-        return
-
-    if is_watchdog:
-        _kill_named_pid(snapshot.pid, "Watchdog", killed)
-    elif is_orchestrator:
-        _kill_named_pid(snapshot.pid, "Spawner", killed)
+    kind, label = classified
+    if kind == "agent":
+        _kill_agent_pid(snapshot.pid, label, killed)
     else:
-        _kill_named_pid(snapshot.pid, _LABEL_TASK_SERVER, killed)
+        _kill_named_pid(snapshot.pid, label, killed)
+
+
+def _reap_process_group(pgid: int, killed: set[int], member_pids: Iterable[int] = ()) -> None:
+    """SIGKILL an entire process group, guarding against pgid reuse.
+
+    Never signals ``pgid <= 0`` (which would broadcast to the caller's whole
+    session/group) or the caller's own group. Only groups whose *leader* we
+    positively identified as repo-owned reach here. ``member_pids`` are recorded
+    in *killed* so the post-sweep summary counts only PIDs later confirmed
+    terminated (see :func:`_count_reaped`) rather than every PID we signalled.
+    """
+    if not hasattr(os, "killpg"):
+        return
+    my_pgid = os.getpgrp() if hasattr(os, "getpgrp") else -1
+    if pgid <= 0 or pgid == my_pgid:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        # pgid anchors on a leader we already classified as ours (Sonar S4828).
+        os.killpg(pgid, signal.SIGKILL)  # NOSONAR python:S4828
+    for pid in member_pids:
+        if pid > 0:
+            killed.add(pid)
+
+
+def _reap_repo_process_groups(killed: set[int]) -> None:
+    """Reap surviving process *groups* owned by this repo (issue #2874).
+
+    Per-PID kills miss a grandchild a worker re-parented into its own process
+    group (e.g. a disowned ``while true; curl`` heartbeat loop). This sweep
+    ``os.killpg``s each group whose *leader* (``pid == pgid``) we positively
+    identify as repo-owned, so a detached grandchild dies with its group.
+    Anchoring only on a group leader keeps the target reuse-safe: the pgid
+    cannot have been recycled by an unrelated group while its original leader
+    is still present in the same scan.
+    """
+    if sys.platform == "win32" or not hasattr(os, "killpg"):
+        return
+    workdir = Path.cwd()
+    heartbeat_prefix = str(workdir / ".sdd" / "runtime" / "heartbeats")
+    worktree_prefix = str(workdir / ".sdd" / "worktrees")
+    snapshots = _list_process_snapshots()
+    members: dict[int, list[int]] = {}
+    for snapshot in snapshots:
+        members.setdefault(snapshot.pgid, []).append(snapshot.pid)
+    for snapshot in snapshots:
+        if snapshot.pid != snapshot.pgid:
+            continue  # anchor only on the group leader (reuse-safe)
+        if _classify_repo_process(snapshot, workdir, heartbeat_prefix, worktree_prefix) is None:
+            continue
+        _reap_process_group(snapshot.pgid, killed, members.get(snapshot.pgid, ()))
 
 
 def _collect_repo_processes(killed: set[int]) -> None:
@@ -566,7 +701,7 @@ def _collect_repo_processes(killed: set[int]) -> None:
     2. Second pass: kill any zsh/bash/sh subshells whose parent was killed in
        pass 1 OR whose command line references ``.sdd/runtime/``.  This
        cleans up the disowned ``while true; do curl … done &`` heartbeat
-       loops left behind when the agent that spawned them dies — those used
+       loops left behind when the agent that spawned them dies - those used
        to keep POSTing to ``/hooks/<session-id>`` with stale Bearer tokens,
        flooding ``server.log`` with 401s long after ``bernstein stop``.
     """
@@ -667,6 +802,17 @@ def _cleanup_runtime_artifacts() -> None:
             f.unlink(missing_ok=True)
 
 
+def _count_reaped(killed_pids: set[int]) -> int:
+    """Count collected PIDs confirmed terminated after the kill sweep.
+
+    Every collector adds a PID it attempted to ``killed_pids``, including PIDs
+    that were already dead or that resisted SIGKILL. Reporting the raw set size
+    over-states what was actually reaped (issue #2800); count only PIDs that are
+    no longer alive.
+    """
+    return sum(1 for pid in killed_pids if not is_alive(pid))
+
+
 def hard_stop() -> None:
     """Hard stop: SIGKILL everything, best-effort save, return tickets."""
     # 1. Best-effort session save while server is still alive
@@ -688,6 +834,9 @@ def hard_stop() -> None:
     _collect_pids_from_agents_json(killed_pids)
     _collect_pids_from_metadata(killed_pids)
     _collect_repo_processes(killed_pids)
+    # Reap whole process groups so a grandchild re-parented into its own group
+    # (disowned heartbeat/curl loops) dies with its leader (#2874).
+    _reap_repo_process_groups(killed_pids)
 
     # 4. Verification sweep - re-scan and retry anything still alive
     time.sleep(0.1)
@@ -720,9 +869,17 @@ def hard_stop() -> None:
     # Remove Bernstein from .claude/mcp.json so stale references are cleaned up
     _unregister_mcp_discovery(Path.cwd())
 
-    total = len(killed_pids)
-    if total:
-        console.print(f"\n[red]Bernstein stopped (hard) - killed {total} process(es).[/red]")
+    reaped = _count_reaped(killed_pids)
+    resisted = len(killed_pids) - reaped
+    if reaped:
+        console.print(f"\n[red]Bernstein stopped (hard) - killed {reaped} process(es).[/red]")
+        if resisted:
+            console.print(f"[yellow]{resisted} process(es) resisted SIGKILL and may still be running.[/yellow]")
+    elif resisted:
+        console.print(
+            f"\n[yellow]Bernstein stop (hard) - {resisted} process(es) resisted SIGKILL "
+            "and may still be running.[/yellow]"
+        )
     else:
         console.print("\n[red]Bernstein stopped (hard) - no processes were running.[/red]")
 

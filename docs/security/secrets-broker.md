@@ -34,7 +34,14 @@ security:
         SHORT_LIVED_TOKEN: 60
     backend_settings:           # forwarded to the backend constructor
       path: /var/lib/bernstein/secrets.enc
+    grants:                     # scoped per-task credential grants (optional)
+      require_grant: false      # refuse to mint without a verifiable grant
+      identity_mode: ed25519    # ed25519 (default) | spiffe
 ```
+
+When `grants.require_grant` is `true`, the orchestrator must supply a
+verifiable, chain-anchored grant to `mint()`; the broker fails closed
+otherwise. See [Scoped per-task grants](#scoped-per-task-grants) below.
 
 ## Backend setup
 
@@ -76,6 +83,7 @@ item with:
 
 ```python
 import keyring
+
 keyring.set_password("bernstein", "ANTHROPIC_API_KEY", "sk-ant-...")
 ```
 
@@ -115,3 +123,103 @@ in-process registry and scrubs every minted token value and raw backing
 value from the text it processes. The registry is updated automatically
 on mint and revoke; tests can clear it via
 `clear_redaction_registry()`.
+
+## Connection documents (#2550)
+
+A connection document is a typed, named record (`prod-github`, `team-slack`)
+that sits *above* the broker as a naming and reuse layer. It carries no
+secret material: it names a broker-managed secret, a scope, and connector
+defaults, and it is signed with the local Ed25519 install identity
+(`src/bernstein/core/lineage/identity.py`). Task specs, routines, and
+triggers reference the document by name, so rotating one document re-points
+every consumer at the next mint with zero spec edits.
+
+The document layer changes nothing the broker lifecycle owns. Resolution
+calls the same `SecretsBroker.mint` path, so the raw secret is minted into a
+short-lived token and registered for redaction exactly as above - the raw
+backing value never appears in an agent environment or a persisted artifact.
+Each resolution additionally emits a `fleet.conn_resolve` lineage receipt
+binding `(document name, document hash, task id, token id)`, so
+`bernstein conn audit` reconstructs every task that ever resolved a document
+offline from the chain alone.
+
+```
+bernstein conn create prod-github --secret github_pat --scope repo:read
+bernstein conn rotate prod-github --secret github_pat_v2   # signed chain event
+bernstein conn audit prod-github
+```
+
+Signature verification runs against the *local* install identity, not the
+key embedded in the document, so a document copied to another install
+refuses to resolve; the refusal is recorded as a `fleet.conn_refuse` event.
+Once scoped grants (below) are wired, a document resolution simply carries
+its grant reference - the document does not redefine mint, resolve, revoke,
+or grant authorization semantics. Documents live under
+`.sdd/fleet/connections/`. Source: `src/bernstein/core/fleet/connection.py`.
+
+## Scoped per-task grants
+
+By default the broker hands any token holder the full backing secret. In
+grant-enforcing mode the credential becomes a projection of a
+chain-recorded grant, so a worker holds only a scoped, expiring token and
+post-incident forensics can prove the exact credential window per task
+from the chain alone.
+
+### The grant record
+
+Before a worker spawn the orchestrator issues a scoped grant with
+`bernstein.core.identity.grants.GrantLedger.issue_grant`: task id, secret
+name, audience, expiry, and capability ceiling. Each grant record carries
+two independent tamper anchors:
+
+- an **Ed25519 signature** by the manager identity over the grant body
+  (proves who authorized it), and
+- an **HMAC** over `prev_hmac` + the canonical record body, keyed by the
+  install audit key (the same construction as the delegation receipts in
+  `docs/security/manager-auth.md`), so a mutated, deleted, or reordered
+  record breaks the chain.
+
+Records land under `<audit>/grants/<run>.jsonl` and reconstruct the full
+`grant_issued -> grant_exchanged -> grant_revoked` lifecycle offline.
+
+### Broker exchange
+
+`SecretsBroker.mint(..., grant=grant)` refuses to mint unless the grant
+verifies against the chain and matches the `(task_id, secret_name)` pair;
+the refusal is itself a `grant_refused` chain record. The minted token
+inherits the grant's task id, audience, and expiry, and the token id is
+recorded via a `grant_exchanged` record so token-to-grant resolution
+works offline. `resolve(token, audience=...)` refuses a token presented
+outside its granted audience, recording the refusal as a chain event.
+`revoke()` and task-exit auto-revoke append a signed `grant_revoked`
+record referencing the grant.
+
+### Verifying offline
+
+```
+bernstein secrets grants list run-42            # reconstructed lifecycle
+bernstein secrets grants verify run-42          # HMAC + Ed25519 offline
+bernstein secrets grants verify run-42 --json   # byte-identical report
+bernstein audit verify                          # includes all grant chains
+```
+
+`grants verify` exits non-zero and names the first failing record on any
+mutation, deletion, or reordering. Two independent verifiers over the
+same chain slice produce byte-identical `--json` reports.
+
+### SPIFFE identity mode
+
+With `grants.identity_mode: spiffe` and the optional `spiffe` extra
+installed against a reachable SPIRE Workload API socket, new grants carry
+the workload's SPIFFE ID as the issuer identity, binding grants to the
+workload identity already checkable via `bernstein spiffe
+verify-binding`. `bernstein doctor` preflights the extra and socket. With
+the extra absent the default Ed25519 identity path is unchanged.
+
+### Migration
+
+Existing broker configs keep working unchanged: `grants.require_grant`
+defaults to `false` and `identity_mode` to `ed25519`, so a broker built
+without a grant ledger behaves exactly as before. To adopt scoped grants,
+add the `grants` block, construct the broker with a `GrantLedger`, and
+issue a grant per task before the spawn.

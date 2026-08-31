@@ -1,9 +1,10 @@
-"""Tests for the Orchestrator — httpx calls and spawner are always mocked."""
+"""Tests for the Orchestrator - httpx calls and spawner are always mocked."""
 
 from __future__ import annotations
 
 import collections
 import json
+import logging
 import subprocess
 import time
 from pathlib import Path
@@ -41,6 +42,8 @@ from bernstein.core.spawner import AgentSpawner
 from bernstein.core.tick_pipeline import prioritize_starving_roles
 
 from bernstein.adapters.base import CLIAdapter, SpawnResult
+from bernstein.core.security.audit_chain import AuditChainStore
+from bernstein.core.security.run_closure import RunClosureOutcome, RunClosureStatus, project_run_closure
 
 if TYPE_CHECKING:
     from bernstein.core.bulletin import BulletinBoard
@@ -234,8 +237,15 @@ def _build_orchestrator(
     transport: httpx.MockTransport,
     adapter: CLIAdapter | None = None,
     config: OrchestratorConfig | None = None,
+    default_model: str | None = "mock-model",
 ) -> Orchestrator:
-    """Convenience: wire up orchestrator with mocked transport."""
+    """Convenience: wire up orchestrator with mocked transport.
+
+    ``default_model`` defaults to a mock value because routing now refuses
+    to spawn when no model is configured anywhere; tests here exercise
+    orchestrator scheduling, not model configuration. Pass ``None``
+    explicitly to exercise the unconfigured-model refusal path.
+    """
     cfg = config or OrchestratorConfig(
         max_agents=6,
         poll_interval_s=1,
@@ -246,7 +256,7 @@ def _build_orchestrator(
     adp = adapter or _mock_adapter()
     templates_dir = tmp_path / "templates" / "roles"
     templates_dir.mkdir(parents=True)
-    spawner = AgentSpawner(adp, templates_dir, tmp_path)
+    spawner = AgentSpawner(adp, templates_dir, tmp_path, default_model=default_model)
     client = httpx.Client(transport=_paginated_transport(transport), base_url="http://testserver")
     return Orchestrator(cfg, spawner, tmp_path, client=client)
 
@@ -567,7 +577,7 @@ class TestTickStarvingRolePriority:
             return httpx.Response(404)
 
         # max_agents=2, pre-seed ONE alive backend agent so only 1 slot remains.
-        # Both backend and qa are under their per-role caps — without starving-first
+        # Both backend and qa are under their per-role caps - without starving-first
         # prioritization, backend (appearing first in alphabetical round-robin) would
         # steal the last slot; with it, qa (starving) must get it.
         cfg = OrchestratorConfig(
@@ -577,7 +587,7 @@ class TestTickStarvingRolePriority:
             max_tasks_per_agent=1,
             server_url="http://testserver",
         )
-        orch = _build_orchestrator(tmp_path, httpx.MockTransport(handler), config=cfg)
+        orch = _build_orchestrator(tmp_path, httpx.MockTransport(handler), config=cfg, default_model="mock-model")
         be_session = AgentSession(
             id="existing-backend",
             role="backend",
@@ -657,7 +667,7 @@ class TestPerRoleCapDistribution:
 
         result = orch.tick()
 
-        # Only QA agent(s) should spawn — backend is at its per-role cap
+        # Only QA agent(s) should spawn - backend is at its per-role cap
         spawned_roles = [orch._agents[sid].role for sid in result.spawned if sid in orch._agents]
         assert "backend" not in spawned_roles, (
             f"backend is at its per-role cap; should not spawn more. Got: {spawned_roles}"
@@ -699,7 +709,7 @@ class TestPerRoleCapDistribution:
 
         Setup: max_agents=5, backend: 9 tasks, qa: 1 task (total 10).
         Backend cap = ceil(5 * 9 / 10) = 5, qa cap = ceil(5 * 1 / 10) = 1.
-        Pre-seed 5 backend agents (at cap). 0 free global slots — no qa spawn.
+        Pre-seed 5 backend agents (at cap). 0 free global slots - no qa spawn.
         This confirms the formula doesn't round qa cap to 0 (ceil enforces >= 1).
         """
         backend_tasks = [_make_task(id=f"T-be{i}", role="backend", title=f"Backend {i}") for i in range(9)]
@@ -730,7 +740,7 @@ class TestPerRoleCapDistribution:
 
         result = orch.tick()
 
-        # Global cap hit — no new spawns
+        # Global cap hit - no new spawns
         assert len(result.spawned) == 0, f"global cap (5/5) should block all spawns; got {result.spawned}"
 
     def test_qa_gets_slot_before_backend_third(self, tmp_path: Path) -> None:
@@ -738,7 +748,7 @@ class TestPerRoleCapDistribution:
 
         Setup: max_agents=3, backend: 5 tasks with 2 alive agents (per-role cap = 2),
         qa: 3 tasks with 0 alive agents (per-role cap = 2).
-        Per-role cap for backend: ceil(3 * 5/8) = 2 — backend is already at cap.
+        Per-role cap for backend: ceil(3 * 5/8) = 2 - backend is already at cap.
         One global slot remains. qa is starving (0 agents) so it is promoted to the
         front of the spawn queue. The slot must go to qa, not to a 3rd backend agent.
         """
@@ -755,7 +765,7 @@ class TestPerRoleCapDistribution:
         )
         orch = _build_orchestrator(tmp_path, httpx.MockTransport(self._make_handler(task_dicts)), config=cfg)
 
-        # Pre-seed 2 alive backend agents — exactly at their per-role cap (ceil(3 * 5/8) = 2)
+        # Pre-seed 2 alive backend agents - exactly at their per-role cap (ceil(3 * 5/8) = 2)
         for i in range(2):
             session = AgentSession(
                 id=f"existing-backend-{i}",
@@ -797,7 +807,7 @@ class TestPerRoleCapDistribution:
         )
         orch = _build_orchestrator(tmp_path, httpx.MockTransport(self._make_handler(task_dicts)), config=cfg)
 
-        # Pre-seed 2 alive backend agents — one per open backend batch
+        # Pre-seed 2 alive backend agents - one per open backend batch
         for i in range(2):
             session = AgentSession(
                 id=f"alive-backend-{i}",
@@ -814,7 +824,7 @@ class TestPerRoleCapDistribution:
 
         spawned_roles = [orch._agents[sid].role for sid in result.spawned if sid in orch._agents]
         assert "backend" not in spawned_roles, (
-            f"backend has {2} agents for {2} batches — must not spawn more. Got: {spawned_roles}"
+            f"backend has {2} agents for {2} batches - must not spawn more. Got: {spawned_roles}"
         )
         assert "qa" in spawned_roles, f"qa (0 agents, 1 batch) should get a slot; got: {spawned_roles}"
 
@@ -866,7 +876,7 @@ class TestRoleFilteredClaiming:
         assert any("claim" in e for e in result.errors), "claim error should be recorded"
 
     def test_only_matching_role_tasks_per_agent(self, tmp_path: Path) -> None:
-        """Spawned agents hold tasks of exactly one role — no cross-role mixing."""
+        """Spawned agents hold tasks of exactly one role - no cross-role mixing."""
         tasks = [
             _make_task(id="T-be1", role="backend", title="Backend 1"),
             _make_task(id="T-be2", role="backend", title="Backend 2"),
@@ -1114,7 +1124,7 @@ class TestOrchestratorTick:
         task_b = _make_task(id="T-B", role="backend")
         task_b.depends_on = ["T-A"]
 
-        # Tick 1: A is open, B depends on A — only A should be scheduled
+        # Tick 1: A is open, B depends on A - only A should be scheduled
         transport = _mock_transport(
             {
                 "GET /tasks": httpx.Response(200, json=[_task_as_dict(task_a), _task_as_dict(task_b)]),
@@ -1359,7 +1369,7 @@ class TestSpawnResiliency:
     """Server outage and spawn failure scenarios."""
 
     def test_claim_500_aborts_spawn(self, tmp_path: Path) -> None:
-        """Server 500 on task claim aborts spawn — agent must not be launched."""
+        """Server 500 on task claim aborts spawn - agent must not be launched."""
         task = _make_task(id="T-claim-500")
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1417,7 +1427,7 @@ class TestSpawnResiliency:
         assert adapter.spawn.call_count == 1
         assert any("spawn" in e for e in r1.errors)
 
-        # Tick 2: immediately after — still within backoff window, batch must be skipped
+        # Tick 2: immediately after - still within backoff window, batch must be skipped
         r2 = orch.tick()
         assert len(r2.spawned) == 0
         assert adapter.spawn.call_count == 1  # not retried
@@ -1625,6 +1635,56 @@ class TestReaping:
 
 
 class TestRunStop:
+    def test_live_otel_stream_attaches_and_finalizes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The orchestrator wires journal appends and finalizes the live stream."""
+        rows: list[dict[str, Any]] = []
+        stream = MagicMock()
+
+        def attach(journal: Any, *, workdir: Path) -> MagicMock:
+            assert workdir == tmp_path
+            journal.set_observer(rows.append)
+            return stream
+
+        monkeypatch.setattr("bernstein.core.observability.otel_bridge.attach_live_export", attach)
+        transport = _mock_transport({"GET /tasks": httpx.Response(200, json=[])})
+        config = OrchestratorConfig(
+            poll_interval_s=0,
+            server_url="http://testserver",
+            dry_run=True,
+        )
+        orch = _build_orchestrator(tmp_path, transport, config=config)
+
+        def seal_capsule_event(_key: bytes) -> None:
+            AuditChainStore(tmp_path / ".sdd" / "audit").log(
+                event_type="intent.journal_seal",
+                actor="test",
+                resource_type="run",
+                resource_id=orch._run_id,
+                details={"run_id": orch._run_id},
+            )
+
+        orch._seal_intent_capsules = seal_capsule_event  # type: ignore[method-assign]
+
+        def finalize_with_run_event() -> None:
+            AuditChainStore(tmp_path / ".sdd" / "audit").log(
+                event_type="otel.projection",
+                actor="test",
+                resource_type="run",
+                resource_id=orch._run_id,
+                details={"run_id": orch._run_id},
+            )
+
+        stream.finalize.side_effect = finalize_with_run_event
+        orch.run()
+
+        assert [row["event"] for row in rows] == ["run_started", "tick_start", "run_completed"]
+        stream.finalize.assert_called_once_with()
+        chain = AuditChainStore(tmp_path / ".sdd" / "audit")
+        closure = project_run_closure(chain, orch._run_id)
+        assert closure.status is RunClosureStatus.CLOSED
+        target_events = [event.event_type for event in chain.query() if event.details.get("run_id") == orch._run_id]
+        assert target_events[-3:] == ["intent.journal_seal", "otel.projection", "run.closure"]
+
     def test_stop_breaks_loop(self, tmp_path: Path) -> None:
         transport = _mock_transport(
             {
@@ -1652,6 +1712,9 @@ class TestRunStop:
         orch.run()
 
         assert call_count == 3
+        closure = project_run_closure(AuditChainStore(tmp_path / ".sdd" / "audit"), orch._run_id)
+        assert closure.status is RunClosureStatus.CLOSED
+        assert closure.outcome is RunClosureOutcome.CANCELLED
 
     def test_tick_does_not_claim_or_spawn_after_stop_requested(self, tmp_path: Path) -> None:
         task = _make_task(id="T-stop", title="Update docs", description="Refresh docs.")
@@ -1980,8 +2043,17 @@ class TestFileOwnership:
         r2 = orch.tick()
         assert len(r2.spawned) == 1  # no conflict, spawns fine
 
+    # The reap path calls agent_lifecycle's own local _is_process_alive, not this
+    # one; patch both bindings so the outcome no longer depends on whether the
+    # real PID 99 is alive on the host (same fix as #1476's sibling test).
+    @patch("bernstein.core.agents.agent_lifecycle._is_process_alive", return_value=False)
     @patch("bernstein.core.agent_recycling._is_process_alive", return_value=False)
-    def test_ownership_released_on_reap(self, _mock_alive: MagicMock, tmp_path: Path) -> None:
+    def test_ownership_released_on_reap(
+        self,
+        _mock_alive: MagicMock,
+        _mock_alive_lifecycle: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """File ownership released when a stale agent is reaped."""
         transport = _mock_transport(
             {
@@ -3220,11 +3292,58 @@ class TestAssignedTaskIdDoubleSpawn:
         assert len(r1.spawned) == 1  # first tick spawns
 
         r2 = orch.tick()
-        assert len(r2.spawned) == 0  # second tick skips — task already assigned
+        assert len(r2.spawned) == 0  # second tick skips - task already assigned
 
         # Only one agent should exist in total
         non_dead = [s for s in orch.active_agents.values() if s.status != "dead"]
         assert len(non_dead) == 1
+
+
+class TestCriticalPathBoostFirstBatch:
+    """The critical-path priority boost must feed the very first spawn batch.
+
+    Tick 1 is a fast tick (the tick counter is incremented to 1 before the
+    normal-phase modulo check, and 1 % normal_tick_phase != 0), so the
+    critical path must be recomputed on fast ticks too. Before the fix the
+    first batch saw an empty critical-path cache and ordered a low-priority
+    dependency of a high-priority task behind unrelated fillers.
+    """
+
+    def test_first_tick_claims_critical_path_dependency_first(self, tmp_path: Path) -> None:
+        """With one agent slot, tick 1 must claim the dependency of the P1 task."""
+        # Filler ids sort lexicographically BEFORE the dependency id, so
+        # without the boost the priority tie (all 3s) would break on task id
+        # and a filler would be claimed first.
+        dep = _make_task(id="T-z-dep", title="Dependency", priority=3)
+        blocked = _make_task(id="T-z-blocked", title="Critical path", priority=1)
+        blocked.depends_on = ["T-z-dep"]
+        fillers = [_make_task(id=f"T-a-filler-{i}", title=f"Filler {i}", priority=3) for i in range(3)]
+        all_tasks = [_task_as_dict(t) for t in [dep, blocked, *fillers]]
+
+        claimed_order: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = request.url
+            if request.method == "GET" and url.path == "/tasks":
+                return _tasks_response(url, all_tasks)
+            if request.method == "POST" and url.path.endswith("/claim"):
+                claimed_order.append(url.path.split("/")[2])
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={})
+
+        config = OrchestratorConfig(
+            max_agents=1,
+            max_tasks_per_agent=1,
+            poll_interval_s=1,
+            heartbeat_timeout_s=120,
+            server_url="http://testserver",
+        )
+        orch = _build_orchestrator(tmp_path, httpx.MockTransport(handler), config=config)
+
+        result = orch.tick()
+
+        assert len(result.spawned) == 1
+        assert claimed_order and claimed_order[0] == "T-z-dep"
 
 
 class TestEvolveAutoCommitRuntimeExclusion:
@@ -3404,8 +3523,15 @@ class TestMaybeRetryTask:
         tmp_path: Path,
         *,
         max_retries: int = 2,
+        default_model: str | None = "mock-model",
     ) -> tuple[Orchestrator, list[dict]]:
-        """Return (orchestrator, captured_post_bodies) with POST /tasks mocked."""
+        """Return (orchestrator, captured_post_bodies) with POST /tasks mocked.
+
+        ``default_model`` is the run-level ``--model`` pin. Tests that assert
+        the Claude tier ladder must pass ``None``: a pinned model is carried
+        through retries verbatim rather than escalated (#4274), so with a pin
+        in place there is no ladder to observe.
+        """
         posted: list[dict] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3416,7 +3542,7 @@ class TestMaybeRetryTask:
 
         transport = httpx.MockTransport(handler)
         cfg = OrchestratorConfig(server_url="http://testserver", max_task_retries=max_retries)
-        orch = _build_orchestrator(tmp_path, transport, config=cfg)
+        orch = _build_orchestrator(tmp_path, transport, config=cfg, default_model=default_model)
         return orch, posted
 
     def test_first_retry_bumps_effort_keeps_model(self, tmp_path: Path) -> None:
@@ -3429,7 +3555,8 @@ class TestMaybeRetryTask:
             model="sonnet",
             effort="low",
         )
-        orch, posted = self._build(tmp_path)
+        # No run-level pin: this test is about the tier ladder itself.
+        orch, posted = self._build(tmp_path, default_model=None)
 
         result = orch._maybe_retry_task(task)
 
@@ -3440,7 +3567,7 @@ class TestMaybeRetryTask:
         assert body["effort"] == "medium"  # low → medium
 
     def test_first_retry_title_unchanged(self, tmp_path: Path) -> None:
-        # audit-017: retry_count tracks attempts — no `[RETRY N]` prefix on
+        # audit-017: retry_count tracks attempts - no `[RETRY N]` prefix on
         # title or description.
         task = Task(
             id="T-fail",
@@ -3468,7 +3595,8 @@ class TestMaybeRetryTask:
             effort="medium",
             retry_count=1,
         )
-        orch, posted = self._build(tmp_path)
+        # No run-level pin: this test is about the tier ladder itself.
+        orch, posted = self._build(tmp_path, default_model=None)
 
         result = orch._maybe_retry_task(task)
 
@@ -3551,7 +3679,8 @@ class TestMaybeRetryTask:
             effort="medium",
             retry_count=1,
         )
-        orch, posted = self._build(tmp_path)
+        # No run-level pin: this test is about the tier ladder itself.
+        orch, posted = self._build(tmp_path, default_model=None)
 
         orch._maybe_retry_task(task)
 
@@ -3595,7 +3724,7 @@ class TestReplenishBacklog:
         },
         {
             "filename": "src/baz.py",
-            "code": "E501",  # duplicate rule — should deduplicate
+            "code": "E501",  # duplicate rule - should deduplicate
             "message": "Line too long (99 > 88 characters)",
             "location": {"row": 20, "column": 1},
         },
@@ -3658,7 +3787,7 @@ class TestReplenishBacklog:
             result.open_tasks = 0
             # Phase 1: submit future
             orch._replenish_backlog(result)
-            assert len(posted) == 0  # no tasks yet — future is pending
+            assert len(posted) == 0  # no tasks yet - future is pending
             # Wait for background thread to finish
             assert orch._pending_ruff_future is not None
             orch._pending_ruff_future.result()
@@ -3748,10 +3877,10 @@ class TestReplenishBacklog:
             orch._replenish_backlog(result)
             assert orch._pending_ruff_future is not None
             orch._pending_ruff_future.result()  # wait for thread
-            # Phase 2: harvest — creates 2 tasks
+            # Phase 2: harvest - creates 2 tasks
             orch._replenish_backlog(result)
             tasks_after_harvest = len(posted)
-            # Phase 3: immediate retry — cooldown blocks new submission
+            # Phase 3: immediate retry - cooldown blocks new submission
             orch._replenish_backlog(result)
 
         assert tasks_after_harvest == 2
@@ -4069,6 +4198,378 @@ class TestRunCompletionSummary:
         assert "**Files modified:**" in content
 
 
+class TestShutdownFinalOnQuiescenceSelfStop:
+    """Regression for the D2 openrouter final leg (2026-07-02,
+    work/bernstein/proofs/d2/openrouter/attempt-final-f15a2a9e).
+
+    Ground truth from that run: a lone manager task's agent died cleanly
+    with an empty diff; `reap_dead_agents` orphan-auto-completed the task
+    within the SAME tick that detected the death (spawner.log:
+    ``orphan_auto_complete: task_id=d6c31deb34f7 ...``). But:
+
+    1. The 8b "queue looks empty" mid-run retrospective read
+       `tasks_by_status` fetched at the TOP of that tick - before the
+       orphan auto-complete ran - so it vacuously reported "HEALTHY" /
+       "Auto-completed after agent death: 0" even though the event had
+       already happened moments earlier in the same tick.
+    2. The A5 shutdown-final regeneration (added in aac43032) only runs
+       from `run()`'s post-tick-loop code, which only executes once
+       something calls `orchestrator.stop()`. But this run exited via
+       `bernstein run --quiet`'s `_wait_for_run_completion()`
+       (cli/run_bootstrap.py), which polls this process's HTTP server from
+       a SEPARATE process and never signals it - so the orchestrator
+       subprocess (launched detached via `start_new_session=True` in
+       server_launch._start_spawner) just idled until the container's
+       PID-namespace teardown SIGKILLed it, running no shutdown code at
+       all. The final retrospective was never regenerated.
+
+    This test drives the exact same shape through the real
+    `reap_dead_agents` / orphan-auto-complete code path (like
+    `TestOrphanMetrics` above) via a single `orch.tick()` call - the same
+    call `orchestrator.run()`'s tick loop makes internally regardless of
+    which CLI surface is waiting on it - and asserts both bugs are fixed.
+    """
+
+    def _build_manager_dies_orphan_transport(self, task_id: str) -> tuple[httpx.MockTransport, dict[str, Any]]:
+        """A stateful mock server: GET reflects current state, POST .../complete mutates it.
+
+        This lets a single tick() exercise the real race: the bulk GET
+        /tasks fetched at the top of the tick sees "claimed" (pre-reap),
+        while a later refetch in the SAME tick (after reap_dead_agents
+        posts the completion) must see "done".
+        """
+        state: dict[str, Any] = {
+            "id": task_id,
+            "title": "Decompose goal",
+            "description": "Break down the goal into child tasks.",
+            "role": "manager",
+            "priority": 1,
+            "scope": "medium",
+            "complexity": "medium",
+            "estimated_minutes": 5,
+            "status": "claimed",
+            "depends_on": [],
+            "owned_files": [],
+            "assigned_agent": "manager-e7bfd5e6",
+            "result_summary": None,
+            "task_type": "standard",
+            "retry_count": 0,
+            "max_retries": 3,
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = request.url
+            if request.method == "GET" and url.path == "/tasks":
+                return _tasks_response(url, [dict(state)])
+            if request.method == "GET" and url.path == f"/tasks/{task_id}":
+                return httpx.Response(200, json=dict(state))
+            if request.method == "GET" and url.path == f"/tasks/{task_id}/snapshots":
+                return httpx.Response(200, json=[])
+            if request.method == "POST" and url.path == f"/tasks/{task_id}/complete":
+                state["status"] = "done"
+                state["result_summary"] = (
+                    "Auto-completed (no changes needed): agent manager-e7bfd5e6 exited "
+                    "cleanly with empty diff (exit code 0, no signals to verify) -- task "
+                    "was auto-completed because its agent died, not because the agent "
+                    "reported completion itself"
+                )
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={})
+
+        return httpx.MockTransport(handler), state
+
+    def test_orphan_auto_complete_self_stop_produces_unhealthy_final_retrospective(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No need to eat the real 2s settle window in a unit test.
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        task_id = "d6c31deb34f7"
+        transport, state = self._build_manager_dies_orphan_transport(task_id)
+        adapter = _mock_adapter()
+        adapter.is_alive.return_value = False  # agent already dead when tick() runs
+        cfg = OrchestratorConfig(
+            server_url="http://testserver",
+            evolve_mode=False,
+            evolution_enabled=False,
+        )
+        orch = _build_orchestrator(tmp_path, transport, adapter=adapter, config=cfg)
+        session = AgentSession(
+            id="manager-e7bfd5e6",
+            role="manager",
+            pid=99,
+            task_ids=[task_id],
+            status="working",
+            exit_code=0,  # clean exit -> "auto-completed, no changes needed" path
+            # Long-lived so this is a genuine "no changes needed" clean exit,
+            # not the suspicious fast exit that is now failed/unverified
+            # (#2810/#2806). The auto-complete-after-death -> UNHEALTHY /
+            # self-stop mechanics under test are the same either way.
+            spawn_ts=time.time() - 300.0,
+        )
+        orch._agents["manager-e7bfd5e6"] = session
+
+        orch.tick()
+
+        # The orphan auto-complete must have actually fired within this tick.
+        assert state["status"] == "done", "reap_dead_agents should have auto-completed the task"
+        assert "auto-completed" in (state["result_summary"] or "").lower()
+
+        # Bug 1 fix: the mid-run summary (8b) must reflect the SAME-TICK
+        # completion, not the pre-reap "claimed" snapshot fetched at the
+        # top of the tick.
+        summary_content = (tmp_path / ".sdd" / "runtime" / "summary.md").read_text()
+        assert "**Total completed:** 1" in summary_content
+
+        # Bug 2 fix: quiescence self-stop must fire so shutdown-final
+        # regeneration actually runs on this terminal path, without
+        # depending on an external stop signal that the --quiet CLI path
+        # never sends.
+        assert orch._running is False, "orchestrator should self-stop once quiescence is confirmed"
+        assert orch._final_retrospective_regenerated is True
+
+        retro_content = (tmp_path / ".sdd" / "runtime" / "retrospective.md").read_text()
+        assert "INTERIM" not in retro_content, "the FINAL retrospective must not be labeled interim"
+        assert "**Verdict:** UNHEALTHY" in retro_content
+        assert "Auto-completed after agent death | 1" in retro_content, (
+            "the auto-completed-after-death task must be counted, not undercounted as 0"
+        )
+        assert "No issues detected; run looks healthy." not in retro_content
+
+    def test_regeneration_is_not_duplicated_by_run_post_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`_regenerate_final_retrospective` must be idempotent: calling it again
+        (as run()'s post-tick-loop code does on every normal exit) after the
+        tick-level self-stop already wrote the final report must be a no-op,
+        not a second write."""
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        task_id = "d6c31deb34f7"
+        transport, _state = self._build_manager_dies_orphan_transport(task_id)
+        adapter = _mock_adapter()
+        adapter.is_alive.return_value = False
+        cfg = OrchestratorConfig(
+            server_url="http://testserver",
+            evolve_mode=False,
+            evolution_enabled=False,
+        )
+        orch = _build_orchestrator(tmp_path, transport, adapter=adapter, config=cfg)
+        orch._agents["manager-e7bfd5e6"] = AgentSession(
+            id="manager-e7bfd5e6",
+            role="manager",
+            pid=99,
+            task_ids=[task_id],
+            status="working",
+            exit_code=0,
+            # Long-lived clean exit -> genuine auto-complete path (see the
+            # sibling test above); the suspicious fast exit is failed/unverified.
+            spawn_ts=time.time() - 300.0,
+        )
+
+        orch.tick()
+        retro_path = tmp_path / ".sdd" / "runtime" / "retrospective.md"
+        first_mtime = retro_path.stat().st_mtime
+
+        # Simulate run()'s post-tick-loop call after the while loop exits
+        # because orch._running is now False.
+        orch._regenerate_final_retrospective(trigger_path="tick-loop-drain")
+
+        assert retro_path.stat().st_mtime == first_mtime, "second call must not rewrite the report"
+
+    def test_regeneration_fires_on_later_quiescence_after_unconfirmed_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Regression for the D2 minimax leg (2026-07-02,
+        work/bernstein/proofs/d2/minimax/attempt-e938bd33).
+
+        Archived shape: tick #7 detected quiescence and wrote the summary +
+        INTERIM retrospective; the settle-window refetch then found a retry
+        task (open=1) so the run correctly continued. But because the whole
+        8b block was gated on `not self._summary_written`, every LATER
+        quiescent tick skipped quiescence handling entirely - the self-stop
+        and shutdown-final regeneration never fired again, and the run
+        exited with the stale tick-7 interim retrospective on disk
+        (3 tasks/$0.0174 vs the real 5 rows/$0.0375).
+
+        This test drives that exact shape: tick 1 quiesces but the settle
+        refetch reveals a new open (retry) task; tick 2 quiesces for real.
+        The FINAL retrospective must be regenerated on tick 2, must differ
+        from the interim, and the explicit trigger log line must fire.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        def _mk(task_id: str, title: str, status: str) -> dict[str, Any]:
+            return {
+                "id": task_id,
+                "title": title,
+                "description": title,
+                "role": "qa",
+                "priority": 1,
+                "scope": "small",
+                "complexity": "low",
+                "estimated_minutes": 5,
+                "status": status,
+                "depends_on": [],
+                "owned_files": [],
+                "assigned_agent": None,
+                "result_summary": "done" if status == "done" else None,
+                "task_type": "standard",
+                "retry_count": 0,
+                "max_retries": 3,
+            }
+
+        done_task = _mk("aaaa11112222", "Implement hello subcommand", "done")
+        retry_task_open = _mk("bbbb33334444", "Add test for hello subcommand (retry)", "open")
+        retry_task_failed = dict(retry_task_open, status="failed")
+
+        phase = {"n": 1, "tasks_calls": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/tasks":
+                phase["tasks_calls"] += 1
+                if phase["n"] == 1:
+                    # Fetches 1 (top-of-tick) and 2 (8b refetch) see a
+                    # quiescent queue; fetch 3 (settle re-check) reveals the
+                    # retry task that appeared during the settle window.
+                    if phase["tasks_calls"] >= 3:
+                        return _tasks_response(request.url, [done_task, retry_task_open])
+                    return _tasks_response(request.url, [done_task])
+                # Phase 2: the retry permanently failed; queue is truly quiescent.
+                return _tasks_response(request.url, [done_task, retry_task_failed])
+            return httpx.Response(200, json={})
+
+        cfg = OrchestratorConfig(
+            server_url="http://testserver",
+            evolve_mode=False,
+            evolution_enabled=False,
+        )
+        orch = _build_orchestrator(tmp_path, httpx.MockTransport(handler), config=cfg)
+        orch._running = True  # as run() sets before its tick loop
+
+        with caplog.at_level(logging.INFO):
+            # Tick 1: quiescence detected -> summary + INTERIM retro written,
+            # settle window finds the retry task -> run continues.
+            orch.tick()
+
+        retro_path = tmp_path / ".sdd" / "runtime" / "retrospective.md"
+        assert orch._summary_written is True, "tick 1 must have written the run summary"
+        assert orch._running is True, "tick 1 settle check must NOT self-stop (open retry task)"
+        assert orch._final_retrospective_regenerated is False
+        interim_content = retro_path.read_text()
+        assert "INTERIM" in interim_content, "tick 1 writes the interim snapshot"
+        assert "shutdown-final regeneration triggered" not in caplog.text
+
+        with caplog.at_level(logging.INFO):
+            # Tick 2: truly quiescent. Before the fix this tick skipped the
+            # entire 8b block (summary already written) and the final
+            # retrospective was never regenerated.
+            phase["n"] = 2
+            orch.tick()
+
+        assert orch._running is False, "tick 2 must self-stop on confirmed quiescence"
+        assert orch._final_retrospective_regenerated is True
+        assert "shutdown-final regeneration triggered via tick-quiescence-self-stop" in caplog.text, (
+            "the explicit trigger log line must fire (this missing line hid the bug twice)"
+        )
+
+        final_content = retro_path.read_text()
+        assert final_content != interim_content, "final retrospective must overwrite the interim snapshot"
+        assert "INTERIM" not in final_content, "the FINAL retrospective must not be labeled interim"
+
+    def test_summary_json_reflects_final_state_not_stale_interim_quiescence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #4223: ``summary.json`` has the same stale-interim problem the
+        retrospective test above already covers, but for the machine-readable
+        report instead of the human-readable one.
+
+        Same two-tick shape as
+        ``test_regeneration_fires_on_later_quiescence_after_unconfirmed_first``:
+        tick 1 quiesces on a single done task and writes summary.json via the
+        8b interim path, then the settle window finds a retry task so the run
+        continues; tick 2 quiesces for real once the retry has permanently
+        failed. Before the fix, tick 2 skipped ``_generate_run_summary``
+        entirely (gated on ``_summary_written``) and nothing else ever
+        rewrote summary.json, so the file shipped with the run's true
+        terminal state was the tick-1 snapshot: 1 task, no failure recorded,
+        even though the run went on to fail a task afterward.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        def _mk(task_id: str, title: str, status: str) -> dict[str, Any]:
+            return {
+                "id": task_id,
+                "title": title,
+                "description": title,
+                "role": "qa",
+                "priority": 1,
+                "scope": "small",
+                "complexity": "low",
+                "estimated_minutes": 5,
+                "status": status,
+                "depends_on": [],
+                "owned_files": [],
+                "assigned_agent": None,
+                "result_summary": "done" if status == "done" else None,
+                "task_type": "standard",
+                "retry_count": 0,
+                "max_retries": 3,
+            }
+
+        done_task = _mk("aaaa11112222", "Implement hello subcommand", "done")
+        retry_task_open = _mk("bbbb33334444", "Add test for hello subcommand (retry)", "open")
+        retry_task_failed = dict(retry_task_open, status="failed")
+
+        phase = {"n": 1, "tasks_calls": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/tasks":
+                phase["tasks_calls"] += 1
+                if phase["n"] == 1:
+                    if phase["tasks_calls"] >= 3:
+                        return _tasks_response(request.url, [done_task, retry_task_open])
+                    return _tasks_response(request.url, [done_task])
+                return _tasks_response(request.url, [done_task, retry_task_failed])
+            return httpx.Response(200, json={})
+
+        cfg = OrchestratorConfig(
+            server_url="http://testserver",
+            evolve_mode=False,
+            evolution_enabled=False,
+        )
+        orch = _build_orchestrator(tmp_path, httpx.MockTransport(handler), config=cfg)
+        orch._running = True  # as run() sets before its tick loop
+
+        # Tick 1: quiescence detected -> summary.json written with the
+        # interim (1-task, 0-failed) snapshot; settle window finds the
+        # retry task -> run continues.
+        orch.tick()
+
+        summary_path = tmp_path / ".sdd" / "runs" / orch._run_id / "summary.json"
+        interim_summary = json.loads(summary_path.read_text())
+        assert interim_summary["tasks_total"] == 1, "tick 1 sees only the already-done task"
+        assert interim_summary["tasks_failed"] == 0
+        assert orch._summary_written is True
+
+        # Tick 2: truly quiescent - the retry task has permanently failed.
+        phase["n"] = 2
+        orch.tick()
+
+        assert orch._running is False, "tick 2 must self-stop on confirmed quiescence"
+        assert orch._final_retrospective_regenerated is True
+
+        final_summary = json.loads(summary_path.read_text())
+        assert final_summary["tasks_total"] == 2, (
+            "summary.json must be regenerated at shutdown to include the retry task "
+            "that appeared after the interim fire"
+        )
+        assert final_summary["tasks_completed"] == 1
+        assert final_summary["tasks_failed"] == 1, (
+            "the retry task's eventual failure must reach summary.json, not just the retrospective"
+        )
+
+
 # --- DryRun ---
 
 
@@ -4173,9 +4674,22 @@ class TestRunEvolutionCycle:
         spawner = AgentSpawner(adp, templates_dir, tmp_path)
         client = httpx.Client(transport=transport, base_url="http://testserver")
         orch = Orchestrator(cfg, spawner, tmp_path, client=client, evolution=evolution)
+        # Seed a finished goal task so AutoSpawnGuard's terminal-baseline
+        # check (#4226) doesn't refuse upgrade_proposal spawns in tests that
+        # aren't exercising that check themselves.
+        goal = Task(
+            id="goal",
+            title="Implement the feature",
+            description="desc",
+            role="backend",
+            task_type=TaskType.STANDARD,
+            status=TaskStatus.DONE,
+        )
+        orch._latest_tasks_by_id = {goal.id: goal}
         return orch, evolution
 
     def _make_proposal(self, proposal_id: str = "P-001", title: str = "Improve routing") -> MagicMock:
+        from bernstein.evolution.detector import UpgradeCategory
         from bernstein.evolution.proposals import UpgradeStatus
 
         proposal = MagicMock()
@@ -4183,6 +4697,7 @@ class TestRunEvolutionCycle:
         proposal.title = title
         proposal.description = f"Description for {title}"
         proposal.status = UpgradeStatus.PENDING
+        proposal.category = UpgradeCategory.MODEL_ROUTING
         return proposal
 
     def test_happy_path_creates_http_task_per_proposal(self, tmp_path: Path) -> None:
@@ -4337,7 +4852,7 @@ class TestRunEvolutionCycle:
         result = TickResult()
         orch._run_evolution_cycle(result)
 
-        # Only the PENDING proposal should create a task — APPLIED one is skipped.
+        # Only the PENDING proposal should create a task - APPLIED one is skipped.
         assert len(posted) == 1
         assert posted[0]["title"] == "Upgrade: Pending proposal"
         assert result.errors == []
@@ -4638,29 +5153,32 @@ class TestCheckEvolve:
 
 
 class TestParallelVerification:
-    """verify_task() calls for multiple done tasks run concurrently."""
+    """verify_task_completion() calls for multiple done tasks run concurrently."""
 
     def test_multiple_done_tasks_verified_concurrently(self, tmp_path: Path) -> None:
         """Multiple done tasks with signals are verified in parallel.
 
-        Mocks verify_task with a 0.2s sleep. With 4 tasks running serially
-        this would take ~0.8s; in parallel it should finish in ~0.2s.
+        Each verify call blocks on a shared barrier that only releases once
+        all 4 calls have arrived. A serial implementation would leave the
+        first call waiting at the barrier alone, so the bounded wait below
+        raises ``BrokenBarrierError`` for it instead of hanging the shard;
+        genuine parallel execution releases the barrier immediately. This
+        proves overlap directly rather than inferring it from elapsed
+        wall-clock time, which flakes under ordinary CI scheduling noise
+        (see #4248).
         """
         import threading
         from unittest.mock import patch
 
-        call_times: list[float] = []
-        lock = threading.Lock()
+        num_tasks = 4
+        barrier = threading.Barrier(num_tasks, timeout=5.0)
 
-        def slow_verify(task: object, workdir: object) -> tuple[bool, list[str]]:
-            start = time.time()
-            time.sleep(0.15)
-            with lock:
-                call_times.append(start)
+        def parallel_verify(task: object, workdir: object) -> tuple[bool, list[str]]:
+            barrier.wait()
             return (True, [])
 
         task_dicts = []
-        for i in range(4):
+        for i in range(num_tasks):
             t = _make_task(id=f"T-par-{i}", status="done")
             td = _task_as_dict(t)
             td["completion_signals"] = [{"type": "path_exists", "value": "x"}]
@@ -4675,34 +5193,33 @@ class TestParallelVerification:
         )
         orch = _build_orchestrator(tmp_path, transport)
 
-        with patch("bernstein.core.tasks.task_lifecycle.verify_task", side_effect=slow_verify):
-            t_start = time.time()
+        # Patch the symbol the janitor enqueue actually submits to the pool.
+        # #2990 moved the completion dispatch seam from ``verify_task`` to
+        # ``verify_task_completion`` so an artifact-mode task resolves to the
+        # receipt path; a code_diff task still reaches ``verify_task`` beneath
+        # it. Patching the retired name binds nothing.
+        with patch("bernstein.core.tasks.task_lifecycle.verify_task_completion", side_effect=parallel_verify):
             result = TickResult()
             orch._process_completed_tasks(tasks_with_signals, result)
-            elapsed = time.time() - t_start
 
-        # All 4 tasks verified
-        assert len(result.verified) == 4
-        # Total wall time should be much less than 4 × 0.15s = 0.6s
-        assert elapsed < 0.5, f"Expected parallel execution but took {elapsed:.2f}s"
-        # All 4 verify calls started within ~0.15s of each other
-        assert len(call_times) == 4
-        spread = max(call_times) - min(call_times)
-        assert spread < 0.1, f"Calls spread too far apart: {spread:.3f}s"
+        # All 4 tasks verified. This is only possible because the barrier
+        # released, which requires all 4 verify calls to have been in
+        # flight at once.
+        assert len(result.verified) == num_tasks
 
 
 # --- Parallel verification ---
 
 
 class TestProcessCompletedTasksParallel:
-    """_process_completed_tasks runs verify_task() concurrently."""
+    """_process_completed_tasks runs verify_task_completion() concurrently."""
 
     def test_multiple_done_tasks_verified_concurrently(self, tmp_path: Path) -> None:
-        """verify_task() for N done tasks must run in parallel, not serially.
+        """Verification for N done tasks must run in parallel, not serially.
 
-        We mock verify_task to sleep 0.2 s per task.  With 4 tasks the serial
-        total would be >= 0.8 s; the parallel total (max_workers=4) should be
-        well under 0.5 s.
+        We mock verify_task_completion to sleep 0.2 s per task.  With 4 tasks
+        the serial total would be >= 0.8 s; the parallel total (max_workers=4)
+        should be well under 0.5 s.
         """
         import time
         from unittest.mock import patch
@@ -4726,21 +5243,50 @@ class TestProcessCompletedTasksParallel:
         )
         orch = _build_orchestrator(tmp_path, transport)
 
+        # Record the [start, end) interval of every verify call. Proving
+        # parallelism by total wall-clock is unreliable on a loaded CI runner
+        # (shard-level oversubscription can serialize threads and inflate the
+        # elapsed time past the serial baseline). Instead assert the calls
+        # OVERLAP: with a real thread pool every call starts before the first
+        # one returns, so the peak number of concurrently-open intervals must
+        # exceed one. That signal is immune to absolute scheduler slowness.
+        import threading
+
+        lock = threading.Lock()
+        intervals: list[tuple[float, float]] = []
+
         def slow_verify(task: object, workdir: object) -> tuple[bool, list[str]]:
+            begin = time.monotonic()
             time.sleep(SLEEP)
+            with lock:
+                intervals.append((begin, time.monotonic()))
             return True, []
 
-        with patch("bernstein.core.tasks.task_lifecycle.verify_task", side_effect=slow_verify):
+        # See the sibling test: the dispatch seam is ``verify_task_completion``
+        # since #2990.
+        with patch("bernstein.core.tasks.task_lifecycle.verify_task_completion", side_effect=slow_verify):
             tick_result = TickResult()
-            start = time.monotonic()
             orch._process_completed_tasks([Task.from_dict(d) for d in task_dicts], tick_result)
-            elapsed = time.monotonic() - start
 
         # All tasks verified successfully
         assert len(tick_result.verified) == N
         assert tick_result.verification_failures == []
-        # Parallel: total wall time should be much less than N * SLEEP
-        assert elapsed < SLEEP * N * 0.75, f"Expected parallel execution (<{SLEEP * N * 0.75:.2f}s), got {elapsed:.2f}s"
+        assert len(intervals) == N
+
+        # Peak concurrency: sweep the interval endpoints and count how many
+        # calls were open at once. Serial execution peaks at 1; a working
+        # thread pool peaks at >= 2 (here up to N).
+        events: list[tuple[float, int]] = []
+        for begin, end in intervals:
+            events.append((begin, 1))
+            events.append((end, -1))
+        events.sort()
+        open_now = 0
+        peak = 0
+        for _ts, delta in events:
+            open_now += delta
+            peak = max(peak, open_now)
+        assert peak >= 2, f"Expected concurrent verification (peak >= 2), got peak={peak}"
 
 
 class TestComputeTotalSpentCache:
@@ -5359,9 +5905,8 @@ class TestAdaptivePollingBackoff:
     def test_idle_ticks_double_sleep_up_to_30s(self, tmp_path: Path, monkeypatch: object) -> None:
         orch = self._make_orch(tmp_path, poll_interval_s=3)
         sleep_calls: list[float] = []
-        import bernstein.core.orchestrator as _orch_mod
 
-        monkeypatch.setattr(_orch_mod.time, "sleep", lambda s: sleep_calls.append(float(s)))
+        monkeypatch.setattr(orch, "_pace", lambda s: sleep_calls.append(float(s)))
 
         call_count = 0
 
@@ -5378,20 +5923,23 @@ class TestAdaptivePollingBackoff:
         monkeypatch.setattr(orch, "_cleanup", lambda: None)
         orch.run()
 
-        # After each idle tick, sleep doubles: 6, 12, 24, 24 (cap at 8x), 24
-        assert len(sleep_calls) > 0
-        assert sleep_calls[0] == pytest.approx(6.0)
-        assert sleep_calls[1] == pytest.approx(12.0)
-        assert sleep_calls[2] == pytest.approx(24.0)
-        assert sleep_calls[3] == pytest.approx(24.0)
-        assert sleep_calls[4] == pytest.approx(24.0)
+        # After each idle tick, sleep doubles: 6, 12, 24, 24 (cap at 8x), 24.
+        # ``_pace`` is the loop's own seam, so this list is the schedule and
+        # nothing else - no sleep performed elsewhere in the process can
+        # enter it.
+        assert sleep_calls == [
+            pytest.approx(6.0),
+            pytest.approx(12.0),
+            pytest.approx(24.0),
+            pytest.approx(24.0),
+            pytest.approx(24.0),
+        ]
 
     def test_active_tick_resets_sleep_to_poll_interval(self, tmp_path: Path, monkeypatch: object) -> None:
         orch = self._make_orch(tmp_path, poll_interval_s=3)
         sleep_calls: list[float] = []
-        import bernstein.core.orchestrator as _orch_mod
 
-        monkeypatch.setattr(_orch_mod.time, "sleep", lambda s: sleep_calls.append(float(s)))
+        monkeypatch.setattr(orch, "_pace", lambda s: sleep_calls.append(float(s)))
 
         call_count = 0
 
@@ -5417,6 +5965,42 @@ class TestAdaptivePollingBackoff:
         # tick 1 (idle) → sleep 6, tick 2 (idle) → sleep 12,
         # tick 3 (active, resets) → sleep 3, tick 4 (idle, stops loop) → sleep 6
         assert sleep_calls == [6.0, 12.0, 3.0, 6.0]
+
+    def test_pacing_record_excludes_sleeps_the_loop_did_not_perform(self, tmp_path: Path, monkeypatch: object) -> None:
+        """A sleep performed by anything else must not read as a pacing decision.
+
+        ``time.sleep`` is one function object for the whole process. Before the
+        loop had its own seam, a test that patched it recorded every sleep any
+        code performed while ``run()`` was on the stack - CPython reaps a
+        finished subprocess with a 1ms/2ms/4ms/8ms busy-wait, so on a machine
+        where a startup subprocess outlived the first tick those four values
+        were the first four entries and the schedule assertions read them
+        instead of the loop's own. Here a tick sleeps like that on purpose: the
+        record must still hold only what the loop paced.
+        """
+        orch = self._make_orch(tmp_path, poll_interval_s=3)
+        paced: list[float] = []
+        monkeypatch.setattr(orch, "_pace", lambda s: paced.append(float(s)))
+
+        call_count = 0
+
+        def fake_tick() -> TickResult:
+            nonlocal call_count
+            call_count += 1
+            # Stands in for CPython's subprocess reaping busy-wait.
+            for delay in (0.001, 0.002, 0.004, 0.008):
+                time.sleep(delay)
+            if call_count >= 2:
+                orch._running = False
+            return TickResult()
+
+        monkeypatch.setattr(orch, "tick", fake_tick)
+        monkeypatch.setattr(orch, "_has_active_agents", lambda: False)
+        monkeypatch.setattr(orch, "_drain_before_cleanup", lambda: None)
+        monkeypatch.setattr(orch, "_cleanup", lambda: None)
+        orch.run()
+
+        assert paced == [pytest.approx(6.0), pytest.approx(12.0)]
 
     def test_idle_multiplier_field_exists(self, tmp_path: Path) -> None:
         orch = self._make_orch(tmp_path)
@@ -5554,7 +6138,7 @@ class TestShouldTriggerManagerReview:
 
 
 class TestRunManagerQueueReview:
-    """Tests for Orchestrator._run_manager_queue_review — mocked ManagerAgent."""
+    """Tests for Orchestrator._run_manager_queue_review - mocked ManagerAgent."""
 
     def _make_orch(self, tmp_path: Path, transport: httpx.MockTransport) -> Orchestrator:
         return _build_orchestrator(tmp_path, transport)
@@ -5749,7 +6333,7 @@ class TestRunManagerQueueReview:
             mock_cls.return_value = mock_agent
             orch._run_manager_queue_review()
 
-        # No PATCH/POST/cancel calls — only the ManagerAgent was invoked
+        # No PATCH/POST/cancel calls - only the ManagerAgent was invoked
         assert not any(m for m in requests_made if "PATCH" in m or "cancel" in m)
 
 
@@ -5786,6 +6370,169 @@ def test_record_live_costs_enforces_max_cost_per_agent(tmp_path: Path) -> None:
     mock_retry.assert_called_once()
 
 
+def test_orchestrator_honors_external_bernstein_run_id(tmp_path: Path) -> None:
+    """An externally-set BERNSTEIN_RUN_ID (exported by run.py before the
+    orchestrator starts) must be adopted as the orchestrator's run id, not
+    overwritten with a fresh timestamp -- otherwise phase results and
+    per-agent instrumentation land under two different run directories."""
+    import os
+
+    transport = _mock_transport({})
+    with patch.dict(os.environ, {"BERNSTEIN_RUN_ID": "external-run-42"}, clear=False):
+        orch = _build_orchestrator(tmp_path, transport=transport)
+        assert orch._run_id == "external-run-42"
+        assert os.environ["BERNSTEIN_RUN_ID"] == "external-run-42"
+
+
+def test_orchestrator_generates_run_id_when_env_unset(tmp_path: Path) -> None:
+    """Without an external BERNSTEIN_RUN_ID the orchestrator still generates
+    a timestamp id and exports it for spawned-agent instrumentation."""
+    import os
+
+    transport = _mock_transport({})
+    env = {k: v for k, v in os.environ.items() if k != "BERNSTEIN_RUN_ID"}
+    with patch.dict(os.environ, env, clear=True):
+        orch = _build_orchestrator(tmp_path, transport=transport)
+        assert orch._run_id
+        assert os.environ["BERNSTEIN_RUN_ID"] == orch._run_id
+
+
+def test_kill_agent_for_cost_cap_reaps_heartbeat_loop(tmp_path: Path) -> None:
+    """The cost-cap forced-kill path must reap the session's backgrounded
+    heartbeat shell loop (Defect-10) so it does not outlive the agent."""
+    config = OrchestratorConfig(
+        max_agents=2,
+        poll_interval_s=1,
+        heartbeat_timeout_s=60,
+        server_url="http://testserver",
+        max_cost_per_agent=0.001,
+    )
+    transport = _mock_transport({})
+    orch = _build_orchestrator(tmp_path, transport=transport, config=config)
+    session = AgentSession(
+        id="agent-cap-reap",
+        role="backend",
+        task_ids=["task-cap"],
+        status="working",
+    )
+    session.tokens_used = 1000
+    orch._agents[session.id] = session
+    orch._spawner.kill = MagicMock()
+    orch._release_file_ownership = MagicMock()
+    orch._release_task_to_session = MagicMock()
+    orch._record_provider_health = MagicMock()
+
+    with (
+        patch("bernstein.core.orchestrator.retry_or_fail_task"),
+        patch("bernstein.core.agents.heartbeat._reap_session_heartbeat_loop") as reap,
+    ):
+        orch._record_live_costs()
+
+    orch._spawner.kill.assert_called_once()
+    reap.assert_called_once()
+    assert reap.call_args.args[1] is session
+    assert reap.call_args.kwargs["reason"] == "cost_cap_kill"
+
+
+def test_handle_anomaly_signal_kill_reaps_heartbeat_loop(tmp_path: Path) -> None:
+    """The anomaly kill_agent path must reap the session's backgrounded
+    heartbeat shell loop (Defect-10) so it does not outlive the agent."""
+    import time as _time
+
+    from bernstein.core.cost_anomaly import AnomalySignal
+
+    transport = _mock_transport({})
+    orch = _build_orchestrator(tmp_path, transport=transport)
+    session = AgentSession(id="agent-anomaly", role="backend", status="working")
+    orch._agents[session.id] = session
+    orch._spawner.kill = MagicMock()
+
+    signal = AnomalySignal(
+        rule="burn_rate",
+        severity="critical",
+        action="kill_agent",
+        agent_id=session.id,
+        task_id=None,
+        message="burn rate exceeded",
+        details={},
+        timestamp=_time.time(),
+    )
+
+    with patch("bernstein.core.agents.heartbeat._reap_session_heartbeat_loop") as reap:
+        orch._handle_anomaly_signal(signal)
+
+    orch._spawner.kill.assert_called_once_with(session)
+    reap.assert_called_once()
+    assert reap.call_args.args[1] is session
+    assert reap.call_args.kwargs["reason"] == "anomaly_kill"
+
+
+def test_record_live_costs_accumulates_from_tokens_sidecar(tmp_path: Path) -> None:
+    """Ledger spent_usd must accumulate from the .tokens sidecar (bug item-7).
+
+    openai_agents sessions never populate ``session.tokens_used``; before the
+    fix the run ledger's spent_usd stayed 0.0 all run. Simulated session cost
+    (sidecar rows) must flow into the tracker: spent_usd > 0 and equal to the
+    priced sum of the sidecar tokens, delta-safe across repeated ticks.
+    """
+    from bernstein.core.cost.cost_tracker import estimate_cost
+
+    transport = _mock_transport({})
+    orch = _build_orchestrator(tmp_path, transport=transport)
+    session = AgentSession(
+        id="agent-sidecar",
+        role="backend",
+        task_ids=["task-sidecar"],
+        status="working",
+    )
+    assert session.tokens_used == 0  # openai_agents path: never populated
+    orch._agents[session.id] = session
+
+    sidecar = tmp_path / ".sdd" / "runtime" / f"{session.id}.tokens"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(
+        '{"ts": 1.0, "in": 1000, "out": 500}\n{"ts": 2.0, "in": 2000, "out": 1500}\n',
+        encoding="utf-8",
+    )
+
+    orch._record_live_costs()
+    expected = estimate_cost("sonnet", 3000, 2000)
+    assert expected > 0
+    status = orch._cost_tracker.status()
+    assert status.spent_usd > 0
+    assert status.spent_usd == pytest.approx(expected)
+
+    # Delta-safe: a second tick over the same sidecar adds nothing.
+    orch._record_live_costs()
+    assert orch._cost_tracker.status().spent_usd == pytest.approx(expected)
+
+    # New sidecar rows increment by exactly the newly-priced delta.
+    with sidecar.open("a", encoding="utf-8") as fh:
+        fh.write('{"ts": 3.0, "in": 500, "out": 250}\n')
+    orch._record_live_costs()
+    expected_total = estimate_cost("sonnet", 3500, 2250)
+    assert orch._cost_tracker.status().spent_usd == pytest.approx(expected_total)
+
+
+def test_record_live_costs_falls_back_to_session_tokens(tmp_path: Path) -> None:
+    """Providers without a sidecar still meter via session.tokens_used."""
+    from bernstein.core.cost.cost_tracker import estimate_cost
+
+    transport = _mock_transport({})
+    orch = _build_orchestrator(tmp_path, transport=transport)
+    session = AgentSession(
+        id="agent-legacy",
+        role="backend",
+        task_ids=["task-legacy"],
+        status="working",
+    )
+    session.tokens_used = 4000
+    orch._agents[session.id] = session
+
+    orch._record_live_costs()
+    assert orch._cost_tracker.status().spent_usd == pytest.approx(estimate_cost("sonnet", 4000, 0))
+
+
 def test_build_notification_manager_includes_seed_webhooks() -> None:
     """Seed-level webhooks should be threaded into NotificationManager targets."""
     from bernstein.core.orchestrator import _build_notification_manager
@@ -5818,3 +6565,376 @@ def test_build_notification_manager_includes_desktop_target() -> None:
     assert manager is not None
     targets = manager._targets  # pyright: ignore[reportPrivateUsage]
     assert any(t.type == "desktop" and t.events == ["task.completed", "task.failed"] for t in targets)
+
+
+# --- Defect 29: self-stop ordering race (D2 MiniMax re-proof) -------------
+
+
+class TestSelfStopOrderingDrain:
+    """Defect 29 (2026-07-02, work/bernstein/proofs/d2/minimax/attempt-83808a8a).
+
+    Regression for the run-summary firing BEFORE the post-/complete chain
+    (task_done -> ``_reap_and_cleanup_session`` -> ``_apply_janitor_verdict_action``)
+    had drained for the just-completed tasks. On MiniMax-M2.7-highspeed's
+    ~40 s child runtimes, the orchestrator's ``open_tasks == active_agents == 0``
+    predicate fired the run-summary in the same poll cycle that first
+    detected quiescence, but before ``process_completed_tasks`` had run the
+    chain for the children - so ``generate_retrospective`` was skipped (no
+    chain-registered completion) and no merge-to-main happened before
+    self-stop.
+
+    The fix introduces a drain counter (incremented when a task is first
+    seen in done/failed state, decremented once ``_processed_done_tasks``
+    contains it AND its session is dead/None). The summary gate now waits
+    on that counter reaching zero.
+    """
+
+    def _build(
+        self,
+        tmp_path: Path,
+        *,
+        done_tasks: list[dict] | None = None,
+        failed_tasks: list[dict] | None = None,
+    ) -> Orchestrator:
+        _done = done_tasks or []
+        _failed = failed_tasks or []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = request.url
+            if request.method == "GET" and url.path == "/tasks":
+                return _tasks_response(url, _done + _failed)
+            return httpx.Response(200, json={})
+
+        transport = httpx.MockTransport(handler)
+        cfg = OrchestratorConfig(
+            server_url="http://testserver",
+            evolve_mode=False,
+            evolution_enabled=False,
+        )
+        return _build_orchestrator(tmp_path, transport, config=cfg)
+
+    def test_summary_defers_when_post_complete_chain_not_yet_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defect 29 (a) regression: terminal tasks visible, but
+        ``process_completed_tasks`` has not registered them in
+        ``_processed_done_tasks`` yet (e.g. a /complete POST landed AFTER
+        the tick-1 snapshot was taken, and the step-1c call already ran
+        against the pre-/complete snapshot). The drain counter is
+        positive, so the run summary MUST NOT be written.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        done = [_task_as_dict(_make_task(id="T-1", title="Backend feature", status="done"))]
+        failed = [_task_as_dict(_make_task(id="T-2", title="QA test", status="failed"))]
+        orch = self._build(tmp_path, done_tasks=done, failed_tasks=failed)
+
+        # Simulate "chain not yet run": patch ``process_completed_tasks`` to
+        # a no-op so it never adds the task ids to ``_processed_done_tasks``.
+        # This is the exact shape the fix targets: tasks are terminal in the
+        # server, the orchestrator can see them, but the chain that drains
+        # them has not run yet (or has been bypassed).
+        import bernstein.core.orchestration.orchestrator as orch_mod
+
+        monkeypatch.setattr(
+            orch_mod,
+            "process_completed_tasks",
+            lambda *_args, **_kwargs: None,
+        )
+
+        orch.tick()
+
+        summary_path = tmp_path / ".sdd" / "runtime" / "summary.md"
+        assert not summary_path.exists(), (
+            "defect 29 regression: summary.md MUST NOT be written while "
+            "pending_post_complete_count > 0; the post-/complete chain "
+            "has not drained for the terminal tasks yet"
+        )
+        assert orch._pending_post_complete_count >= 1, (
+            "drain tracker should still report pending tasks; tick should "
+            "have re-evaluated and either processed or deferred"
+        )
+
+    def test_summary_fires_when_post_complete_chain_drains(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defect 29 (b) positive: once every terminal task is in
+        ``_processed_done_tasks`` AND its session is dead (or None), the
+        drain counter reaches zero and the run summary fires.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        done = [_task_as_dict(_make_task(id="T-1", title="Backend feature", status="done"))]
+        failed = [_task_as_dict(_make_task(id="T-2", title="QA test", status="failed"))]
+        orch = self._build(tmp_path, done_tasks=done, failed_tasks=failed)
+
+        orch.tick()
+
+        summary_path = tmp_path / ".sdd" / "runtime" / "summary.md"
+        assert summary_path.exists(), (
+            "summary.md should fire once the post-/complete chain has "
+            "drained: _processed_done_tasks has both task ids, no sessions "
+            "are alive for them"
+        )
+        assert orch._pending_post_complete_count == 0
+        assert orch._summary_written is True
+
+    def test_summary_defers_until_session_transitions_to_dead(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defect 29 (a) tighter: chain HAS run (``_processed_done_tasks``
+        has the task id) but the session is still alive (status != dead).
+        The drain counter MUST stay positive until the session is dead.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        task_id = "T-1"
+        done = [_task_as_dict(_make_task(id=task_id, title="Live work", status="done"))]
+        orch = self._build(tmp_path, done_tasks=done)
+
+        orch._processed_done_tasks[task_id] = None
+        orch._post_complete_seen_task_ids.add(task_id)
+        orch._pending_post_complete_count = 1
+        orch._agents["backend-xyz"] = AgentSession(
+            id="backend-xyz",
+            role="backend",
+            pid=12345,
+            task_ids=[task_id],
+            status="working",
+            exit_code=None,
+        )
+        orch._task_to_session[task_id] = "backend-xyz"
+
+        orch.tick()
+
+        summary_path = tmp_path / ".sdd" / "runtime" / "summary.md"
+        assert not summary_path.exists(), (
+            "defect 29 regression: summary.md MUST NOT fire while the "
+            "agent session is still alive (reap step inside "
+            "_reap_and_cleanup_session has not transitioned it to dead)"
+        )
+        assert orch._pending_post_complete_count == 1, (
+            "drain tracker should still report the live-session task as "
+            "pending - the chain ran but the session has not been reaped"
+        )
+
+        orch._agents["backend-xyz"].status = "dead"
+
+        orch.tick()
+
+        assert summary_path.exists(), (
+            "summary.md should fire once the session is dead and _processed_done_tasks has the task id (chain drained)"
+        )
+        assert orch._pending_post_complete_count == 0
+
+    def test_run_end_check_log_emitted_with_all_inputs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Defect 29 (c): the run-end decision MUST log every input that
+        drove it (open, active, pending_post_complete, summary_written,
+        action) so a 2-minute diagnosis from logs alone is possible.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        done = [_task_as_dict(_make_task(id="T-1", title="Real work", status="done"))]
+        orch = self._build(tmp_path, done_tasks=done)
+
+        logging.getLogger().setLevel(logging.INFO)
+        with caplog.at_level(logging.INFO):
+            orch.tick()
+
+        run_end_lines = [
+            rec
+            for rec in caplog.records
+            if rec.name == "bernstein.core.orchestration.orchestrator" and rec.getMessage().startswith("run_end_check:")
+        ]
+        assert run_end_lines, (
+            f"run_end_check log line MUST be emitted on the quiescent tick; "
+            f"got {len(caplog.records)} records total. Records:"
+            + "\n".join(r.getMessage()[:120] for r in caplog.records)
+        )
+        msg = run_end_lines[-1].getMessage()
+        assert "tick=#" in msg
+        assert "open=" in msg
+        assert "active=" in msg
+        assert "pending_post_complete=" in msg
+        assert "summary_written=" in msg
+        assert "-> action=" in msg
+        action = msg.split("-> action=")[1].split(" ")[0].strip()
+        assert action in {"fire_summary", "defer_summary", "wait"}, f"unexpected action value {action!r}"
+
+    def test_run_summary_firing_log_emitted_with_all_inputs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Defect 29 (c): the firing log line MUST emit every input that
+        the run-summary generation saw, so logs alone diagnose the run.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        done = [_task_as_dict(_make_task(id="T-1", title="Work A", status="done"))]
+        orch = self._build(tmp_path, done_tasks=done)
+
+        with caplog.at_level(logging.INFO):
+            orch.tick()
+
+        firing_lines = [rec for rec in caplog.records if rec.getMessage().startswith("run_summary_firing:")]
+        assert firing_lines, (
+            "run_summary_firing log line MUST be emitted at the top of _generate_run_summary with all inputs"
+        )
+        msg = firing_lines[-1].getMessage()
+        assert "tick=#" in msg
+        assert "tasks_completed=" in msg
+        assert "tasks_failed=" in msg
+        assert "files_modified=" in msg
+        assert "cost_usd=" in msg
+        assert "wall_clock_s=" in msg
+        assert "pending_post_complete=" in msg
+        assert "processed_done_tasks=" in msg
+        assert "-> action=fire_summary" in msg
+
+    def test_defer_summary_log_lists_pending_task_ids(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Defect 29 (c): when the action is defer_summary, the log MUST
+        list the task ids whose post-/complete chain is still pending.
+        """
+        monkeypatch.setenv("BERNSTEIN_QUIESCENCE_SETTLE_S", "0")
+
+        done = [_task_as_dict(_make_task(id="T-stuck", title="Stuck work", status="done"))]
+        orch = self._build(tmp_path, done_tasks=done)
+
+        import bernstein.core.orchestration.orchestrator as orch_mod
+
+        monkeypatch.setattr(
+            orch_mod,
+            "process_completed_tasks",
+            lambda *_args, **_kwargs: None,
+        )
+
+        with caplog.at_level(logging.INFO):
+            orch.tick()
+
+        run_end_lines = [rec for rec in caplog.records if rec.getMessage().startswith("run_end_check:")]
+        assert run_end_lines
+        msg = run_end_lines[-1].getMessage()
+        assert "defer_summary" in msg
+        assert "T-stuck" in msg, "defer_summary log MUST include the task ids still pending the post-/complete chain"
+
+
+# --- Cost-aware dispatch gate wired into the live spawn loop (#2354) ---
+
+
+class TestCostPolicyDispatchWiring:
+    """The deterministic USD dispatch policy consulted before a real spawn.
+
+    #2354 shipped ``decide_dispatch`` + the dispatch receipt as a pure policy
+    layer, but nothing consulted it inside the live ``bernstein run`` spawn
+    loop, so a run only discovered a USD-cap breach after the fact. These tests
+    drive a real orchestrator tick to the cap and assert the run halts before
+    breaching, sealing a verifiable receipt -- and that a run with no cost
+    policy configured is a clean no-op (fail-open).
+    """
+
+    @staticmethod
+    def _priced_task_dict(task_id: str = "T-cost-1", model: str = "claude-sonnet-5") -> dict[str, object]:
+        """A ready task carrying a priced model so its pre-spawn estimate is a
+        deterministic, positive USD figure (round-trips via Task.from_dict)."""
+        task = _make_task(id=task_id, scope="large", complexity="high")
+        payload = _task_as_dict(task)
+        payload["model"] = model
+        return payload
+
+    def test_run_halts_before_breaching_usd_cap_and_seals_receipt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bernstein.core.config.config_schema import CostCapsSchema, CostPolicySchema
+        from bernstein.core.cost.scheduling.receipt import verify_dispatch_receipt
+        from bernstein.core.cost.spend_ledger import CallTags
+        from bernstein.core.security.audit import load_or_create_audit_key
+        from bernstein.core.security.audit_chain import EVENT_COST_DISPATCH_RECEIPT, AuditChainStore
+
+        monkeypatch.setenv("BERNSTEIN_AUDIT_KEY_PATH", str(tmp_path / "audit.key"))
+        transport = _mock_transport({"GET /tasks": httpx.Response(200, json=[self._priced_task_dict()])})
+        config = OrchestratorConfig(
+            server_url="http://testserver",
+            poll_interval_s=1,
+            cost_policy=CostPolicySchema(caps=CostCapsSchema(per_run_usd=5.0)),
+        )
+        orch = _build_orchestrator(tmp_path, transport, config=config)
+        # The cap gate runs before claim/spawn; the spawner must never fire.
+        orch._spawner.spawn_for_tasks = MagicMock(
+            side_effect=AssertionError("spawn must not run once the USD cap gate halts")
+        )
+        # Seed prior run spend just under the cap; the projected next dispatch tips it over.
+        orch._spend_ledger.record(
+            tags=CallTags(task_id="T-prev", agent_id="prev", role="backend"),
+            model="claude-sonnet-5",
+            cost_usd=4.5,
+        )
+
+        result = orch.tick()
+
+        assert result.spawned == []
+        assert result.cost_dispatch_halt, "tick must record the halting decision hash"
+        orch._spawner.spawn_for_tasks.assert_not_called()
+
+        # The halt is a receipt that verifies offline, naming its inputs + overrun.
+        verify = verify_dispatch_receipt(
+            workdir=tmp_path,
+            lineage_root=tmp_path / ".sdd" / "lineage",
+            hmac_key=load_or_create_audit_key(),
+            decision_hash=result.cost_dispatch_halt,
+        )
+        assert verify.ok is True
+        assert verify.receipt is not None
+        decision = verify.receipt.decision
+        assert decision.admit is False
+        assert decision.breached_dimension == "run"
+        assert decision.projected_overrun_usd > 0
+        assert decision.price_table_hash.startswith("sha256:")
+
+        # Mirrored into the HMAC audit chain so the halt is chain-provable.
+        chain = AuditChainStore(tmp_path / ".sdd" / "audit", key=load_or_create_audit_key())
+        events = chain.query(event_type=EVENT_COST_DISPATCH_RECEIPT)
+        assert len(events) == 1
+        assert events[0].details["admit"] is False
+        assert events[0].details["breached_dimension"] == "run"
+        assert events[0].details["decision_hash"] == result.cost_dispatch_halt
+
+    def test_no_cost_policy_is_fail_open_no_op(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BERNSTEIN_AUDIT_KEY_PATH", str(tmp_path / "audit.key"))
+        tasks = [_make_task(id="T-1"), _make_task(id="T-2")]
+        transport = _mock_transport({"GET /tasks": httpx.Response(200, json=[_task_as_dict(t) for t in tasks])})
+        # No cost_policy configured -> the gate is a clean no-op.
+        config = OrchestratorConfig(server_url="http://testserver", poll_interval_s=1)
+        orch = _build_orchestrator(tmp_path, transport, config=config)
+
+        result = orch.tick()
+
+        assert result.cost_dispatch_halt is None
+        assert len(result.spawned) == 1  # normal spawn proceeds
+        assert len(result.errors) == 0
+
+    def test_zero_caps_are_fail_open_no_op(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bernstein.core.config.config_schema import CostCapsSchema, CostPolicySchema
+        from bernstein.core.cost.spend_ledger import CallTags
+
+        monkeypatch.setenv("BERNSTEIN_AUDIT_KEY_PATH", str(tmp_path / "audit.key"))
+        transport = _mock_transport({"GET /tasks": httpx.Response(200, json=[_task_as_dict(_make_task(id="T-1"))])})
+        # cost_policy present but every cap is 0 (unlimited) -> still a no-op.
+        config = OrchestratorConfig(
+            server_url="http://testserver",
+            poll_interval_s=1,
+            cost_policy=CostPolicySchema(caps=CostCapsSchema()),
+        )
+        orch = _build_orchestrator(tmp_path, transport, config=config)
+        orch._spend_ledger.record(
+            tags=CallTags(task_id="T-prev", agent_id="prev", role="backend"),
+            model="claude-sonnet-5",
+            cost_usd=1000.0,
+        )
+
+        result = orch.tick()
+
+        assert result.cost_dispatch_halt is None
+        assert len(result.spawned) == 1

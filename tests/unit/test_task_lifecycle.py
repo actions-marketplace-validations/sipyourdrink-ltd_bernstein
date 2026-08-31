@@ -5,14 +5,17 @@
 from __future__ import annotations
 
 import collections
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
+from bernstein.core.ab_test_results import ABTestStore
 from bernstein.core.convergence_guard import ConvergenceGuard
 from bernstein.core.models import (
+    AgentHeartbeat,
     AgentSession,
     CompletionSignal,
     Complexity,
@@ -23,9 +26,12 @@ from bernstein.core.models import (
 )
 from bernstein.core.orchestrator import TickResult
 from bernstein.core.task_lifecycle import (
+    _enqueue_dlq_if_workdir,
     _enqueue_paired_test_task,
     _has_llm_judge_signal,
     _move_backlog_ticket,
+    _record_ab_test_outcome,
+    _verify_against_merge_preview,
     _verify_via_janitor,
     claim_and_spawn_batches,
     prepare_speculative_warm_pool,
@@ -34,6 +40,7 @@ from bernstein.core.task_lifecycle import (
 )
 from bernstein.core.warm_pool import WarmPool, WarmPoolConfig
 
+from bernstein.core.agents.agent_signals import AgentSignalManager
 from bernstein.core.knowledge.task_graph import TaskGraph
 
 
@@ -211,6 +218,41 @@ def test_claim_and_spawn_batches_aborts_on_claim_transport_error(tmp_path: Path,
     assert result.errors == ["claim:T-net: server down"]
 
 
+def test_spawn_backoff_keyed_on_lineage_not_ephemeral_retry_id(tmp_path: Path, make_task: Any) -> None:
+    """A retry inherits its lineage's spawn backoff instead of resetting it.
+
+    Regression for #2806: the spawn-failure backoff was keyed on the current
+    attempt's task ids, so every retry (a fresh id) started fail_count back at
+    0 and the ``_MAX_SPAWN_FAILURES`` ceiling never accumulated against a
+    repeating spawn failure. Keying on the lineage
+    (``metadata["original_task_id"]``) makes a retry respect the backoff the
+    original lineage already accrued.
+    """
+    import time as _time
+
+    orch = _claim_orch(tmp_path)
+
+    # The lineage root "T-orig" already failed to spawn twice and its most
+    # recent failure is fresh, so the lineage is in active backoff.
+    lineage_key = frozenset(["T-orig"])
+    orch._spawn_failures[lineage_key] = (2, _time.time())
+
+    # A retry of that lineage arrives with a brand-new task id but carries the
+    # same original_task_id in its metadata.
+    retry = make_task(id="T-retry-1", role="backend")
+    retry.metadata = {"original_task_id": "T-orig"}
+    result = TickResult()
+
+    claim_and_spawn_batches(orch, [[retry]], alive_count=0, assigned_task_ids=set(), done_ids=set(), result=result)
+
+    # The retry is skipped by the inherited backoff: no claim, no spawn. Before
+    # the fix the id-keyed backoff missed the lineage entry and the retry was
+    # claimed/spawned immediately.
+    orch._client.post.assert_not_called()
+    orch._spawner.spawn_for_tasks.assert_not_called()
+    assert result.spawned == []
+
+
 def test_claim_and_spawn_batches_auto_decomposes_large_task_before_claim(tmp_path: Path, make_task: Any) -> None:
     """claim_and_spawn_batches creates a planner task instead of claiming a decomposable large task."""
     orch = _claim_orch(tmp_path)
@@ -230,8 +272,14 @@ def test_claim_and_spawn_batches_auto_decomposes_large_task_before_claim(tmp_pat
 
 
 def test_claim_and_spawn_batches_submits_provider_batch_without_spawning(tmp_path: Path, make_task: Any) -> None:
-    """Eligible provider-batch work is submitted and skips the local spawn path."""
+    """Eligible provider-batch work is submitted and skips the local spawn path.
+
+    The capability-gated route_batch decision (#2354) only reaches the batch
+    surface on a batch-capable adapter, so the orchestrator resolves ``claude``
+    (a declared batch adapter).
+    """
     orch = _claim_orch(tmp_path)
+    orch._spawner.default_adapter_name = "claude"
     task = make_task(id="T-batch", title="Update docs", description="Refresh the API docs.")
     task.batch_eligible = True
     orch._batch_api = MagicMock()
@@ -247,6 +295,83 @@ def test_claim_and_spawn_batches_submits_provider_batch_without_spawning(tmp_pat
     orch._batch_api.try_submit.assert_called_once()
     orch._spawner.spawn_for_tasks.assert_not_called()
     assert result.spawned == ["batch-T-batch"]
+
+
+class _FakeBatchSurface:
+    """A faithful mock batch-capable adapter surface (#2354).
+
+    Mirrors the ``ProviderBatchManager.try_submit`` contract: it records the
+    task ids it was asked to dispatch and reports them as handled + submitted,
+    so a test can prove which tasks the live path actually routed to the batch
+    endpoint versus which bypassed it to interactive dispatch.
+    """
+
+    def __init__(self) -> None:
+        self.submitted_task_ids: list[str] = []
+
+    def try_submit(self, orch: Any, task: Any) -> SimpleNamespace:
+        self.submitted_task_ids.append(task.id)
+        return SimpleNamespace(handled=True, submitted=True, session_id=f"batch-{task.id}")
+
+    def poll(self, orch: Any) -> None:  # pragma: no cover - parity with the real surface
+        del orch
+
+
+def test_live_path_routes_batch_eligible_task_through_batch_surface(tmp_path: Path, make_task: Any) -> None:
+    """A batch-eligible task on a batch-capable adapter routes to the batch surface (AC3)."""
+    orch = _claim_orch(tmp_path)
+    orch._spawner.default_adapter_name = "claude"  # declared batch-capable
+    surface = _FakeBatchSurface()
+    orch._batch_api = surface
+    task = make_task(id="T-eligible", title="Update docs", description="Refresh the docs.")
+    task.batch_eligible = True
+    result = TickResult()
+
+    claim_and_spawn_batches(orch, [[task]], alive_count=0, assigned_task_ids=set(), done_ids=set(), result=result)
+
+    assert surface.submitted_task_ids == ["T-eligible"]
+    orch._spawner.spawn_for_tasks.assert_not_called()
+    assert result.spawned == ["batch-T-eligible"]
+
+
+def test_live_path_non_eligible_task_bypasses_batch_surface(tmp_path: Path, make_task: Any) -> None:
+    """A non-eligible task never routes to batch, even on a batch-capable adapter (AC3)."""
+    orch = _claim_orch(tmp_path)
+    orch._spawner.default_adapter_name = "claude"  # capable, but the task is not eligible
+    surface = _FakeBatchSurface()
+    orch._batch_api = surface
+    task = make_task(id="T-realtime", title="Design the API", description="Interactive work.")
+    task.batch_eligible = False  # explicit realtime -> never a batch candidate
+    session = AgentSession(
+        id="A-realtime", role="backend", task_ids=[task.id], model_config=ModelConfig("sonnet", "high")
+    )
+    orch._spawner.spawn_for_tasks.return_value = session
+    result = TickResult()
+
+    claim_and_spawn_batches(orch, [[task]], alive_count=0, assigned_task_ids=set(), done_ids=set(), result=result)
+
+    assert surface.submitted_task_ids == []  # batch surface was bypassed
+    orch._spawner.spawn_for_tasks.assert_called_once()
+
+
+def test_live_path_eligible_on_incapable_adapter_is_refused_not_faked(tmp_path: Path, make_task: Any) -> None:
+    """A batch-eligible task on an adapter with no batch surface runs interactively (AC3)."""
+    orch = _claim_orch(tmp_path)
+    orch._spawner.default_adapter_name = "mock"  # not a batch-capable adapter
+    surface = _FakeBatchSurface()
+    orch._batch_api = surface
+    task = make_task(id="T-refused", title="Update docs", description="Refresh the docs.")
+    task.batch_eligible = True
+    session = AgentSession(
+        id="A-refused", role="backend", task_ids=[task.id], model_config=ModelConfig("sonnet", "high")
+    )
+    orch._spawner.spawn_for_tasks.return_value = session
+    result = TickResult()
+
+    claim_and_spawn_batches(orch, [[task]], alive_count=0, assigned_task_ids=set(), done_ids=set(), result=result)
+
+    assert surface.submitted_task_ids == []  # refused, not faked onto a missing surface
+    orch._spawner.spawn_for_tasks.assert_called_once()
 
 
 def test_claim_and_spawn_batches_sets_small_timeout_bucket(tmp_path: Path, make_task: Any) -> None:
@@ -318,7 +443,13 @@ def test_claim_and_spawn_batches_sets_xl_timeout_bucket_for_high_risk_batch(tmp_
 
 
 def test_claim_and_spawn_batches_blocked_by_high_error_rate(tmp_path: Path, make_task: Any) -> None:
-    """claim_and_spawn_batches skips the entire spawn wave when convergence guard detects high error rate."""
+    """claim_and_spawn_batches skips the spawn wave when the error rate is high.
+
+    ``alive_count`` is 1, not 0: the rate gates are backpressure, and at zero
+    active agents the guard deliberately stops gating (see
+    ``test_convergence_guard_idle_floor``). One is also below ``max_agents``,
+    so the guard is the only gate that can block this wave.
+    """
     orch = _claim_orch(tmp_path)
     # Wire a convergence guard with a low error-rate threshold
     cg = ConvergenceGuard(ConvergenceGuardConfig(max_error_rate=0.3))
@@ -336,9 +467,9 @@ def test_claim_and_spawn_batches_blocked_by_high_error_rate(tmp_path: Path, make
     task = make_task(id="T-blocked", role="backend")
     result = TickResult()
 
-    claim_and_spawn_batches(orch, [[task]], alive_count=0, assigned_task_ids=set(), done_ids=set(), result=result)
+    claim_and_spawn_batches(orch, [[task]], alive_count=1, assigned_task_ids=set(), done_ids=set(), result=result)
 
-    # Spawn must not happen — convergence guard blocked it
+    # Spawn must not happen - convergence guard blocked it
     orch._client.post.assert_not_called()
     orch._spawner.spawn_for_tasks.assert_not_called()
     assert result.spawned == []
@@ -671,12 +802,23 @@ def test_process_completed_tasks_dispatches_llm_judge_to_run_janitor(
     assert mock_process.call_count == 2
     assert len(submitted) == 2
 
-    dispatched = {args[0].id: fn for fn, args, _ in submitted}
-    assert dispatched["T-judge"] is _verify_via_janitor
-    # Non-judge tasks keep the sync verify_task fast path.
-    from bernstein.core.janitor import verify_task as _expected_verify_task
+    # A task whose session owns a worktree is verified against the agent
+    # branch merged onto the run branch (issue #4367), so the submitted
+    # callable is the preview wrapper and the real verifier is its first
+    # argument. Unwrap it so this test keeps asserting dispatch routing.
+    def _unwrap(fn: Any, args: tuple[Any, ...]) -> tuple[Any, Any]:
+        if fn is _verify_against_merge_preview:
+            return args[0], args[1]
+        return fn, args[0]
 
-    assert dispatched["T-sync"] is _expected_verify_task
+    dispatched = {task_obj.id: verifier for verifier, task_obj in (_unwrap(fn, args) for fn, args, _ in submitted)}
+    assert dispatched["T-judge"] is _verify_via_janitor
+    # Non-judge tasks keep the sync fast path. Since #2990 that seam is
+    # ``verify_task_completion``, which dispatches on the task's artifact kind
+    # and resolves a code_diff task to ``verify_task`` unchanged.
+    from bernstein.core.tasks.artifact_completion import verify_task_completion as _expected_sync_verify
+
+    assert dispatched["T-sync"] is _expected_sync_verify
 
 
 def test_verify_via_janitor_runs_run_janitor_for_llm_judge(
@@ -694,10 +836,14 @@ def test_verify_via_janitor_runs_run_janitor_for_llm_judge(
         workdir: Path,
         *,
         server_url: str | None = None,
+        judge_model: str | None = None,
+        judge_provider: str | None = None,
     ) -> list[Any]:
         captured["tasks"] = tasks
         captured["workdir"] = workdir
         captured["server_url"] = server_url
+        captured["judge_model"] = judge_model
+        captured["judge_provider"] = judge_provider
         return [
             SimpleNamespace(
                 task_id=tasks[0].id,
@@ -719,7 +865,7 @@ def test_verify_via_janitor_runs_run_janitor_for_llm_judge(
 
 
 # ---------------------------------------------------------------------------
-# Formal verification gate — audit-030
+# Formal verification gate - audit-030
 # ---------------------------------------------------------------------------
 
 
@@ -870,3 +1016,572 @@ def test_formal_verification_gate_swallows_runner_exception(tmp_path: Path, make
 
     assert passed is True
     assert result.verification_failures == []
+
+
+# ---------------------------------------------------------------------------
+# Normal-completion cost sourcing (D2 canary-host-99d0eac0 regression,
+# 2026-07-03): task_m.cost_usd is populated by nothing on the normal
+# completion path (the live-cost loop feeds CostTracker only), so tasks
+# whose runner wrote a real .tokens sidecar (canary qa task 325c200e1985:
+# 51,880/1,401 tokens) still recorded cost_usd 0.0 in metrics/tasks.jsonl.
+# _record_completion_metrics must fall back to the sidecar.
+# ---------------------------------------------------------------------------
+
+
+def _write_tokens_sidecar(workdir: Path, session_id: str, input_tokens: int, output_tokens: int) -> Path:
+    """Write a runner cost sidecar with one usage record (runner schema)."""
+    import json as _json
+
+    runtime_dir = workdir / ".sdd" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = runtime_dir / f"{session_id}.tokens"
+    with sidecar.open("a", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"ts": 1783039683.9, "in": input_tokens, "out": output_tokens}) + "\n")
+    return sidecar
+
+
+def test_record_completion_metrics_sources_cost_from_tokens_sidecar(tmp_path: Path, make_task: Any) -> None:
+    """A normally-completed task whose collector entry has cost_usd=0 but
+    whose session wrote a real .tokens sidecar must record the sidecar's
+    priced cost (and token counts), not 0.0."""
+    from bernstein.core.tasks.task_lifecycle import _record_completion_metrics
+
+    task = make_task(id="T-cost", title="qa task", description="d", status=TaskStatus.DONE)
+    session = _session_for(task.id, exit_code=0)
+    orch = _process_orch(tmp_path, session)
+
+    # Collector entry exists (start_task ran at spawn) but nothing ever
+    # populated its cost - the exact canary state.
+    collector = MagicMock()
+    task_m = SimpleNamespace(
+        cost_usd=0.0,
+        tokens_prompt=0,
+        tokens_completion=0,
+        tokens_used=0,
+        start_time=10.0,
+        end_time=15.0,
+    )
+    collector.task_metrics = {task.id: task_m}
+    collector.agent_metrics = {session.id: SimpleNamespace(tasks_completed=1)}
+
+    # The canary qa task's real figures.
+    _write_tokens_sidecar(tmp_path, session.id, input_tokens=51_880, output_tokens=1_401)
+
+    with patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector):
+        returned_task_m, cost_usd = _record_completion_metrics(
+            orch,
+            task,
+            session,
+            janitor_passed=True,
+            qg_result=None,
+            completion_data=None,
+            agent_just_reaped=False,
+        )
+
+    # Sidecar cost was folded in (sonnet is a priced model).
+    assert cost_usd > 0.0, "cost_usd must come from the sidecar, not the never-populated collector figure"
+    assert returned_task_m is task_m
+    # The in-memory record was reconciled (what retrospective's fallback reads).
+    assert task_m.cost_usd == cost_usd
+    assert task_m.tokens_prompt == 51_880
+    assert task_m.tokens_completion == 1_401
+    assert task_m.tokens_used == 53_281
+    # complete_task received the real figures.
+    _, complete_kwargs = collector.complete_task.call_args
+    assert complete_kwargs["cost_usd"] == cost_usd
+    assert complete_kwargs["tokens_used"] == 53_281
+    # CostTracker got the same cost.
+    _, cumulative_kwargs = orch._cost_tracker.record_cumulative.call_args
+    assert cumulative_kwargs["total_cost_usd"] == cost_usd
+    assert cumulative_kwargs["total_input_tokens"] == 51_880
+
+
+def test_record_completion_metrics_tags_alive_exit_sidecar_source(tmp_path: Path, make_task: Any) -> None:
+    """item 31: an alive-exit /complete that sources cost from the sidecar must
+    tag the ledger mutation with tokens_sidecar_source=alive_exit so the run
+    ledger entry is distinguishable from an orphan/dead-exit recovery."""
+    from bernstein.core.tasks.task_lifecycle import _record_completion_metrics
+
+    task = make_task(id="T-alive", title="qa task", description="d", status=TaskStatus.DONE)
+    session = _session_for(task.id, exit_code=0)
+    orch = _process_orch(tmp_path, session)
+
+    collector = MagicMock()
+    task_m = SimpleNamespace(
+        cost_usd=0.0,
+        tokens_prompt=0,
+        tokens_completion=0,
+        tokens_used=0,
+        start_time=10.0,
+        end_time=15.0,
+    )
+    collector.task_metrics = {task.id: task_m}
+    collector.agent_metrics = {session.id: SimpleNamespace(tasks_completed=1)}
+
+    _write_tokens_sidecar(tmp_path, session.id, input_tokens=51_880, output_tokens=1_401)
+
+    with patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector):
+        _record_completion_metrics(
+            orch,
+            task,
+            session,
+            janitor_passed=True,
+            qg_result=None,
+            completion_data=None,
+            agent_just_reaped=False,
+        )
+
+    _, cumulative_kwargs = orch._cost_tracker.record_cumulative.call_args
+    assert cumulative_kwargs["cost_tags"] == {"tokens_sidecar_source": "alive_exit"}
+
+
+def test_record_completion_metrics_keeps_collector_cost_when_it_knows_more(tmp_path: Path, make_task: Any) -> None:
+    """When the collector already carries a real (higher) cost, the sidecar
+    must not clobber it."""
+    from bernstein.core.tasks.task_lifecycle import _record_completion_metrics
+
+    task = make_task(id="T-keep", title="t", description="d", status=TaskStatus.DONE)
+    session = _session_for(task.id, exit_code=0)
+    orch = _process_orch(tmp_path, session)
+    collector = _collector_for(task.id, session.id)  # cost_usd=2.5 pre-populated
+
+    # A tiny sidecar that prices below the collector figure.
+    _write_tokens_sidecar(tmp_path, session.id, input_tokens=10, output_tokens=5)
+
+    with patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector):
+        _, cost_usd = _record_completion_metrics(
+            orch,
+            task,
+            session,
+            janitor_passed=True,
+            qg_result=None,
+            completion_data=None,
+            agent_just_reaped=False,
+        )
+
+    assert cost_usd == 2.5
+
+
+def test_record_completion_metrics_recovers_sidecar_cost_when_session_reaped(tmp_path: Path, make_task: Any) -> None:
+    """Bug 14 (D2 minimax attempt-e938bd33): the agent died on MaxTurnsExceeded
+    and was reaped BEFORE the completion sweep processed its /complete'd task,
+    so _find_session_for_task returned None and the metrics row recorded $0
+    despite a .tokens sidecar carrying 54,003/1,026 real tokens. With
+    session=None but task.assigned_agent set, the sidecar must still be read
+    (model recovered from the collector's AgentMetrics) and the real cost
+    recorded."""
+    from bernstein.core.tasks.task_lifecycle import _record_completion_metrics
+
+    task = make_task(id="T-dead", title="backend task", description="d", status=TaskStatus.DONE)
+    task.assigned_agent = "backend-ae800d98"
+    # Orch stub: session object irrelevant - we pass session=None directly.
+    orch = _process_orch(tmp_path, _session_for(task.id, exit_code=1))
+
+    collector = MagicMock()
+    task_m = SimpleNamespace(
+        cost_usd=0.0,
+        tokens_prompt=0,
+        tokens_completion=0,
+        tokens_used=0,
+        start_time=10.0,
+        end_time=15.0,
+    )
+    collector.task_metrics = {task.id: task_m}
+    # AgentMetrics recorded at spawn carries the model used for pricing.
+    collector.agent_metrics = {"backend-ae800d98": SimpleNamespace(tasks_completed=0, model="sonnet")}
+
+    # The real figures from the failing run's sidecar.
+    _write_tokens_sidecar(tmp_path, "backend-ae800d98", input_tokens=54_003, output_tokens=1_026)
+
+    with patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector):
+        returned_task_m, cost_usd = _record_completion_metrics(
+            orch,
+            task,
+            None,  # session already reaped - the exact bug-14 state
+            janitor_passed=True,
+            qg_result=None,
+            completion_data=None,
+            agent_just_reaped=False,
+        )
+
+    assert cost_usd > 0.0, "MaxTurns-reaped session's sidecar cost must not be zeroed"
+    assert returned_task_m is task_m
+    assert task_m.tokens_prompt == 54_003
+    assert task_m.tokens_completion == 1_026
+    assert task_m.cost_usd == cost_usd
+    _, complete_kwargs = collector.complete_task.call_args
+    assert complete_kwargs["cost_usd"] == cost_usd
+    assert complete_kwargs["tokens_used"] == 55_029
+
+
+def test_record_completion_metrics_no_session_no_assigned_agent_stays_zero(tmp_path: Path, make_task: Any) -> None:
+    """Without a session AND without task.assigned_agent there is no sidecar
+    key to read - the function must not crash and must record the collector
+    figures unchanged."""
+    from bernstein.core.tasks.task_lifecycle import _record_completion_metrics
+
+    task = make_task(id="T-nokey", title="t", description="d", status=TaskStatus.DONE)
+    task.assigned_agent = None
+    orch = _process_orch(tmp_path, _session_for(task.id, exit_code=1))
+    collector = _collector_for(task.id, "A-1")  # cost_usd=2.5 pre-populated
+
+    with patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector):
+        _, cost_usd = _record_completion_metrics(
+            orch,
+            task,
+            None,
+            janitor_passed=False,
+            qg_result=None,
+            completion_data=None,
+            agent_just_reaped=False,
+        )
+
+    assert cost_usd == 2.5
+
+
+def test_record_evolution_completion_passes_reconciled_tokens(tmp_path: Path, make_task: Any) -> None:
+    """The evolution tasks.jsonl writer receives the reconciled token counts
+    from task_m alongside cost_usd."""
+    from bernstein.core.tasks.task_lifecycle import _record_evolution_completion
+
+    task = make_task(id="T-evo", title="t", description="d", status=TaskStatus.DONE)
+    session = _session_for(task.id, exit_code=0)
+    orch = _process_orch(tmp_path, session)
+    orch._evolution = MagicMock()
+    orch._latest_tasks_by_id = {}
+
+    task_m = SimpleNamespace(
+        cost_usd=0.0123,
+        tokens_prompt=51_880,
+        tokens_completion=1_401,
+        tokens_used=53_281,
+        start_time=10.0,
+        end_time=15.0,
+    )
+
+    _record_evolution_completion(orch, task, session, task_m, cost_usd=0.0123, janitor_passed=True)
+
+    _, kwargs = orch._evolution.record_task_completion.call_args
+    assert kwargs["cost_usd"] == 0.0123
+    assert kwargs["tokens_prompt"] == 51_880
+    assert kwargs["tokens_completion"] == 1_401
+
+
+# ---------------------------------------------------------------------------
+# Bug 1b (2026-07-02, fix/claim-conflict-churn): claim-then-never-spawn
+# deadlock. Root cause: in a multi-task batch, if an EARLIER task claimed
+# successfully but a LATER task in the same batch failed to claim, the whole
+# batch used to abort via `continue`, leaving the already-claimed task
+# server-side claimed with no agent ever spawned for it -- rescued only by
+# the 15-minute stale-claim reaper. Evidence:
+# work/bernstein/proofs/d2/claude/attempt4-meridian-fixed/FAIL-NOTE.md
+# (duplicate-titled task pair, one twin claimed while its sibling's claim
+# was rejected, claimed twin blocked the dependency graph for 15 minutes
+# with agents=0 spawned=0).
+# ---------------------------------------------------------------------------
+
+
+def test_claim_and_spawn_batches_spawns_claimed_subset_on_partial_claim_failure(tmp_path: Path, make_task: Any) -> None:
+    """A batch where task A claims successfully but task B's claim is
+    rejected (409, and B turns out to be claimed by a foreign session on
+    re-fetch) must still spawn an agent for A -- not leave A claimed with no
+    worker."""
+    orch = _claim_orch(tmp_path)
+    task_a = make_task(id="T-a", role="backend")
+    task_b = make_task(id="T-b", role="backend")
+    session = AgentSession(
+        id="A-partial", role="backend", task_ids=[task_a.id], model_config=ModelConfig("sonnet", "high")
+    )
+    orch._spawner.spawn_for_tasks.return_value = session
+
+    def _post_side_effect(url: str, **kwargs: Any) -> SimpleNamespace:
+        if url.endswith("/T-a/claim"):
+            return SimpleNamespace(status_code=200)
+        if url.endswith("/T-b/claim"):
+            return SimpleNamespace(status_code=409, text="task T-b is not open")
+        raise AssertionError(f"unexpected POST {url}")
+
+    def _get_side_effect(url: str, **kwargs: Any) -> SimpleNamespace:
+        assert url.endswith("/tasks/T-b")
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "id": "T-b",
+                "title": task_b.title,
+                "description": task_b.description,
+                "role": "backend",
+                "version": 2,
+                "status": "claimed",
+                "claimed_by_session": "some-other-session",
+            },
+            raise_for_status=lambda: None,
+        )
+
+    orch._client.post.side_effect = _post_side_effect
+    orch._client.get.side_effect = _get_side_effect
+    result = TickResult()
+
+    claim_and_spawn_batches(
+        orch, [[task_a, task_b]], alive_count=0, assigned_task_ids=set(), done_ids=set(), result=result
+    )
+
+    # The agent was spawned for the claimed subset (task A only).
+    orch._spawner.spawn_for_tasks.assert_called_once()
+    spawned_batch = orch._spawner.spawn_for_tasks.call_args[0][0]
+    assert [t.id for t in spawned_batch] == ["T-a"]
+    # Task B's claim failure is recorded, but does not block A.
+    assert any("T-b" in e for e in result.errors)
+
+
+# ---------------------------------------------------------------------------
+# Response-profile ledger coupling
+# ---------------------------------------------------------------------------
+
+
+def test_record_cost_tags_response_profile_from_session(tmp_path: Path, make_task: Any) -> None:
+    """A task spawned with a terse response profile produces a cost ledger
+    entry carrying response_profile and the rendered-addendum hash."""
+    from bernstein.core.tasks.task_lifecycle import _record_cost_and_convergence
+
+    task = make_task(id="T-style", title="qa task", description="d", status=TaskStatus.DONE)
+    session = _session_for(task.id, exit_code=0)
+    session.response_profile = "terse"
+    session.profile_content_sha256 = "f" * 64
+    orch = _process_orch(tmp_path, session)
+    task_m = SimpleNamespace(tokens_prompt=100, tokens_completion=50)
+
+    _record_cost_and_convergence(orch, task, session, task_m, cost_usd=1.0, janitor_passed=True)
+
+    _, cumulative_kwargs = orch._cost_tracker.record_cumulative.call_args
+    tags = cumulative_kwargs["cost_tags"]
+    assert tags["response_profile"] == "terse"
+    assert tags["profile_content_sha256"] == "f" * 64
+
+
+def test_record_cost_tags_response_profile_from_task_metadata_when_session_lost(tmp_path: Path, make_task: Any) -> None:
+    """When the session is already gone (dead-exit recovery), the profile
+    stamped on task metadata at spawn still reaches the ledger entry."""
+    from bernstein.core.tasks.task_lifecycle import _record_cost_and_convergence
+
+    task = make_task(id="T-style-meta", title="t", description="d", status=TaskStatus.DONE)
+    task.metadata["response_profile"] = "verbose"
+    task.metadata["profile_content_sha256"] = "a" * 64
+    session = _session_for("other-task", exit_code=0)
+    orch = _process_orch(tmp_path, session)
+    task_m = SimpleNamespace(tokens_prompt=1, tokens_completion=1)
+
+    _record_cost_and_convergence(orch, task, None, task_m, cost_usd=0.5, janitor_passed=True)
+
+    _, cumulative_kwargs = orch._cost_tracker.record_cumulative.call_args
+    tags = cumulative_kwargs["cost_tags"]
+    assert tags["response_profile"] == "verbose"
+    assert tags["profile_content_sha256"] == "a" * 64
+
+
+def test_record_cost_tags_absent_for_pre_change_sessions(tmp_path: Path, make_task: Any) -> None:
+    """Sessions and tasks with no profile stamped (pre-change state) keep the
+    ledger mutation byte-identical: cost_tags stays None."""
+    from bernstein.core.tasks.task_lifecycle import _record_cost_and_convergence
+
+    task = make_task(id="T-legacy", title="t", description="d", status=TaskStatus.DONE)
+    session = _session_for(task.id, exit_code=0)
+    orch = _process_orch(tmp_path, session)
+    task_m = SimpleNamespace(tokens_prompt=1, tokens_completion=1)
+
+    _record_cost_and_convergence(orch, task, session, task_m, cost_usd=0.5, janitor_passed=True)
+
+    _, cumulative_kwargs = orch._cost_tracker.record_cumulative.call_args
+    assert cumulative_kwargs["cost_tags"] is None
+
+
+# ---------------------------------------------------------------------------
+# Evidence auto-seal on completion (issue #2362, AC1)
+# ---------------------------------------------------------------------------
+
+
+def _seal_wiring_orch(tmp_path: Path, session: AgentSession) -> Any:
+    """Process-completion orch stub with a clean-merge spawner for seal tests."""
+    orch = _process_orch(tmp_path, session)
+    worktree = tmp_path / "agent-worktree"
+    worktree.mkdir(exist_ok=True)
+    orch._spawner.get_worktree_path.return_value = worktree
+    orch._spawner.reap_completed_agent.return_value = SimpleNamespace(success=True, conflicting_files=[])
+    return orch
+
+
+def test_completion_seals_evidence_for_task_with_declared_producers(tmp_path: Path, make_task: Any) -> None:
+    """A completing task that declares producers has the evidence gate invoked
+    with the durable workdir before its worktree is reclaimed."""
+    task = make_task(id="T-ev", title="ship it", description="Done.", status=TaskStatus.DONE)
+    task.result_summary = "shipped"
+    task.evidence_producers = [{"name": "tests", "kind": "test", "command": ["true"], "required": True}]
+    session = _session_for(task.id, exit_code=0)
+    orch = _seal_wiring_orch(tmp_path, session)
+    collector = _collector_for(task.id, session.id)
+
+    with (
+        patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector),
+        patch("bernstein.core.tasks.task_lifecycle._get_git_diff_line_count_in_worktree", return_value=7),
+        patch("bernstein.core.tasks.task_lifecycle.append_decision"),
+        patch("bernstein.core.tasks.task_lifecycle.seal_evidence_on_completion") as seal,
+    ):
+        process_completed_tasks(orch, [task], TickResult())
+
+    seal.assert_called_once_with(tmp_path, task)
+    orch._spawner.cleanup_worktree.assert_called_once_with(session.id)
+
+
+def test_completion_untouched_when_task_declares_no_producers(tmp_path: Path, make_task: Any) -> None:
+    """The seal is still invoked, but with an empty producer set it is a no-op
+    (proven by the helper's own tests); the completion path is unchanged."""
+    task = make_task(id="T-plain", title="plain", description="Done.", status=TaskStatus.DONE)
+    task.result_summary = "done"
+    session = _session_for(task.id, exit_code=0)
+    orch = _seal_wiring_orch(tmp_path, session)
+    collector = _collector_for(task.id, session.id)
+
+    with (
+        patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector),
+        patch("bernstein.core.tasks.task_lifecycle._get_git_diff_line_count_in_worktree", return_value=3),
+        patch("bernstein.core.tasks.task_lifecycle.append_decision"),
+    ):
+        result = TickResult()
+        process_completed_tasks(orch, [task], result)
+
+    # No producers declared -> no bundle sealed anywhere under the workdir.
+    assert not (tmp_path / ".sdd" / "evidence").exists()
+    assert result.verified == [task.id]
+
+
+def test_completion_survives_evidence_gate_exception(tmp_path: Path, make_task: Any) -> None:
+    """A raising evidence gate must NOT fail the completion: the task still
+    completes and the worktree is still reclaimed."""
+    task = make_task(id="T-raise", title="raise", description="Done.", status=TaskStatus.DONE)
+    task.result_summary = "done"
+    task.evidence_producers = [{"name": "tests", "kind": "test", "command": ["true"], "required": True}]
+    session = _session_for(task.id, exit_code=0)
+    orch = _seal_wiring_orch(tmp_path, session)
+    collector = _collector_for(task.id, session.id)
+
+    def _boom(**_kwargs: object) -> object:
+        raise RuntimeError("gate blew up")
+
+    with (
+        patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector),
+        patch("bernstein.core.tasks.task_lifecycle._get_git_diff_line_count_in_worktree", return_value=5),
+        patch("bernstein.core.tasks.task_lifecycle.append_decision"),
+        patch("bernstein.core.evidence.completion_gate.run_evidence_gate", _boom),
+    ):
+        result = TickResult()
+        # Must not raise: the real fail-open guard swallows the gate error.
+        process_completed_tasks(orch, [task], result)
+
+    assert result.verified == [task.id]
+    orch._spawner.cleanup_worktree.assert_called_once_with(session.id)
+
+
+def _incident_cases_dir(workdir: Path) -> Path:
+    """Return the corpus directory IncidentSynthesizer writes cases into."""
+    return workdir / "src" / "bernstein" / "eval" / "cases" / "incidents"
+
+
+def test_dead_lettered_task_writes_an_incident_eval_case(tmp_path: Path, make_task: Any) -> None:
+    """A task that exhausts its retry budget leaves an incident eval case on disk.
+
+    Reaching the dead-letter queue is the trigger for synthesising a
+    regression case from the failure. The synthesis step is fail-open, so a
+    broken call into the synthesiser costs the corpus every terminal failure
+    without surfacing anything louder than a debug line.
+    """
+    task = make_task(id="T-dlq-synth", title="Stabilize parser", role="backend")
+
+    _enqueue_dlq_if_workdir(
+        workdir=tmp_path,
+        task=task,
+        retry_count=3,
+        reason="max_retries_exceeded",
+        original_error="AssertionError: parser returned None",
+    )
+
+    written = sorted(_incident_cases_dir(tmp_path).glob("inc-*.yaml"))
+    assert len(written) == 1, f"expected one incident eval case, found {[p.name for p in written]}"
+    body = written[0].read_text(encoding="utf-8")
+    assert "Stabilize parser" in body
+    assert "max_retries_exceeded" in body
+
+
+def test_repeated_dead_letter_does_not_duplicate_the_incident_case(tmp_path: Path, make_task: Any) -> None:
+    """The same terminal failure twice yields exactly one incident eval case.
+
+    Cases are content-addressed, so a re-run of the same failure must be
+    recognised as already present rather than written a second time.
+    """
+    task = make_task(id="T-dlq-dup", title="Stabilize parser", role="backend")
+    kwargs: dict[str, Any] = {
+        "retry_count": 3,
+        "reason": "max_retries_exceeded",
+        "original_error": "AssertionError: parser returned None",
+    }
+
+    _enqueue_dlq_if_workdir(workdir=tmp_path, task=task, **kwargs)
+    _enqueue_dlq_if_workdir(workdir=tmp_path, task=task, **kwargs)
+
+    written = sorted(_incident_cases_dir(tmp_path).glob("inc-*.yaml"))
+    assert len(written) == 1, f"expected deduplication to one case, found {[p.name for p in written]}"
+
+
+def test_ab_test_outcome_records_the_files_changed_the_agent_reported(
+    tmp_path: Path,
+    make_task: Any,
+) -> None:
+    """The persisted A/B record carries the agent's own changed-file count.
+
+    files_changed is one of the three axes an A/B comparison is decided on.
+    Recording is fail-open, so reading it from the wrong place costs every
+    A/B record silently rather than raising.
+    """
+    task = make_task(id="T-ab", title="Tune the router")
+    session = _session_for(task.id, exit_code=0)
+
+    signal_mgr = AgentSignalManager(tmp_path)
+    signal_mgr.write_heartbeat(
+        session.id,
+        AgentHeartbeat(timestamp=time.time(), files_changed=7, status="working"),
+    )
+
+    orch = SimpleNamespace(
+        _config=SimpleNamespace(ab_test=True),
+        _ab_split_tracker={task.id: "sonnet"},
+        _workdir=tmp_path,
+        _signal_mgr=signal_mgr,
+    )
+
+    _record_ab_test_outcome(orch, task, session, janitor_passed=True)
+
+    records = ABTestStore(tmp_path).load()
+    assert len(records) == 1, "expected exactly one A/B outcome record"
+    assert records[0].files_changed == 7
+    assert records[0].status == "completed"
+
+
+def test_ab_test_outcome_defaults_files_changed_when_no_heartbeat(
+    tmp_path: Path,
+    make_task: Any,
+) -> None:
+    """A session that never reported a heartbeat still records an outcome."""
+    task = make_task(id="T-ab-nohb", title="Tune the router")
+    session = _session_for(task.id, exit_code=0)
+
+    orch = SimpleNamespace(
+        _config=SimpleNamespace(ab_test=True),
+        _ab_split_tracker={task.id: "sonnet"},
+        _workdir=tmp_path,
+        _signal_mgr=AgentSignalManager(tmp_path),
+    )
+
+    _record_ab_test_outcome(orch, task, session, janitor_passed=False)
+
+    records = ABTestStore(tmp_path).load()
+    assert len(records) == 1, "expected exactly one A/B outcome record"
+    assert records[0].files_changed == 0
+    assert records[0].status == "failed"

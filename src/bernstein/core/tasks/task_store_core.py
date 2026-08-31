@@ -1,4 +1,4 @@
-"""CRUD operations and the TaskStore class — core task mutations.
+"""CRUD operations and the TaskStore class - core task mutations.
 
 All task mutations go through this class so the JSONL log stays consistent.
 """
@@ -15,15 +15,18 @@ import uuid
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, Protocol, cast
 
 from fastapi import HTTPException
 from typing_extensions import TypedDict
 
 from bernstein.core.defaults import TASK as _TASK_DEFAULTS
 from bernstein.core.hook_events import HookEvent
+from bernstein.core.persistence.anchored_write import anchored_append
 from bernstein.core.persistence.durable_write import fsynced_write
 from bernstein.core.persistence.runtime_state import rotate_log_file
+from bernstein.core.security.sanitize import sanitize_log
+from bernstein.core.tasks.artifacts import ArtifactSpec
 from bernstein.core.tasks.errors import TaskDomainError
 from bernstein.core.tasks.lifecycle import IllegalTransitionError, transition_agent, transition_task
 from bernstein.core.tasks.models import (
@@ -38,12 +41,69 @@ from bernstein.core.tasks.models import (
     TaskType,
     UpgradeProposalDetails,
 )
-from bernstein.core.tenanting import ensure_tenant_layout, normalize_tenant_id
+from bernstein.core.tasks.unreachable import blocking_dependency, unreachable_tasks
+from bernstein.core.tenanting import ensure_tenant_layout, normalize_tenant_id, try_normalize_tenant_id
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
+
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.tasks.contracts import ContractViolation, WorkerCompletion, WorkerRefusal
 
 logger = logging.getLogger(__name__)
+
+#: Statuses a worker can be sitting in while it still owns the task (#3037).
+#: A task moving out of one of these is either going back to the pool or
+#: terminating without delivering, so the transition has to be paired with a
+#: ``task.release_receipt`` unless it is a delivery (``DONE`` / ``CLOSED``, see
+#: :data:`CLAIM_DELIVERED_STATUSES`). ``OPEN`` and ``PLANNED`` are excluded
+#: because nothing owns those. This set is not the test for "was a claim
+#: actually held" -- that is claim evidence on the task itself, see
+#: :meth:`TaskStore._claim_snapshot` -- it is the set the release guard in
+#: ``tests/unit/test_task_release_receipt.py`` reads to decide which
+#: transitions need a receipt.
+CLAIM_HELD_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.CLAIMED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.WAITING_FOR_SUBTASKS,
+        TaskStatus.BLOCKED,
+        TaskStatus.ORPHANED,
+    }
+)
+
+#: Statuses a task reaches by delivering its result (#3037). Reaching one of
+#: these is not a surrender: the worker finished the job it claimed, and the
+#: claim only ends when the task later goes back to the pool (``reopen``, which
+#: does mint a receipt) or stays terminal. Release receipts are deliberately
+#: not minted here, so a fold of the chain reports a delivered task under the
+#: worker that delivered it rather than as unowned. See
+#: :func:`bernstein.core.security.audit_chain.reconstruct_claim_holders`.
+CLAIM_DELIVERED_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.DONE,
+        TaskStatus.CLOSED,
+    }
+)
+
+
+class ClaimSnapshot(NamedTuple):
+    """Claim state read off a task before a transition that may end it (#3037).
+
+    Attributes:
+        status: Status the task was in.
+        holder: Claim owner, matching the claim receipt's ``claimed_by``.
+        held: Whether the task carried evidence of an actual claim. Status
+            membership is deliberately not part of this: a task can reach
+            ``WAITING_FOR_SUBTASKS`` or ``BLOCKED`` without ever having been
+            claimed, and minting a surrender for a claim that never existed
+            writes a false record onto a signed chain.
+    """
+
+    status: TaskStatus
+    holder: str
+    held: bool
+
 
 # ---------------------------------------------------------------------------
 # TypedDicts for file-based state records
@@ -94,6 +154,9 @@ class TaskRecord(TypedDict):
     max_output_tokens: NotRequired[int | None]
     meta_messages: NotRequired[list[str]]
     metadata: NotRequired[dict[str, Any]]
+    # Explicit compute_max_turns() override (see claude_max_turns.py). Optional
+    # for backward compat with records written before this field existed.
+    max_turns: NotRequired[int | None]
 
 
 class ArchiveRecord(TypedDict):
@@ -194,9 +257,15 @@ class TaskCreateRequest(Protocol):
     retry_delay_s: float | None
     terminal_reason: str | None
     max_output_tokens: int | None
+    max_turns: int | None
 
     @property
     def meta_messages(self) -> Sequence[str] | None: ...
+
+    # Issue #3110: the declared artifact contract, as the validated
+    # ``ArtifactSpec.to_dict()`` payload. ``None`` = default code_diff.
+    @property
+    def artifact_spec(self) -> Mapping[str, Any] | None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +273,7 @@ class TaskCreateRequest(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _parse_upgrade_dict(raw: dict[str, Any] | None) -> UpgradeProposalDetails | None:
+def _parse_upgrade_dict(raw: Mapping[str, Any] | None) -> UpgradeProposalDetails | None:
     if not raw:
         return None
     risk = RiskAssessment(**raw.get("risk_assessment", {}))
@@ -220,6 +289,75 @@ def _parse_upgrade_dict(raw: dict[str, Any] | None) -> UpgradeProposalDetails | 
     )
 
 
+def _artifact_spec_from_request(raw: Mapping[str, Any] | None) -> ArtifactSpec:
+    """Parse a request's declared artifact contract into an :class:`ArtifactSpec`.
+
+    Defense in depth for issue #3110: the ``TaskCreate`` schema already
+    validates the block at the API boundary, but the store is also driven by
+    other :class:`TaskCreateRequest` implementers. Re-running the one shared
+    strict parser here means a malformed declaration can never reach a stored
+    task, whatever the caller. Raises
+    :class:`bernstein.core.tasks.artifacts.ArtifactSpecError` (a
+    ``ValueError``) naming the offending field.
+    """
+    if not raw:
+        return ArtifactSpec()
+    from bernstein.core.tasks.artifacts import parse_artifact_spec
+
+    return parse_artifact_spec(dict(raw))
+
+
+#: Mirrors :attr:`bernstein.core.tasks.models.CompletionSignal.type`. Request-layer
+#: schemas (e.g. ``CompletionSignalSchema``) already validate incoming signal types
+#: against a Literal, but the ``TaskCreateRequest`` protocol widens ``type`` to
+#: ``str`` so any implementer can satisfy it - this re-narrows before constructing
+#: the dataclass instead of widening the dataclass's own Literal.
+type CompletionSignalType = Literal[
+    "path_exists",
+    "glob_exists",
+    "test_passes",
+    "file_contains",
+    "llm_review",
+    "llm_judge",
+    "schema_valid",
+    "criteria_match",
+    "hash_stable",
+    "figures_grounded",
+]
+
+_COMPLETION_SIGNAL_TYPES: tuple[CompletionSignalType, ...] = (
+    "path_exists",
+    "glob_exists",
+    "test_passes",
+    "file_contains",
+    "llm_review",
+    "llm_judge",
+    "schema_valid",
+    "criteria_match",
+    "hash_stable",
+    "figures_grounded",
+)
+
+
+def _narrow_signal_type(raw: str) -> CompletionSignalType:
+    """Validate and narrow a completion-signal type string.
+
+    Raises ValueError outside the closed set instead of widening
+    ``CompletionSignal.type``'s Literal to accept bare ``str``.
+    """
+    if raw not in _COMPLETION_SIGNAL_TYPES:
+        raise ValueError(f"Unsupported completion signal type: {raw!r}")
+    return raw
+
+
+#: Mirrors the ``Task.estimated_minutes`` dataclass default. ``TaskCreateRequest``
+#: declares the field ``int | None`` (client may omit it), while ``Task`` itself
+#: requires a concrete ``int`` - route handlers normalise ``None`` before it
+#: reaches the store in the normal HTTP path (see ``task_crud.py``), so this is
+#: a same-default fallback for the type checker, not a behaviour change.
+_DEFAULT_ESTIMATED_MINUTES = 30
+
+
 async def _retry_io(fn: Any, *args: Any) -> Any:
     """Retry a sync file I/O function with exponential backoff.
 
@@ -230,7 +368,11 @@ async def _retry_io(fn: Any, *args: Any) -> Any:
     import errno
 
     max_retries = _TASK_DEFAULTS.max_io_retries
-    non_transient = {errno.ENOSPC, errno.EROFS, errno.EACCES, errno.EPERM}
+    # ELOOP/ENOTDIR come from an anchored write refusing a component that is a
+    # symlink or not a directory. That is a statement about the layout, not a
+    # condition that clears on its own, so retrying only delays the same
+    # failure and reports it as a store outage rather than as what it is.
+    non_transient = {errno.ENOSPC, errno.EROFS, errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENOTDIR}
     last_exc: OSError | None = None
     for attempt in range(max_retries):
         try:
@@ -262,6 +404,7 @@ PANEL_GRACE_MS: int = 30_000
 
 # reason used when auto-failing a task due to empty result_summary.
 _EMPTY_COMPLETION_REASON = "completion missing summary"
+_ZERO_YIELD_PLANNING_REASON = "Planning task produced no child tasks"
 
 # rotate the per-task progress JSONL file once it exceeds 5 MiB.
 # Old rollovers become ``{task_id}.jsonl.1``; replay also reads them so no
@@ -296,7 +439,7 @@ class TaskStore:
     Concurrency model:
         Mutations are coordinated by an in-process ``asyncio.Lock`` and the
         JSONL append path does NOT take an OS-level file lock (no
-        ``fcntl.flock``). The store is therefore **single-process only** —
+        ``fcntl.flock``). The store is therefore **single-process only** -
         running the server under ``uvicorn --workers N`` (or with
         ``WEB_CONCURRENCY>1``) interleaves appends, produces torn lines
         that ``replay_jsonl`` silently drops, and lets multiple workers
@@ -315,6 +458,7 @@ class TaskStore:
         archive_path: Path = DEFAULT_ARCHIVE_PATH,
         metrics_jsonl_path: Path | None = None,
     ) -> None:
+        self._task_listeners: list[Callable[[Task], None]] = []
         self._tasks: dict[str, Task] = {}
         self._agents: dict[str, AgentSession] = {}
         # Secondary indices for O(1) status/role lookups
@@ -324,7 +468,7 @@ class TaskStore:
         # ``_by_status`` and ``_by_role_status`` inside ``self._lock`` so route
         # callers can count subtasks without walking the full task list.
         self._by_parent: dict[str, set[str]] = {}
-        # Min-heaps keyed by (role, status) — entries are (priority, task_id)
+        # Min-heaps keyed by (role, status) - entries are (priority, task_id)
         # Uses lazy deletion: stale entries are discarded in claim_next()
         self._priority_queues: dict[tuple[str, TaskStatus], list[tuple[int, str]]] = {}
         self._jsonl_path: Path = jsonl_path
@@ -349,6 +493,123 @@ class TaskStore:
         # here so that progress history survives a server crash.  Rebuilt on
         # startup by ``replay_progress()``.
         self._progress_dir: Path = jsonl_path.parent / "progress"
+        # Audit chain the claim ledger is written to (#3037). Attached by
+        # ``create_app`` on every server, so a plain ``bernstein serve`` node
+        # mints release receipts without the orchestrator's ``BERNSTEIN_AUDIT``
+        # wiring. ``None`` in bare store usage (CLI, tests), where the receipt
+        # is skipped rather than the transition refused.
+        self._audit_chain: AuditChainStore | None = None
+
+    # -- claim ledger --------------------------------------------------------
+
+    def attach_audit_chain(self, chain: AuditChainStore | None) -> None:
+        """Route this store's claim ledger to *chain* (#3037).
+
+        Claims mint a ``task.claim_receipt``; every transition that surrenders
+        a held claim mints the matching ``task.release_receipt`` here, so the
+        chain records both halves and a replay reports the real holder of a
+        task instead of the last node that acquired it.
+
+        Args:
+            chain: Audit chain store to append release receipts to, or
+                ``None`` to detach.
+        """
+        self._audit_chain = chain
+
+    def add_task_listener(self, listener: Callable[[Task], None]) -> None:
+        """Register a callback invoked whenever a task's status or record is updated."""
+        if listener not in self._task_listeners:
+            self._task_listeners.append(listener)
+
+    def remove_task_listener(self, listener: Callable[[Task], None]) -> None:
+        """Unregister a task update callback."""
+        if listener in self._task_listeners:
+            self._task_listeners.remove(listener)
+
+    def _notify_task_updated(self, task: Task) -> None:
+        """Invoke registered task listeners with the updated task."""
+        for listener in list(self._task_listeners):
+            try:
+                listener(task)
+            except Exception:
+                logger.exception("Error in task listener for task %s", task.id)
+
+    @staticmethod
+    def _claim_snapshot(task: Task) -> ClaimSnapshot:
+        """Capture *task*'s claim state before a transition that may end it (#3037).
+
+        Must be read before the transition: the releasing paths clear
+        ``claimed_at`` / ``claimed_by_session`` and move the status, so after
+        the fact there is nothing left to attribute the release to.
+
+        ``held`` is decided on claim evidence carried by the task, not on its
+        status. ``OPEN -> WAITING_FOR_SUBTASKS`` and ``... -> BLOCKED`` are
+        legal without any claim, so a status test mints a surrender for a
+        claim that never existed, and a fabricated surrender on a signed chain
+        is worse than a missing one: a verifier folding the chain cannot tell
+        it apart from a real one.
+
+        Args:
+            task: The task about to transition.
+
+        Returns:
+            The status, claim owner, and whether the task carried evidence of
+            an actual claim. The owner matches the ``claimed_by`` field of the
+            claim receipt, so claim and release receipts name the same
+            identity.
+        """
+        return ClaimSnapshot(
+            status=task.status,
+            holder=task.claimed_by_session or task.assigned_agent or "",
+            held=task.claimed_at is not None or bool(task.claimed_by_session),
+        )
+
+    def _record_release_receipt(
+        self,
+        task: Task,
+        snapshot: ClaimSnapshot,
+        *,
+        release_path: str,
+        reason: str,
+    ) -> None:
+        """Mirror a surrendered claim into the audit chain (#3037).
+
+        The counterpart of the claim receipt the claim path mints. Called by
+        every transition that surrenders a held claim, after the transition
+        has been applied, so the receipt carries the post-transition task
+        version.
+
+        No-ops when no chain is attached or when the task carried no claim
+        evidence (a never-claimed task being cancelled surrenders nothing).
+        Best-effort: a chain append failure never rolls back the transition
+        that already happened.
+
+        Args:
+            task: The task whose claim ended, already transitioned.
+            snapshot: Claim state captured by :meth:`_claim_snapshot` before
+                the transition.
+            release_path: Which path ended the claim.
+            reason: The transition's recorded reason.
+        """
+        chain = self._audit_chain
+        if chain is None or not snapshot.held:
+            return
+        from bernstein.core.security.audit_chain import record_task_release_receipt
+
+        try:
+            record_task_release_receipt(
+                chain=chain,
+                task_id=task.id,
+                role=task.role,
+                released_by=snapshot.holder,
+                task_version=task.version,
+                release_path=release_path,
+                reason=reason,
+                from_status=snapshot.status.value,
+                to_status=task.status.value,
+            )
+        except Exception as exc:  # intentional-broad-except: receipt mirror is best-effort, never blocks the transition
+            logger.warning("task.release receipt append failed: %s", type(exc).__name__)
 
     # -- index helpers -------------------------------------------------------
 
@@ -409,6 +670,34 @@ class TaskStore:
         """
         return len(self._by_parent.get(parent_task_id, ()))
 
+    def _planning_yield_is_zero(self, task: Task) -> bool:
+        """Return True when planning *task* produced no work of its own.
+
+        "Produced no work" (#4401) is scoped to this task's own attempt
+        (#4466), and a planning task can show its yield two ways:
+
+        * a task naming it in ``parent_task_id`` - the explicit link the
+          in-process splitter and the ``self-create`` route write; or
+        * a task that came into existence after this one was claimed - the
+          only signal the agent-driven planner path leaves, because its
+          prompt has the manager POST plain ``/tasks`` bodies carrying no
+          back-link, and tells it to drop the link outright when the parent
+          id does not resolve for its token.
+
+        Demanding the back-link alone would fail every agent-driven planner
+        that decomposed correctly, and the run then re-plans from scratch and
+        multiplies the subtasks instead of failing loudly. Asking only "does
+        the store hold any other task" (the original form) is satisfied by any
+        prior history at all, including this task's own earlier attempt, so it
+        never fires on a real run. The window from claim to completion is the
+        part of the store that belongs to this attempt: work that predates the
+        claim is somebody else's, and an empty window is a zero yield.
+        """
+        if self.count_subtasks(task.id) > 0:
+            return False
+        started_at = task.claimed_at if task.claimed_at is not None else task.created_at
+        return not any(other.id != task.id and other.created_at > started_at for other in self._tasks.values())
+
     # -- persistence --------------------------------------------------------
 
     def replay_jsonl(self) -> None:
@@ -436,7 +725,7 @@ class TaskStore:
                     record: TaskRecord = json.loads(line)
                 except json.JSONDecodeError:
                     logger.error(
-                        "Corrupted JSONL record at %s:%d — skipping: %s",
+                        "Corrupted JSONL record at %s:%d - skipping: %s",
                         self._jsonl_path,
                         line_num,
                         raw_line[:500],
@@ -480,6 +769,7 @@ class TaskStore:
         reset_tasks: list[Task] = []
         for stale_status in (TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS):
             for task in list(self._by_status.get(stale_status, {}).values()):
+                snapshot = self._claim_snapshot(task)
                 self._index_remove(task)
                 # Use the FSM for the transition so audit/telemetry fire and
                 # any illegal jump is caught.  CLAIMED→OPEN and
@@ -494,6 +784,12 @@ class TaskStore:
                 task.claimed_at = None
                 task.claimed_by_session = None
                 self._index_add(task)
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="restart_recovery",
+                    reason="recover_stale_after_restart",
+                )
                 reset_tasks.append(task)
                 reset_count += 1
         if reset_count:
@@ -504,6 +800,66 @@ class TaskStore:
             for task in reset_tasks:
                 self._append_jsonl_sync(self._task_to_record(task))
             logger.info("recover_stale_claimed_tasks: reset %d task(s) to open after restart", reset_count)
+        return reset_count
+
+    def reopen_tasks_for_node(self, node_id: str) -> int:
+        """Reset a departed cluster node's in-flight tasks back to OPEN.
+
+        A cluster worker claims through ``/tasks/next`` with its node id
+        recorded as the claim owner (``claimed_by_session``). When that node
+        leaves -- by heartbeat timeout (crash) or graceful unregister -- its
+        CLAIMED/IN_PROGRESS tasks would otherwise stay claimed forever with no
+        live agent, and no reaper would ever release them (#2801). This
+        re-queues exactly that node's tasks so a surviving worker can pick them
+        up.
+
+        Mirrors :meth:`recover_stale_claimed_tasks` but scoped to one node.
+        The method performs no ``await``, so it runs atomically with respect to
+        concurrent claims in the single-threaded async server loop and is safe
+        to call from both the async node reaper and the sync unregister route.
+
+        Args:
+            node_id: Owning node id whose claims should be released.
+
+        Returns:
+            Number of tasks reset to open.
+        """
+        if not node_id:
+            return 0
+        reset_count = 0
+        reset_tasks: list[Task] = []
+        for stale_status in (TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS):
+            for task in list(self._by_status.get(stale_status, {}).values()):
+                if task.claimed_by_session != node_id:
+                    continue
+                snapshot = self._claim_snapshot(task)
+                self._index_remove(task)
+                transition_task(
+                    task,
+                    TaskStatus.OPEN,
+                    actor="task_store",
+                    reason="recover_node_departed",
+                )
+                task.claimed_at = None
+                task.claimed_by_session = None
+                task.version += 1
+                self._index_add(task)
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="node_departure",
+                    reason="recover_node_departed",
+                )
+                reset_tasks.append(task)
+                reset_count += 1
+        if reset_count:
+            for task in reset_tasks:
+                self._append_jsonl_sync(self._task_to_record(task))
+            logger.info(
+                "reopen_tasks_for_node: reset %d task(s) for departed node %s",
+                reset_count,
+                sanitize_log(node_id),
+            )
         return reset_count
 
     def _append_jsonl_sync(self, record: TaskRecord) -> None:
@@ -521,8 +877,7 @@ class TaskStore:
 
         try:
             tenant_paths = ensure_tenant_layout(self._sdd_dir, str(record["tenant_id"]))
-            target_path = tenant_paths.backlog_dir / "tasks.jsonl"
-            with target_path.open("a", encoding="utf-8") as handle:
+            with anchored_append(tenant_paths.anchor.child("backlog"), "tasks.jsonl") as handle:
                 handle.write(line)
         except OSError as exc:
             # Tenant mirror is best-effort during recovery; the authoritative
@@ -593,7 +948,7 @@ class TaskStore:
                         records.append(json.loads(line))
                     except json.JSONDecodeError:
                         logger.error(
-                            "Corrupted archive record at %s:%d — skipping: %s",
+                            "Corrupted archive record at %s:%d - skipping: %s",
                             self._archive_path,
                             line_num,
                             raw_line[:500],
@@ -604,7 +959,12 @@ class TaskStore:
 
         if tenant_id is not None:
             normalized = normalize_tenant_id(tenant_id)
-            records = [record for record in records if normalize_tenant_id(str(record.get("tenant_id"))) == normalized]
+            # The stored value goes through unchanged. Coercing it first turns
+            # a row that cannot be read into one that reads as a tenant name:
+            # `str(True)` is `"True"` and `str(None)` is `"None"`, both valid
+            # identifiers, so the row would be handed to whichever tenant
+            # happens to be called that.
+            records = [record for record in records if try_normalize_tenant_id(record.get("tenant_id")) == normalized]
         return records[-limit:]
 
     async def _append_archive(self, task: Task, completed_at: float) -> None:
@@ -643,10 +1003,10 @@ class TaskStore:
         """Mirror task lifecycle records into a tenant-scoped backlog file."""
 
         tenant_paths = ensure_tenant_layout(self._sdd_dir, str(record["tenant_id"]))
-        target_path = tenant_paths.backlog_dir / "tasks.jsonl"
+        backlog = tenant_paths.anchor.child("backlog")
 
         def _write() -> None:
-            with target_path.open("a", encoding="utf-8") as handle:
+            with anchored_append(backlog, "tasks.jsonl") as handle:
                 handle.write(line)
 
         await _retry_io(_write)
@@ -655,10 +1015,10 @@ class TaskStore:
         """Mirror archive records into a tenant-scoped backlog archive file."""
 
         tenant_paths = ensure_tenant_layout(self._sdd_dir, tenant_id)
-        target_path = tenant_paths.backlog_dir / "archive.jsonl"
+        backlog = tenant_paths.anchor.child("backlog")
 
         def _write() -> None:
-            with target_path.open("a", encoding="utf-8") as handle:
+            with anchored_append(backlog, "archive.jsonl") as handle:
                 handle.write(line)
 
         await _retry_io(_write)
@@ -731,7 +1091,7 @@ class TaskStore:
         for task_id, paths in per_task.items():
             task = self._tasks.get(task_id)
             if task is None:
-                # Owning task has been purged — progress is orphaned, skip.
+                # Owning task has been purged - progress is orphaned, skip.
                 continue
             progress: list[ProgressEntry] = cast("list[ProgressEntry]", task.progress_log)  # type: ignore[reportUnknownMemberType]
             snap_q = self._progress_snapshots.setdefault(task_id, deque(maxlen=10))
@@ -749,7 +1109,7 @@ class TaskStore:
                         record = json.loads(stripped)
                     except json.JSONDecodeError:
                         logger.error(
-                            "Corrupted progress record at %s:%d — skipping: %s",
+                            "Corrupted progress record at %s:%d - skipping: %s",
                             path,
                             line_num,
                             stripped[:500],
@@ -811,6 +1171,10 @@ class TaskStore:
             "claimed_by_session": task.claimed_by_session,
             "parent_session_id": task.parent_session_id,
             "subtask_wait_started_at": task.subtask_wait_started_at,
+            # The parent agent's context summary is what ties a subtask back to
+            # the exploration that produced it; omitting it here rebuilt every
+            # subtask without its parent context after a replay.
+            "parent_context": task.parent_context,
             # retry bookkeeping (typed source of truth).
             "retry_count": task.retry_count,
             "max_retries": task.max_retries,
@@ -819,6 +1183,7 @@ class TaskStore:
             "max_output_tokens": task.max_output_tokens,
             "meta_messages": list(task.meta_messages),
             "metadata": dict(task.metadata),
+            "max_turns": task.max_turns,
         }
 
     # -- public API ---------------------------------------------------------
@@ -838,7 +1203,7 @@ class TaskStore:
         graph: dict[str, list[str]] = {t.id: list(t.depends_on) for t in tasks.values()}
         graph[new_task.id] = list(new_task.depends_on)
 
-        # DFS from new_task only — existing tasks were validated on insertion.
+        # DFS from new_task only - existing tasks were validated on insertion.
         visited: set[str] = set()
         path: list[str] = []
 
@@ -859,16 +1224,236 @@ class TaskStore:
 
         return dfs(new_task.id)
 
+    async def _mark_blocked_by_failed_dep(self, task: Task, blocking_task_id: str) -> bool:
+        """Move *task* to ``BLOCKED_BY_FAILED_DEP``, naming what stranded it.
+
+        Mirrors the abandon cascade's per-downstream body (#1350): the claim is
+        surrendered, the row is journalled, and a release receipt is minted,
+        because a downstream can be CLAIMED or IN_PROGRESS under a different
+        node than the one whose task ended.
+
+        Returns ``True`` when the task moved, ``False`` when it was already
+        past the point where the cascade applies.
+        """
+        blocker = self._tasks.get(blocking_task_id)
+        if blocker is None:
+            return False
+        reason = f"dependency {blocking_task_id} is {blocker.status.value}"
+        snapshot = self._claim_snapshot(task)
+        self._index_remove(task)
+        try:
+            transition_task(task, TaskStatus.BLOCKED_BY_FAILED_DEP, actor="task_store", reason=reason)
+        except IllegalTransitionError:
+            # Restore index entry - leave the task untouched, exactly as the
+            # abandon cascade does for a downstream it may not move.
+            self._index_add(task)
+            return False
+        task.result_summary = reason
+        task.terminal_reason = "blocked_by_failed_dependency"
+        # The id, not an inference: "why did this never run" is answered by a
+        # task id a replay can look up.
+        task.metadata["blocking_task_id"] = blocking_task_id
+        task.version += 1
+        self._index_add(task)
+        await self._append_jsonl(self._task_to_record(task))
+        self._record_release_receipt(
+            task,
+            snapshot,
+            release_path="failed_dependency_cascade",
+            reason=reason,
+        )
+        logger.info(
+            "Task %s blocked by failed dependency %s (%s)",
+            task.id,
+            blocking_task_id,
+            blocker.status.value,
+        )
+        self._notify_task_updated(task)
+        return True
+
+    async def _cascade_failed_dependency(self, *task_ids: str) -> None:
+        """Strand every task that can no longer run because *task_ids* ended.
+
+        Propagation is transitive: a task moved to ``BLOCKED_BY_FAILED_DEP``
+        is itself a stranding dependency, so the next ring is found on the
+        following pass. Each ring is walked in id order and each stranded task
+        records its own nearest cause, so a chain A -> B -> C names B as C's
+        cause rather than A.
+
+        Several ids seed one walk rather than one walk each, so a subtree
+        cancelled together strands its dependents in a single pass and a task
+        depending on two of them still records only its nearest cause
+        (#4247). The four single-task terminal transitions pass one id; the
+        cancel cascade passes the whole set it cancelled.
+
+        Must be called with ``self._lock`` held.
+        """
+        frontier = set(task_ids)
+        while frontier:
+            next_frontier: set[str] = set()
+            for candidate in sorted(self._tasks.values(), key=lambda t: t.id):
+                if candidate.id in frontier or not frontier.intersection(candidate.depends_on):
+                    continue
+                blocker_id = blocking_dependency(candidate, self._tasks)
+                if blocker_id is None:
+                    continue
+                if await self._mark_blocked_by_failed_dep(candidate, blocker_id):
+                    next_frontier.add(candidate.id)
+            frontier = next_frontier
+
+    async def _unblock_task(self, task: Task, unblocker_task_id: str) -> bool:
+        """Move *task* from ``BLOCKED_BY_FAILED_DEP`` back to ``OPEN``.
+
+        Returns ``True`` when the task moved, ``False`` otherwise.
+        """
+        reason = f"dependency {unblocker_task_id} completed"
+        snapshot = self._claim_snapshot(task)
+        self._index_remove(task)
+        try:
+            transition_task(task, TaskStatus.OPEN, actor="task_store", reason=reason)
+        except IllegalTransitionError:
+            self._index_add(task)
+            return False
+        task.result_summary = None
+        task.terminal_reason = None
+        if isinstance(task.metadata, dict):
+            task.metadata.pop("blocking_task_id", None)
+        task.version += 1
+        self._index_add(task)
+        await self._append_jsonl(self._task_to_record(task))
+        self._record_release_receipt(
+            task,
+            snapshot,
+            release_path="unblock_dependency_cascade",
+            reason=reason,
+        )
+        logger.info(
+            "Task %s unblocked by completed dependency %s",
+            sanitize_log(task.id),
+            sanitize_log(unblocker_task_id),
+        )
+        self._notify_task_updated(task)
+        return True
+
+    async def _revive_blocked_dependents(self, *task_ids: str) -> None:
+        """Revive tasks stranded on *task_ids* now that a retry of them succeeded.
+
+        A failed dependency that is retried and then completes does not
+        automatically clear its stranded dependents: the cascade that ran
+        when it first failed moved them to ``BLOCKED_BY_FAILED_DEP`` naming
+        the original id, and the original id is still terminal. This walks
+        the same frontier as :meth:`_cascade_unblock_dependency` but seeds it
+        from ``retry_of`` links, so a dependent whose
+        ``blocking_task_id`` matches a retried-and-succeeded task is moved
+        back to ``OPEN``.
+
+        Only the direct dependent is rewired -- a task stranded on a task
+        that was itself stranded is not reachable through this path, and the
+        retry's own completion re-runs the transitive unblock. Mirrors
+        :meth:`_cascade_failed_dependency`, which strands the same ring in
+        the failure direction (issue #4376).
+
+        Must be called with ``self._lock`` held.
+        """
+        solved_blocker_ids: set[str] = set()
+        for tid in task_ids:
+            completed_task = self._tasks.get(tid)
+            if completed_task is None or not isinstance(completed_task.metadata, dict):
+                continue
+            retry_of = completed_task.metadata.get("retry_of")
+            if isinstance(retry_of, str) and retry_of:
+                solved_blocker_ids.add(retry_of)
+
+        frontier = set(solved_blocker_ids)
+        while frontier:
+            next_frontier: set[str] = set()
+            for candidate in sorted(self._tasks.values(), key=lambda t: t.id):
+                if candidate.status is not TaskStatus.BLOCKED_BY_FAILED_DEP:
+                    continue
+                blocker_id = (
+                    candidate.metadata.get("blocking_task_id") if isinstance(candidate.metadata, dict) else None
+                )
+                if blocker_id in solved_blocker_ids and await self._unblock_task(candidate, blocker_id):
+                    solved_blocker_ids.add(candidate.id)
+                    next_frontier.add(candidate.id)
+            frontier = next_frontier
+
+    async def _cascade_unblock_dependency(self, *completed_task_ids: str) -> None:
+        """Unblock tasks that were stranded by failed dependencies now succeeded by *completed_task_ids*.
+
+        Propagation is transitive: unblocking a task allows its downstream
+        dependents to be unblocked on subsequent passes.
+
+        Must be called with ``self._lock`` held.
+        """
+        solved_blocker_ids = set(completed_task_ids)
+        for tid in completed_task_ids:
+            completed_task = self._tasks.get(tid)
+            if completed_task is None:
+                continue
+            if isinstance(completed_task.metadata, dict):
+                orig_id = completed_task.metadata.get("original_task_id")
+                retry_of = completed_task.metadata.get("retry_of")
+                if isinstance(orig_id, str) and orig_id:
+                    solved_blocker_ids.add(orig_id)
+                if isinstance(retry_of, str) and retry_of:
+                    solved_blocker_ids.add(retry_of)
+
+        frontier = set(completed_task_ids)
+        while frontier:
+            next_frontier: set[str] = set()
+            for candidate in sorted(self._tasks.values(), key=lambda t: t.id):
+                if candidate.status is not TaskStatus.BLOCKED_BY_FAILED_DEP:
+                    continue
+                blocker_id = (
+                    candidate.metadata.get("blocking_task_id") if isinstance(candidate.metadata, dict) else None
+                )
+                blocker = self._tasks.get(blocker_id) if blocker_id else None
+                blocker_unblocked = blocker is not None and blocker.status not in (
+                    TaskStatus.BLOCKED_BY_FAILED_DEP,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.REFUSED,
+                )
+                blocker_cleared = bool(blocker_id and (blocker_id in solved_blocker_ids or blocker_unblocked))
+                if (blocker_cleared or self._dependencies_satisfied(candidate)) and await self._unblock_task(
+                    candidate, blocker_id or candidate.id
+                ):
+                    solved_blocker_ids.add(candidate.id)
+                    next_frontier.add(candidate.id)
+            frontier = next_frontier
+
     def _dependencies_satisfied(self, task: Task) -> bool:
-        done_ids = {done_task.id for done_task in self._by_status[TaskStatus.DONE].values()}
+        # A dependency is satisfied by either terminal-success status: tasks
+        # move from "done" to "closed" once their agent is reaped and its
+        # branch merged (the store soft-archives via status). Accepting only
+        # "done" here rejected claims of dependents whose dependency had
+        # already completed and been closed.
+        completed_tasks = list(self._by_status[TaskStatus.DONE].values()) + list(
+            self._by_status[TaskStatus.CLOSED].values()
+        )
+        done_ids = {done_task.id for done_task in completed_tasks}
+        for done_task in completed_tasks:
+            if isinstance(done_task.metadata, dict):
+                orig = done_task.metadata.get("original_task_id")
+                retry_of = done_task.metadata.get("retry_of")
+                if isinstance(orig, str) and orig:
+                    done_ids.add(orig)
+                if isinstance(retry_of, str) and retry_of:
+                    done_ids.add(retry_of)
+
+        # A dependency that ended without delivering never satisfies its
+        # dependents (#3452). The classification lives in one place so a path
+        # that moves a task to a new terminal status cannot forget it.
+        if blocking_dependency(task, self._tasks) is not None:
+            return False
+
         if not all(dep in done_ids for dep in task.depends_on):
             return False
         if task.depends_on_repo is None:
             return True
         if not task.depends_on:
-            return any(
-                done_task.repo == task.depends_on_repo for done_task in self._by_status[TaskStatus.DONE].values()
-            )
+            return any(done_task.repo == task.depends_on_repo for done_task in completed_tasks)
         return all(
             (self._tasks.get(dep_id) is not None and self._tasks[dep_id].repo == task.depends_on_repo)
             for dep_id in task.depends_on
@@ -913,19 +1498,35 @@ class TaskStore:
         max_retries_raw = getattr(req, "max_retries", None)
         retry_delay_raw = getattr(req, "retry_delay_s", None)
         meta_messages_raw = getattr(req, "meta_messages", None)
+        max_turns_raw = getattr(req, "max_turns", None)
+        # Issue #3110: fail closed on a malformed artifact declaration. The
+        # TaskCreate schema already refused it at the API boundary; this
+        # re-parse covers every other TaskCreateRequest implementer, so a
+        # malformed block can never be stored as a silent code_diff task.
+        try:
+            artifact_spec = _artifact_spec_from_request(getattr(req, "artifact_spec", None))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        logger.info(
+            "TaskStore.create: max_turns=%r for title=%r (None => auto-computed at spawn time)",
+            max_turns_raw,
+            sanitize_log(req.title),
+        )
 
         task = Task(
-            id=uuid.uuid4().hex[:12],
+            id=getattr(req, "id", None) or uuid.uuid4().hex[:12],
             title=req.title,
             description=req.description,
             role=req.role,
             priority=req.priority,
             scope=Scope(req.scope),
             complexity=complexity_val,
-            estimated_minutes=req.estimated_minutes,
-            depends_on=req.depends_on,
+            estimated_minutes=(
+                req.estimated_minutes if req.estimated_minutes is not None else _DEFAULT_ESTIMATED_MINUTES
+            ),
+            depends_on=list(req.depends_on),
             parent_task_id=getattr(req, "parent_task_id", None),
-            owned_files=req.owned_files,
+            owned_files=list(req.owned_files),
             tenant_id=normalize_tenant_id(getattr(req, "tenant_id", "default")),
             cell_id=req.cell_id,
             repo=getattr(req, "repo", None),
@@ -939,8 +1540,11 @@ class TaskStore:
             eu_ai_act_risk=getattr(req, "eu_ai_act_risk", "minimal"),
             approval_required=bool(getattr(req, "approval_required", False)),
             risk_level=getattr(req, "risk_level", "low"),
-            completion_signals=[CompletionSignal(type=s.type, value=s.value) for s in req.completion_signals],
-            slack_context=req.slack_context,
+            completion_signals=[
+                CompletionSignal(type=_narrow_signal_type(s.type), value=s.value) for s in req.completion_signals
+            ],
+            artifact_spec=artifact_spec,
+            slack_context=dict(req.slack_context) if req.slack_context is not None else None,
             metadata=getattr(req, "metadata", None) or {},
             parent_session_id=getattr(req, "parent_session_id", None),
             parent_context=getattr(req, "parent_context", None),
@@ -950,6 +1554,7 @@ class TaskStore:
             terminal_reason=getattr(req, "terminal_reason", None),
             max_output_tokens=getattr(req, "max_output_tokens", None),
             meta_messages=list(meta_messages_raw) if meta_messages_raw is not None else [],
+            max_turns=int(max_turns_raw) if max_turns_raw is not None else None,
         )
         async with self._lock:
             if task.depends_on:
@@ -962,7 +1567,7 @@ class TaskStore:
                 cycle = self._detect_cycle(self._tasks, task)
                 if cycle is not None:
                     raise HTTPException(
-                        status_code=422,
+                        status_code=400,
                         detail="Circular dependency detected: " + " -> ".join(cycle),
                     )
             if task.depends_on_repo is not None:
@@ -1010,9 +1615,274 @@ class TaskStore:
 
         return task
 
+    # -- clearance-gate wiring (#2556) --------------------------------------
+    # A ``blocker`` bulletin signal materializes a clearance task with a
+    # deterministic id (derived from the blocker content hash) plus injected
+    # ``depends_on`` edges onto the open dependent tasks in scope. The clearance
+    # task participates as an ordinary dependency edge, so ``claim_next`` and the
+    # ``list_tasks(status="open")`` exclusion already withhold dependent work
+    # until the gate is terminal. These additive helpers let the deterministic
+    # projection create a task at a chosen id and inject the edges without going
+    # through the id-generating ``create`` path.
+
+    async def create_gate_task(
+        self,
+        *,
+        clearance_task_id: str,
+        title: str,
+        role: str,
+        cell_id: str | None = None,
+        priority: int = 1,
+        tenant_id: str = "default",
+    ) -> Task:
+        """Create a clearance task with a caller-supplied deterministic id.
+
+        Args:
+            clearance_task_id: The projected clearance-task id (``clearance-…``).
+            title: Human-readable gate title.
+            role: Role lane the clearance task belongs to (kept distinct from
+                worker roles so workers never claim the gate itself).
+            cell_id: Cell scope the gate belongs to.
+            priority: Task priority (defaults to 1 so the gate surfaces first).
+            tenant_id: Tenant scope.
+
+        Returns:
+            The created clearance :class:`Task`.
+
+        Raises:
+            ValueError: If a task with ``clearance_task_id`` already exists.
+        """
+        task = Task(
+            id=clearance_task_id,
+            title=title,
+            description=f"Clearance gate for a bulletin blocker in cell {cell_id or 'global'}.",
+            role=role,
+            priority=priority,
+            status=TaskStatus.OPEN,
+            cell_id=cell_id,
+            tenant_id=normalize_tenant_id(tenant_id),
+        )
+        async with self._lock:
+            if clearance_task_id in self._tasks:
+                raise ValueError(f"clearance task already exists: {clearance_task_id}")
+            self._tasks[task.id] = task
+            self._index_add(task)
+            self._parent_index_add(task)
+            await self._append_jsonl(self._task_to_record(task))
+        return task
+
+    async def create_gate_with_edges(
+        self,
+        *,
+        clearance_task_id: str,
+        title: str,
+        role: str,
+        cell_id: str | None = None,
+        priority: int = 1,
+        tenant_id: str = "default",
+        dependent_task_ids: Sequence[str] | None = None,
+    ) -> tuple[Task, list[str]]:
+        """Create a clearance gate and inject every dependent edge atomically.
+
+        Creating the gate task and injecting the ``depends_on`` edges as two
+        separate lock acquisitions leaves a claim race window: between the two
+        steps the gate exists but the dependents are not yet gated, so
+        ``claim_next`` can hand out work the gate was meant to withhold. This
+        method performs the whole mutation under a single lock acquisition and
+        re-selects the OPEN dependents *inside* that lock, so no claim can
+        interleave and no dependent that was open at gate time is missed.
+
+        The mutation is transactional: if any step raises (for example a failed
+        journal append), every in-memory change made by this call is rolled
+        back, so an interrupted materialization leaves neither an orphan gate
+        task nor an orphan edge.
+
+        Args:
+            clearance_task_id: The projected clearance-task id (``clearance-…``).
+            title: Human-readable gate title.
+            role: Role lane the clearance task belongs to (kept distinct from
+                worker roles so workers never claim the gate itself).
+            cell_id: Cell scope the gate belongs to.
+            priority: Task priority (defaults to 1 so the gate surfaces first).
+            tenant_id: Tenant scope.
+            dependent_task_ids: Optional explicit dependent set. When supplied,
+                only these ids receive an edge (intersected with the OPEN tasks
+                re-selected under the lock). When ``None``, every OPEN task in
+                the gate's cell scope **and tenant** is gated; tasks belonging
+                to another tenant are never gated by this gate.
+
+        Returns:
+            A tuple of ``(gate_task, injected_dependent_ids)`` where the id list
+            is sorted and de-duplicated.
+
+        Raises:
+            ValueError: If a task with ``clearance_task_id`` already exists.
+        """
+        gate = Task(
+            id=clearance_task_id,
+            title=title,
+            description=f"Clearance gate for a bulletin blocker in cell {cell_id or 'global'}.",
+            role=role,
+            priority=priority,
+            status=TaskStatus.OPEN,
+            cell_id=cell_id,
+            tenant_id=normalize_tenant_id(tenant_id),
+        )
+        requested = set(dependent_task_ids) if dependent_task_ids is not None else None
+
+        async with self._lock:
+            if clearance_task_id in self._tasks:
+                raise ValueError(f"clearance task already exists: {clearance_task_id}")
+
+            # Re-select the OPEN dependents under the same lock that creates the
+            # gate. A gate never gates another gate, and never gates itself.
+            # Scope by tenant as well as cell. Every other selection path in
+            # this store filters candidates by normalized tenant; omitting it
+            # here would let a gate created for one tenant inject depends_on
+            # edges onto another tenant's OPEN tasks in the same cell, which is
+            # a containment failure rather than a cosmetic gap (#2648).
+            candidates = [
+                task.id
+                for task in self._by_status[TaskStatus.OPEN].values()
+                if task.id != clearance_task_id
+                and not task.id.startswith("clearance-")
+                and (cell_id is None or task.cell_id == cell_id)
+                and task.tenant_id == gate.tenant_id
+                and (requested is None or task.id in requested)
+            ]
+            targets = sorted(set(candidates))
+
+            edged: list[Task] = []
+            created = False
+            staged = len(self._write_buffer)
+            try:
+                self._tasks[gate.id] = gate
+                self._index_add(gate)
+                self._parent_index_add(gate)
+                created = True
+
+                for dependent_id in targets:
+                    dependent = self._tasks[dependent_id]
+                    if clearance_task_id in dependent.depends_on:
+                        continue
+                    dependent.depends_on = [*dependent.depends_on, clearance_task_id]
+                    dependent.version += 1
+                    edged.append(dependent)
+
+                # Stage the gate row and every edge row, then flush once. The
+                # buffer is written by a single fsynced write, so the journal
+                # never records a gate without its edges: replaying a crashed
+                # materialization restores the whole gate or none of it.
+                rows = [self._task_to_record(task) for task in (gate, *edged)]
+                lines = [json.dumps(record, default=str) + "\n" for record in rows]
+                self._write_buffer.extend(lines)
+                await self._flush_buffer_unlocked()
+            except BaseException:
+                # Roll back every in-memory mutation so a partial failure leaves
+                # neither an orphan gate nor an orphan edge behind.
+                del self._write_buffer[staged:]
+                for dependent in edged:
+                    dependent.depends_on = [d for d in dependent.depends_on if d != clearance_task_id]
+                    dependent.version -= 1
+                if created:
+                    self._index_remove(gate)
+                    self._parent_index_remove(gate)
+                    self._tasks.pop(gate.id, None)
+                raise
+
+            # Mirror into the tenant backlog only after the primary journal
+            # write committed, so a rolled-back gate never appears in the
+            # tenant view. The mirror is a derived view: by this point the
+            # mutation is durable, so a mirror failure is logged rather than
+            # raised, which would report failure for a committed gate and
+            # strand it with no receipt.
+            for record, line in zip(rows, lines, strict=True):
+                try:
+                    await self._append_tenant_backlog_record(record, line)
+                except Exception:
+                    logger.exception(
+                        "tenant backlog mirror failed for clearance gate %s; the gate is committed",
+                        clearance_task_id,
+                    )
+
+        return gate, targets
+
+    async def inject_dependency(self, task_id: str, depends_on_id: str) -> Task:
+        """Inject a ``depends_on`` edge onto an existing non-terminal task.
+
+        The edge is idempotent (a repeated injection is a no-op) and the target
+        dependency must already exist so the dependency gate can resolve it. The
+        task's version is bumped and the change is persisted.
+
+        Args:
+            task_id: The dependent task receiving the edge.
+            depends_on_id: The clearance (or other) task it must now wait on.
+
+        Returns:
+            The updated dependent :class:`Task`.
+
+        Raises:
+            KeyError: If either task id is unknown.
+        """
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if depends_on_id not in self._tasks:
+                raise KeyError(depends_on_id)
+            if depends_on_id not in task.depends_on:
+                task.depends_on = [*task.depends_on, depends_on_id]
+                task.version += 1
+                await self._append_jsonl(self._task_to_record(task))
+        return task
+
+    async def resolve_gate_task(self, clearance_task_id: str, *, resolution: str = "cleared") -> Task:
+        """Mark a clearance task terminal so its dependents are released.
+
+        Transitions the gate ``OPEN -> CLAIMED -> DONE`` (both legal steps) so
+        the terminal ``DONE`` status satisfies the dependency gate and dependent
+        work becomes claimable again. ``resolution`` is recorded in the result
+        summary for the archive trail.
+
+        Args:
+            clearance_task_id: The clearance task to resolve.
+            resolution: ``cleared`` or ``expired`` (recorded in the summary).
+
+        Returns:
+            The resolved clearance :class:`Task`.
+
+        Raises:
+            KeyError: If ``clearance_task_id`` is unknown.
+            ClearanceResolutionRefusal: If ``resolution`` is outside
+                ``{cleared, expired}``. The refusal happens before the lock is
+                taken, so an unrecognised resolution never reaches the task
+                state or the result summary (#2648).
+        """
+        from bernstein.core.security.audit_chain import (
+            GATE_TERMINAL_RESOLUTIONS,
+            validate_gate_resolution,
+        )
+
+        validate_gate_resolution(resolution, allowed=GATE_TERMINAL_RESOLUTIONS)
+        async with self._lock:
+            task = self._tasks.get(clearance_task_id)
+            if task is None:
+                raise KeyError(clearance_task_id)
+            if task.status not in (TaskStatus.DONE, TaskStatus.CLOSED):
+                self._index_remove(task)
+                if task.status == TaskStatus.OPEN:
+                    transition_task(task, TaskStatus.CLAIMED, actor="clearance_gate", reason="gate resolve")
+                transition_task(task, TaskStatus.DONE, actor="clearance_gate", reason=f"gate {resolution}")
+                task.result_summary = f"clearance {resolution}"
+                task.completed_at = time.time()
+                task.version += 1
+                self._index_add(task)
+                await self._append_jsonl(self._task_to_record(task))
+        return task
+
     async def create_batch(
         self,
-        requests: list[TaskCreateRequest],
+        requests: Sequence[TaskCreateRequest],
         *,
         dedup_by_title: bool = True,
     ) -> tuple[list[Task], list[str]]:
@@ -1067,6 +1937,17 @@ class TaskStore:
                     _cls = classify_task(_probe)
                     batch_eligible = _cls.level in (TaskLevel.L0, TaskLevel.L1)
 
+                # Issue #3110: fail closed per entry - a malformed artifact
+                # declaration skips this entry with the field named (matching
+                # the dependency-validation skip below) and never becomes a
+                # silent code_diff task; the rest of the batch continues.
+                try:
+                    artifact_spec = _artifact_spec_from_request(getattr(req, "artifact_spec", None))
+                except ValueError as exc:
+                    logger.warning("create_batch: skipping %r - %s", req.title, exc)
+                    skipped_titles.append(req.title)
+                    continue
+
                 task = Task(
                     id=uuid.uuid4().hex[:12],
                     title=req.title,
@@ -1075,10 +1956,12 @@ class TaskStore:
                     priority=req.priority,
                     scope=Scope(req.scope),
                     complexity=complexity_val,
-                    estimated_minutes=req.estimated_minutes,
-                    depends_on=req.depends_on,
+                    estimated_minutes=(
+                        req.estimated_minutes if req.estimated_minutes is not None else _DEFAULT_ESTIMATED_MINUTES
+                    ),
+                    depends_on=list(req.depends_on),
                     parent_task_id=getattr(req, "parent_task_id", None),
-                    owned_files=req.owned_files,
+                    owned_files=list(req.owned_files),
                     tenant_id=normalize_tenant_id(getattr(req, "tenant_id", "default")),
                     cell_id=req.cell_id,
                     repo=getattr(req, "repo", None),
@@ -1092,8 +1975,12 @@ class TaskStore:
                     eu_ai_act_risk=getattr(req, "eu_ai_act_risk", "minimal"),
                     approval_required=bool(getattr(req, "approval_required", False)),
                     risk_level=getattr(req, "risk_level", "low"),
-                    completion_signals=[CompletionSignal(type=s.type, value=s.value) for s in req.completion_signals],
-                    slack_context=req.slack_context,
+                    completion_signals=[
+                        CompletionSignal(type=_narrow_signal_type(s.type), value=s.value)
+                        for s in req.completion_signals
+                    ],
+                    artifact_spec=artifact_spec,
+                    slack_context=dict(req.slack_context) if req.slack_context is not None else None,
                     metadata=getattr(req, "metadata", None) or {},
                     parent_session_id=getattr(req, "parent_session_id", None),
                 )
@@ -1103,7 +1990,7 @@ class TaskStore:
                     missing = [dep for dep in task.depends_on if dep not in self._tasks]
                     if missing:
                         logger.warning(
-                            "create_batch: skipping %r — depends_on references non-existent task(s): %s",
+                            "create_batch: skipping %r - depends_on references non-existent task(s): %s",
                             task.title,
                             ", ".join(missing),
                         )
@@ -1112,7 +1999,7 @@ class TaskStore:
                     cycle = self._detect_cycle(self._tasks, task)
                     if cycle is not None:
                         logger.warning(
-                            "create_batch: skipping %r — circular dependency: %s",
+                            "create_batch: skipping %r - circular dependency: %s",
                             task.title,
                             " -> ".join(cycle),
                         )
@@ -1182,6 +2069,9 @@ class TaskStore:
                 return None
             task: Task | None = None
             blocked_entries: list[tuple[int, str]] = []
+            # Stranded candidates are moved off the queue rather than back
+            # onto it (#3452); mutating mid-drain would reorder the heap.
+            stranded_entries: list[tuple[Task, str]] = []
             normalized_tenant = normalize_tenant_id(tenant_id) if tenant_id is not None else None
             while pq:
                 priority, task_id = heapq.heappop(pq)
@@ -1199,19 +2089,28 @@ class TaskStore:
                 if parent_session_id is not None and candidate.parent_session_id != parent_session_id:
                     blocked_entries.append((priority, task_id))
                     continue
+                # A dependency that ended without delivering makes this
+                # candidate unclaimable for good, so re-queuing it just burns
+                # a heap slot every tick, forever (#3452).
+                stranding_dep = blocking_dependency(candidate, self._tasks)
+                if stranding_dep is not None:
+                    stranded_entries.append((candidate, stranding_dep))
+                    continue
                 if not self._dependencies_satisfied(candidate):
                     blocked_entries.append((priority, task_id))
                     continue
                 # TASK-003: file ownership overlap check
                 overlap_msg = self._check_file_ownership_overlap(candidate)
                 if overlap_msg is not None:
-                    logger.info("claim_next: skipping %s — %s", task_id, overlap_msg)
+                    logger.info("claim_next: skipping %s - %s", task_id, overlap_msg)
                     blocked_entries.append((priority, task_id))
                     continue
                 task = candidate
                 break
             for entry in blocked_entries:
                 heapq.heappush(pq, entry)
+            for stranded, stranding_dep in stranded_entries:
+                await self._mark_blocked_by_failed_dep(stranded, stranding_dep)
             if task is None:
                 return None
             self._index_remove(task)
@@ -1242,7 +2141,7 @@ class TaskStore:
 
         Args:
             task_id: Task identifier.
-            expected_version: If set, CAS — reject if task.version != this.
+            expected_version: If set, CAS - reject if task.version != this.
             agent_role: If set, reject if task.role != agent_role.
             claimed_by_session: Parent orchestrator session ID to record as claim owner.
 
@@ -1269,7 +2168,7 @@ class TaskStore:
                 )
             if task.status != TaskStatus.OPEN:
                 # never silently re-return an already-claimed or
-                # terminal task — that enables double-claim. Raise so the
+                # terminal task - that enables double-claim. Raise so the
                 # HTTP layer can map it to 409 Conflict.
                 raise ValueError(
                     f"task {task_id} is not open (status={task.status.value}); "
@@ -1353,12 +2252,22 @@ class TaskStore:
                 claimed.append(task_id)
         return claimed, failed
 
-    async def complete(self, task_id: str, result_summary: str) -> Task:
+    async def complete(
+        self,
+        task_id: str,
+        result_summary: str,
+        *,
+        completion: WorkerCompletion | None = None,
+    ) -> Task:
         """Mark a task as done.
 
         Args:
             task_id: Task identifier.
             result_summary: Non-empty summary of what was done (diff or log reference).
+            completion: Optional contract-validated completion payload
+                (#2244). When provided, the payload, contract version, and
+                validation outcome are persisted in ``task.metadata`` and
+                recorded as an HMAC-chained audit event.
 
         Returns:
             The updated Task.
@@ -1388,8 +2297,10 @@ class TaskStore:
                     TaskStatus.FAILED,
                     TaskStatus.CANCELLED,
                     TaskStatus.CLOSED,
+                    TaskStatus.REFUSED,
                 ):
                     raise EmptyCompletionError(task_id, task)
+                snapshot = self._claim_snapshot(task)
                 self._index_remove(task)
                 transition_task(
                     task,
@@ -1404,15 +2315,65 @@ class TaskStore:
                 completed_at = task.completed_at
                 await self._append_jsonl(self._task_to_record(task))
                 await self._append_archive(task, completed_at)
+                # The slot this frees is a surrender, not a delivery: the
+                # worker held the claim and produced nothing, so the ledger
+                # needs the release half or the chain keeps naming it as the
+                # holder of a task it never finished (#3037).
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="fail_empty_completion",
+                    reason=_EMPTY_COMPLETION_REASON,
+                )
             raise EmptyCompletionError(task_id, task)
 
         async with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
                 raise KeyError(task_id)
+
+            # Issue #4401: A planning/manager task that created zero child tasks has not
+            # accomplished any work. It must fail rather than falsely reporting success.
+            # Scoped to this task's own attempt (issue #4466) - see
+            # ``_planning_yield_is_zero``.
+            if task.role == "manager" and self._planning_yield_is_zero(task):
+                snapshot = self._claim_snapshot(task)
+                self._index_remove(task)
+                transition_task(
+                    task,
+                    TaskStatus.FAILED,
+                    actor="task_store",
+                    reason=_ZERO_YIELD_PLANNING_REASON,
+                )
+                task.result_summary = _ZERO_YIELD_PLANNING_REASON
+                task.completed_at = time.time()
+                task.version += 1
+                self._index_add(task)
+                completed_at = task.completed_at
+                await self._append_jsonl(self._task_to_record(task))
+                await self._append_archive(task, completed_at)
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="fail_zero_yield_planning",
+                    reason=_ZERO_YIELD_PLANNING_REASON,
+                )
+                logger.warning(
+                    "Planning task %s completed without creating child tasks; marked FAILED (%s).",
+                    sanitize_log(task_id),
+                    _ZERO_YIELD_PLANNING_REASON,
+                )
+                return task
+
             self._index_remove(task)
             transition_task(task, TaskStatus.DONE, actor="task_store", reason="complete")
             task.result_summary = result_summary
+            if completion is not None:
+                from bernstein.core.tasks.contracts import WORKER_CONTRACT_VERSION
+
+                task.metadata["worker_completion"] = completion.to_dict()
+                task.metadata["contract_version"] = WORKER_CONTRACT_VERSION
+                task.metadata["contract_validation"] = "valid"
             task.completed_at = time.time()
             task.version += 1
             self._index_add(task)
@@ -1420,7 +2381,11 @@ class TaskStore:
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
             await self._complete_parent_if_ready(task.parent_task_id)
-            return task
+            await self._revive_blocked_dependents(task_id)
+            await self._cascade_unblock_dependency(task_id)
+        if completion is not None:
+            self._audit_contract_outcome(task_id, outcome="valid")
+        return task
 
     async def close(self, task_id: str) -> Task:
         """Mark a verified task as closed (terminal success state).
@@ -1446,6 +2411,7 @@ class TaskStore:
             task.version += 1
             self._index_add(task)
             await self._append_jsonl(self._task_to_record(task))
+            await self._cascade_unblock_dependency(task_id)
             return task
 
     async def wait_for_subtasks(self, task_id: str, subtask_count: int) -> Task:
@@ -1468,12 +2434,14 @@ class TaskStore:
             await self._append_jsonl(self._task_to_record(task))
             return task
 
-    async def fail(self, task_id: str, reason: str) -> Task:
+    async def fail(self, task_id: str, reason: str, *, terminal_reason: str | None = None) -> Task:
         """Mark a task as failed.
 
         Args:
             task_id: Task identifier.
             reason: Why it failed.
+            terminal_reason: Optional machine-readable failure class
+                (e.g. ``"contract_violation"``) persisted on the task.
 
         Returns:
             The updated Task.
@@ -1485,15 +2453,308 @@ class TaskStore:
             task = self._tasks.get(task_id)
             if task is None:
                 raise KeyError(task_id)
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.FAILED, actor="task_store", reason=reason)
             task.result_summary = reason
+            if terminal_reason is not None:
+                task.terminal_reason = terminal_reason
             task.completed_at = time.time()
             task.version += 1
             self._index_add(task)
             completed_at = task.completed_at
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
+            self._record_release_receipt(task, snapshot, release_path="fail", reason=reason)
+            await self._cascade_failed_dependency(task_id)
+            return task
+
+    async def fail_contract_violation(self, task_id: str, violation: ContractViolation) -> Task:
+        """Fail a task whose terminal payload violated the completion contract.
+
+        Distinct from a plain :meth:`fail` in that the contract version,
+        validation outcome, and schema error path are persisted in
+        ``task.metadata`` and recorded as an HMAC-chained audit event, so
+        chain verification covers "this task's terminal payload was
+        rejected against contract vX" (#2244).
+
+        Args:
+            task_id: Task identifier.
+            violation: The schema violation raised by the contract parser.
+
+        Returns:
+            The updated Task.
+
+        Raises:
+            KeyError: If task_id does not exist.
+            IllegalTransitionError: If the task cannot transition to FAILED.
+        """
+        from bernstein.core.tasks.contracts import WORKER_CONTRACT_VERSION
+
+        reason = f"contract_violation: {violation.path}: {violation.message}"
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            snapshot = self._claim_snapshot(task)
+            self._index_remove(task)
+            transition_task(task, TaskStatus.FAILED, actor="task_store", reason=reason)
+            task.result_summary = reason
+            task.terminal_reason = "contract_violation"
+            task.metadata["contract_version"] = WORKER_CONTRACT_VERSION
+            task.metadata["contract_validation"] = "violation"
+            task.metadata["contract_error_path"] = violation.path
+            task.completed_at = time.time()
+            task.version += 1
+            self._index_add(task)
+            completed_at = task.completed_at
+            await self._append_jsonl(self._task_to_record(task))
+            await self._append_archive(task, completed_at)
+            self._record_release_receipt(task, snapshot, release_path="fail_contract_violation", reason=reason)
+            await self._cascade_failed_dependency(task_id)
+        self._audit_contract_outcome(task_id, outcome="violation", schema_error_path=violation.path)
+        return task
+
+    async def refuse(self, task_id: str, refusal: WorkerRefusal) -> Task:
+        """Mark *task_id* as :class:`TaskStatus.REFUSED` with a typed refusal.
+
+        Distinct from :meth:`fail`: REFUSED is the terminal state for a
+        worker that reported - via the completion contract (#2244) - that
+        the task cannot proceed as specified. The validated refusal
+        payload, contract version, and validation outcome are persisted
+        on the task record and recorded as an HMAC-chained audit event.
+
+        Args:
+            task_id: Task identifier.
+            refusal: The validated refusal payload.
+
+        Returns:
+            The updated Task.
+
+        Raises:
+            KeyError: If task_id does not exist.
+            IllegalTransitionError: If the current status cannot
+                transition to REFUSED (e.g. already terminal).
+        """
+        from bernstein.core.tasks.contracts import WORKER_CONTRACT_VERSION
+
+        outcome = f"refused:{refusal.kind.value}"
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            snapshot = self._claim_snapshot(task)
+            self._index_remove(task)
+            transition_task(task, TaskStatus.REFUSED, actor="task_store", reason=refusal.detail)
+            task.result_summary = refusal.detail
+            task.terminal_reason = outcome
+            task.metadata["refusal"] = refusal.to_dict()
+            task.metadata["contract_version"] = WORKER_CONTRACT_VERSION
+            task.metadata["contract_validation"] = outcome
+            task.completed_at = time.time()
+            task.version += 1
+            self._index_add(task)
+            completed_at = task.completed_at
+            await self._append_jsonl(self._task_to_record(task))
+            await self._append_archive(task, completed_at)
+            self._record_release_receipt(task, snapshot, release_path="refuse", reason=outcome)
+            await self._cascade_failed_dependency(task_id)
+        self._audit_contract_outcome(task_id, outcome=outcome)
+        return task
+
+    async def create_refusal_follow_ups(self, parent: Task, refusal: WorkerRefusal) -> list[Task]:
+        """Create the deterministic follow-up task set for a scope_exceeded refusal.
+
+        Task ids are content-addressed (see
+        :func:`bernstein.core.tasks.contracts.derive_follow_up_specs`), so
+        the same refusal payload always yields the same follow-up set and a
+        redelivered refusal is a no-op for ids that already exist.
+
+        Args:
+            parent: The refused task the split derives from.
+            refusal: Validated refusal; non-``scope_exceeded`` kinds
+                yield an empty list.
+
+        Returns:
+            The newly created follow-up tasks (existing ids are skipped).
+        """
+        from bernstein.core.tasks.contracts import WORKER_CONTRACT_VERSION, derive_follow_up_specs
+
+        specs = derive_follow_up_specs(parent.id, refusal)
+        created: list[Task] = []
+        async with self._lock:
+            for spec in specs:
+                if spec.task_id in self._tasks:
+                    continue
+                task = Task(
+                    id=spec.task_id,
+                    title=spec.title,
+                    description=spec.description,
+                    role=parent.role,
+                    priority=parent.priority,
+                    scope=parent.scope,
+                    complexity=parent.complexity,
+                    parent_task_id=parent.id,
+                    tenant_id=parent.tenant_id,
+                    cell_id=parent.cell_id,
+                    repo=parent.repo,
+                    batch_eligible=False,
+                    metadata={
+                        "origin": "scope_exceeded_split",
+                        "refused_task_id": parent.id,
+                        "contract_version": WORKER_CONTRACT_VERSION,
+                    },
+                )
+                self._tasks[task.id] = task
+                self._index_add(task)
+                self._parent_index_add(task)
+                await self._append_jsonl(self._task_to_record(task))
+                created.append(task)
+        if created:
+            logger.info(
+                "Refusal split created %d follow-up task(s) for %s",
+                len(created),
+                sanitize_log(parent.id),
+            )
+        return created
+
+    def _audit_contract_outcome(self, task_id: str, *, outcome: str, schema_error_path: str = "") -> None:
+        """Record a contract-validation outcome in the HMAC-chained audit log.
+
+        Best-effort: audit is additive, so a missing or failing audit log
+        never blocks the task mutation that already happened.
+        """
+        from bernstein.core.tasks.contracts import WORKER_CONTRACT_VERSION
+        from bernstein.core.tasks.lifecycle import get_audit_log
+
+        audit = get_audit_log()
+        if audit is None:
+            return
+        details: dict[str, Any] = {
+            "contract_version": WORKER_CONTRACT_VERSION,
+            "outcome": outcome,
+        }
+        if schema_error_path:
+            details["schema_error_path"] = schema_error_path
+        try:
+            audit.log(
+                event_type="task.contract_validation",
+                actor="task_store",
+                resource_type="task",
+                resource_id=task_id,
+                details=details,
+            )
+        except OSError as exc:
+            logger.warning("Contract audit event write failed for %s: %s", sanitize_log(task_id), exc)
+
+    async def reopen(self, task_id: str, reason: str) -> Task:
+        """Reopen a done task that failed janitor verification.
+
+        Transitions DONE -> OPEN so the SAME task (same id) is re-claimed and
+        re-attempted - no new task is created. Increments
+        ``metadata['janitor_reopen_count']`` so the orchestrator can bound the
+        number of reopen cycles before permanent failure.
+
+        Args:
+            task_id: Task identifier.
+            reason: Why the task is being reopened (e.g. failed janitor signals).
+
+        Returns:
+            The updated Task.
+
+        Raises:
+            KeyError: If task_id does not exist.
+            IllegalTransitionError: If the task is not in DONE status.
+        """
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            snapshot = self._claim_snapshot(task)
+            self._index_remove(task)
+            transition_task(task, TaskStatus.OPEN, actor="task_store", reason=reason)
+            reopen_count = int(task.metadata.get("janitor_reopen_count", 0) or 0) + 1
+            task.metadata["janitor_reopen_count"] = reopen_count
+            task.claimed_at = None
+            task.claimed_by_session = None
+            task.assigned_agent = None
+            task.completed_at = None
+            task.result_summary = None
+            task.priority = 0
+            task.version += 1
+            self._index_add(task)
+            await self._append_jsonl(self._task_to_record(task))
+            self._record_release_receipt(task, snapshot, release_path="reopen", reason=reason)
+            logger.info(
+                "task.reopen: task_id=%s reopen_count=%d reason=%s",
+                sanitize_log(task_id),
+                reopen_count,
+                sanitize_log(reason),
+            )
+            return task
+
+    async def release(self, task_id: str, reason: str = "") -> Task:
+        """Release an in-flight task back to OPEN so another node can claim it.
+
+        Distinct from :meth:`fail` (terminal FAILED) and :meth:`reopen`
+        (DONE -> OPEN): this returns a CLAIMED/IN_PROGRESS task to the pool
+        without marking it failed. It exists for the case where a worker claims
+        a task but cannot start its agent -- e.g. the workspace is unusable or
+        the adapter spawn fails -- so the task must not be stranded in CLAIMED
+        with no live agent (#3018).
+
+        Unlike :meth:`force_claim`, the original priority is preserved, so a
+        released task does not jump ahead of untried work; it simply becomes
+        claimable again by any node.
+
+        Args:
+            task_id: Task identifier.
+            reason: Why the task is being released (audited on the transition).
+
+        Returns:
+            The updated Task (now OPEN).
+
+        Raises:
+            KeyError: If task_id does not exist.
+            IllegalTransitionError: If the task is not CLAIMED or IN_PROGRESS.
+        """
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            # Validate the transition *before* mutating the index so an illegal
+            # release (e.g. the task is already OPEN or terminal) cannot leave
+            # the task de-indexed. Only in-flight tasks can be released.
+            if task.status not in (TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS):
+                raise IllegalTransitionError("task", task.id, task.status.value, TaskStatus.OPEN.value)
+            # Read the claim off the task before the transition clears it: this
+            # path returns the task to the pool, so it is a surrender and needs
+            # the matching task.release_receipt (#3037).
+            snapshot = self._claim_snapshot(task)
+            self._index_remove(task)
+            transition_task(
+                task,
+                TaskStatus.OPEN,
+                actor="task_store",
+                reason=reason or "released_to_pool",
+            )
+            task.claimed_at = None
+            task.claimed_by_session = None
+            task.assigned_agent = None
+            task.version += 1
+            self._index_add(task)
+            await self._append_jsonl(self._task_to_record(task))
+            self._record_release_receipt(
+                task,
+                snapshot,
+                release_path="release",
+                reason=reason or "released_to_pool",
+            )
+            logger.info(
+                "task.release: task_id=%s reason=%s",
+                sanitize_log(task_id),
+                sanitize_log(reason or "released_to_pool"),
+            )
             return task
 
     async def abandon(
@@ -1558,6 +2819,7 @@ class TaskStore:
                 attempts=task.retry_count,
             )
 
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.ABANDONED, actor="task_store", reason=detail or reason)
             task.result_summary = detail or reason
@@ -1568,9 +2830,18 @@ class TaskStore:
             completed_at = task.completed_at
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
+            self._record_release_receipt(
+                task,
+                snapshot,
+                release_path="abandon",
+                reason=row.reason.value,
+            )
 
             # Cascade: downstream tasks waiting on this one move to
-            # BLOCKED_BY_ABANDON so consumers stop waiting forever.
+            # BLOCKED_BY_ABANDON so consumers stop waiting forever. A
+            # downstream can be CLAIMED or IN_PROGRESS under a different node
+            # than the one that abandoned the upstream, so this loop ends
+            # claims it never granted and owes each one a receipt (#3037).
             for downstream in list(self._tasks.values()):
                 if task_id not in downstream.depends_on:
                     continue
@@ -1581,6 +2852,7 @@ class TaskStore:
                     TaskStatus.WAITING_FOR_SUBTASKS,
                 }:
                     continue
+                downstream_snapshot = self._claim_snapshot(downstream)
                 self._index_remove(downstream)
                 try:
                     transition_task(
@@ -1590,13 +2862,19 @@ class TaskStore:
                         reason=f"upstream {task_id} abandoned: {row.reason.value}",
                     )
                 except IllegalTransitionError:
-                    # Restore index entry — leave downstream untouched.
+                    # Restore index entry - leave downstream untouched.
                     self._index_add(downstream)
                     continue
                 downstream.result_summary = f"upstream {task_id} abandoned"
                 downstream.version += 1
                 self._index_add(downstream)
                 await self._append_jsonl(self._task_to_record(downstream))
+                self._record_release_receipt(
+                    downstream,
+                    downstream_snapshot,
+                    release_path="abandon_cascade",
+                    reason=f"upstream {task_id} abandoned: {row.reason.value}",
+                )
 
             # Ledger write is last so the in-memory state is the source
             # of truth even when the ledger file is read-only / OOS.
@@ -1790,6 +3068,7 @@ class TaskStore:
             }
             if task.status not in _cancellable:
                 raise ValueError(f"Task '{task_id}' cannot be cancelled from status '{task.status.value}'")
+            snapshot = self._claim_snapshot(task)
             self._index_remove(task)
             transition_task(task, TaskStatus.CANCELLED, actor="task_store", reason=reason)
             task.result_summary = reason
@@ -1799,6 +3078,8 @@ class TaskStore:
             completed_at = task.completed_at
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
+            self._record_release_receipt(task, snapshot, release_path="cancel", reason=reason)
+            await self._cascade_failed_dependency(task_id)
             return task
 
     # -- TASK-002: WAITING_FOR_SUBTASKS timeout with escalation ---------------
@@ -1838,7 +3119,7 @@ class TaskStore:
                     reason=f"subtask wait timeout after {threshold:.0f}s",
                 )
                 task.result_summary = (
-                    f"ESCALATION: subtask wait exceeded {threshold:.0f}s — "
+                    f"ESCALATION: subtask wait exceeded {threshold:.0f}s - "
                     "requires manager review or human intervention"
                 )
                 task.version += 1
@@ -1923,12 +3204,14 @@ class TaskStore:
                 task = self._tasks.get(tid)
                 if task is None or task.status not in cancellable:
                     continue
+                cascade_reason = reason if tid == task_id else f"parent {task_id} cancelled: {reason}"
+                snapshot = self._claim_snapshot(task)
                 self._index_remove(task)
                 transition_task(
                     task,
                     TaskStatus.CANCELLED,
                     actor="task_store",
-                    reason=reason if tid == task_id else f"parent {task_id} cancelled: {reason}",
+                    reason=cascade_reason,
                 )
                 task.result_summary = reason if tid == task_id else f"Cascade: parent {task_id} cancelled"
                 task.completed_at = time.time()
@@ -1937,7 +3220,24 @@ class TaskStore:
                 completed_at = task.completed_at
                 await self._append_jsonl(self._task_to_record(task))
                 await self._append_archive(task, completed_at)
+                self._record_release_receipt(
+                    task,
+                    snapshot,
+                    release_path="cancel_cascade",
+                    reason=cascade_reason,
+                )
                 cancelled.append(task)
+
+            # Dependents are stranded after the whole subtree is cancelled,
+            # not per task inside the loop. A dependent that is itself a
+            # descendant must be cancelled by the walk above rather than
+            # marked blocked first: ``cancellable`` does not include
+            # ``BLOCKED_BY_FAILED_DEP``, so an early mark would make the
+            # cascade skip it and a subtask would end in the wrong terminal
+            # status. Seeding one walk with the whole set also means a task
+            # depending on two cancelled tasks records a single nearest cause.
+            if cancelled:
+                await self._cascade_failed_dependency(*(t.id for t in cancelled))
 
         return cancelled
 
@@ -1948,7 +3248,7 @@ class TaskStore:
         priority: int | None,
         model: str | None = None,
     ) -> Task:
-        """Update mutable task fields (role, priority, model) — manager corrections.
+        """Update mutable task fields (role, priority, model) - manager corrections.
 
         Only open or failed tasks can be reassigned; claimed/in-progress tasks
         are left to finish before the new assignment takes effect.
@@ -1975,7 +3275,7 @@ class TaskStore:
                 # Role and priority are both inputs to the priority heap / role
                 # index; any change requires re-indexing so the heap entry
                 # reflects the new key.  A stale (old_priority, id) entry may
-                # remain in the old heap — claim_next lazy-deletes it on pop
+                # remain in the old heap - claim_next lazy-deletes it on pop
                 # by comparing against the live task.priority.
                 self._index_remove(task)
                 if role_changed:
@@ -2022,7 +3322,7 @@ class TaskStore:
 
         If the task is already open its priority is set to 0 and it stays open.
         If it is in a terminal state (done, failed, cancelled) it is returned
-        unchanged — only open/claimed/in_progress tasks can be force-claimed.
+        unchanged - only open/claimed/in_progress tasks can be force-claimed.
 
         Args:
             task_id: Task identifier.
@@ -2038,13 +3338,14 @@ class TaskStore:
             task = self._tasks.get(task_id)
             if task is None:
                 raise KeyError(task_id)
-            terminal = {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+            terminal = {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.REFUSED}
             if task.status in terminal:
                 raise ValueError(
                     f"Task '{task_id}' is in terminal state '{task.status.value}' and cannot be force-claimed"
                 )
+            snapshot = self._claim_snapshot(task)
             # Set priority *before* re-indexing so the heap entry carries the
-            # final priority — otherwise the pushed (old_priority, id) tuple
+            # final priority - otherwise the pushed (old_priority, id) tuple
             # diverges from task.priority and claim_next will skip it as
             # lazy-deleted (or, worse, pop it at the wrong priority).
             if task.status != TaskStatus.OPEN:
@@ -2054,7 +3355,7 @@ class TaskStore:
                 task.priority = 0
                 self._index_add(task)
             elif task.priority != 0:
-                # Already OPEN — re-index to refresh heap with priority=0.
+                # Already OPEN - re-index to refresh heap with priority=0.
                 self._index_remove(task)
                 task.priority = 0
                 self._index_add(task)
@@ -2062,6 +3363,7 @@ class TaskStore:
             task.claimed_by_session = None  # Clear ownership on force-claim
             task.version += 1
             await self._append_jsonl(self._task_to_record(task))
+            self._record_release_receipt(task, snapshot, release_path="force_claim", reason="force_claim")
             return task
 
     # -- query / listing (delegated from task_store_index) ------------------
@@ -2126,7 +3428,7 @@ class TaskStore:
             and (not check_open_deps or self._dependencies_satisfied(t))
         ]
 
-        if offset is None and limit is None:
+        if offset is limit is None:
             return filtered
 
         start = max(0, offset) if offset is not None else 0
@@ -2135,11 +3437,55 @@ class TaskStore:
         end = start + max(0, limit)
         return filtered[start:end]
 
+    def count_tasks(
+        self,
+        status: str | None = None,
+        cell_id: str | None = None,
+        tenant_id: str | None = None,
+        claimed_by_session: str | None = None,
+        parent_session_id: str | None = None,
+    ) -> int:
+        """Return task count, optionally filtered, without materialising task lists.
+
+        Args:
+            status: If provided, only count tasks with this status.
+            cell_id: If provided, only count tasks in this cell.
+            tenant_id: If provided, only count tasks in this tenant.
+            claimed_by_session: If provided, only count tasks claimed by this session.
+            parent_session_id: If provided, only count tasks scoped to this parent session.
+
+        Returns:
+            Number of matching tasks.
+        """
+        if status is not None:
+            try:
+                ts = TaskStatus(status)
+                seed: list[Task] = list(self._by_status[ts].values())
+            except ValueError:
+                return 0
+        else:
+            seed = list(self._tasks.values())
+
+        normalized_tenant = normalize_tenant_id(tenant_id) if tenant_id is not None else None
+        check_open_deps = status == "open"
+
+        count = 0
+        for t in seed:
+            if (
+                (cell_id is None or t.cell_id == cell_id)
+                and (normalized_tenant is None or t.tenant_id == normalized_tenant)
+                and (claimed_by_session is None or t.claimed_by_session == claimed_by_session)
+                and (parent_session_id is None or t.parent_session_id == parent_session_id)
+                and (not check_open_deps or self._dependencies_satisfied(t))
+            ):
+                count += 1
+        return count
+
     def count_by_status(self, tenant_id: str | None = None) -> dict[str, int]:
         """Return task counts per status without materialising task lists.
 
         This is O(N) in the worst case when tenant filtering is applied, but
-        avoids serialising full task bodies — ideal for the /tasks/counts
+        avoids serialising full task bodies - ideal for the /tasks/counts
         endpoint that the orchestrator polls every tick.
 
         Args:
@@ -2186,7 +3532,7 @@ class TaskStore:
             return None
 
         if task.priority != new_priority:
-            # Refresh heap entry — the old (priority, id) tuple is lazy-deleted
+            # Refresh heap entry - the old (priority, id) tuple is lazy-deleted
             # on pop via the priority mismatch check in claim_next.
             self._index_remove(task)
             task.priority = new_priority
@@ -2216,8 +3562,6 @@ class TaskStore:
                 try:
                     transition_agent(agent, status, actor="heartbeat", reason=f"agent {agent_id} self-report")
                 except IllegalTransitionError:
-                    from bernstein.core.sanitize import sanitize_log
-
                     logger.warning(
                         "Ignoring illegal heartbeat transition %s -> %s for %s",
                         sanitize_log(str(agent.status)),
@@ -2254,10 +3598,51 @@ class TaskStore:
 
     # -- status summary / cost tracking --------------------------------------
 
-    def status_summary(self) -> dict[str, Any]:
-        """Return aggregated task counts for the dashboard."""
-        role_counts = self._build_role_counts()
-        total_cost, cost_by_role = self._compute_costs()
+    def status_summary(self, tenant_id: str | None = None) -> dict[str, Any]:
+        """Return aggregated task counts for the dashboard.
+
+        Args:
+            tenant_id: If provided, the task figures are computed over that
+                tenant's rows only.  ``None`` keeps the whole-store roll-up,
+                matching :meth:`list_tasks`, whose ``tenant_id`` is optional
+                for the same reason: the CLI, the TUI and the supervisor read
+                this store outside any request and have no scope to apply.
+
+        Note:
+            A tenant scope narrows the *task* figures.  The cost figures keep
+            folding in the per-role metrics JSONL, which carries no tenant of
+            its own, exactly as they did before - narrowing untenanted cost
+            records is a separate question from narrowing task rows, and
+            ``/status`` reads that same file directly for its headline spend
+            besides.
+
+            Per-status counts are read from the same by-status index the
+            unscoped roll-up and :meth:`count_by_status` read, filtered rather
+            than recomputed, so a scoped ``/status`` and a scoped
+            ``/tasks/counts`` cannot disagree with each other.
+        """
+        normalized_tenant = normalize_tenant_id(tenant_id) if tenant_id is not None else None
+        counted_statuses = (
+            TaskStatus.OPEN,
+            TaskStatus.CLAIMED,
+            TaskStatus.DONE,
+            TaskStatus.FAILED,
+            TaskStatus.REFUSED,
+        )
+        if normalized_tenant is None:
+            tasks = list(self._tasks.values())
+            status_counts = {status: len(self._by_status.get(status, {})) for status in counted_statuses}
+        else:
+            tasks = [task for task in self._tasks.values() if task.tenant_id == normalized_tenant]
+            status_counts = {
+                status: sum(
+                    1 for task in self._by_status.get(status, {}).values() if task.tenant_id == normalized_tenant
+                )
+                for status in counted_statuses
+            }
+
+        role_counts = self._build_role_counts(tasks)
+        total_cost, cost_by_role = self._compute_costs(tasks)
 
         per_role = []
         for role, counts in sorted(role_counts.items()):
@@ -2269,21 +3654,29 @@ class TaskStore:
             per_role.append(entry)
 
         summary: dict[str, Any] = {
-            "total": len(self._tasks),
-            "open": len(self._by_status.get(TaskStatus.OPEN, {})),
-            "claimed": len(self._by_status.get(TaskStatus.CLAIMED, {})),
-            "done": len(self._by_status.get(TaskStatus.DONE, {})),
-            "failed": len(self._by_status.get(TaskStatus.FAILED, {})),
+            "total": len(tasks),
+            "open": status_counts[TaskStatus.OPEN],
+            "claimed": status_counts[TaskStatus.CLAIMED],
+            "done": status_counts[TaskStatus.DONE],
+            "failed": status_counts[TaskStatus.FAILED],
+            "refused": status_counts[TaskStatus.REFUSED],
             "per_role": per_role,
             "total_cost_usd": round(total_cost, 4),
+            # Read-only projection (#3452): tasks that can never run, each
+            # with the dependency that stranded it. Derived from the graph on
+            # every read, so an operator recomputing it from the journal gets
+            # the same list in the same order.
+            "unreachable": [
+                {"task_id": task_id, "blocked_by": blocking_id} for task_id, blocking_id in unreachable_tasks(tasks)
+            ],
         }
         self._attach_bandit_stats(summary)
         return summary
 
-    def _build_role_counts(self) -> dict[str, dict[str, int]]:
-        """Build per-role breakdown across all statuses."""
+    def _build_role_counts(self, tasks: list[Task]) -> dict[str, dict[str, int]]:
+        """Build per-role breakdown across all statuses for *tasks*."""
         role_counts: dict[str, dict[str, int]] = {}
-        for task in self._tasks.values():
+        for task in tasks:
             if task.role not in role_counts:
                 role_counts[task.role] = {"open": 0, "claimed": 0, "done": 0, "failed": 0}
             status_key = task.status.value
@@ -2291,9 +3684,9 @@ class TaskStore:
                 role_counts[task.role][status_key] += 1
         return role_counts
 
-    def _compute_costs(self) -> tuple[float, dict[str, float]]:
-        """Compute total cost from in-memory tasks and metrics JSONL."""
-        total_cost = sum(t.cost_usd for t in self._tasks.values() if hasattr(t, "cost_usd") and t.cost_usd)
+    def _compute_costs(self, tasks: list[Task]) -> tuple[float, dict[str, float]]:
+        """Compute total cost from *tasks* and the metrics JSONL."""
+        total_cost = sum(t.cost_usd for t in tasks if hasattr(t, "cost_usd") and t.cost_usd)
         cost_by_role = self._read_cost_by_role()
         metrics_cost = sum(cost_by_role.values())
         if metrics_cost > total_cost:
@@ -2315,7 +3708,7 @@ class TaskStore:
                 "shadow_stats": bandit_data.get("shadow_stats", {}),
             }
         except json.JSONDecodeError:
-            logger.warning("Corrupted bandit state at %s — skipping", bandit_state_path)
+            logger.warning("Corrupted bandit state at %s - skipping", bandit_state_path)
         except OSError as exc:
             logger.warning("Cannot read bandit state at %s: %s", bandit_state_path, exc)
 
@@ -2331,7 +3724,7 @@ class TaskStore:
             List of tasks that completed within the grace window, newest first.
         """
         cutoff = time.time() - grace_ms / 1000.0
-        terminal = {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+        terminal = {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.REFUSED}
         result: list[Task] = []
         for status in terminal:
             for task in self._by_status.get(status, {}).values():
@@ -2370,7 +3763,7 @@ class TaskStore:
                 record_data: dict[str, Any] = json.loads(line)
             except json.JSONDecodeError:
                 logger.error(
-                    "Corrupted metrics record in %s — skipping: %s",
+                    "Corrupted metrics record in %s - skipping: %s",
                     self._metrics_jsonl_path,
                     raw_line[:500],
                 )

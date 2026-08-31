@@ -16,7 +16,7 @@ boundary.
 
 ## What the residency guard actually enforces
 
-Bernstein's [`OllamaAdapter`](../../src/bernstein/adapters/ollama.py)
+Bernstein's [`OllamaAdapter`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/adapters/ollama.py)
 calls `_is_self_hosted_endpoint(base_url)` on every `spawn()`. The
 guard fires when **either** of the following is true:
 
@@ -38,6 +38,79 @@ whose host is not on the self-hosted allowlist:
 Any other host (public IP, hosted-API hostname, unrecognised FQDN) is
 rejected with a structured `RESIDENCY_VIOLATION` error that names
 both the offending endpoint and the model that triggered the guard.
+
+## One flag: the sovereign profile
+
+The residency posture composes four independent surfaces (air-gap
+network profile, residency policy, endpoint certification, and the
+storage / catalog / compliance defaults). Assembling them by hand is
+error-prone: one missed setting -- a cloud storage sink left
+configured, a non-certified remote endpoint in a role, a catalog left
+online -- violates the constraints silently, because nothing states
+the intended posture, so nothing can detect drift from it.
+
+`--profile sovereign` composes those pieces with one flag and turns the
+active posture into a **signed, verifiable claim**:
+
+```bash
+$ bernstein run --profile sovereign --seed eu_residency.yaml
+Sovereign posture attested: sha256:68d8804db375b53aa6550c81a5f2f22e...
+```
+
+What the flag does:
+
+- **Pins** deny-all egress (the air-gap network posture and runtime
+  socket guard), offline catalog mode, local storage backends, strict
+  EU residency, and the compliance pack.
+- **Attests** the posture: the effective-policy document is projected
+  deterministically from your config, signed with the install's
+  Ed25519 sovereign identity, and anchored in the HMAC audit chain. The
+  document's canonical-JSON SHA-256 is the *posture identity*. An
+  auditor recomputes that hash from your config snapshot alone and
+  matches it against the chain-anchored attestation -- no need to trust
+  the running install.
+- **Refuses drift**: at every spawn the orchestrator recomputes the
+  posture from the live config. If it diverges from the attested hash
+  (for example a cloud storage sink was added after attestation), the
+  spawn is blocked and a signed drift record naming the exact diverging
+  keys is written to the chain. Drift is caught at spawn time, not at
+  audit time.
+
+Declare the residency regions in `bernstein.yaml` so they are part of
+the config snapshot the posture hash is computed from:
+
+```yaml
+# bernstein.yaml
+sovereign:
+  enabled: true
+  regions: [eu-central, eu-west]
+  enforce_strict: true
+  # Egress is deny-all by default. To reach a self-hosted EU model server,
+  # list it here (host / host:port / CIDR) -- NOT via --allow-network -- so the
+  # runtime network policy and the signed attestation come from the same config
+  # and cannot diverge. Every entry must be self-hosted or EU-region.
+  allowed_egress: ["10.0.0.5:11434"]
+storage:
+  backend: memory        # local sink only; a remote backend is drift
+```
+
+Under `--profile sovereign`, `--allow-network` is rejected: egress is declared
+in config so a deny-all attestation can never coexist with a runtime that
+quietly allows a destination.
+
+Verify the posture at any time:
+
+```bash
+$ bernstein doctor sovereign      # green when every axis is satisfied
+$ bernstein audit verify          # re-verifies the signed attestation offline
+```
+
+`bernstein doctor sovereign` renders the live posture hash against the
+chain-anchored attestation and fails on any drift; `bernstein audit
+verify` re-checks the attestation's Ed25519 signature and the recorded
+posture hash from the chain alone. The manual deployment recipe below
+remains valid for the underlying components, but the sovereign profile
+replaces the hand-assembly of the four surfaces with the single flag.
 
 ## Deployment recipe
 
@@ -95,7 +168,7 @@ data_residency:
   enforce_strict: true                # any region drift = abort
 lineage:
   customer_signing_enabled: true
-  kms_adapter: env                    # or 'file' / 'hsm'
+  kms_adapter: env                    # or 'file' / 'hsm' (see note below)
   kms_adapter_env_var: LINEAGE_SIGNING_KEY
   regulatory_class_default: production_detection_rule
 network_policy:
@@ -110,6 +183,13 @@ The combination matters:
   rather than warning.
 - `network_policy.profile: airgap` -- the runtime socket guard
   blocks any unintended outbound dial.
+- `kms_adapter: hsm` is only viable when a customer-provided
+  `HSMKMSAdapter` subclass (PKCS#11 / Cloud-KMS) is on the classpath.
+  Without one, the orchestrator aborts at config-load time. For
+  non-production smoke tests, set `BERNSTEIN_ALLOW_HSM_STUB=1` to opt
+  in to the documentation stub explicitly. See
+  [regulatory-lineage.md](regulatory-lineage.md) for the integration
+  shape.
 
 ### 3. Verify the deployment with `bernstein doctor airgap`
 
@@ -161,7 +241,7 @@ for the auditor.
 ## Expected log lines
 
 A well-configured EU-residency run emits (one per line) the following
-in `.sdd/audit/audit.jsonl`:
+in `.sdd/audit/<YYYY-MM-DD>.jsonl` (the log is daily-rotated):
 
 ```
 event=adapter.spawn adapter=ollama model=deepseek-v4-flash base_url=http://10.0.0.5:11434
@@ -178,15 +258,15 @@ event=adapter.spawn.aborted reason=RESIDENCY_VIOLATION
 ```
 
 The audit chain HMAC covers every line so a tampered log is
-detectable via `bernstein verify --memory-audit` and
+detectable via `bernstein audit verify` and
 `bernstein doctor airgap`.
 
 ## What to hand the auditor
 
 Three artefacts settle the Article-12 evidence story:
 
-1. **`.sdd/audit/audit.jsonl`** -- the residency-gate decisions for
-   the audit window, with the HMAC chain intact.
+1. **`.sdd/audit/<YYYY-MM-DD>.jsonl`** -- the residency-gate decisions
+   for the audit window (daily-rotated), with the HMAC chain intact.
 2. **`MANIFEST.customer.json`** in the deployed wheelhouse -- the
    customer countersignature plus the org cosign signature, proving
    the running code was both vendor-signed AND customer-signed.
@@ -207,7 +287,7 @@ Three artefacts settle the Article-12 evidence story:
 
 - [`docs/compliance/regulatory-lineage.md`](./regulatory-lineage.md)
   -- regulatory_class taxonomy and lineage v2 schema.
-- [`scripts/build_airgap_wheelhouse.py`](../../scripts/build_airgap_wheelhouse.py)
+- [`scripts/build_airgap_wheelhouse.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/scripts/build_airgap_wheelhouse.py)
   -- offline wheel bundle builder.
-- [`bernstein wheelhouse countersign --help`](../../src/bernstein/cli/commands/wheelhouse_cmd.py)
+- [`bernstein wheelhouse countersign --help`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/cli/commands/wheelhouse_cmd.py)
   -- customer-side countersignature CLI.

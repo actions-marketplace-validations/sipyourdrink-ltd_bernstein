@@ -16,6 +16,7 @@ tests against the ``status`` command.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -141,6 +142,9 @@ def telemetry_status(home: Path | None) -> None:
     share = resolve_share(home=home)
     install_id = read_install_id(home=home)
     dsn = os.environ.get(sidechannel.DSN_ENV) or "(unset)"
+    from bernstein.core.telemetry.share import resolve_share_endpoint
+
+    share_endpoint_configured = resolve_share_endpoint(os.environ.copy()) is not None
     lines: list[str] = [
         f"enabled: {str(state.enabled).lower()}",
         f"source: {state.source.value}",
@@ -151,6 +155,7 @@ def telemetry_status(home: Path | None) -> None:
         f"share_with_maintainer: {str(share.enabled).lower()}",
         f"share_source: {share.source.value} ({explain_share_source(share.source)})",
         f"share_config_file: {consent_file_path(home=home)}",
+        f"share_endpoint_configured: {str(share_endpoint_configured).lower()}",
         f"dsn: {dsn}",
     ]
     click.echo("\n".join(lines))
@@ -223,7 +228,7 @@ def telemetry_probe(message: str) -> None:
     sink.close()
     if accepted:
         click.echo(f"telemetry probe: event {event.event_id} queued for delivery.")
-        click.echo("Check your GlitchTip project; the event carries logger=bernstein.probe.")
+        click.echo("Check your error-tracker project; the event carries logger=bernstein.probe.")
     else:
         click.echo("telemetry probe: event was dropped under backpressure.")
 
@@ -344,6 +349,292 @@ def telemetry_disable(home: Path | None) -> None:
     click.echo(f"telemetry: share_with_maintainer = false (written to {path}).")
 
 
+@telemetry_group.command("export-otel")
+@click.option("--run", "run_id", required=True, help="Run id whose event journal to export.")
+@click.option(
+    "--workdir",
+    "-w",
+    type=click.Path(file_okay=False, exists=True),
+    default=".",
+    show_default=True,
+    help="Project root containing .sdd/.",
+)
+@click.option(
+    "--endpoint",
+    default=None,
+    help="OTLP/gRPC collector endpoint (defaults to BERNSTEIN_OTEL_ENDPOINT).",
+)
+@click.option(
+    "--no-genai-stability",
+    "no_stability",
+    is_flag=True,
+    default=False,
+    help="Omit the (Development-stage) GenAI convention attributes; ids stay journal-anchored.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print the OTLP/JSON spans to stdout instead of exporting; no network, no audit event.",
+)
+def telemetry_export_otel(
+    run_id: str,
+    workdir: str,
+    endpoint: str | None,
+    no_stability: bool,
+    dry_run: bool,
+) -> None:
+    """Backfill a completed run's journal-anchored spans over OTLP (#2526).
+
+    Projects ``--run``'s event journal into the deterministic span set
+    (span ids derived from journal entry hashes, every span carrying
+    ``bernstein.journal.entry_hash`` and the ``bernstein.audit.anchor``
+    run-head hash), exports it to the collector, and records the
+    ``otel.projection`` audit event binding the exported trace to the
+    chain. Re-running over the same journal exports byte-identical spans.
+
+    Exit codes: 0 = exported, 1 = no journal / no endpoint / bad input.
+    """
+    from bernstein.core.observability.otel_bridge import (
+        JournalOTLPBridge,
+        OTLPExportError,
+        projection_to_otlp_json_spans,
+        record_projection_audit_event,
+    )
+    from bernstein.core.observability.otel_projection import (
+        ProjectionError,
+        project_spans,
+        sign_projection,
+    )
+    from bernstein.core.observability.otlp_exporter import OTLPExporterConfig
+    from bernstein.core.replay.journal import JournalPathError, load_events, run_journal_path
+    from bernstein.core.security.audit_dsse import keyid_from_public_key
+    from bernstein.core.security.install_key import (
+        InstallKeyError,
+        load_or_create_install_key,
+        signing_key_path,
+    )
+    from bernstein.core.security.sanitize import sanitize_log
+
+    root = Path(workdir).resolve()
+    try:
+        journal_path = run_journal_path(root / ".sdd", run_id)
+    except JournalPathError as exc:
+        raise click.ClickException(sanitize_log(str(exc))) from exc
+    events = load_events(journal_path).events
+    if not events:
+        raise click.ClickException(
+            f"no event journal for run {sanitize_log(run_id)} at {sanitize_log(str(journal_path))}",
+        )
+
+    try:
+        key = load_or_create_install_key(signing_key_path(root))
+    except InstallKeyError as exc:
+        raise click.ClickException(sanitize_log(str(exc))) from exc
+
+    try:
+        projection = project_spans(
+            events,
+            run_id=run_id,
+            genai_stability=not no_stability,
+            keyid=keyid_from_public_key(key.public_key()),
+        )
+    except ProjectionError as exc:
+        raise click.ClickException(sanitize_log(str(exc))) from exc
+    signed = sign_projection(projection, signing_key=key)
+
+    if dry_run:
+        click.echo(json.dumps(projection_to_otlp_json_spans(signed, events), sort_keys=True, indent=2))
+        return
+
+    base = OTLPExporterConfig.from_env()
+    # Preserve every env-derived field (headers/auth, insecure/TLS,
+    # resource attributes); only the endpoint is overridden. Rebuilding a
+    # fresh config would silently drop those.
+    config = base if endpoint is None else dataclasses.replace(base, endpoint=endpoint)
+    if config.endpoint is None:
+        raise click.ClickException(
+            "no OTLP endpoint configured; set BERNSTEIN_OTEL_ENDPOINT or pass --endpoint (or use --dry-run)",
+        )
+    bridge = JournalOTLPBridge(config, batch=False)
+    if not bridge.enabled:
+        raise click.ClickException(
+            "OTLP exporter unavailable; install 'bernstein[otel]' for opentelemetry-exporter-otlp-proto-grpc",
+        )
+    try:
+        count = bridge.export_projection(signed, events)
+    except OTLPExportError as exc:
+        # The collector returned FAILURE (unreachable / rejected): do not
+        # report success and do not record an audit event for undelivered
+        # spans. Exit nonzero so scripts can detect the failed export.
+        raise click.ClickException(
+            f"OTLP export failed; no spans delivered and no audit event recorded: {sanitize_log(str(exc))}",
+        ) from exc
+    finally:
+        bridge.shutdown()
+
+    try:
+        record_projection_audit_event(
+            workdir=root,
+            journal_path=journal_path,
+            run_id=run_id,
+            genai_stability=not no_stability,
+        )
+    except Exception as exc:  # pragma: no cover - defensive; export is primary
+        click.echo(f"warning: otel projection audit record failed: {sanitize_log(str(exc))}", err=True)
+
+    click.echo(
+        f"exported {count} journal-anchored spans for run {sanitize_log(run_id)} "
+        f"(trace {signed.trace_id[:16]}...) to {sanitize_log(config.endpoint)}"
+    )
+
+
+def _read_span_source(source: str) -> str:
+    """Return the raw span JSON text from a file path or stdin.
+
+    ``-`` or ``@-`` reads stdin; a leading ``@`` names a file (curl-style);
+    anything else is treated as a file path.
+    """
+    if source in {"-", "@-"}:
+        return click.get_text_stream("stdin").read()
+    from bernstein.core.security.sanitize import sanitize_log
+
+    path = source[1:] if source.startswith("@") else source
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(f"cannot read span file: {sanitize_log(str(exc))}") from exc
+
+
+def _single_exported_span(payload: Any) -> Any:
+    """Unwrap a one-element JSON array so operators can paste either shape."""
+    if isinstance(payload, list):
+        if len(payload) == 1:
+            return payload[0]
+        raise click.ClickException(f"expected a single exported span, got a JSON array of {len(payload)}")
+    return payload
+
+
+def _render_span_verdict(result: Any, *, run_id: str, journal_path: Path) -> list[str]:
+    """Render the human-facing verdict lines for a span verification."""
+    if result.ok:
+        return [
+            "VERDICT: genuine",
+            f"  span {result.span_id} recomputes from journal entry_hash {result.entry_hash} (index {result.index})",
+            f"  anchor {result.anchor} resolves to otel.projection trace {result.chain_trace_id}",
+            f"  run {run_id} journal {journal_path}",
+        ]
+    label = "unverifiable" if result.unverifiable else "forged"
+    return [f"VERDICT: {label}", f"  reason: {result.reason}"]
+
+
+@telemetry_group.command("verify-span")
+@click.option("--run", "run_id", required=True, help="Run id whose journal and audit chain prove the span.")
+@click.option(
+    "--workdir",
+    "-w",
+    type=click.Path(file_okay=False, exists=True),
+    default=".",
+    show_default=True,
+    help="Project root containing .sdd/.",
+)
+@click.option(
+    "--span",
+    "span_source",
+    required=True,
+    metavar="PATH|@-",
+    help="Exported OTLP span JSON: a file path, or '-' / '@-' to read from stdin.",
+)
+@click.pass_context
+def telemetry_verify_span(ctx: click.Context, run_id: str, workdir: str, span_source: str) -> None:
+    """Prove an exported OTLP span against the run journal and chain (#2526).
+
+    Reads a single OTLP span (its id plus attributes, as JSON copied out of a
+    tracing pipeline) and recomputes its identity: the span id must derive
+    from the ``bernstein.journal.entry_hash`` it carries -- using the same
+    derivation the export bridge used -- that entry must exist in ``--run``'s
+    journal, and the ``bernstein.audit.anchor`` must resolve to the run's
+    ``otel.projection`` audit event. A span whose id does not recompute, or
+    whose anchor mismatches, is rejected as a forgery.
+
+    Exit codes: 0 = genuine, 1 = could not be evaluated (missing journal,
+    corrupted journal, malformed span, bad input), 2 = verification failed
+    (forged). Same convention as ``trace verify-projection``; a rejection
+    is always a hard nonzero exit, never a warning.
+    """
+    from bernstein.core.observability.otel_bridge import (
+        SpanParseError,
+        parse_exported_span,
+        verify_exported_span,
+    )
+    from bernstein.core.replay.journal import (
+        JournalParseError,
+        JournalPathError,
+        load_events,
+        run_journal_path,
+    )
+    from bernstein.core.security.audit import load_or_create_audit_key
+    from bernstein.core.security.audit_chain import EVENT_OTEL_PROJECTION, AuditChainStore
+    from bernstein.core.security.sanitize import sanitize_log
+
+    raw = _read_span_source(span_source)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"span is not valid JSON: {sanitize_log(str(exc))}") from exc
+    payload = _single_exported_span(payload)
+    try:
+        span = parse_exported_span(payload)
+    except SpanParseError as exc:
+        raise click.ClickException(sanitize_log(str(exc))) from exc
+
+    root = Path(workdir).resolve()
+    try:
+        journal_path = run_journal_path(root / ".sdd", run_id)
+    except JournalPathError as exc:
+        raise click.ClickException(sanitize_log(str(exc))) from exc
+    try:
+        events = load_events(journal_path, strict=True).events
+    except JournalParseError as exc:
+        # A verifier attests over the journal on disk, not a filtered
+        # sequence: a malformed row is exactly the corruption a verifier
+        # exists to surface, so refuse rather than verify a partial view.
+        raise click.ClickException(
+            f"journal is corrupted: {sanitize_log(str(exc))}; refusing to verify a filtered sequence"
+        ) from exc
+
+    projections: list[dict[str, Any]] = []
+    try:
+        chain = AuditChainStore(root / ".sdd" / "audit", key=load_or_create_audit_key())
+        # include_archived: retention must not make an old genuine span
+        # unverifiable -- the verified snapshot covers archived segments, so
+        # the consumed rows must too.
+        chain_ok, chain_errors, chain_events = chain.verify_and_query(
+            event_type=EVENT_OTEL_PROJECTION, include_archived=True
+        )
+        if chain_ok:
+            projections = [event.details for event in chain_events]
+        else:
+            # A chain that fails its own HMAC verification is not evidence.
+            # Leaving ``projections`` empty makes the verdict "unverifiable"
+            # (exit 1, never a pass) -- report and continue.
+            detail = "; ".join(chain_errors) if chain_errors else "chain verification failed"
+            click.echo(f"warning: audit chain failed integrity check: {sanitize_log(detail)}", err=True)
+    except Exception as exc:
+        # A missing or unreadable chain leaves ``projections`` empty, so the
+        # verdict is "unverifiable" (never a silent pass) -- report and continue.
+        click.echo(f"warning: could not read audit chain: {sanitize_log(str(exc))}", err=True)
+
+    result = verify_exported_span(span, events, projections, run_id=run_id)
+    for line in _render_span_verdict(result, run_id=run_id, journal_path=journal_path):
+        click.echo(line)
+    if result.ok:
+        ctx.exit(0)
+    # Same convention as ``trace verify-projection``: 1 = could not be
+    # evaluated, 2 = verification failed. A forgery is the hard failure.
+    ctx.exit(1 if result.unverifiable else 2)
+
+
 @telemetry_group.command("tail")
 @click.option(
     "-n",
@@ -399,10 +690,12 @@ __all__ = [
     "telemetry_disable",
     "telemetry_enable",
     "telemetry_export",
+    "telemetry_export_otel",
     "telemetry_group",
     "telemetry_off",
     "telemetry_on",
     "telemetry_probe",
     "telemetry_status",
     "telemetry_tail",
+    "telemetry_verify_span",
 ]

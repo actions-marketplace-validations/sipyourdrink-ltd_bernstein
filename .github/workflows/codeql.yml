@@ -8,21 +8,35 @@ on:
       - "tests/**"
       - "scripts/**"
       - "pyproject.toml"
-  # No `paths:` filter on pull_request: branch protection on `main` lists
-  # `CodeQL` and `CodeQL (python)` as required status checks. If this
-  # workflow is path-filtered out of a PR (e.g. docs-only or workflow-only
-  # change), the required checks never appear and the PR sits BLOCKED
-  # indefinitely. Running CodeQL on every PR costs 2-3 min of CI but
-  # eliminates the deadlock; analysis is cheap when no Python source has
-  # changed because CodeQL re-uses its cached database.
+      - "uv.lock"
+      - ".github/workflows/codeql.yml"
+      - ".github/codeql/**"
+  # Path-scoped on pull_request: CodeQL analyzes Python sources only, so
+  # PRs that touch no analyzable path (docs-only, workflow-only) skip the
+  # run and free a runner slot. This is safe for branch protection: the
+  # required status check on `main` is `CI gate` only, so a skipped
+  # CodeQL run cannot deadlock a PR. Push-to-main and
+  # the weekly schedule keep full-coverage analysis on everything that
+  # lands.
   pull_request:
     branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/codeql.yml"
+      - ".github/codeql/**"
   schedule:
     - cron: "0 4 * * 1"  # Weekly Monday 4 AM UTC
 
 concurrency:
   group: codeql-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded PR analyses, but never cancel a main-branch analysis
+  # mid-run: a cancelled CodeQL run leaves code scanning in a "CodeQL exited
+  # with errors" configuration-error state and drops that commit's coverage.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Default-deny at workflow scope; the analyze job re-asserts the narrow
 # writes it actually needs (Scorecard token-permissions).
@@ -37,7 +51,6 @@ jobs:
     permissions:
       security-events: write
       contents: read
-      pull-requests: write
       actions: read
     strategy:
       fail-fast: false
@@ -45,24 +58,24 @@ jobs:
         language: [python]
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@9e0d7b8d25671d64c341c19c0152d693099fb5ba # v4
+        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
         with:
           languages: ${{ matrix.language }}
           queries: +security-extended
           config-file: .github/codeql/codeql-config.yml
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@9e0d7b8d25671d64c341c19c0152d693099fb5ba # v4
+        uses: github/codeql-action/autobuild@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@9e0d7b8d25671d64c341c19c0152d693099fb5ba # v4
+        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
         with:
           category: "/language:${{ matrix.language }}"

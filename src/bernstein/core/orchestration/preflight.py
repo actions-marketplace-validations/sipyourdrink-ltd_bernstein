@@ -17,6 +17,8 @@ from pathlib import Path
 
 from rich.console import Console
 
+from bernstein.core.defaults import QWEN_INSTALL_HINT
+
 logger = logging.getLogger(__name__)
 
 console = Console()
@@ -41,7 +43,7 @@ _CLI_INSTALL_HINT: dict[str, str] = {
     "claude": "https://claude.ai/code",
     "codex": "npm install -g @openai/codex",
     "gemini": "npm install -g @google/gemini-cli",
-    "qwen": "npm install -g qwen-code",
+    "qwen": QWEN_INSTALL_HINT,
 }
 
 # Primary API key env var(s) per adapter.
@@ -348,7 +350,7 @@ def _check_port_free(port: int) -> None:
             sock.bind(("127.0.0.1", port))
             return  # Port is free.
 
-    # Port is occupied — try to identify and kill a stale Bernstein server.
+    # Port is occupied - try to identify and kill a stale Bernstein server.
     try:
         result = subprocess.run(
             ["lsof", "-ti", f":{port}"],
@@ -419,6 +421,25 @@ def preflight_checks(cli: str, port: int) -> None:
     _check_port_free(port)
 
 
+def _routing_note(agent_count: int) -> str:
+    """Describe how this run will pick adapters.
+
+    An explicit ``BERNSTEIN_ADAPTER`` pin wins over auto-routing at spawn
+    time, so the startup line names the pinned adapter instead of
+    advertising routing that will not happen.
+
+    Args:
+        agent_count: Number of agents found by discovery.
+
+    Returns:
+        The trailing routing sentence for the startup detection line.
+    """
+    pinned = os.environ.get("BERNSTEIN_ADAPTER", "").strip()
+    if pinned and pinned.lower() != "auto":
+        return f"Adapter pinned: {pinned}."
+    return "Using auto-routing." if agent_count > 1 else "Using as primary."
+
+
 def _preflight_auto_mode() -> None:
     """Run auto-discovery preflight for multi-agent mode."""
     from bernstein.core.agent_discovery import discover_agents_cached, short_model
@@ -435,8 +456,7 @@ def _preflight_auto_mode() -> None:
         short_models = [short_model(m) for m in agent.available_models[:2]]
         auth_note = "" if agent.logged_in else " [dim](not authenticated)[/dim]"
         agent_parts.append(f"{agent.name.capitalize()} ({'/'.join(short_models)}){auth_note}")
-    routing_note = "Using auto-routing." if len(discovery.agents) > 1 else "Using as primary."
-    console.print(f"[green]{_CHECK}[/green] Found: {', '.join(agent_parts)}. {routing_note}")
+    console.print(f"[green]{_CHECK}[/green] Found: {', '.join(agent_parts)}. {_routing_note(len(discovery.agents))}")
 
     for w in discovery.warnings:
         console.print(f"  [yellow]{_ARROW}[/yellow] {w}")

@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# CheckpointState — serialization
+# CheckpointState - serialization
 # ---------------------------------------------------------------------------
 
 
@@ -71,7 +71,7 @@ def test_checkpoint_state_from_dict_missing_timestamp_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CheckpointState — staleness
+# CheckpointState - staleness
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_STALE_MINUTES = 30
@@ -96,7 +96,7 @@ def test_checkpoint_state_custom_stale_minutes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CheckpointState — file I/O
+# CheckpointState - file I/O
 # ---------------------------------------------------------------------------
 
 
@@ -161,7 +161,7 @@ def test_save_checkpoint_creates_parent_dirs(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# WrapUpBrief — serialization
+# WrapUpBrief - serialization
 # ---------------------------------------------------------------------------
 
 
@@ -189,6 +189,17 @@ def test_wrapup_brief_defaults() -> None:
     assert brief.learnings == []
     assert brief.next_session_brief == ""
     assert brief.git_diff_stat == ""
+    assert brief.completed_task_ids == []
+
+
+def test_wrapup_brief_completed_task_ids_roundtrip() -> None:
+    """Completed task ids survive a to_dict/from_dict round-trip (issue #2362).
+
+    The PR-open path reads these ids to link each task's sealed evidence bundle.
+    """
+    original = WrapUpBrief(timestamp=1.0, session_id="s", completed_task_ids=["T-1", "T-2"])
+    restored = WrapUpBrief.from_dict(original.to_dict())
+    assert restored.completed_task_ids == ["T-1", "T-2"]
 
 
 def test_wrapup_brief_from_dict_missing_optional_fields() -> None:
@@ -205,7 +216,7 @@ def test_wrapup_brief_from_dict_missing_timestamp_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# WrapUpBrief — file I/O
+# WrapUpBrief - file I/O
 # ---------------------------------------------------------------------------
 
 

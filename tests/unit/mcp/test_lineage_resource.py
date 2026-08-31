@@ -5,9 +5,10 @@ Per ADR-009 §7 the MCP exposure is:
   * Resource ``lineage://artefact/<repo-relative-path>`` → JSONL stream of
     the chain for that artefact.
   * Resource ``lineage://stats`` → JSON with entry counts.
-  * Tool ``verify_chain(path)`` → ``{"ok": bool, "reason": str|None}``.
+  * Tool ``bernstein_verify_lineage(path)`` → ``{"ok": bool, "reason":
+    str|None}`` (with ``verify_chain`` kept as a deprecated alias, #3087).
 
-Default off for remote MCP, on for local stdio — but registration itself
+Default off for remote MCP, on for local stdio - but registration itself
 is unconditional; the gate lives at the registrar boundary.
 """
 
@@ -22,7 +23,7 @@ import pytest
 from mcp.server.fastmcp import FastMCP
 
 from bernstein.core.lineage.identity import AgentCard, generate_keypair
-from bernstein.core.lineage.recorder import LineageRecorder
+from bernstein.core.lineage.signed_write import SignedLineageLog
 from bernstein.core.lineage.store import LineageStore
 from bernstein.mcp.resources.lineage import register_lineage_resources
 
@@ -32,7 +33,7 @@ def seeded_store(tmp_path: Path) -> tuple[Path, LineageStore]:
     """Two-entry chain on ``src/foo.py``."""
     root = tmp_path / "lineage"
     store = LineageStore(root)
-    recorder = LineageRecorder(store=store, operator_hmac_key=b"k" * 32)
+    recorder = SignedLineageLog(store=store, operator_hmac_key=b"k" * 32)
     priv, pub = generate_keypair()
     card = AgentCard(agent_id="agent:worker", kid="k1", public_key_pem=pub)
     recorder.record_write(
@@ -107,7 +108,7 @@ def test_stats_resource_counts_entries(seeded_store: tuple[Path, LineageStore]) 
     assert payload["total_entries"] == 2
     assert payload["artefacts"] == 1
     assert payload["open_forks"] == 0
-    # agents_seen is a list-or-int — accept either as long as it accounts for 1.
+    # agents_seen is a list-or-int - accept either as long as it accounts for 1.
     seen = payload.get("agents_seen")
     if isinstance(seen, int):
         assert seen == 1
@@ -117,7 +118,7 @@ def test_stats_resource_counts_entries(seeded_store: tuple[Path, LineageStore]) 
 
 def test_stats_resource_on_empty_lineage(tmp_path: Path) -> None:
     root = tmp_path / "lineage"
-    LineageStore(root)  # init only — no entries
+    LineageStore(root)  # init only - no entries
     mcp: FastMCP[None] = FastMCP("test")
     register_lineage_resources(mcp, lineage_root=root)
     contents = _run(mcp.read_resource("lineage://stats"))
@@ -128,7 +129,7 @@ def test_stats_resource_on_empty_lineage(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# verify_chain tool — happy + error paths
+# verify_chain tool - happy + error paths
 # ---------------------------------------------------------------------------
 
 
@@ -137,7 +138,7 @@ def test_verify_chain_ok(seeded_store: tuple[Path, LineageStore]) -> None:
     mcp: FastMCP[None] = FastMCP("test")
     register_lineage_resources(mcp, lineage_root=root)
 
-    result = _run(mcp.call_tool("verify_chain", {"artefact_path": "src/foo.py"}))
+    result = _run(mcp.call_tool("bernstein_verify_lineage", {"artefact_path": "src/foo.py"}))
     # FastMCP.call_tool returns (contents, structuredOutput) on newer versions.
     payload = _payload_from_tool_result(result)
     assert payload["ok"] is True
@@ -153,7 +154,7 @@ def test_verify_chain_unknown_path_returns_ok_empty(seeded_store: tuple[Path, Li
     root, _store = seeded_store
     mcp: FastMCP[None] = FastMCP("test")
     register_lineage_resources(mcp, lineage_root=root)
-    result = _run(mcp.call_tool("verify_chain", {"artefact_path": "src/never.py"}))
+    result = _run(mcp.call_tool("bernstein_verify_lineage", {"artefact_path": "src/never.py"}))
     payload = _payload_from_tool_result(result)
     assert payload["ok"] is True
 
@@ -162,7 +163,7 @@ def test_verify_chain_detects_tampered_log(seeded_store: tuple[Path, LineageStor
     root, _store = seeded_store
     log = root / "log.jsonl"
     raw = log.read_bytes()
-    # Flip a byte in the artefact_path of the first record — must trip both
+    # Flip a byte in the artefact_path of the first record - must trip both
     # the parent-chain invariant (the child still references the original
     # entry_hash) and (if we were checking it) the HMAC.
     tampered = raw.replace(b"src/foo.py", b"src/BAD.py", 1)
@@ -171,7 +172,7 @@ def test_verify_chain_detects_tampered_log(seeded_store: tuple[Path, LineageStor
 
     mcp: FastMCP[None] = FastMCP("test")
     register_lineage_resources(mcp, lineage_root=root)
-    result = _run(mcp.call_tool("verify_chain", {"artefact_path": "src/foo.py"}))
+    result = _run(mcp.call_tool("bernstein_verify_lineage", {"artefact_path": "src/foo.py"}))
     payload = _payload_from_tool_result(result)
     assert payload["ok"] is False
     assert payload["reason"]
@@ -226,3 +227,15 @@ def _payload_from_contents(contents: object) -> dict[str, object]:
                 texts.append(text)
     joined = "\n".join(texts)
     return json.loads(joined)
+
+
+def test_verify_chain_alias_names_its_replacement(seeded_store: tuple[Path, LineageStore]) -> None:
+    """The old name stays callable and answers with the deprecation wrapper."""
+    root, _store = seeded_store
+    mcp: FastMCP[None] = FastMCP("test")
+    register_lineage_resources(mcp, lineage_root=root)
+    result = _run(mcp.call_tool("verify_chain", {"artefact_path": "src/foo.py"}))
+    payload = _payload_from_tool_result(result)
+    assert payload["deprecated"] is True
+    assert payload["replacement"] == "bernstein_verify_lineage"
+    assert payload["result"]["ok"] is True

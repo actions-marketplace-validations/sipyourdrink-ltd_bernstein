@@ -39,9 +39,12 @@ import asyncio
 import logging
 from collections import deque
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from itertools import count
 from typing import Any, Literal
+
+from bernstein.core.dataclass_helpers import typed_replace as _typed_replace
+from bernstein.core.orchestration import run_actor_registry
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +83,7 @@ class Event:
         seq: Monotonic sequence number assigned by the actor. ``-1`` for
             unstamped events.
         source: Free-form caller tag for tracing (``"watchdog"``,
-            ``"worker"``, …).
+            ``"worker"``, ...).
     """
 
     kind: EventKind
@@ -157,6 +160,11 @@ def _merge_task(
     return new
 
 
+def _replace_state(state: RunState, **changes: Any) -> RunState:
+    updated = _typed_replace(state, **changes)
+    return updated
+
+
 def apply_event(state: RunState, event: Event) -> RunState:
     """Pure reducer mapping ``(state, event)`` to a new state.
 
@@ -190,18 +198,18 @@ def apply_event(state: RunState, event: Event) -> RunState:
     payload = event.payload
 
     if kind == "session_started":
-        return replace(state, status="running", last_seq=event.seq)
+        return _replace_state(state, status="running", last_seq=event.seq)
 
     if kind == "session_ended":
         end_status = payload.get("status", "done")
         if end_status not in {"done", "failed"}:
             end_status = "done"
-        return replace(state, status=end_status, last_seq=event.seq)
+        return _replace_state(state, status=end_status, last_seq=event.seq)
 
     if kind in {"task_started", "task_progress", "task_completed", "task_failed"}:
         task_id = str(payload.get("task_id", ""))
         if not task_id:
-            return replace(state, last_seq=event.seq)
+            return _replace_state(state, last_seq=event.seq)
         status_map = {
             "task_started": "running",
             "task_progress": "running",
@@ -212,7 +220,7 @@ def apply_event(state: RunState, event: Event) -> RunState:
         for k, v in payload.items():
             if k != "task_id":
                 patch[k] = v
-        return replace(
+        return _replace_state(
             state,
             tasks=_merge_task(state.tasks, task_id, patch),
             last_seq=event.seq,
@@ -221,7 +229,7 @@ def apply_event(state: RunState, event: Event) -> RunState:
     if kind in {"approval_requested", "approval_granted", "approval_denied"}:
         approval_id = str(payload.get("approval_id", ""))
         if not approval_id:
-            return replace(state, last_seq=event.seq)
+            return _replace_state(state, last_seq=event.seq)
         status_map_a: dict[str, Literal["pending", "granted", "denied"]] = {
             "approval_requested": "pending",
             "approval_granted": "granted",
@@ -229,15 +237,15 @@ def apply_event(state: RunState, event: Event) -> RunState:
         }
         new_approvals = dict(state.approvals)
         new_approvals[approval_id] = status_map_a[kind]
-        return replace(state, approvals=new_approvals, last_seq=event.seq)
+        return _replace_state(state, approvals=new_approvals, last_seq=event.seq)
 
     if kind == "watchdog_tick":
         # Pure liveness ping; only advances seq.
-        return replace(state, last_seq=event.seq)
+        return _replace_state(state, last_seq=event.seq)
 
     # Unknown kind: advance seq so we do not block the log, but do not mutate.
     logger.warning("apply_event: unknown event kind %r; advancing seq only", kind)
-    return replace(state, last_seq=event.seq)
+    return _replace_state(state, last_seq=event.seq)
 
 
 # ---------------------------------------------------------------------------
@@ -367,16 +375,32 @@ class RunActor:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the writer task. Idempotent."""
+        """Start the writer task and make this actor reachable to sync writers. Idempotent."""
         if self._started:
             return
         self._started = True
         self._task = asyncio.create_task(self._run_loop(), name=f"run-actor-{self._state.session_id}")
+        # Register HERE, and not at any of the call sites that construct an actor.
+        #
+        # `run_actor_registry` exists so synchronous writers - file-driven CLI helpers, subprocess
+        # shims - can publish into a live actor by session id. Nothing ever called `register`, so
+        # the registry was empty for the life of every process and `publish_event_sync` returned
+        # False on every call: `approval_gate`'s parallel emit has never emitted (#4899).
+        #
+        # This is the call site `register` was written for. It defaults `loop` to
+        # `asyncio.get_running_loop()`, which is only correct from inside the actor's own
+        # coroutine, and "a STARTED RunActor" is what its docstring asks for. Registering at
+        # construction would hand out an actor whose writer task does not exist yet.
+        run_actor_registry.register(self)
 
     async def stop(self) -> None:
-        """Drain pending events and stop the writer task."""
+        """Drain pending events, stop the writer task, and leave the registry."""
         if not self._started or self._task is None:
             return
+        # Before the drain, so nothing can publish into an actor that is on its way down. The
+        # registry is the only route a sync writer has, so leaving it first is what makes "stopped"
+        # mean unreachable rather than merely draining.
+        run_actor_registry.unregister(self._state.session_id, self)
         self._stopped.set()
         # Submit a no-op so the loop wakes up and observes the flag.
         await self._queue.put((Event(kind="watchdog_tick", source="stop"), None))
@@ -480,7 +504,7 @@ def fold(events: Iterable[Event], initial: RunState) -> RunState:
 
     Args:
         events: Stamped events in ascending sequence order.
-        initial: Starting state (typically ``RunState(session_id=…)``).
+        initial: Starting state (typically ``RunState(session_id=...)``).
 
     Returns:
         Final state after every event has been applied.

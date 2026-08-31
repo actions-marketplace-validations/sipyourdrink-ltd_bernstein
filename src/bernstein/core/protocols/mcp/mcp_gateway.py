@@ -1,4 +1,4 @@
-"""MCP Gateway Proxy — transparent recording and replay.
+"""MCP Gateway Proxy - transparent recording and replay.
 
 Intercepts all JSON-RPC MCP traffic between clients and upstream servers,
 recording each tool call to the WAL and supporting offline replay.
@@ -9,6 +9,13 @@ Architecture:
 - ToolMetrics: per-tool call/latency/error tracking
 - create_gateway_sse_app: FastAPI SSE server for MCP SSE transport
 
+The SSE app is stateless (issue #2506): responses are correlated to their
+requests by the content-derived span id (from the request ``_meta`` when
+present, otherwise a deterministic projection of the request content), so
+any gateway instance can serve any request with no per-client state. When a
+run journal / audit chain is wired in, every proxied call is anchored as an
+``mcp.stateless_call`` chain entry.
+
 WAL decision_type: "mcp_tool_call"
 WAL inputs:  {method, server_name, tool_name, arguments, request_id}
 WAL output:  {result, error, latency_ms}
@@ -18,16 +25,31 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from bernstein.core.orchestration.worker_loop_detector import WorkerLoopDetector
+from bernstein.core.persistence.action_cache import open_cache
+from bernstein.core.protocols.mcp.stateless_core import (
+    StatelessCallRecord,
+    anchor_stateless_call,
+    request_span_id,
+)
+from bernstein.core.security.claude_tool_result_injection import ToolResultInjector
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from bernstein.core.wal import WALWriter
+    from bernstein.core.protocols.payments.x402 import X402SettlementCoordinator
+    from bernstein.core.replay.journal import EventJournal
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.security.toolcall_interlock import ToolCallAttestationInterlock
+    from bernstein.core.wal import WALEntry, WALWriter
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +124,7 @@ class GatewayReplay:
         except FileNotFoundError:
             pass  # No cache file yet; start with empty index
         except Exception:
-            # Malformed or partially-written WAL — load what was indexed so far
+            # Malformed or partially-written WAL - load what was indexed so far
             # and continue without crashing.  This is intentionally broad: any
             # corruption in the WAL file must not take down the gateway process.
             pass
@@ -159,12 +181,29 @@ class MCPGateway:
         replay: GatewayReplay | None = None,
         *,
         server_name: str = "unknown",
+        journal: EventJournal | None = None,
+        audit_chain: AuditChainStore | None = None,
+        settlement: X402SettlementCoordinator | None = None,
+        attestation_interlock: ToolCallAttestationInterlock | None = None,
     ) -> None:
         self._upstream_cmd = upstream_cmd
         self._wal_writer = wal_writer
         self._replay = replay
         self._server_name = server_name.strip() or "unknown"
+        self._journal = journal
+        self._audit_chain = audit_chain
+        # x402 settlement coordinator (issue #2528). ``None`` keeps the gateway
+        # byte-identical to the pre-settlement proxy; a 402 then surfaces as an
+        # ordinary tool error. The coordinator gates against a spending mandate
+        # before any payment. The settlement seam lives on the live-proxy
+        # branch only, so replay can never invoke the hook or double-settle.
+        self._settlement = settlement
+        # Provider-neutral enforced/observed boundary (#2931).  When wired,
+        # every live ``tools/call`` must cross it before upstream I/O.  Replay
+        # never invokes the interlock because it has no connector side effect.
+        self._attestation_interlock = attestation_interlock
         self._metrics: dict[str, ToolMetrics] = {}
+        self._loop_detector = WorkerLoopDetector()
         self._proc: asyncio.subprocess.Process | None = None
         self._pending: dict[Any, asyncio.Future[dict[str, Any]]] = {}
         self._reader_task: asyncio.Task[None] | None = None
@@ -218,7 +257,7 @@ class MCPGateway:
                     if fut and not fut.done():
                         fut.set_result(msg)
         except Exception:
-            # Upstream died — fail all pending futures
+            # Upstream died - fail all pending futures
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(RuntimeError("Upstream process died"))
@@ -252,11 +291,16 @@ class MCPGateway:
 
     def _record_wal_and_metrics(
         self, method: str, params: dict[str, Any], req_id: Any, response: dict[str, Any], latency_ms: float
-    ) -> None:
-        """Write WAL record and update per-tool metrics."""
+    ) -> WALEntry:
+        """Write WAL record and update per-tool metrics; return the WAL entry.
+
+        The returned entry's ``entry_hash`` is the WAL invocation digest an
+        x402 spend receipt binds (issue #2528), so a settlement is provably
+        tied to the exact recorded call it paid for.
+        """
         tool_name = str(params.get("name", "")) if method == "tools/call" else ""
         has_error = response.get("error") is not None
-        self._wal_writer.append(
+        entry = self._wal_writer.append(
             decision_type="mcp_tool_call",
             inputs={
                 "method": method,
@@ -276,6 +320,7 @@ class MCPGateway:
         if metric_key not in self._metrics:
             self._metrics[metric_key] = ToolMetrics(tool_name=metric_key)
         self._metrics[metric_key].record(latency_ms, error=has_error)
+        return entry
 
     async def handle_jsonrpc(self, message: dict[str, Any]) -> dict[str, Any] | None:
         """Handle one JSON-RPC message, recording to WAL.
@@ -295,10 +340,78 @@ class MCPGateway:
             return self._handle_replay(method, params, req_id, is_notification)
 
         if is_notification:
+            await self._prepare_tool_dispatch(message, method, params, req_id)
             if self._proc:
                 await self._send_upstream(message)
             return None
 
+        await self._prepare_tool_dispatch(message, method, params, req_id)
+        response, latency_ms = await self._send_request(message, req_id)
+        self._record_wal_and_metrics(method, params, req_id, response, latency_ms)
+        record = self._anchor_proxied_call(method, params)
+
+        if self._settlement is not None and method == "tools/call":
+            response = await self._maybe_settle(message, params, response)
+
+        if method == "tools/call" and record and self._journal and "error" not in response:
+            meta = params.get("_meta", {})
+            content_hash = meta.get("cacheScope", {}).get("content_hash") if isinstance(meta, dict) else None
+
+            if content_hash:
+                cache = open_cache(self._journal.path.parents[3])
+                action = cache.resolve_by_content_hash(content_hash)
+                if action:
+                    loop_type = self._loop_detector.observe(action)
+                    if loop_type:
+                        self._journal.record(
+                            "worker_loop_intervention",
+                            loop_type=loop_type,
+                            repetition_count=self._loop_detector.threshold,
+                            threshold=self._loop_detector.threshold,
+                            action_identity=content_hash,
+                            intervention_number=self._loop_detector._interventions_used,
+                        )
+                        injector = ToolResultInjector()
+                        injector.add_gate_output(
+                            gate_name="LoopDetector",
+                            passed=False,
+                            errors=[f"Worker repeated {loop_type} action cycle. Please reconsider your approach."],
+                        )
+                        payload = injector.build_payload(fmt="text")
+                        response["result"] = payload.to_context_text()
+
+        return response
+
+    async def _prepare_tool_dispatch(
+        self,
+        message: dict[str, Any],
+        method: str,
+        params: dict[str, Any],
+        req_id: Any,
+    ) -> None:
+        """Cross the attestation interlock before live connector I/O."""
+        if method != "tools/call" or self._attestation_interlock is None:
+            return
+        from bernstein.core.security.toolcall_interlock import ToolCallIntent
+
+        intent = ToolCallIntent.from_request(
+            scope_id=self._attestation_interlock.scope_id,
+            server_name=self._server_name,
+            method=method,
+            tool_name=str(params.get("name", "")),
+            request_id=req_id,
+            span_id=request_span_id(message),
+            arguments=params.get("arguments", {}),
+        )
+        await self._attestation_interlock.before_dispatch(intent)
+
+    async def _send_request(self, message: dict[str, Any], req_id: Any) -> tuple[dict[str, Any], float]:
+        """Send one JSON-RPC request upstream and await its response.
+
+        Returns the response and the round-trip latency in milliseconds. The
+        pending-future dance is factored out here so the x402 retry (issue
+        #2528) reuses the identical send/await path as the original call.
+        """
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
         t0 = time.monotonic()
@@ -307,11 +420,90 @@ class MCPGateway:
             response: dict[str, Any] = await asyncio.wait_for(asyncio.shield(fut), timeout=30.0)
         finally:
             self._pending.pop(req_id, None)
+        return response, (time.monotonic() - t0) * 1000.0
 
-        latency_ms = (time.monotonic() - t0) * 1000.0
-        self._record_wal_and_metrics(method, params, req_id, response, latency_ms)
+    async def _maybe_settle(
+        self, message: dict[str, Any], params: dict[str, Any], response: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run the x402 settlement flow when a proxied call answers with a 402.
 
-        return response
+        Detects an x402 challenge, gates it against the active spending mandate,
+        invokes the operator settlement hook, retries the call with the payment
+        reference, records the retried invocation to the WAL, and emits a
+        chain-anchored spend receipt binding the WAL invocation digest, the
+        challenge, the payment reference, the retried request, and the mandate.
+
+        A non-402 response, a disabled config, or a refused/declined settlement
+        returns the original response unchanged -- so the 402 surfaces as an
+        ordinary tool error and Bernstein never pays outside a mandate.
+        """
+        from bernstein.core.protocols.payments.x402 import (
+            SettlementStatus,
+            build_retry_request,
+            parse_challenge,
+        )
+
+        assert self._settlement is not None
+        challenge = parse_challenge(response)
+        if challenge is None:
+            return response
+
+        tool_name = str(params.get("name", ""))
+        pre = self._settlement.pre_authorize(challenge, server_name=self._server_name, tool_name=tool_name)
+        if pre.status is not SettlementStatus.AUTHORIZED or not pre.payment_ref:
+            # SKIPPED (disabled) or REFUSED (fail closed): the original 402
+            # surfaces as an ordinary tool error; a refusal is already anchored.
+            return response
+
+        retried = build_retry_request(message, pre.payment_ref)
+        retried_id = retried.get("id")
+        retried_params: dict[str, Any] = retried.get("params") or {}
+        await self._prepare_tool_dispatch(retried, "tools/call", retried_params, retried_id)
+        settled, latency_ms = await self._send_request(retried, retried_id)
+        wal_entry = self._record_wal_and_metrics("tools/call", retried_params, retried_id, settled, latency_ms)
+        self._anchor_proxied_call("tools/call", retried_params)
+
+        try:
+            self._settlement.record_settlement(
+                challenge,
+                server_name=self._server_name,
+                tool_name=tool_name,
+                payment_ref=pre.payment_ref,
+                amount_usd=pre.amount_usd,
+                retried_request=retried,
+                wal_entry=wal_entry,
+            )
+        except Exception:
+            # A recording failure must not swallow the settled response the
+            # operator already paid for; it surfaces in the log and as a
+            # missing receipt a verifier can detect.
+            logger.exception("x402: failed to record settlement receipt for %s", tool_name)
+
+        return settled
+
+    def _anchor_proxied_call(self, method: str, params: dict[str, Any]) -> StatelessCallRecord | None:
+        """Anchor a proxied call into the run journal and audit chain.
+
+        Mirrors the WAL record with a chain-anchored continuity record
+        (issue #2506): the call's content-derived ids bind to the journal
+        head, so a verifier reconstructs the proxied call ordering from
+        chain entries alone. Anchoring failures never take the proxy down:
+        a missing anchor is visible to a verifier as a call-index gap.
+        """
+        if self._journal is None:
+            return
+        try:
+            return anchor_stateless_call(
+                journal=self._journal,
+                method=method,
+                params=params,
+                chain=self._audit_chain,
+            )
+        except Exception:
+            # Anchoring stays non-fatal -- a missing anchor is visible to a
+            # verifier as a call-index gap -- but the failure is surfaced in
+            # the log rather than silently swallowed (AC4).
+            logger.exception("Failed to anchor proxied mcp.stateless_call for %s", method)
 
     # ------------------------------------------------------------------
     # Transport runners
@@ -359,10 +551,22 @@ class MCPGateway:
 def create_gateway_sse_app(gateway: MCPGateway, *, run_id: str) -> Any:
     """Create a FastAPI SSE app that proxies MCP over HTTP.
 
-    Implements a minimal MCP SSE transport:
-    - ``GET /sse``     — opens SSE stream; sends session endpoint URL as first event
-    - ``POST /message`` — accepts JSON-RPC, forwards through gateway, pushes
-                         response back via SSE
+    Implements a minimal, stateless MCP SSE transport (issue #2506):
+
+    - ``GET /sse``     - opens an SSE stream; the first event names the POST
+                         endpoint (no per-client token in the URL).
+    - ``POST /message`` - accepts JSON-RPC, forwards through the gateway,
+                          and returns the response in the POST body. The
+                          response is correlated to its request by the
+                          content-derived span id (``X-Bernstein-Span-Id``
+                          header and the SSE event ``id`` line), so a client
+                          holding several requests in flight matches each
+                          response without any server-held state.
+
+    Every response is also fanned out to the open SSE streams tagged with
+    its span id, keeping SSE-consuming hosts working. Because correlation is
+    a pure function of the request content, consecutive requests may be
+    served by different app instances with no shared memory.
 
     Args:
         gateway: Configured MCPGateway (already started).
@@ -378,19 +582,18 @@ def create_gateway_sse_app(gateway: MCPGateway, *, run_id: str) -> Any:
     app.state.gateway = gateway
     app.state.run_id = run_id
 
-    # Per-session SSE queues: session_id → asyncio.Queue
-    _sessions: dict[str, asyncio.Queue[str | None]] = {}
+    # Open SSE consumer queues. This is fan-out plumbing for live streams on
+    # this instance, not continuity state: correlation lives in the span id.
+    _streams: set[asyncio.Queue[tuple[str, str] | None]] = set()
 
-    @app.get("/sse")
-    def sse_endpoint(request: Request) -> StreamingResponse:  # type: ignore[misc]
-        """Open an SSE stream and receive an endpoint URL for sending requests."""
-        session_id = uuid.uuid4().hex
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
-        _sessions[session_id] = queue
+    def sse_endpoint(request: Any) -> Any:
+        """Open an SSE stream; responses arrive tagged with their span id."""
+        queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+        _streams.add(queue)
 
         async def _event_stream() -> Any:
-            # MCP SSE spec: first event tells client where to POST
-            yield f"event: endpoint\ndata: /message?sessionId={session_id}\n\n"
+            # MCP SSE spec: first event tells client where to POST.
+            yield "event: endpoint\ndata: /message\n\n"
             try:
                 while True:
                     if await request.is_disconnected():
@@ -402,9 +605,10 @@ def create_gateway_sse_app(gateway: MCPGateway, *, run_id: str) -> Any:
                         continue
                     if item is None:
                         break
-                    yield f"data: {item}\n\n"
+                    span_id, payload = item
+                    yield f"id: {span_id}\ndata: {payload}\n\n"
             finally:
-                _sessions.pop(session_id, None)
+                _streams.discard(queue)
 
         return StreamingResponse(
             _event_stream(),
@@ -415,22 +619,35 @@ def create_gateway_sse_app(gateway: MCPGateway, *, run_id: str) -> Any:
             },
         )
 
-    @app.post("/message")
-    async def message_endpoint(request: Request) -> JSONResponse:  # type: ignore[misc]
-        """Accept a JSON-RPC request and push the response to the SSE stream."""
-        session_id = request.query_params.get("sessionId", "")
+    async def message_endpoint(request: Any) -> Any:
+        """Serve a JSON-RPC request, correlated by content-derived span id."""
         body: dict[str, Any] = await request.json()
+        span_id = request_span_id(body)
 
         response = await gateway.handle_jsonrpc(body)
 
-        if response is not None and session_id in _sessions:
-            await _sessions[session_id].put(json.dumps(response, separators=(",", ":")))
+        if response is None:
+            # Notification: acknowledged, nothing to correlate.
+            return JSONResponse({"status": "accepted"}, headers={"X-Bernstein-Span-Id": span_id})
 
-        return JSONResponse({"status": "accepted"})
+        payload = json.dumps(response, separators=(",", ":"))
+        for queue in list(_streams):
+            await queue.put((span_id, payload))
+        return JSONResponse(response, headers={"X-Bernstein-Span-Id": span_id})
+
+    # ``from __future__ import annotations`` stringifies the endpoint
+    # annotations and FastAPI resolves them against module globals, where the
+    # lazily imported fastapi names do not exist. Bind real annotation
+    # objects so the Request parameter is injected rather than treated as a
+    # required query field.
+    sse_endpoint.__annotations__ = {"request": Request, "return": StreamingResponse}
+    message_endpoint.__annotations__ = {"request": Request, "return": JSONResponse}
+    app.get("/sse")(sse_endpoint)
+    app.post("/message")(message_endpoint)
 
     @app.get("/gateway/metrics")
-    def metrics_endpoint(request: Request) -> JSONResponse:  # type: ignore[misc]
-        """Return current per-tool metrics for this gateway session."""
+    def metrics_endpoint() -> Any:
+        """Return current per-tool metrics for this gateway process."""
         return JSONResponse(
             {
                 "run_id": run_id,

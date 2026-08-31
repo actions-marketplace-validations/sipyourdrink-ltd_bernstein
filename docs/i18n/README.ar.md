@@ -1,434 +1,292 @@
-[English](../../README.md) | [Español (Spanish)](README.es.md) | [中文 (Chinese)](README.zh.md) | **العربية (Arabic)** | [Português (Portuguese)](README.pt.md) | [Bahasa Indonesia (Indonesian)](README.id.md) | [Français (French)](README.fr.md) | [日本語 (Japanese)](README.ja.md) | [Русский (Russian)](README.ru.md) | [Deutsch (German)](README.de.md) | [עברית (Hebrew)](README.he.md) | [יידיש (Yiddish)](README.yi.md)
-
-<div dir="rtl">
-
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="../../docs/assets/logo-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="../../docs/assets/logo-light.svg">
-  <img alt="Bernstein" src="../../docs/assets/logo-light.svg" width="340">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/logo-light.svg">
+  <img alt="Bernstein" src="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/logo-light.svg" width="340">
 </picture>
 
 <br>
 
-> *"لتحقيق إنجازات عظيمة، يلزم أمران: خطة، ووقت لا يكفي تماماً."* — Leonard Bernstein
+<img alt="Bernstein - the open-source governance layer for AI agents" src="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/banner-readme.webp" width="820">
 
-### نسِّق أي وكيل برمجة بالذكاء الاصطناعي. أي نموذج. بأمر واحد.
+<br>
+
+> *"To achieve great things, two things are needed: a plan and not quite enough time."* - [attributed to](https://quoteinvestigator.com/2020/08/19/plan-time/) Leonard Bernstein
+
+### طبقة الحوكمة مفتوحة المصدر لوكلاء الذكاء الاصطناعي
+<!-- l10n: en="the open-source governance layer for AI agents" hash="sha256:739f0a7ad1af" -->
 
 [![CI](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/ci.yml/badge.svg)](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/bernstein)](https://pypi.org/project/bernstein/)
+[![GHCR](https://img.shields.io/badge/ghcr.io-bernstein-2496ed?logo=docker&logoColor=white)](https://ghcr.io/sipyourdrink-ltd/bernstein)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?logo=python&logoColor=white)](https://python.org)
-[![License](https://img.shields.io/github/license/sipyourdrink-ltd/bernstein)](../../LICENSE)
-[![MseeP.ai](https://img.shields.io/badge/MseeP.ai-verified-2496ed)](https://mseep.ai/app/chernistry-bernstein)
+[![License](https://img.shields.io/github/license/sipyourdrink-ltd/bernstein)](https://github.com/sipyourdrink-ltd/bernstein/blob/main/LICENSE)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/sipyourdrink-ltd/bernstein/badge)](https://scorecard.dev/viewer/?uri=github.com/sipyourdrink-ltd/bernstein)
+[![CodeQL](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/codeql.yml)
+[![Open in Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/sipyourdrink-ltd/bernstein?quickstart=1)
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.sipyourdrink-ltd%2Fbernstein.svg)](https://mcptoplist.com/server/io.github.sipyourdrink-ltd%2Fbernstein)
+<a href="https://deepwiki.com/sipyourdrink-ltd/bernstein"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 
-[الموقع الإلكتروني](https://bernstein.run?utm_source=github.com&utm_medium=readme&utm_campaign=bernstein-readme) &middot; [التوثيق](https://bernstein.readthedocs.io/) &middot; [البدء](../../docs/getting-started/GETTING_STARTED.md) &middot; [المسرد](../../docs/reference/GLOSSARY.md) &middot; [القيود](../../docs/reference/KNOWN_LIMITATIONS.md)
+[website](https://bernstein.run) &middot; [docs](https://bernstein.readthedocs.io/) &middot; [install](https://bernstein.readthedocs.io/en/latest/getting-started/install/) &middot; [first run](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/getting-started/first-run.md) &middot; [glossary](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/GLOSSARY.md) &middot; [limitations](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/KNOWN_LIMITATIONS.md) &middot; [name policy](https://github.com/sipyourdrink-ltd/bernstein/blob/main/TRADEMARKS.md) &middot; [sponsor](https://github.com/sponsors/chernistry)
+
+[简体中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.zh-Hans.md) &middot; [繁體中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.zh-TW.md) &middot; [日本語](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.ja.md) &middot; [한국어](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.ko.md) &middot; [हिन्दी](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.hi.md) &middot; [বাংলা](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.bn.md) &middot; [Русский](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.ru.md) &middot; [Español](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.es.md) &middot; [Português](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.pt.md) &middot; [Deutsch](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.de.md) &middot; [Français](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.fr.md) &middot; [Italiano](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.it.md) &middot; [Nederlands](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.nl.md) &middot; [Polski](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.pl.md) &middot; [Svenska](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.sv.md) &middot; [Suomi](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.fi.md) &middot; [Українська](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.uk.md) &middot; [Türkçe](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.tr.md) &middot; [العربية](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.ar.md) &middot; [עברית](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.he.md) &middot; [Bahasa Indonesia](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.id.md) &middot; [Tiếng Việt](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.vi.md) &middot; [ไทย](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.th.md)
 
 </div>
 
 ---
 
-Bernstein هو مُجدوِل حتمي مكتوب بـ Python يُشغِّل فريقاً من وكلاء البرمجة عبر سطر الأوامر (Claude Code وCodex وGemini CLI و40 وكيلاً آخر) لتحقيق هدف واحد بالتوازي داخل worktrees مستقلة في git، مع سلسلة تدقيق موقَّعة بـ HMAC على كل خطوة.
+> **الحالة: تجريبي (beta).** تتم صيانته بواسطة شخص واحد، وهو قيد التطوير النشط. رقم الإصدار يحسب عدد الإصدارات وليس النضج — قد تغيّر الإصدارات الفرعية الواجهات. قم بتثبيت الإصدار لأي شيء تعتمد عليه؛ يتم إصلاح التراجعات سريعاً، [أبلغ عنها](https://github.com/sipyourdrink-ltd/bernstein/issues).
 
-### ثبِّته في 30 ثانية
+Bernstein هو طبقة الحوكمة مفتوحة المصدر لوكلاء الذكاء الاصطناعي. مجدوِل حتمي - لا نموذج في حلقة التنسيق - يشغّل الوكلاء بالتوازي، ويفحص ما ينتجونه عبر بوابات، ويسجّل كل خطوة، بحيث يمكن التحقق من التشغيل لاحقًا، دون اتصال، من المخرجات وحدها. وكلاء البرمجة عبر سطر الأوامر يعملون فورًا (Claude Code وCodex وGemini CLI وأكثر من 40 غيرها)، والطبقة نفسها تحكم أي حمل وكيلي: يمكن أن يكون الناتج diff أو تقرير بحث أو مجموعة بيانات أو حزمة أدلة تدقيق. ملف تعريف تثبيت air-gap مضمّن. Apache-2.0.
 
-```bash
-pipx install bernstein
-bernstein init
-bernstein run -g "fix the failing test in tests/test_foo.py"
-```
+### لمحة سريعة
+<!-- l10n: en="at a glance" hash="sha256:97aa8e70f076" -->
 
-### شاهده في 60 ثانية
+أربعة أمور تميزه عن غيره؛ وكل ما بعد ذلك تفاصيل.
 
-يغطي المقطع التالي تشغيلاً كاملاً: المُدير يُفكِّك الهدف، وثلاثة وكلاء يعملون بالتوازي، وسلسلة التدقيق تُسجِّل كل تسليم بين الأطراف، والـ janitor يتحقق، ثم يُفتح PR.
+- **لا وجود لنماذج LLM في حلقة التنسيق.** الجدولة مبنية بلغة Python الخالصة، مما يجعل التشغيل قابلاً لإعادة الإنتاج من البداية إلى النهاية. أعد تشغيل خطة الأمس وستحصل على نفس مخطط المهام تماماً.
+- **قابل للتحقق بعد التنفيذ.** يسجل سجل إعادة التشغيل (replay journal) كل عملية تشغيل، ويسجل عمود النسب الفقري (lineage spine) الدائم كل خطوة ذات نسب؛ ويضيف سجل التدقيق الاختياري المتسلسل بـ HMAC (`BERNSTEIN_AUDIT=1`) إيصالات يمكنك التحقق منها بدون اتصال بالإنترنت. يظهر عدم الحتمية كعدم تطابق في التجزئة (hash mismatch) عند الخطوة المحددة تماماً، وليس كعدم استقرار عشوائي عند إعادة التشغيل. المعاملات غير البرمجية تعامل بالمثل: يمكن للمهمة تحديد عقد نواتج (تقرير، مجموعة بيانات، سجل إجراءات، نتيجة عمليات) وتكتمل بإيصال نسب موقّع بدلاً من commit في git.
+- **معزول بالتصميم.** تحصل كل مهمة برمجية على git worktree خاص بها خلف بوابات الدمج؛ وتحصل مهام وضع النواتج على دليل عمل تحت `.sdd/workspaces/`. لا يتشارك الوكلاء أي مساحة عمل قابلة للتعديل افتراضياً؛ الحالة المشتركة الوحيدة هي قائمة المهام المتراكمة (backlog) التي يتم حجزها ذرياً. فرض قيود أشد على نظام الملفات اختياري عبر [خلفيات بيئة الحماية (sandbox)](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/architecture/sandbox.md). عند تعطيل worktrees تعمل كل مهمة في مساحة العمل المشتركة.
+- **شامل ومحلي.** أكثر من 40 محولاً لوكلاء CLI بالإضافة إلى غلاف `--prompt` عام، وحالة قائمة على الملفات، بدون وسيط SaaS، وبدون مستوى بيانات من طرف ثالث.
 
-<p align="center">
-  <img alt="عرض Bernstein لمدة 60 ثانية: المدير يُفكِّك الهدف، وثلاثة وكلاء يعملون بالتوازي، وسلسلة التدقيق تُسجِّل كل تسليم، ثم يُفتح PR" src="../../docs/demo/demo.gif" width="800">
-</p>
+القائمة الكاملة متوفرة في [صفحة الإمكانيات](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/capabilities.md)؛ و[مصفوفة الميزات](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/FEATURE_MATRIX.md) هي الفهرس الشامل.
 
-بعد التشغيل، ينشر Bernstein تعليقاً منظماً على الـ PR يتضمن التكلفة ونتائج الاختبارات والـ lineage وسلسلة هاش التدقيق:
+### كيف يبدو التشغيل
+<!-- l10n: en="what a run looks like" hash="sha256:980d54d982be" -->
 
-<p align="center">
-  <img alt="تعليق Bernstein على الـ PR: أقسام الملخص والتكلفة والـ Lineage والاختبارات وسلسلة التدقيق" src="../../docs/demo/screenshot-pr-comment.svg" width="720">
-</p>
-
-> يُنتَج الـ GIF من [`docs/demo/demo.tape`](../../docs/demo/demo.tape) بواسطة [vhs](https://github.com/charmbracelet/vhs)؛ أعِد توليده محلياً بـ `vhs docs/demo/demo.tape`.
-
-### كيف يقارن نفسه
-
-| الميزة                                | Bernstein   | Archon   | LangGraph |
-|---------------------------------------|-------------|----------|-----------|
-| فريق متعدد الوكلاء (محوِّلات متوازية)  | نعم         | واحد     | نعم       |
-| Lineage موقَّع / سلسلة تدقيق           | نعم         | لا       | لا        |
-| نشر Air-gap / سيادي                   | نعم         | جزئي     | لا        |
-| YAML تدفق عمل بصري                    | نعم [^yaml] | نعم      | لا        |
-| لوحة مُستضافة / SaaS                   | لا          | جزئي     | لا        |
-
-[^yaml]: دعم YAML لتدفقات العمل ينزل مع [PR #1108](https://github.com/sipyourdrink-ltd/bernstein/pull/1108) (في الدفعة نفسها). حتى ذلك الحين، تُكتب الخطط بـ Python أو عبر `bernstein run plan.yaml` على المخطط القديم.
-
-تجد مصفوفة ميزات أطول مقارنةً بـ CrewAI وAutoGen وLangGraph وأربعة من منسِّقات وكلاء سطر الأوامر التي تشترك مع Bernstein في الفئة نفسها في قسم [المقارنة المفصَّلة](#detailed-comparison) أدناه.
-
----
-
-### ما هذا، في فقرة واحدة؟
-
-أنت تخبر Bernstein بما تريد بناءه. يُقسِّم العمل بين عدة وكلاء برمجة بالذكاء الاصطناعي، ويُشغِّلهم بالتوازي داخل worktrees مستقلة في git، ويُسجِّل كل تسليم في سجل تدقيق مُسلسل بـ HMAC، ويُشغِّل الاختبارات، ويدمج الشيفرة التي تنجح فعلاً. وتعود لتجد PR أخضر.
-
-Forward-deployed engineering، بأسلوب السرب. ضع Bernstein في مستودع عميل وستحصل على فريق متعدد الوكلاء بحالة على ملفات وعزل اعتمادات لكل وكيل وأثر تدقيق موقَّع، يعمل على وكلاء سطر الأوامر التي يثق بها العميل أصلاً.
-
-### طرق تثبيت أخرى
-
-```bash
-curl -fsSL https://bernstein.run/install.sh | sh        # سطر واحد على macOS / Linux
-irm https://bernstein.run/install.ps1 | iex             # PowerShell على Windows
-pip install bernstein                                   # pip
-uv tool install bernstein                               # uv
-brew tap chernistry/tap && brew install bernstein       # Homebrew
-```
-
-انظر [مصفوفة التثبيت](#install) الكاملة لـ `dnf copr` و`npx` والإضافات الاختيارية ومسار الـ wheelhouse للمواقع المعزولة (air-gap).
-
-### لماذا المُجدوِل Python خالص
-
-تستخدم معظم منسِّقات الوكلاء نموذجاً لغوياً كبيراً ليقرر مَن يفعل ماذا. وهذا غير حتمي ويستهلك الرموز (tokens) في الجدولة بدلاً من الشيفرة. أما Bernstein فيُجري نداءً واحداً للنموذج اللغوي لتفكيك هدفك، وما تبقى (تشغيل الوكلاء بالتوازي، وعزل فروع git الخاصة بهم، وتشغيل الاختبارات، وتوجيه إعادات المحاولة) هو Python خالص. كل تشغيل قابل للاستنساخ. وكل خطوة مُسجَّلة وقابلة للإعادة.
-
-لا إطار عمل عليك تعلُّمه. ولا تقييد بمزوِّد. بدِّل أي وكيل، أي نموذج، أي مزوِّد.
-
-<img alt="Bernstein أثناء العمل: وكلاء ذكاء اصطناعي متوازون يُنسَّقون في الزمن الحقيقي" src="../../docs/assets/in-action-small.gif" width="700">
-
-ما تراه أثناء التشغيل:
-
-```
-$ bernstein -g "Add JWT auth"
-[manager] decomposed into 4 tasks
-[agent-1] claude-sonnet: src/auth/middleware.py  (done, 2m 14s)
-[agent-2] codex:         tests/test_auth.py      (done, 1m 58s)
-[verify]  all gates pass. merging to main.
-```
-
-## الوكلاء المدعومون
-
-يكتشف Bernstein تلقائياً وكلاء سطر الأوامر (CLI) المثبَّتين. اخلطهم في التشغيل نفسه. نماذج محلية رخيصة للأعمال الروتينية، ونماذج سحابية أثقل للهندسة المعمارية.
-
-41 محوِّل وكيل CLI: 38 غلافاً لأطراف ثالثة بالإضافة إلى غلاف عام لأي شيء يدعم `--prompt`.
-
-| الوكيل | النماذج | التثبيت |
-|-------|--------|---------|
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Opus 4, Sonnet 4.6, Haiku 4.5 | `npm install -g @anthropic-ai/claude-code` |
-| [Codex CLI](https://github.com/openai/codex) | GPT-5, GPT-5 mini | `npm install -g @openai/codex` |
-| [OpenAI Agents SDK v2](https://openai.github.io/openai-agents-python/) | GPT-5, GPT-5 mini, o4 | `pip install 'bernstein[openai]'` |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | مُدارة بواسطة Copilot (GPT-5, Sonnet 4.6) | `npm install -g @github/copilot` |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Gemini 2.5 Pro, Gemini Flash | `npm install -g @google/gemini-cli` |
-| [Cursor](https://www.cursor.com) | Sonnet 4.6, Opus 4, GPT-5 | [تطبيق Cursor](https://www.cursor.com) |
-| [Aider](https://aider.chat) | أي نموذج متوافق مع OpenAI/Anthropic | `pip install aider-chat` |
-| [Amp](https://ampcode.com) | مُدارة بواسطة Amp | `npm install -g @sourcegraph/amp` |
-| [Cody](https://sourcegraph.com/cody) | مستضافة لدى Sourcegraph | `npm install -g @sourcegraph/cody` |
-| [Continue](https://continue.dev) | أي نموذج متوافق مع OpenAI/Anthropic | `npm install -g @continuedev/cli` (الثنائي: `cn`) |
-| [Goose](https://block.github.io/goose/) | أي مزوِّد يدعمه Goose | انظر [توثيق Goose](https://block.github.io/goose/) |
-| [IaC](https://www.terraform.io/) (Terraform/Pulumi) | أي مزوِّد يستخدمه الوكيل الأساسي | مدمج |
-| [Kilo](https://kilo.dev) | مستضافة لدى Kilo | انظر [توثيق Kilo](https://kilo.dev) |
-| [Kiro](https://kiro.dev) | مستضافة لدى Kiro | انظر [توثيق Kiro](https://kiro.dev) |
-| [Ollama](https://ollama.ai) + Aider | نماذج محلية (دون اتصال) | `brew install ollama` |
-| [OpenCode](https://opencode.ai) | أي مزوِّد يدعمه OpenCode | انظر [توثيق OpenCode](https://opencode.ai) |
-| [Qwen](https://github.com/QwenLM/qwen-code) | نماذج Qwen Code | `npm install -g @qwen-code/qwen-code` |
-| [Cloudflare Agents](https://developers.cloudflare.com/agents/) | نماذج Workers AI | `bernstein cloud login` |
-| [OpenHands](https://github.com/OpenHands/OpenHands) | أي نموذج يدعمه LiteLLM (Anthropic, OpenAI, ...) | `uv tool install openhands --python 3.12` |
-| [Open Interpreter](https://github.com/OpenInterpreter/open-interpreter) | أي نموذج (مدعوم عبر LiteLLM) | `pip install open-interpreter` |
-| [gptme](https://github.com/gptme/gptme) | Anthropic, OpenAI, OpenRouter | `pipx install gptme` |
-| [Plandex](https://github.com/plandex-ai/plandex) | Plandex Cloud أو نماذج مستضافة ذاتياً | `curl -sL https://plandex.ai/install.sh \| bash` |
-| [AIChat](https://github.com/sigoden/aichat) | OpenAI, Anthropic, OpenRouter, Groq, Gemini | `cargo install aichat` |
-| [Letta Code](https://github.com/letta-ai/letta-code) | موجَّهة عبر Letta (Anthropic, OpenAI) | `npm install -g @letta-ai/letta-code` |
-| **Generic** | أي CLI يدعم `--prompt` | مدمج |
-
-#### تفويض المنسِّق (عقدة طرفية)
-
-فئة منفصلة وأصغر من المحوِّلات تُغلِّف **منسِّقات CLI أخرى** كأنها وكلاء فرديون. يُسلِّم Bernstein الأداةَ المُغلَّفة موجِّهاً (prompt) أو خطةً، ولا يرى سوى رمز الخروج النهائي؛ تكاليف الوكلاء الفرعيين وبوابات الجودة داخل المنسِّق المُغلَّف غير مرئية لـ Bernstein. مفيد حين تريد إدراج سير عمل قائم على إحدى هذه الأدوات ضمن خطوة في خطة Bernstein أكبر.
-
-| المنسِّق | مُغلَّف باسم | التثبيت |
-|--------------|------------|---------|
-| [Composio Agent Orchestrator](https://github.com/ComposioHQ/agent-orchestrator) (`@aoagents/ao`) | `composio` | `npm install -g @aoagents/ao` |
-| [umputun/ralphex](https://github.com/umputun/ralphex) | `ralphex` | `go install github.com/umputun/ralphex/cmd/ralphex@latest` |
-
-أي محوِّل يعمل أيضاً بوصفه **النموذج اللغوي الداخلي للجدولة**. شغِّل الحزمة بأكملها دون أي مزوِّد بعينه:
+ملف YAML واحد يعلن التشغيل كاملًا: المراحل والأدوار والاعتماديات والشروط التي يعمل بموجبها كل عقدة أصلًا. المجدوِل ينفّذه كـ Python خالص - لا شيء في الملف موجّه نصي، ولا يقرر أي نموذج ما يحدث تاليًا. هذا المخطط ينتج حزمة أدلة تدقيق؛ الملف الكامل في [`.bernstein/workflows/audit-evidence-pack.yaml`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/.bernstein/workflows/audit-evidence-pack.yaml).
 
 ```yaml
-internal_llm_provider: gemini            # or qwen, ollama, codex, goose, ...
-internal_llm_model: gemini-3.1-pro
+name: audit-evidence-pack
+version: "1.0.0"
+
+phases:
+  - name: scope
+    allowed_roles: [manager, architect]
+  - name: collect
+  - name: validate
+    allowed_roles: [qa, security]
+  - name: deliver
+    allowed_roles: [security, manager]
+
+nodes:
+  define-control-inventory:
+    phase: scope
+    role: architect
+
+  collect-audit-logs:
+    phase: collect
+    role: security
+    depends_on: [define-control-inventory]
+
+  # three more evidence streams collect in parallel:
+  # collect-sboms-and-attestations, collect-runbooks-and-policies,
+  # collect-eval-results
+
+  assemble-pack:
+    phase: validate
+    role: docs
+    depends_on:
+      - collect-audit-logs
+      - collect-sboms-and-attestations
+      - collect-runbooks-and-policies
+      - collect-eval-results
+
+  mock-auditor-pass:
+    phase: validate
+    role: qa
+    depends_on: [assemble-pack]
+
+  remediate-findings:
+    phase: collect
+    role: docs
+    depends_on:
+      - source: mock-auditor-pass
+        condition: "status == 'failed'"
+    retry:
+      max_attempts: 3
+      until: "status == 'done'"
+
+  sign-and-deliver:
+    phase: deliver
+    role: security
+    depends_on:
+      - source: mock-auditor-pass
+        condition: "status == 'done'"
 ```
 
-> [!TIP]
-> شغِّل `bernstein --headless` لخطوط أنابيب CI. بلا واجهة طرفية (TUI)، ومخرجات JSON منظَّمة، ورمز خروج غير صفري عند الفشل.
+```mermaid
+flowchart LR
+    inv[define-control-inventory] --> logs[collect-audit-logs]
+    inv --> sbom[collect-sboms-and-attestations]
+    inv --> rb[collect-runbooks-and-policies]
+    inv --> ev[collect-eval-results]
+    logs --> pack[assemble-pack]
+    sbom --> pack
+    rb --> pack
+    ev --> pack
+    pack --> gate{mock-auditor-pass}
+    gate -->|failed| fix["remediate-findings (retry x3)"]
+    gate -->|done| sign[sign-and-deliver]
+```
 
-## بداية سريعة
+كل عقدة يأخذها وكيل تسمح المرحلة بدوره؛ وتبقى أسوار الأدوار وبوابات الموافقة قائمة مهما فعل الوكيل داخل المهمة. عقدة الكود تكتمل خلف بوابات الدمج في git worktree خاص بها. العقد أعلاه تكتمل بشكل مختلف: [عقد المخرجات](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/artifacts.md) يسمّي الناتج (تقرير، مجموعة بيانات، فحص، سجل إجراءات)، وتُغلق العقدة بإيصال lineage موقّع بدل commit. المجدوِل نفسه، السجل نفسه، التحقق دون اتصال نفسه - سواء حمل المخطط كودًا أو بحثًا أو تغيير عمليات أو مزيجًا من الثلاثة. مخططات جاهزة للبرمجيات والبحث والوثائق والمؤسسات ومسارات المساهمين في [`.bernstein/scenarios/`](https://github.com/sipyourdrink-ltd/bernstein/tree/main/.bernstein/scenarios).
+
+### التثبيت في 30 ثانية
+<!-- l10n: en="install in 30 seconds" hash="sha256:81b04220e0ff" -->
+
+```bash
+uv tool install bernstein    # or: pipx install bernstein
+bernstein init
+bernstein doctor             # checks a CLI agent is installed and authenticated
+bernstein -g "fix the failing test in tests/test_foo.py"
+```
+
+تمت تغطية pipx وpip وbrew وdnf وnpm وDocker في [دليل التثبيت](https://bernstein.readthedocs.io/en/latest/getting-started/install/)؛ وحزمة التثبيت المعزولة لها [دليل air-gap](https://bernstein.readthedocs.io/en/latest/installation/air-gap/) الخاص بها.
+
+<img alt="A real bernstein demo run: mock agents fix four seeded bugs, ending on the run's signed receipt verifying offline" src="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/demo-run/demo.gif" width="820">
+
+التسجيل أعلاه هو لتشغيل حقيقي ويأتي مع إثباته الخاص. التسجيل وإيصال التشغيل الموقع المشتق من سجل ذلك التشغيل والمفتاح العام الذي يثبته موجودة في [`docs/assets/demo-run/`](https://github.com/sipyourdrink-ltd/bernstein/tree/main/docs/assets/demo-run). تحقق من التشغيل الذي شاهدته للتو دون اتصال بالإنترنت:
+
+```bash
+bernstein verify receipt docs/assets/demo-run/run-receipt.json \
+    --public-key docs/assets/demo-run/run-receipt.pub.pem
+```
+
+يعيد نظام CI التحقق من الإيصال المعتمد مع كل push إلى main — ويثبت أن النسخة التي تم العبث بها تفشل — حتى لا تتحول الأدلة المنشورة إلى مجرد ملفات ديكورية. يعيد `scripts/record_demo.sh` إنشاء التسجيل والإيصال والمفتاح من تشغيل حقيقي جديد؛ لا يوجد شيء اصطناعي داخل الطرفية.
+
+يمكن متابعة التشغيل الجاري من أي من واجهتي المشغل. تقرأ كلتاهما نفس واجهة برمجة تطبيقات المهام، لذا لا تعد أي منهما انعكاساً متأخراً للأخرى. في `bernstein live`، يتم التمرير في العمودين الأيسر والأيمن بشكل مستقل كلوحات كاملة، مما يحافظ على إمكانية الوصول إلى العناصر في الطرفيات القصيرة.
+
+| ![A two-column terminal dashboard - agents with their live logs on the left, the task board on the right - with a full-width activity feed and a cost line underneath](https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/tui-agents.png) | ![A browser dashboard listing sixty-two tasks with eleven running, one of them opened to its working-tree diff](https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/webui-agents-diffs.png) |
+|:---:|:---:|
+| `bernstein live` — لوحة معلومات الطرفية | `bernstein gui serve` — لوحة معلومات المتصفح |
+
+### إثبات عملية تشغيل
+<!-- l10n: en="prove a run" hash="sha256:a97100ca1818" -->
+
+الحتمية هنا شيء يمكنك التحقق منه بنفسك، وليست أمراً تسلم به دون دليل. قم بالتشغيل مرة واحدة مع تمكين التدقيق، ثم تحقق مما تم تسجيله:
+
+```bash
+BERNSTEIN_AUDIT=1 bernstein -g "fix the failing test in tests/test_foo.py"
+bernstein replay list                 # run ids recorded on disk
+bernstein replay latest --verify      # recompute the journal head, name the first divergent step
+bernstein lineage verify <run_id>     # recompute the always-on lineage spine
+bernstein audit verify                # HMAC chain + Merkle seal (written because audit was enabled)
+bernstein audit diagnose <run_id> --signal gate --sign-key KEY
+                                      # name the exact step a failure entered the run, as a signed receipt
+bernstein verify run <run_id> --signing-key-path key.pem   # sign one portable run receipt
+bernstein verify receipt .sdd/runs/<run_id>/run-receipt.json  # verify it offline: file only
+```
+
+يتم كتابة السجل في كل تشغيل؛ عمود النسب الفقري يعمل دائماً ويكتسب إدخالاً لكل خطوة ذات نسب، لذا يمكن أن ينتهي التشغيل القصير بعمود فقري صالح وفارغ. يمتلك `bernstein audit verify` سلسلة للتحقق منها فقط عند بدء التشغيل بـ `BERNSTEIN_AUDIT=1` أو إعداد مسبق للامتثال أو `bernstein run --audit`. ينتمي الخيار `--audit` إلى `bernstein run`؛ في صيغة `bernstein -g` أعلاه، قم بتعيين متغير البيئة.
+
+يربط إيصال التشغيل رأس السجل، ورأس عمود النسب الفقري عندما يكتب التشغيل إدخالات، واختيارياً نطاق سلسلة التدقيق، تحت كيان واحد موقع بـ Ed25519 مع تضمين المفتاح العام. يمكن للمراجع الذي يمتلك هذا الملف والمفتاح العام للمشغل التأكد من عدم تعديل الإجراءات والسلاسل المضمنة: لا حاجة لمفتاح HMAC، ولا حاجة لمجلد `.sdd/` نشط، ورمز الخروج `2` يحدد أول خطوة متباينة عند التلاعب. يحدد ذلك الإيصال حالة السجل المضمنة؛ وإثبات أن تلك الحالة هي السجل المكتمل بالكامل يتطلب بالإضافة إلى ذلك ختماً مستقلاً للرأس/العدد. مع الملف بمفرده ودون تحديد `--public-key`، يكون الفحص للنزاهة الداخلية فقط. التفاصيل في [إعادة التشغيل الحتمي](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/deterministic-replay.md#signed-run-receipt-one-file-offline-verification).
+
+تنطبق نفس إمكانية التحقق على أرقام التقييم. يقوم `bernstein bench run <suite> --reliability k` (يكتب أيضاً `bernstein eval --reliability k`) بتشغيل كل مهمة `k` من المرات بتنسيق ثابت، ثم يبلغ عن حد أدنى `pass^k` (يجب أن تنجح جميع محاولات `k`) إلى جانب الحد الأقصى `pass@1`. يتم ختم هذه النتيجة في إيصال موقّع يعيد `bernstein bench reliability-verify` حسابه دون اتصال، وبالتالي فإن أي حد أدنى مفتعل يفشل في التحقق. التفاصيل: [الحد الأدنى للموثوقية pass^k](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/eval/reliability.md).
+
+### كيف يعمل
+<!-- l10n: en="how it works" hash="sha256:f818df2e6cbb" -->
+
+يمر كل هدف عبر أربع مراحل:
+
+1. **التفكيك (Decompose)**. يقوم المدير بتقسيم هدفك إلى مهام ذات أدوار وملفات مخصصة وإشارات اكتمال. استدعاء واحد لـ LLM، وبعد ذلك بلغة Python الخالصة فقط.
+2. **التشغيل (Spawn)**. يبدأ الوكلاء في [git worktrees](https://git-scm.com/docs/git-worktree) معزولة، واحد لكل مهمة برمجية؛ بينما تحصل مهام وضع النواتج على دليل عمل عادي. يظل الفرع الرئيسي نظيفاً.
+3. **التحقق (Verify)**. يتحقق المدقق (janitor) من إشارات ملموسة: نجاح الاختبارات، وجود الملفات، نظافة التنسيق (lint)، وصحة الأنواع.
+4. **الدمج (Merge)**. يتم دمج العمل المتحقق منه في main. تتم إعادة محاولة المهام الفاشلة أو توجيهها إلى نموذج مختلف.
+
+لماذا تم بناء المجدول بلغة Python الخالصة، وما المقايضات المترتبة على ذلك: [لماذا الحتمية](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/architecture/WHY_DETERMINISTIC.md).
+
+### أوامر الاستخدام اليومي
+<!-- l10n: en="everyday commands" hash="sha256:7d149b09b9bc" -->
 
 ```bash
 cd your-project
-bernstein init                    # creates .sdd/ workspace + bernstein.yaml
+bernstein init                    # creates .sdd/ workspace, bernstein.yaml + templates/
 bernstein -g "Add rate limiting"  # agents spawn, work in parallel, verify, exit
 bernstein live                    # watch progress in the TUI dashboard
+bernstein run plan.yaml           # multi-stage plan: skip LLM planning, execute directly
 bernstein stop                    # graceful shutdown with drain
 ```
 
-للمشاريع متعددة المراحل، عرِّف خطة YAML:
+واجهة المشغل الكاملة (أتمتة طلبات السحب PR، الجداول الزمنية، جسور المحادثة، برنامج الإصلاح التلقائي autofix) مفصلة في [أوامر المشغل](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/commands.md).
+
+يقوم `bernstein workflow` بتشغيل مخططات DAG تعريفية بصيغة YAML من عقد الوكيل / الأمر / الحلقة - مع دعم الاستئناف للتشغيلات المتوقفة:
 
 ```bash
-bernstein run plan.yaml           # skips LLM planning, goes straight to execution
-bernstein run --dry-run plan.yaml # preview tasks and estimated cost
+bernstein workflow run idea-to-pr -g "Add JWT auth"   # prints run_id
+bernstein workflow resume <run_id>                    # picks up at the first non-completed node
 ```
 
-## كيف يعمل
+يتم تسجيل نقطة تحقق لحالة التشغيل في `.sdd/runs/<run_id>/` عند كل عقدة. يتحقق الاستئناف من تجزئة البيان عند بدء التشغيل، لذا يتم رفض أي تغيير في المواصفة بدلاً من تنفيذ بيان مختلف بصمت. انظر [بيانات سير العمل](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/workflows.md).
 
-1. **التفكيك**. يُقسِّم المدير هدفك إلى مهام بأدوار، وملفات مملوكة، وإشارات إنجاز.
-2. **الإطلاق**. تنطلق الوكلاء في أشجار عمل git معزولة (worktrees)، واحدة لكل مهمة. ويظل الفرع الرئيسي نظيفاً.
-3. **التحقُّق**. يفحص "البوّاب" (janitor) إشارات ملموسة: نجاح الاختبارات، وجود الملفات، نظافة فحص الأسلوب (lint)، صحة الأنواع.
-4. **الدمج**. يُدمج العمل المُتحقَّق منه في الفرع الرئيسي. أما المهام الفاشلة فتُعاد محاولتها أو تُوجَّه إلى نموذج مختلف.
+بوابات سلامة المستودع: يفشل `bernstein readme-l10n verify` أي طلب سحب تباعدت ملفات README المترجمة فيه عن الأصل الإنجليزي (مع تسمية القسم القديم)، بينما يعيد `bernstein readme-l10n sync` ربطها بعد التعديل الإنجليزي. انظر [readme-l10n](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/playbooks/readme-l10n.md).
 
-المنسِّق هو مُجدول Python، وليس نموذجاً لغوياً كبيراً. قرارات الجدولة حتمية وقابلة للتدقيق وقابلة للاستنساخ.
+### الوكلاء المدعومون
+<!-- l10n: en="supported agents" hash="sha256:c3a0c276b6b6" -->
 
-## التشغيل السحابي (Cloudflare)
+Claude Code وCodex CLI وGemini CLI وGitHub Copilot CLI وCursor وAider وGoose وMuse Code وOpenAI Agents SDK وAmp وCody وContinue وDevin Terminal وJunie وKilo وKiro وAWS Q Developer وOllama وOpenCode وOpenHands وOpen Interpreter وgptme وPlandex وAIChat وLetta Code وQwen وغيرهم. يحتوي [فهرس المحولات](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/adapters/index.md) على أوامر تثبيت لـ 30 منهم. تسرد `bernstein integrations list` جميع عمليات التكامل الـ 52 المتصلة من `src/bernstein/adapters/registry.py`، المصدر الوحيد للحقيقة. 50 منها عبارة عن محولات وكلاء قابلة للاختيار؛ والسطران الآخران هما نموذج الاختبار `mock` وملف تعريف نقطة النهاية `self-hosted-endpoints`. أي أداة أخرى تدعم خيار `--prompt` تعمل من خلال الغلاف العام.
 
-يمكن لـ Bernstein تشغيل الوكلاء على Cloudflare Workers بدلاً من التشغيل محلياً. يتولى `bernstein cloud` CLI أمر النشر ودورة الحياة.
+امزج بين الوكلاء في نفس التشغيل: نماذج محلية منخفضة التكلفة للأكواد النمطية، ونماذج سحابية أقوى للأمور المعمارية. يعرض `bernstein integrations list --installed` ما هو متاح على جهازك.
 
-- **Workers**. تنفيذ الوكلاء على حافة شبكة Cloudflare، مع Durable Workflows للمهام متعددة الخطوات وإعادة المحاولة التلقائية.
-- **عزل صندوق رمل V8**. يعمل كل وكيل في عزله الخاص (isolate)، دون نفقات حاويات.
-- **مزامنة مساحة العمل R2**. تُزامَن حالة شجرة العمل المحلية إلى تخزين كائنات R2 ليرى الوكلاء السحابيون الملفات نفسها.
-- **Workers AI** (تجريبي). استخدم النماذج المستضافة لدى Cloudflare بوصفها مزوِّد النموذج اللغوي، دون الحاجة إلى مفاتيح API خارجية.
-- **تحليلات D1**. تُخزَّن مقاييس المهام وبيانات التكلفة في D1 للاستعلام.
-- **Vectorize**. ذاكرة تخزين دلالية مدعومة بقاعدة بيانات المتجهات لدى Cloudflare.
-- **عرض المتصفح**. Chrome بلا واجهة على Workers للوكلاء الذين يحتاجون إلى فحص مخرجات الويب.
-- **نقل MCP عن بُعد**. اكشف خوادم MCP أو استهلكها عبر شبكة Cloudflare.
+### الحوسبة التطوعية
+<!-- l10n: en="volunteer compute" hash="sha256:f0bd4a22affd" -->
+
+يمكن لمشروع أن يضع على مسائله علامة تفيد بأنها مفتوحة للمتطوعين، ويمكن لأي شخص تشغيل واحدة منها على جهازه الخاص دون حساب ودون منسّق. يعلن المشروع ما يُسمح للمهمة بفعله في بيان `volunteer.json` - الخلفية المستخدمة للعزل، وقائمة الشبكة المسموح بها، وسقفا الزمن والذاكرة - ولا تستطيع حدود المتبرع نفسه إلا تضييق ذلك، لا توسيعه أبدًا. يربط الإيصال الذي تنتجه مهمة منتهية النتيجةَ بقرار الاحتواء الذي جرت تحته، فيستطيع المشرف بعد أشهر أن يتحقق مما كان مسموحًا للعمل فعليًا أن يمسّه.
 
 ```bash
-bernstein cloud login      # authenticate with Bernstein Cloud
-bernstein cloud deploy     # push agent workers
-bernstein cloud run plan.yaml  # execute a plan on Cloudflare
+bernstein volunteer verify .
+bernstein volunteer browse --budget 60
 ```
 
-## القدرات
+يغطي [دليل المتبرع](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/volunteer/donor-guide.md) تشغيل العامل والميزانية التي تحددها، ويغطي [دليل المشروع](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/volunteer/project-guide.md) إعلان البيان، ويوضح [نموذج التهديد](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/volunteer/threat-model.md) ما يحميه كل حد وما لا يحميه. لم يُصدر بعد المشغّل ذو الأمر الواحد: الأوامر الفرعية العاملة اليوم هي `verify` و`browse` و`hub`.
 
-**التنسيق الجوهري**. تنفيذ متوازٍ، وعزل عبر git worktree، وتحقُّق "البوّاب"، وبوابات جودة (lint، الأنواع، فحص بيانات التعريف الشخصية PII)، ومراجعة شيفرة عبر النماذج المختلفة، وقاطع تيار (circuit breaker) للوكلاء المُسيئين، ومراقبة نمو الرموز (tokens) مع تدخُّل تلقائي.
+### ما وراء الصفحة الرئيسية
+<!-- l10n: en="beyond the front page" hash="sha256:ee01fbaaebd6" -->
 
-**الذكاء**. موجِّه قطاع طرقي سياقي (contextual bandit) لاختيار النموذج/الجهد. رسم بياني للمعرفة لتحليل الأثر على قاعدة الشيفرة. التخزين الدلالي يوفِّر الرموز على الأنماط المتكررة. كشف شذوذ التكلفة (تنبيهات معدل الإنفاق). كشف شذوذ السلوك بإشارة Z-score.
+كل التفاصيل المعمقة متوفرة على [موقع التوثيق](https://bernstein.readthedocs.io/):
 
-**العزل في صناديق الرمل**. بروتوكول [`SandboxBackend`](../../docs/architecture/sandbox.md) قابل للتوصيل — شغِّل الوكلاء في git worktrees محلية (افتراضي)، أو حاويات Docker، أو أجهزة [E2B](https://e2b.dev) Firecracker الافتراضية الدقيقة (microVMs)، أو حاويات [Modal](https://modal.com) بلا خادم (مع GPU اختيارية). يستطيع مؤلِّفو الإضافات تسجيل خلفيات مخصَّصة عبر مجموعة نقاط الدخول `bernstein.sandbox_backends`. افحص الخلفيات المثبَّتة بـ `bernstein agents sandbox-backends`.
+| الصفحة | ما تغطيه |
+|---|---|
+| [capabilities](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/capabilities.md) | قائمة الإمكانيات الكاملة: وضع خادم MCP، بطاقات الوكلاء الموقعة، خلفيات الحماية، مصارف النواتج، التوافق التنظيمي |
+| [who this is for](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/use-cases.md) | أين تكمن القيمة ومتى يكون Bernstein أداة غير مناسبة |
+| [workflows](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/workflow-manifests.md) | مخططات DAG تعريفية بصيغة YAML من عقد الوكيل / الأمر / الحلقة |
+| [web UI](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/gui/index.md) | لوحة تحكم في المتصفح تعتمد على نفس API المستخدم في TUI |
+| [cloud execution](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/cloudflare/cloudflare-overview.md) | تجريبي: تشغيل الوكلاء على Cloudflare Workers مع مزامنة R2 لمساحة العمل على حسابك الخاص. الخدمة المستضافة `api.bernstein.run` ليست متاحة بعد |
+| [datasources](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/datasources.md) | إيصالات استعلام للقراءة فقط، ومشغل استعلام يربط كل نتيجة بلقطة المخطط المقابلة |
+| [agent catalogs](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/agent-catalogs.md) | توجيه الأدوار إلى تعريفات وكلاء خارج القوالب المضمنة — دليل YAML/SKILL.md عام أو هيكل إضافات Claude Code |
+| [security](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/security.md) | بطاقة التقييم الأمني، واختبار العشوائية (fuzzing)، والتحصين |
+| [architecture](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/architecture/ARCHITECTURE.md) | كيف يعمل النظام من الداخل |
 
-**تخزين القطع الأثرية (artifacts)**. يمكن تدفُّق حالة `.sdd/` إلى خلفيات [`ArtifactSink`](../../docs/architecture/storage.md) قابلة للتوصيل: نظام الملفات المحلي (افتراضي)، أو S3، أو Google Cloud Storage، أو Azure Blob، أو Cloudflare R2. يحفظ `BufferedSink` عقد سلامة WAL ضد الأعطال بالكتابة محلياً مع fsync أولاً، ثم النسخ إلى البعيد بشكل غير متزامن.
+### لماذا هذا الاسم؟
+<!-- l10n: en="why the name?" hash="sha256:2444448b9e03" -->
 
-**حزم المهارات**. [مهارات](../../docs/architecture/skills.md) ذات إفصاح تدريجي (نمط OpenAI Agents SDK): يُشحن فهرس مهارات مُدمج فقط في موجِّه النظام لكل إطلاق، ويسحب الوكلاء الأجساد الكاملة عبر أداة MCP `load_skill` عند الطلب. 17 حزمة دور مدمجة بالإضافة إلى نقاط دخول `bernstein.skill_sources` لأطراف ثالثة.
+سمي Bernstein تيمناً بـ Leonard Bernstein، قائد الأوركسترا والملحن الأمريكي. يقوم المشروع بتنسيق فريق من وكلاء البرمجة بنفس الطريقة التي قاد بها برنشتاين أوركسترا نيويورك الفيلهارمونية: كل عازف يدخل في وقته المحدد، النوتة الموسيقية حتمية، وقائد الأوركسترا مسؤول عن النتيجة.
 
-**عناصر التحكم**. سجلات تدقيق متسلسلة بـ HMAC، ومحرِّك سياسات، وتصفية مخرجات بيانات التعريف الشخصية، واستعادة من الأعطال مدعومة بـ WAL (سلامة متعددة العمال تجريبية)، وOAuth 2.0 PKCE.
+كتبت bernstein لأنني كنت أدفع 400 دولار شهرياً في فواتير claude لتشغيل ثلاثة وكلاء برمجة بالتوازي والحصول على عمليات دمج غير حتمية. مرخص تحت Apache 2.0، وتتم صيانته فردياً. إحصائيات مباشرة: [bernstein.run](https://bernstein.run).
 
-**القابلية للرصد**. `/metrics` لـ Prometheus، وإعدادات مسبقة لمصدِّر OTel، ولوحات Grafana. تتبُّع التكلفة لكل نموذج (`bernstein cost`). واجهة طرفية (TUI) ولوحة قيادة ويب. رؤية عملية الوكيل في `ps`.
+### ذكر في
+<!-- l10n: en="mentioned in" hash="sha256:e1dfaf62cb5d" -->
 
-**المنظومة**. وضع خادم MCP، ودعم بروتوكول A2A، وتكامل مع GitHub App، ونظام إضافات قائم على pluggy، ومساحات عمل متعددة المستودعات، ووضع عنقودي للتنفيذ الموزَّع، والتطوُّر الذاتي عبر `--evolve` (تجريبي).
-
-مصفوفة الميزات الكاملة: [FEATURE_MATRIX.md](../../docs/reference/FEATURE_MATRIX.md) &middot; الميزات الأخيرة: [ما الجديد](../../docs/whats-new.md)
-
-## ما الجديد في v1.9
-
-**جسر ACP** — يعرض `bernstein acp serve --stdio` خدمة Bernstein لأي محرر يتحدث بروتوكول اتصال الوكلاء (Agent Communication Protocol) مثل Zed وغيره. لا حاجة لشيفرة إضافة على جانب المحرر.
-
-**إصلاح CI الذاتي** — يراقب `bernstein autofix` طلبات السحب (PRs) المفتوحة لـ Bernstein، وحين يتحول CI إلى الأحمر، يُطلق وكيل إصلاح تلقائياً. وحين يصبح أخضر، يدفع الإصلاح ويعيد طلب المراجعة.
-
-**خزنة الاعتمادات** — يكتب `bernstein connect <provider>` مفاتيح API إلى مفتاح نظام التشغيل (keychain)؛ ويُدرجها `bernstein creds` ويُدوِّرها. ترث الوكلاء اعتمادات بنطاقات محدَّدة دون لمس متغيرات البيئة.
-
-**أنفاق المعاينة** — يُقلع `bernstein preview start` خادم تطوير معزولاً ويطبع رابطاً عاماً. مفيد لمشاركة فرع قيد التشغيل مع مراجِع دون النشر إلى التجهيز (staging).
-
-سجل التغييرات الكامل: [docs/whats-new.md](../../docs/whats-new.md)
-
-## أوامر المُشغِّل
-
-أوامر تُلغي الشيفرة اللاصقة التي ينتهي بها الحال إلى كتابتها معظم الفرق حول تشغيلاتها.
-
-| الأمر | ما يفعله |
-|---------|--------------|
-| `bernstein pr` | يُنشئ تلقائياً طلب سحب GitHub من جلسة منتهية؛ ويحمل المتن نتائج بوابات "البوّاب" وتفصيل تكلفة الرموز/الدولار. |
-| `bernstein from-ticket <url>` | يستورد تذكرة Linear / GitHub Issues / Jira بوصفها مهمة Bernstein. استنتاج الدور والنطاق بناءً على التسميات (labels). يدعم `--dry-run` و`--run`. |
-| `bernstein ticket import <url>` | اسم بديل / صيغة جماعية لـ `from-ticket` للبرمجة النصية. |
-| `bernstein remote` | خلفية صندوق رمل عبر SSH. `remote test <host>`، `remote run <host> <path>`، `remote forget <host>`. إعادة استخدام مقبس ControlMaster لمكالمات متكررة سريعة. |
-| `bernstein hooks` | خطافات دورة حياة لـ `pre_task` و`post_task` و`pre_merge` و`post_merge` و`pre_spawn` و`post_spawn` — برامج صدفة (shell scripts) أو `@hookimpl` عبر pluggy. `hooks list`، `hooks run <event>`، `hooks check`. |
-| `bernstein chat serve --platform=telegram\|discord\|slack` | قُد التشغيلات من المحادثة بأوامر `/run`، `/status`، `/approve`، `/reject`، `/switch`، `/stop`. |
-| `bernstein approve-tool` / `bernstein reject-tool` | موافقة تفاعلية على نداءات الأدوات في منتصف التشغيل. `--latest`، `--id`، `--always`. |
-| `bernstein tunnel start <port> [--provider auto\|cloudflared\|ngrok\|bore\|tailscale]` | غلاف واحد حول أربعة مزوِّدي أنفاق. وأيضاً `tunnel list`، `tunnel stop <name>\|--all`. إعادة استخدام عمليات بأسلوب ControlMaster. |
-| `bernstein daemon install [--user\|--system] [--command="..."] [--env KEY=VAL]...` | يُثبِّت وحدة systemd (Linux) أو launchd (macOS) للبدء التلقائي. وأيضاً `daemon start/stop/restart/status/uninstall`. |
-| `bernstein connect <provider>` / `bernstein creds` | يُخزِّن اعتمادات API ويُدوِّرها في مفتاح نظام التشغيل. ترث الوكلاء مفاتيح بنطاقات محدَّدة لكل تشغيل. |
-| `bernstein autofix` | عفريت (daemon) يراقب طلبات السحب المفتوحة لـ Bernstein؛ يُطلق وكيل إصلاح حين يفشل CI ويدفع الإصلاح تلقائياً. |
-| `bernstein preview start` | يُشغِّل خادم تطوير معزولاً للفرع الحالي ويطبع رابط نفق عام قابلاً للمشاركة. |
-
-## كيف يقارن
-
-| الميزة | Bernstein | CrewAI | AutoGen [^autogen] | LangGraph |
-|---------|-----------|--------|---------|-----------|
-| المنسِّق | شيفرة حتمية | مُحرَّك بنموذج لغوي (+ Flows برمجية) | مُحرَّك بنموذج لغوي | رسم بياني + نموذج لغوي |
-| يعمل مع | أي وكيل CLI (41 محوِّلاً) | أصناف Python SDK | وكلاء Python | عُقد LangChain |
-| عزل git | Worktrees لكل وكيل | لا | لا | لا |
-| صناديق رمل قابلة للتوصيل | Worktree, Docker, E2B, Modal | لا | لا | لا |
-| التحقُّق | البوّاب + بوابات جودة | حواجز + مخرجات Pydantic | شروط إنهاء | حواف شرطية |
-| تتبُّع التكلفة | مدمج | `usage_metrics` | `RequestUsage` | عبر LangSmith |
-| نموذج الحالة | قائم على الملفات (.sdd/) | في الذاكرة + نقطة فحص SQLite | في الذاكرة | Checkpointer |
-| منافذ قطع أثرية بعيدة | S3, GCS, Azure Blob, R2 | لا | لا | لا |
-| تطوُّر ذاتي | مدمج (تجريبي) | لا | لا | لا |
-| خطط تصريحية (YAML) | نعم | نعم (`agents.yaml`, `tasks.yaml`) | لا | جزئي (`langgraph.json`) |
-| توجيه النموذج لكل مهمة | نعم | نموذج لغوي لكل وكيل | `model_client` لكل وكيل | لكل عقدة (يدوي) |
-| دعم MCP | نعم (عميل + خادم) | نعم | نعم (عميل + workbench) | نعم (عميل + خادم) |
-| محادثة من وكيل إلى وكيل | لوحة إعلانات (bulletin board) | نعم (عملية Crew) | نعم (محادثة جماعية) | نعم (مُشرِف، سرب) |
-| واجهة ويب | TUI + لوحة قيادة ويب | CrewAI AMP | AutoGen Studio | LangGraph Studio + LangSmith |
-| خيار استضافة سحابية | نعم (Cloudflare) | نعم (CrewAI AMP) | لا | نعم (LangGraph Cloud) |
-| RAG/استرجاع مدمج | نعم (FTS5 لقاعدة الشيفرة + BM25) | `crewai_tools` | مسترجِعات `autogen_ext` | عبر LangChain |
-
-*آخر تحقُّق: 2026-04-19. انظر [صفحات المقارنة الكاملة](../../docs/compare/README.md) للاطلاع على مصفوفات الميزات التفصيلية.*
-
-يقارن الجدول أعلاه Bernstein بأطر تنسيق النماذج اللغوية (تُنسِّق نداءات النموذج اللغوي). أما الجدول التالي فيُغطي الفئة الأقرب — أدوات أخرى تُنسِّق **وكلاء برمجة CLI**:
-
-| الميزة | Bernstein | [awslabs/cli-agent-orchestrator](https://github.com/awslabs/cli-agent-orchestrator) | [ComposioHQ/agent-orchestrator](https://github.com/ComposioHQ/agent-orchestrator) | [emdash](https://github.com/generalaction/emdash) | [umputun/ralphex](https://github.com/umputun/ralphex) |
-|---------|-----------|-----------|-----------|-----------|-----------|
-| الشكل | Python CLI + مكتبة + خادم MCP | Python CLI + جلسات tmux + واجهة ويب | TypeScript CLI + لوحة قيادة محلية | تطبيق سطح مكتب Electron | Go CLI |
-| اللغة الأساسية | Python | Python | TypeScript | TypeScript | Go |
-| التثبيت | `pipx install bernstein` | `uv tool install cli-agent-orchestrator` | `npm install -g @aoagents/ao` | `.dmg` / `.msi` / `.AppImage` | `go install` / ثنائي وحيد |
-| محوِّلات الوكلاء | 41 | 5 (Kiro, Claude Code, Codex, Gemini, Kimi) | 3 (Claude Code, Codex, Aider) | 24 | 1 (Claude Code فقط) |
-| تنفيذ متوازٍ متعدد الوكلاء | نعم | نعم (جلسة tmux لكل وكيل) | نعم | نعم | لا (جلسة تسلسلية واحدة) |
-| Git worktree لكل وكيل | نعم | لا (مخطَّط، [#100](https://github.com/awslabs/cli-agent-orchestrator/issues/100)) | نعم | نعم | علم `--worktree` اختياري |
-| وضع خادم MCP (يكشف ذاته بوصفه MCP) | نعم (stdio + HTTP/SSE) | نعم (تواصل بين الوكلاء) | لا | لا | لا |
-| المُنسِّق | مُجدول Python حتمي | مُشرِف نموذج لغوي هرمي | مُحرَّك بنموذج لغوي | غير موثَّق | مُنفِّذ خطة خطية |
-| إعادة تشغيل تدقيق متسلسلة بـ HMAC | نعم | لا | لا | لا | لا |
-| مدقِّق عبر النماذج / بوابات جودة | نعم (متعدد المراحل) | لا | لا | لا | مراجعة متعددة المراحل (Claude فقط) |
-| إصلاح CI ذاتي / تدفق PR | نعم (`bernstein autofix`) | لا | نعم | لا | لا |
-| لوحة قيادة بصرية | TUI + ويب | واجهة ويب + tmux | ويب | تطبيق سطح مكتب | ويب (`--serve`) |
-| منافذ الإشعارات | Telegram/Slack/Discord/Email/Webhook/Shell | — | لا | لا | Telegram / Email / Slack / Webhook |
-| الجهة الداعمة | OSS فردي | AWS Labs | مُموَّل (Composio.dev) | YC W26 | OSS فردي |
-| الترخيص | Apache 2.0 | Apache 2.0 | MIT | Apache 2.0 | MIT |
-
-ميزة Bernstein التنافسية في هذه الفئة: **أصلي في Python، وخادم MCP أولاً، وأوسع تغطية للمحوِّلات، وتوازٍ حقيقي متعدد الوكلاء، ومُجدول حتمي بلا نموذج لغوي في حلقة التنسيق**. إن أردت عزل جلسات tmux متوافقاً مع AWS مع مُشرِف نموذج لغوي هرمي، فإن `cao` من AWS Labs أنسب؛ وإن كانت حزمتك TypeScript وأردت منتجاً مع لوحة قيادة، فإن `@aoagents/ao` من Composio أنسب؛ وإن أردت بيئة تطوير وكلاء (ADE) سطح مكتب أنيقة، فإن emdash هو الخيار؛ وإن كنت تستخدم Claude Code فقط وتريد ثنائي Go وحيداً يسير في خطة من أعلى إلى أسفل، فإن ralphex هو الأنسب. أما إن أردت لبنة تُستورَد إلى Python، وتكشف ذاتها عبر MCP لأي عميل، وتُشغِّل وكلاء عديدين بالتوازي، وتُغطي عرض الوكلاء الكامل (بما في ذلك Qwen، وGoose، وOllama، وOpenAI Agents SDK، وCloudflare Agents، وغيرها) — فهو Bernstein.
-
-[^autogen]: AutoGen في وضع الصيانة؛ خَلَفُهُ Microsoft Agent Framework 1.0.
-
-## المراقبة
-
-```bash
-bernstein live       # TUI dashboard
-bernstein dashboard  # web dashboard
-bernstein status     # task summary
-bernstein ps         # running agents
-bernstein cost       # spend by model/task
-bernstein doctor     # pre-flight checks
-bernstein recap      # post-run summary
-bernstein trace <ID> # agent decision trace
-bernstein run-changelog --hours 48  # changelog from agent-produced diffs
-bernstein explain <cmd>  # detailed help with examples
-bernstein dry-run    # preview tasks without executing
-bernstein dep-impact # API breakage + downstream caller impact
-bernstein aliases    # show command shortcuts
-bernstein config-path    # show config file locations
-bernstein init-wizard    # interactive project setup
-bernstein debug-bundle   # collect logs, config, and state for bug reports
-bernstein skills list    # discoverable skill packs (progressive disclosure)
-bernstein skills show <name>  # print a skill body with its references
-```
-
-```bash
-bernstein fingerprint build --corpus-dir ~/oss-corpus  # build local similarity index
-bernstein fingerprint check src/foo.py                 # check generated code against the index
-```
-
-## التثبيت
-
-| الطريقة | الأمر |
-|--------|---------|
-| **سطر واحد (macOS / Linux)** | `curl -fsSL https://bernstein.run/install.sh \| sh` |
-| **سطر واحد (Windows)** | `irm https://bernstein.run/install.ps1 \| iex` |
-| **pip** | `pip install bernstein` |
-| **pipx** | `pipx install bernstein` |
-| **uv** | `uv tool install bernstein` |
-| **Homebrew** | `brew tap chernistry/tap && brew install bernstein` |
-| **Fedora / RHEL** | `sudo dnf copr enable alexchernysh/bernstein && sudo dnf install bernstein` |
-| **npm** (غلاف) | `npx bernstein-orchestrator` |
-
-تتحقَّق برامج السطر الواحد من وجود Python 3.12+، وتُهيِّئ pipx إن كان مفقوداً، وتُصلح PATH للجلسة الحالية، وتُثبِّت (أو تُحدِّث) `bernstein`. وتتعامل مع بيئات macOS التي تُديرها brew وآلية احتياط مُطلِق `py -3` في Windows. مصادر البرامج: [install.sh](../../scripts/install.sh) · [install.ps1](../../scripts/install.ps1).
-
-### إضافات اختيارية
-
-تُعدّ حزم تطوير المزوِّدين (SDKs) اختيارية ليبقى التثبيت الأساسي خفيفاً. اختر ما تحتاجه:
-
-| الإضافة | تُفعِّل |
-|-------|---------|
-| `bernstein[openai]` | محوِّل OpenAI Agents SDK v2 (`openai_agents`) |
-| `bernstein[docker]` | خلفية صندوق رمل Docker |
-| `bernstein[e2b]` | خلفية صندوق رمل [E2B](https://e2b.dev) microVM (تتطلب `E2B_API_KEY`) |
-| `bernstein[modal]` | خلفية صندوق رمل [Modal](https://modal.com)، GPU اختيارية (تتطلب `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`) |
-| `bernstein[s3]` | منفذ قطع أثرية S3 (عبر `boto3`) |
-| `bernstein[gcs]` | منفذ قطع أثرية Google Cloud Storage |
-| `bernstein[azure]` | منفذ قطع أثرية Azure Blob |
-| `bernstein[r2]` | منفذ قطع أثرية Cloudflare R2 (متوافق مع S3 عبر `boto3`) |
-| `bernstein[grpc]` | جسر gRPC |
-| `bernstein[k8s]` | تكاملات Kubernetes |
-
-ادمج الإضافات بين قوسين مربَّعين، مثلاً `pip install 'bernstein[openai,docker,s3]'`.
-
-إضافات المحرِّر: [VS Marketplace](https://marketplace.visualstudio.com/items?itemName=alex-chernysh.bernstein) &middot; [Open VSX](https://open-vsx.org/extension/alex-chernysh/bernstein)
-
-## المساهمة
-
-طلبات السحب مُرحَّب بها. انظر [CONTRIBUTING.md](../../CONTRIBUTING.md) للإعداد وأسلوب الشيفرة.
-
-## الدعم
-
-إن وفَّر لك Bernstein وقتاً: [GitHub Sponsors](https://github.com/sponsors/chernistry)
-
-التواصل: [forte@bernstein.run](mailto:forte@bernstein.run)
-
-## أُبرِز في
-
-قوائم منتقاة، ونشرات إخبارية، ومشاريع نظيرة تبنَّت Bernstein:
-
-- [**Python Weekly #742**](https://www.pythonweekly.com/p/python-weekly-issue-742-april-23-2026) (23 أبريل 2026) — إشارة في النشرة الإخبارية.
-- [**Augment Code — 9 Open-Source Agent Orchestrators for AI Coding (2026)**](https://www.augmentcode.com/tools/open-source-agent-orchestrators) — تقرير تحريري؛ "الأداة الأكثر إثارةً للاهتمام معمارياً في هذا التقرير."
-- [**nibzard/awesome-agentic-patterns**](https://github.com/nibzard/awesome-agentic-patterns/blob/main/patterns/deterministic-zero-llm-orchestration.md) — اسْتُشهِد بـ Bernstein بوصفه التنفيذ الإنتاجي لنمط "التنسيق الحتمي بصفر نموذج لغوي".
-- [**Jenqyang/Awesome-AI-Agents**](https://github.com/Jenqyang/Awesome-AI-Agents)
-- [**jamesmurdza/awesome-ai-devtools**](https://github.com/jamesmurdza/awesome-ai-devtools)
-- [**jim-schwoebel/awesome_ai_agents**](https://github.com/jim-schwoebel/awesome_ai_agents)
-- [**Piebald-AI/awesome-gemini-cli**](https://github.com/Piebald-AI/awesome-gemini-cli)
-- [**ComposioHQ/awesome-codex-skills**](https://github.com/ComposioHQ/awesome-codex-skills)
-- [**jxzhangjhu/Awesome-LLM-RAG**](https://github.com/jxzhangjhu/Awesome-LLM-RAG)
-- [**rohitg00/awesome-claude-code-toolkit**](https://github.com/rohitg00/awesome-claude-code-toolkit)
-- [**numtide/llm-agents.nix**](https://github.com/numtide/llm-agents.nix) — توزيع Nix flake.
+مدرج في [vinta/awesome-python](https://github.com/vinta/awesome-python)، وتم تناوله في تقرير Augment Code حول [منسقي الوكلاء مفتوحي المصدر](https://www.augmentcode.com/tools/open-source-agent-orchestrators)، ومدرج في [Python Weekly #742](https://www.pythonweekly.com/p/python-weekly-issue-742-april-23-2026). كما وثقنا هذا النهج كنمط [التنسيق الحتمي بدون LLM](https://github.com/nibzard/awesome-agentic-patterns/blob/main/patterns/deterministic-zero-llm-orchestration.md) في awesome-agentic-patterns.
 
 <details>
-<summary>المزيد من القوائم الرائعة وانتقاء المجتمع</summary>
+<summary>كل التغطيات: أكثر من 20 قائمة awesome وأدلة ونشرات إخبارية واقتباسات</summary>
+<br>
 
-- [andyrewlee/awesome-agent-orchestrators](https://github.com/andyrewlee/awesome-agent-orchestrators)
-- [bradAGI/awesome-cli-coding-agents](https://github.com/bradAGI/awesome-cli-coding-agents)
-- [milisp/awesome-codex-cli](https://github.com/milisp/awesome-codex-cli)
-- [yaolifeng0629/Awesome-independent-tools](https://github.com/yaolifeng0629/Awesome-independent-tools) (中文 + EN)
-- [caramaschiHG/awesome-ai-agents-2026](https://github.com/caramaschiHG/awesome-ai-agents-2026)
-- [ai-for-developers/awesome-vibe-coding](https://github.com/ai-for-developers/awesome-vibe-coding)
-- [killop/anything_about_game](https://github.com/killop/anything_about_game) (`AI.md`)
-- [Glama MCP Catalog](https://glama.ai/mcp/servers/sipyourdrink-ltd/bernstein) — قائمة تحريرية لخوادم MCP.
-- مرايا: [icopy-site/awesome](https://github.com/icopy-site/awesome)، و[icopy-site/awesome-cn](https://github.com/icopy-site/awesome-cn)، و[trackawesomelist/trackawesomelist](https://github.com/trackawesomelist/trackawesomelist).
+القائمة الكاملة التي يتم تتبعها، بما في ذلك كل إدخال في قوائم awesome والقوائم التوثيقية والاقتباسات السابقة وإشارات النشرات الإخبارية، موجودة في [docs/mentions.md](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/mentions.md). تتم إضافة الإدخالات فور ظهورها؛ ونرحب بالتصحيحات عبر issue أو PR.
 
 </details>
 
-<details>
-<summary>اسْتُشهِد بوصفه فناً سابقاً من قِبل مشاريع نظيرة</summary>
+### المساهمة، الدعم، الترخيص
+<!-- l10n: en="contributing, support, license" hash="sha256:94b6541e4b15" -->
 
-- [**mkb23/overcode**](https://github.com/mkb23/overcode/blob/main/docs/design/bakeoffs/overcode-vs-bernstein.md) — مقارنة مطوَّلة تتعامل مع Bernstein بوصفه التنفيذ المرجعي.
-- [**Vintersong/NOVA-Cognition-Framework**](https://github.com/Vintersong/NOVA-Cognition-Framework) — `BERNSTEIN_PATTERNS.md`، "أنماط جديرة بالاقتباس".
-- [**AJV009/drupal-contrib-workbench**](https://github.com/AJV009/drupal-contrib-workbench) — ملاحظات بحثية حول الفصل بين المدير والبوّاب.
-- [**danielvaughan/codex-blog**](https://github.com/danielvaughan/codex-blog/blob/main/_posts/2026-04-09-loki-mode-autonomous-execution.md) — مقال مقارنة يضع Bernstein على الطرف الحتمي.
+نرحب بطلبات السحب (PRs)؛ يحتوي [CONTRIBUTING.md](https://github.com/sipyourdrink-ltd/bernstein/blob/main/CONTRIBUTING.md) على إرشادات الإعداد ونمط الكود. يتم تقديم بلاغات الأمان عبر [SECURITY.md](https://github.com/sipyourdrink-ltd/bernstein/blob/main/SECURITY.md). إذا كان Bernstein يوفر وقتك: [GitHub Sponsors](https://github.com/sponsors/chernistry). التواصل: [forte@bernstein.run](mailto:forte@bernstein.run).
 
-</details>
-
-## تاريخ النجوم
-
-[![Star History Chart](https://api.star-history.com/svg?repos=sipyourdrink-ltd/bernstein&type=Date)](https://star-history.com/#sipyourdrink-ltd/bernstein&Date)
-
-## الترخيص
-
-[Apache License 2.0](../../LICENSE)
+البيانات الوصفية للاقتباس موجودة في [CITATION.cff](https://github.com/sipyourdrink-ltd/bernstein/blob/main/CITATION.cff). الترخيص: [Apache-2.0](https://github.com/sipyourdrink-ltd/bernstein/blob/main/LICENSE)؛ واسم المشروع محمي بشكل منفصل في [TRADEMARKS.md](https://github.com/sipyourdrink-ltd/bernstein/blob/main/TRADEMARKS.md).
 
 ---
 
-صُنع بحب بواسطة [Alex Chernysh](https://alexchernysh.com) &middot; [GitHub](https://github.com/chernistry) &middot; [X](https://x.com/alex_chernysh) &middot; [bernstein.run](https://bernstein.run?utm_source=github.com&utm_medium=readme&utm_campaign=bernstein-readme)
+[Alex Chernysh](https://alexchernysh.com) &middot; [GitHub](https://github.com/chernistry) &middot; [X](https://x.com/alex_chernysh) &middot; [bernstein.run](https://bernstein.run)
 
 <!-- mcp-name: io.github.sipyourdrink-ltd/bernstein -->
-
-</div>

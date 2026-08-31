@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# _inject_hooks_config — settings.local.json generation
+# _inject_hooks_config - settings.local.json generation
 # ---------------------------------------------------------------------------
 
 
@@ -134,3 +134,91 @@ class TestInjectHooksConfig:
         assert "openssl dgst -sha256 -hmac" in hook_cmd
         assert "X-Bernstein-Hook-Signature-256: sha256=$SIG" in hook_cmd
         assert "Content-Type: application/json" in hook_cmd
+
+
+class TestEmbeddedAgentTeamsPin:
+    """The settings.local.json env block pins the embedded agent-team gate off.
+
+    Claude Code reads ``env`` from settings.local.json independently of the
+    process env we filter in ``build_filtered_env``.  A spawned worker that
+    inherits ``CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`` can launch its own
+    teammates, which run outside this worker's HMAC audit trail.  We pin the
+    gate to ``"false"`` here (deny-by-default) unless the operator explicitly
+    opts in.
+    """
+
+    def test_gate_pinned_false_by_default(self, tmp_path: Path, monkeypatch) -> None:
+        """No opt-in -> env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS == 'false'."""
+        monkeypatch.delenv("BERNSTEIN_ALLOW_EMBEDDED_AGENT_TEAMS", raising=False)
+        ClaudeCodeAdapter._inject_hooks_config(tmp_path, "sess-pin")
+        settings = tmp_path / ".claude" / "settings.local.json"
+        data = json.loads(settings.read_text(encoding="utf-8"))
+
+        assert data["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "false"
+
+    def test_gate_pin_omitted_when_opted_in(self, tmp_path: Path, monkeypatch) -> None:
+        """Opt-in -> the pin is not injected, leaving the gate untouched."""
+        monkeypatch.setenv("BERNSTEIN_ALLOW_EMBEDDED_AGENT_TEAMS", "1")
+        ClaudeCodeAdapter._inject_hooks_config(tmp_path, "sess-optin")
+        settings = tmp_path / ".claude" / "settings.local.json"
+        data = json.loads(settings.read_text(encoding="utf-8"))
+
+        env_block = data.get("env", {})
+        assert "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" not in env_block
+
+    def test_preexisting_true_gate_overwritten_keys_preserved(self, tmp_path: Path, monkeypatch) -> None:
+        """Pre-existing gate 'true' -> overwritten to 'false'; other keys kept."""
+        monkeypatch.delenv("BERNSTEIN_ALLOW_EMBEDDED_AGENT_TEAMS", raising=False)
+        settings_dir = tmp_path / ".claude"
+        settings_dir.mkdir(parents=True)
+        settings_path = settings_dir / "settings.local.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "true",
+                        "MY_UNRELATED_VAR": "keep-me",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        ClaudeCodeAdapter._inject_hooks_config(tmp_path, "sess-overwrite-gate")
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+
+        assert data["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "false"
+        assert data["env"]["MY_UNRELATED_VAR"] == "keep-me"
+
+
+# ---------------------------------------------------------------------------
+# In-process verification-gate hook merge (issue #2360)
+# ---------------------------------------------------------------------------
+
+
+class TestGateHookMerge:
+    """A gate policy installed for a session adds blocking gate hooks."""
+
+    def test_no_policy_leaves_events_unchanged(self, tmp_path: Path) -> None:
+        ClaudeCodeAdapter._inject_hooks_config(tmp_path, "sess-nogate")
+        data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        # No PreToolUse hook is injected absent a policy (degrade, AC4).
+        assert "PreToolUse" not in data["hooks"]
+        assert len(data["hooks"]["Stop"]) == 1
+
+    def test_policy_present_injects_gate_hooks(self, tmp_path: Path) -> None:
+        from bernstein.core.security.hook_gate import policy_from_task_fields, write_policy
+
+        policy = policy_from_task_fields("sess-gate", owned_files=["src/**"], evidence_producers=[])
+        write_policy(tmp_path, "sess-gate", policy)
+
+        ClaudeCodeAdapter._inject_hooks_config(tmp_path, "sess-gate")
+        data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+
+        assert "PreToolUse" in data["hooks"]
+        pre_cmd = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        assert "hook-gate" in pre_cmd
+        assert "sess-gate" in pre_cmd
+        # The Stop event now carries both the HTTP monitor hook and the gate.
+        stop_cmds = [h["command"] for entry in data["hooks"]["Stop"] for h in entry["hooks"]]
+        assert any("hook-gate" in c for c in stop_cmds)

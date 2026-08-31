@@ -2,12 +2,12 @@
 
 The runner walks a :class:`ReviewPipeline` stage by stage:
 
-* Stages are sequential at the top level — no diamond joins.  Stage *N+1*
+* Stages are sequential at the top level - no diamond joins.  Stage *N+1*
   starts only once stage *N* finishes (deliberate, per spec).
 * Within a stage, agents run in parallel up to ``stage.parallelism`` via an
   ``asyncio.Semaphore``.
 * Stage outputs (verdict + structured findings) are forwarded to the next
-  stage's prompt context using the existing :class:`BulletinBoard` —
+  stage's prompt context using the existing :class:`BulletinBoard` -
   posted as ``finding`` messages tagged with the stage name. No new IPC.
 * Each stage logs an HMAC-chained audit event when an :class:`AuditLog` is
   injected, with stage-level breakdown.
@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from bernstein.core.communication.bulletin import BulletinBoard, BulletinMessage
+from bernstein.core.communication.bulletin import BulletinBoard, BulletinMessage, SignalActionFailure
+from bernstein.core.knowledge.conventions import get_active_conventions
 from bernstein.core.llm import call_llm
 from bernstein.core.quality.cross_model_verifier import (
     _MAX_DIFF_CHARS,
@@ -40,6 +41,7 @@ from bernstein.core.quality.cross_model_verifier import (
     _parse_response,
     select_reviewer_model,
 )
+from bernstein.core.quality.review_pipeline.ruleset import EMPTY_RULESET, ReviewRuleset
 from bernstein.core.quality.review_pipeline.verdict import (
     AgentVerdict,
     PipelineVerdict,
@@ -50,17 +52,19 @@ from bernstein.core.quality.review_pipeline.verdict import (
 
 if TYPE_CHECKING:
     from bernstein.core.models import Task
+    from bernstein.core.quality.review_pipeline.contour import CheckRollup
     from bernstein.core.quality.review_pipeline.schema import (
         AgentSpec,
         ReviewPipeline,
         StageSpec,
     )
+    from bernstein.core.quality.review_pipeline.scope import ScopeResolution
     from bernstein.core.security.audit import AuditLog
 
 logger = logging.getLogger(__name__)
 
 
-# Type alias for the pluggable LLM caller — the runner default uses the
+# Type alias for the pluggable LLM caller - the runner default uses the
 # same provider/temperature settings as the cross-model verifier.
 LLMCaller = Callable[..., Awaitable[str]]
 
@@ -80,6 +84,7 @@ class DiffSource:
         diff: Unified diff text.  Already truncated by the caller.
         pr_number: Optional PR number for audit / display.
         owned_files: Files in scope (used by the prompt builder).
+        pr_url: Optional PR url; the review receipt is keyed on it.
     """
 
     title: str
@@ -87,6 +92,7 @@ class DiffSource:
     diff: str
     pr_number: int | None = None
     owned_files: list[str] = field(default_factory=list[str])
+    pr_url: str = ""
 
 
 def diff_from_task(task: Task, worktree: Path, max_chars: int = _MAX_DIFF_CHARS) -> DiffSource:
@@ -106,6 +112,72 @@ def diff_from_task(task: Task, worktree: Path, max_chars: int = _MAX_DIFF_CHARS)
     )
 
 
+def gh_pr_view_json(
+    pr_number: int,
+    fields: str,
+    *,
+    repo_root: Path | None = None,
+    timeout: float = 30.0,
+) -> dict[str, object]:
+    """Read selected PR fields via ``gh pr view <N> --json <fields>``.
+
+    The single place the review surface talks to GitHub about a pull request:
+    the diff fetch, the receipt's PR url, and the check rollup all go through
+    it, so there is one auth story and no second HTTP layer.
+
+    Args:
+        pr_number: GitHub PR number.
+        fields: Comma-separated ``gh`` JSON field list.
+        repo_root: Repository working directory; defaults to ``cwd``.
+        timeout: Subprocess timeout in seconds.
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        RuntimeError: If ``gh`` is unavailable, errors, or returns non-JSON.
+    """
+    import subprocess
+
+    cwd = repo_root if repo_root is not None else Path.cwd()
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", fields],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"gh pr view failed: {exc}") from exc
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh pr view failed: {proc.stderr.strip()}")
+    try:
+        payload: object = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"gh pr view returned invalid JSON: {exc}") from exc
+    return cast("dict[str, object]", payload if isinstance(payload, dict) else {})
+
+
+def check_rollup_from_pr(pr_number: int, *, repo_root: Path | None = None) -> CheckRollup:
+    """Read a PR's aggregate check rollup through the same ``gh`` path.
+
+    Args:
+        pr_number: GitHub PR number.
+        repo_root: Repository working directory; defaults to ``cwd``.
+
+    Returns:
+        The parsed :class:`~bernstein.core.quality.review_pipeline.contour.CheckRollup`.
+
+    Raises:
+        RuntimeError: If ``gh`` is unavailable or the rollup cannot be read.
+    """
+    from bernstein.core.quality.review_pipeline.contour import rollup_from_payload
+
+    return rollup_from_payload(gh_pr_view_json(pr_number, "statusCheckRollup", repo_root=repo_root))
+
+
 def diff_from_pr(pr_number: int, *, repo_root: Path | None = None, max_chars: int = _MAX_DIFF_CHARS) -> DiffSource:
     """Fetch a PR's diff via ``gh pr diff <N>`` and wrap it as a :class:`DiffSource`.
 
@@ -123,24 +195,7 @@ def diff_from_pr(pr_number: int, *, repo_root: Path | None = None, max_chars: in
     import subprocess
 
     cwd = repo_root if repo_root is not None else Path.cwd()
-    try:
-        proc = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--json", "title,body"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"gh pr view failed: {exc}") from exc
-    if proc.returncode != 0:
-        raise RuntimeError(f"gh pr view failed: {proc.stderr.strip()}")
-    try:
-        meta_obj: object = json.loads(proc.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"gh pr view returned invalid JSON: {exc}") from exc
-    meta = cast("dict[str, object]", meta_obj if isinstance(meta_obj, dict) else {})
+    meta = gh_pr_view_json(pr_number, "title,body,url", repo_root=repo_root)
 
     try:
         proc = subprocess.run(
@@ -164,6 +219,7 @@ def diff_from_pr(pr_number: int, *, repo_root: Path | None = None, max_chars: in
         description=str(meta.get("body", "")),
         diff=diff,
         pr_number=pr_number,
+        pr_url=str(meta.get("url", "")),
     )
 
 
@@ -180,7 +236,7 @@ async def _default_llm_caller(
     max_tokens: int = _MAX_TOKENS,
     temperature: float = 0.0,
 ) -> str:
-    """Default LLM caller — keyword-only mirror of ``call_llm``.
+    """Default LLM caller - keyword-only mirror of ``call_llm``.
 
     Lives here so tests can monkeypatch a single attribute without the
     indirection of patching ``bernstein.core.llm.call_llm``.
@@ -206,11 +262,11 @@ def _format_prior_context(stage_verdicts: list[StageVerdict]) -> str:
     lines: list[str] = ["", "## Prior stage findings", ""]
     for sv in stage_verdicts:
         marker = "approved" if sv.verdict == "approve" else "request_changes"
-        lines.append(f"### {sv.stage} — {marker}")
+        lines.append(f"### {sv.stage} - {marker}")
         for av in sv.agents:
             head = f"- {av.role} ({av.model}): {av.verdict}"
             if av.feedback:
-                head += f" — {av.feedback}"
+                head += f" - {av.feedback}"
             lines.append(head)
             for issue in av.issues:
                 lines.append(f"  - issue: {issue}")
@@ -264,16 +320,19 @@ async def _run_one_agent(
     llm_caller: LLMCaller,
     provider: str,
     max_tokens: int,
+    ruleset: ReviewRuleset = EMPTY_RULESET,
 ) -> AgentVerdict:
     """Run a single agent and return its verdict.
 
     On adapter / LLM failure, defaults to ``approve`` so a transient outage
-    never permanently blocks merge — same behaviour as today's verifier.
+    never permanently blocks merge - same behaviour as today's verifier.
     """
-    # Cost-aware routing — if the spec pinned a model use it; otherwise let
+    # Cost-aware routing - if the spec pinned a model use it; otherwise let
     # the cascade pick one based on writer style ("low" effort → cheap).
     model = agent.model or select_reviewer_model("any", override=None)
-    prompt = _build_agent_prompt(diff_src, prior_stages)
+    # An empty ruleset renders to "", so a repository without a rules file
+    # sends exactly the prompt it sent before rulesets existed.
+    prompt = _build_agent_prompt(diff_src, prior_stages, extra=ruleset.to_prompt_section())
 
     started = time.monotonic()
     try:
@@ -286,7 +345,7 @@ async def _run_one_agent(
         )
     except (TimeoutError, RuntimeError, OSError) as exc:
         logger.warning(
-            "review_pipeline: agent %s/%s LLM call failed: %s — defaulting to approve",
+            "review_pipeline: agent %s/%s LLM call failed: %s - defaulting to approve",
             agent.role,
             model,
             exc,
@@ -329,6 +388,7 @@ async def _run_stage(
     max_tokens: int,
     bulletin: BulletinBoard | None,
     pipeline: ReviewPipeline,
+    ruleset: ReviewRuleset = EMPTY_RULESET,
 ) -> StageVerdict:
     """Run a single stage's agents (parallel, capped by ``parallelism``)."""
     sem = asyncio.Semaphore(stage.parallelism)
@@ -342,6 +402,7 @@ async def _run_stage(
                 llm_caller=llm_caller,
                 provider=provider,
                 max_tokens=max_tokens,
+                ruleset=ruleset,
             )
 
     started = time.monotonic()
@@ -350,24 +411,30 @@ async def _run_stage(
 
     sv = aggregate_stage(stage, agent_verdicts.copy(), pipeline)
 
-    # Forward stage context via bulletin board — same mechanism agents use
+    # Forward stage context via bulletin board - same mechanism agents use
     # for cross-agent findings.  No new IPC.
     if bulletin is not None:
-        for av in sv.agents:
+        # These are advisory forwards of stage context. A failing signal-action
+        # hook queues the message for retry on the board; it must not abort the
+        # review stage (#2648).
+        try:
+            for av in sv.agents:
+                bulletin.post(
+                    BulletinMessage(
+                        agent_id=f"review_pipeline:{sv.stage}:{av.role}",
+                        type="finding",
+                        content=(f"[{sv.stage}/{av.role}] verdict={av.verdict} feedback={av.feedback[:280]}"),
+                    )
+                )
             bulletin.post(
                 BulletinMessage(
-                    agent_id=f"review_pipeline:{sv.stage}:{av.role}",
-                    type="finding",
-                    content=(f"[{sv.stage}/{av.role}] verdict={av.verdict} feedback={av.feedback[:280]}"),
+                    agent_id=f"review_pipeline:{sv.stage}",
+                    type="status",
+                    content=sv.feedback,
                 )
             )
-        bulletin.post(
-            BulletinMessage(
-                agent_id=f"review_pipeline:{sv.stage}",
-                type="status",
-                content=sv.feedback,
-            )
-        )
+        except SignalActionFailure:
+            logger.exception("bulletin signal action pending retry for review stage %s", sv.stage)
 
     logger.info(
         "review_pipeline: stage %s verdict=%s (%d/%d, %.2fs)",
@@ -395,8 +462,13 @@ async def run_pipeline(
     bulletin: BulletinBoard | None = None,
     audit_log: AuditLog | None = None,
     actor: str = "review_pipeline",
-) -> PipelineVerdict:
-    """Execute *pipeline* against *diff_src* and return the final verdict.
+    ruleset: ReviewRuleset | None = None,
+    sdd_dir: Path | None = None,
+) -> tuple[PipelineVerdict, ScopeResolution]:
+    """Execute *pipeline* against *diff_src* and return the final verdict and scope.
+
+    Scope is resolved once before any reviewer runs.  Changed paths are derived
+    from the diff; active conventions are loaded from ``sdd_dir`` (when provided).
 
     Args:
         pipeline: Validated pipeline spec.
@@ -411,15 +483,23 @@ async def run_pipeline(
             wider orchestrator board.
         audit_log: When supplied, each stage and the final verdict are
             written as HMAC-chained events.
-        actor: Audit ``actor`` field — defaults to ``review_pipeline``.
+        actor: Audit ``actor`` field - defaults to ``review_pipeline``.
+        ruleset: The raise / guard rules every reviewer is held to.  ``None``
+            (or an empty ruleset) leaves the prompt untouched.
+        sdd_dir: Path to the project .sdd directory for loading active conventions.
 
     Returns:
-        :class:`PipelineVerdict`.
+        ``(PipelineVerdict, ScopeResolution)``.
     """
     caller = llm_caller or _default_llm_caller
+    rules = ruleset if ruleset is not None else EMPTY_RULESET
     board = bulletin if bulletin is not None else BulletinBoard()
     pipeline_started = time.monotonic()
     pr_resource = f"pr-{diff_src.pr_number}" if diff_src.pr_number is not None else f"task:{diff_src.title[:60]}"
+
+    if sdd_dir is not None:
+        with contextlib.suppress(Exception):
+            get_active_conventions(sdd_dir)
 
     if audit_log is not None:
         with contextlib.suppress(OSError):
@@ -432,6 +512,7 @@ async def run_pipeline(
                     "pipeline_name": pipeline.name,
                     "stages": [s.name for s in pipeline.stages],
                     "block_on_fail": pipeline.block_on_fail,
+                    "ruleset_digest": rules.digest,
                 },
             )
 
@@ -446,6 +527,7 @@ async def run_pipeline(
             max_tokens=max_tokens,
             bulletin=board,
             pipeline=pipeline,
+            ruleset=rules,
         )
         stage_verdicts.append(sv)
         if audit_log is not None:
@@ -489,6 +571,7 @@ async def run_pipeline(
                     "stages_total": len(stage_verdicts),
                     "elapsed_sec": round(time.monotonic() - pipeline_started, 3),
                     "block_on_fail": final.block_on_fail,
+                    "ruleset_digest": rules.digest,
                 },
             )
     logger.info(

@@ -19,6 +19,7 @@ from bernstein.adapters.use_cases import USE_CASES, AdapterUseCase
 from bernstein.cli.commands.integrations_cmd import (
     CONFIG_KNOB,
     DOCS_INDEX,
+    _binary_for,
     _enumerate_rows,
     _fallback_headline,
     _filter_installed,
@@ -116,11 +117,60 @@ def test_integrations_list_unknown_subcommand_returns_nonzero(
     assert "No such command" in result.output or "Error" in result.output
 
 
+def test_binary_for_consults_profile_when_no_use_case() -> None:
+    """A profiled adapter with no curated use-case entry resolves its binary
+    from its capability profile, not from the registry key.
+
+    ``pydantic_ai`` is factory-built and its CLI binary (``clai``) differs
+    from its registry key. It is not in the ``adapter_cmd`` override table.
+    When a curated ``use_cases`` entry is absent the resolver must consult
+    the profile declaration; otherwise it probes ``shutil.which("pydantic_ai")``
+    and misreports the integration as not installed. This resolver is the
+    third binary-resolution surface (alongside ``report._binary_for_adapter``
+    and ``adapter_cmd._binary_for_adapter``); all three must agree.
+    """
+    assert _binary_for("pydantic_ai", None) == "clai"
+
+
+def test_binary_for_prefers_use_case_over_profile() -> None:
+    """A curated use-case entry stays authoritative over the profile."""
+    use_case = AdapterUseCase(headline="h", details="d", binary="curated-bin", docs_path="")
+    assert _binary_for("pydantic_ai", use_case) == "curated-bin"
+
+
+def test_binary_for_falls_back_to_registry_key_without_profile() -> None:
+    """An adapter with neither use-case, override, nor profile probes its key."""
+    assert _binary_for("no_such_adapter_xyz", None) == "no_such_adapter_xyz"
+
+
 def test_enumerate_rows_includes_generic_adapter() -> None:
     """The synthetic ``generic`` adapter must appear in the listing."""
     rows = _enumerate_rows()
     names = {row["name"] for row in rows}
     assert "generic" in names
+
+
+def test_enumerate_rows_includes_self_hosted_endpoints() -> None:
+    """AC3: the self-hosted OpenAI-compatible endpoint path is surfaced.
+
+    It is a capability, not an installable binary, so it carries no binary
+    and never reports as ``installed``. It links to the operator docs page.
+    """
+    rows = _enumerate_rows()
+    by_name = {row["name"]: row for row in rows}
+    assert "self-hosted-endpoints" in by_name
+    row = by_name["self-hosted-endpoints"]
+    assert row["binary"] == ""
+    assert row["installed"] is False
+    assert row["headline"]
+    assert row["docs"] == "docs/operations/self-hosted-endpoints.md"
+
+
+def test_integrations_list_shows_self_hosted_endpoint_path(runner: CliRunner) -> None:
+    """AC3: ``integrations list`` surfaces the self-hosted endpoint path."""
+    result = runner.invoke(cli, ["integrations", "list"])
+    assert result.exit_code == 0, result.output
+    assert "self-hosted-endpoints" in result.output
 
 
 def test_filter_installed_predicate() -> None:
@@ -138,8 +188,8 @@ def test_use_case_entries_have_clean_text() -> None:
     """Curated copy must not contain em-dashes (style rule)."""
     for name, entry in USE_CASES.items():
         assert isinstance(entry, AdapterUseCase), name
-        assert "—" not in entry.headline, (name, entry.headline)
-        assert "—" not in entry.details, (name, entry.details)
+        assert "\u2014" not in entry.headline, (name, entry.headline)
+        assert "\u2014" not in entry.details, (name, entry.details)
         # Headlines stay compact so they fit a terminal column.
         assert len(entry.headline) <= 120, (name, entry.headline)
 

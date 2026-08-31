@@ -4,7 +4,7 @@
 # src/bernstein/adapters/claude.py::_build_command. Flags added only
 # conditionally (e.g. --fallback-model, --allowedTools, --add-dir,
 # --agents, --max-budget-usd, --json-schema, --mcp-config) are NOT
-# part of the hard contract — they are covered by the unit suite at
+# part of the hard contract - they are covered by the unit suite at
 # tests/unit/adapters/.
 adapter: claude
 binary: claude
@@ -16,7 +16,8 @@ auth:
   required_for_help: false
   # Model listing would require auth; left disabled by default.
   required_for_models: false
-  secret_env: "ANTHROPIC_API_KEY"
+  secret_env:
+  basis: api_key
 required_flags:
   - "--model"
   - "--effort"

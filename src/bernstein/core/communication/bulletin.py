@@ -4,7 +4,7 @@ The bulletin board is the shared communication channel between cells.
 Agents post messages (alerts, blockers, findings, status updates, dependency
 declarations) and read messages posted since their last check.
 
-Also provides the MessageBoard for agent-to-agent delegation — structured
+Also provides the MessageBoard for agent-to-agent delegation - structured
 requests where one agent asks another (by role/capability) to perform work
 and optionally waits for a response.
 """
@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
+import os
 import threading
 import time
 import uuid
@@ -21,9 +23,27 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 MessageType = Literal["alert", "blocker", "finding", "status", "dependency"]
+
+
+class SignalActionFailure(RuntimeError):
+    """Typed refusal raised when a bulletin post hook fails (#2648).
+
+    The board is append-only, so the message itself is retained, but the post
+    is not acknowledged as successful: a ``blocker`` whose clearance gate only
+    partially materialized must not be reported to its poster as handled. The
+    offending message is carried on the exception and queued in the board's
+    retry outbox.
+    """
+
+    def __init__(self, message: BulletinMessage) -> None:
+        super().__init__(f"post hook failed for {message.type} signal from {message.agent_id}")
+        self.message = message
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +52,10 @@ MessageType = Literal["alert", "blocker", "finding", "status", "dependency"]
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_STR_NONE = "str | None"
+type _CAST_STR_NONE = str | None
+# JSON-derived scalar shape accepted by float()/int() (values loaded from
+# a loosely-typed dict; the "or 0" fallback already guards falsy values).
+type _CAST_NUMERIC = str | float | int
 
 
 @dataclass
@@ -45,7 +68,7 @@ class AgentStatusNotification:
     Attributes:
         agent_id: Unique agent session identifier.
         task_id: Task the agent was working on.
-        status: Terminal status — "completed", "failed", or "killed".
+        status: Terminal status - "completed", "failed", or "killed".
         summary: Human-readable outcome text.
         result: Optional machine-readable result payload (JSON serialisable).
         usage_tokens: Total tokens consumed during the run.
@@ -84,9 +107,9 @@ class AgentStatusNotification:
             status=str(d.get("status", "")),
             summary=str(d.get("summary", "")),
             result=cast("dict[str, object] | None", d.get("result")),
-            usage_tokens=int(d.get("usage_tokens", 0) or 0),
-            usage_cost_usd=float(d.get("usage_cost_usd", 0.0) or 0.0),
-            timestamp=float(d.get("timestamp", 0.0) or 0.0),
+            usage_tokens=int(cast(_CAST_NUMERIC, d.get("usage_tokens", 0)) or 0),
+            usage_cost_usd=float(cast(_CAST_NUMERIC, d.get("usage_cost_usd", 0.0)) or 0.0),
+            timestamp=float(cast(_CAST_NUMERIC, d.get("timestamp", 0.0)) or 0.0),
         )
 
 
@@ -164,11 +187,11 @@ class Delegation:
             origin_agent=str(d.get("origin_agent", "")),
             target_role=str(d.get("target_role", "")),
             description=str(d.get("description", "")),
-            deadline=float(d.get("deadline", 0.0) or 0.0),
+            deadline=float(cast(_CAST_NUMERIC, d.get("deadline", 0.0)) or 0.0),
             status=status,
             claimed_by=cast(_CAST_STR_NONE, d.get("claimed_by")),
             result=cast(_CAST_STR_NONE, d.get("result")),
-            created_at=float(d.get("created_at", 0.0) or 0.0),
+            created_at=float(cast(_CAST_NUMERIC, d.get("created_at", 0.0)) or 0.0),
             cell_id=cast(_CAST_STR_NONE, d.get("cell_id")),
         )
 
@@ -423,8 +446,17 @@ class AgentActivitySummary:
         return cls(
             agent_id=str(d.get("agent_id", "")),
             summary=str(d.get("summary", "")),
-            timestamp=float(d.get("timestamp", 0.0) or 0.0),
+            timestamp=float(cast(_CAST_NUMERIC, d.get("timestamp", 0.0)) or 0.0),
         )
+
+
+DEFAULT_MESSAGE_TYPE_WEIGHTS: dict[str, float] = {
+    "blocker": 5.0,
+    "alert": 4.0,
+    "finding": 3.0,
+    "dependency": 2.0,
+    "status": 1.0,
+}
 
 
 @dataclass
@@ -439,6 +471,144 @@ class BulletinBoard:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _status_notifications: list[AgentStatusNotification] = field(default_factory=list)
     _activity_summaries: dict[str, AgentActivitySummary] = field(default_factory=dict)
+    # Optional per-type action hook (#2556). When set via ``set_post_hook``, it
+    # is invoked with each stored message after the append + lock release, so a
+    # typed signal (e.g. ``blocker``) can drive deterministic scheduler state.
+    # Default ``None`` keeps existing observe-only behaviour unchanged.
+    _post_hook: Callable[[BulletinMessage], None] | None = field(default=None, repr=False)
+    # Durable retry outbox for messages whose action hook failed (#2648). A
+    # blocker whose clearance gate did not materialize is never acknowledged as
+    # posted; it lands here (and, when an outbox path is configured, on disk)
+    # so the action can be replayed instead of silently lost.
+    _pending_actions: list[BulletinMessage] = field(default_factory=list, repr=False)
+    _outbox_path: Path | None = field(default=None, repr=False)
+
+    def set_post_hook(
+        self,
+        hook: Callable[[BulletinMessage], None] | None,
+        *,
+        outbox_path: Path | None = None,
+    ) -> None:
+        """Register (or clear) a per-message action hook invoked after ``post``.
+
+        The hook receives every stored message (timestamp filled in) and may
+        dispatch a typed-signal action such as materializing a clearance gate.
+
+        A hook failure is no longer swallowed. The message stays on the
+        append-only board, but it is recorded in the retry outbox and the
+        failure is propagated to the caller as
+        :class:`SignalActionFailure`, so a blocker whose gate only partially
+        materialized is never acknowledged as successfully posted (#2648).
+
+        Args:
+            hook: Callable invoked with each stored message, or ``None`` to clear.
+            outbox_path: Optional JSONL path. When set, every failed action is
+                durably appended there before the failure is raised, and any
+                actions already recorded there are loaded back into the pending
+                queue, so a pending action survives a crash and is replayed by
+                :meth:`retry_pending_actions`.
+        """
+        self._post_hook = hook
+        self._outbox_path = outbox_path
+        if outbox_path is not None:
+            self._load_outbox(outbox_path)
+
+    def _load_outbox(self, path: Path) -> None:
+        """Hydrate the pending queue from a durable outbox file.
+
+        Without this the outbox would be write-only: a crash would leave the
+        failed action on disk with nothing ever reading it back (#2648).
+        """
+        if not path.is_file():
+            return
+        loaded: list[BulletinMessage] = []
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            logger.exception("failed to read pending signal actions from %s", path)
+            return
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                loaded.append(BulletinMessage(**json.loads(line)))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                logger.exception("skipping malformed pending signal action in %s", path)
+        if not loaded:
+            return
+        with self._lock:
+            known = {(m.agent_id, m.type, m.content, m.timestamp) for m in self._pending_actions}
+            self._pending_actions.extend(m for m in loaded if (m.agent_id, m.type, m.content, m.timestamp) not in known)
+
+    def _rewrite_outbox(self) -> None:
+        """Rewrite the outbox so drained entries are not replayed again."""
+        path = self._outbox_path
+        if path is None:
+            return
+        with self._lock:
+            remaining = self._pending_actions.copy()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as handle:
+                for msg in remaining:
+                    handle.write(json.dumps(asdict(msg), sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            logger.exception("failed to compact pending signal actions in %s", path)
+
+    @property
+    def pending_actions(self) -> list[BulletinMessage]:
+        """Messages whose action hook failed and has not yet been replayed."""
+        with self._lock:
+            return self._pending_actions.copy()
+
+    def _record_pending_action(self, msg: BulletinMessage) -> None:
+        """Record *msg* in the retry outbox, durably when a path is configured."""
+        with self._lock:
+            self._pending_actions.append(msg)
+        path = self._outbox_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(asdict(msg), sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            # The in-memory outbox entry and the raised failure still prevent a
+            # false acknowledgement; only the durable copy is lost.
+            logger.exception("failed to persist pending signal action to %s", path)
+
+    def retry_pending_actions(self) -> int:
+        """Replay every pending action through the current hook.
+
+        Returns:
+            The number of pending actions that were successfully replayed and
+            cleared from the outbox. Entries whose replay fails stay pending.
+        """
+        hook = self._post_hook
+        if hook is None:
+            return 0
+        with self._lock:
+            queued = self._pending_actions.copy()
+        drained: list[BulletinMessage] = []
+        for msg in queued:
+            try:
+                hook(msg)
+            except Exception:
+                logger.exception("bulletin action replay failed for %s signal from %s", msg.type, msg.agent_id)
+                continue
+            drained.append(msg)
+        if drained:
+            drained_ids = {id(m) for m in drained}
+            with self._lock:
+                self._pending_actions[:] = [m for m in self._pending_actions if id(m) not in drained_ids]
+            # Compact the durable copy too, so a later load does not replay an
+            # action that already succeeded.
+            self._rewrite_outbox()
+        return len(drained)
 
     def post(self, msg: BulletinMessage) -> BulletinMessage:
         """Append a message to the board.
@@ -450,6 +620,11 @@ class BulletinBoard:
 
         Returns:
             The stored message (with timestamp filled in).
+
+        Raises:
+            SignalActionFailure: If a registered post hook raised. The message
+                is still on the board and is queued in the retry outbox, but the
+                post is not acknowledged as successful (#2648).
         """
         if msg.timestamp == 0:
             msg = BulletinMessage(
@@ -461,7 +636,24 @@ class BulletinBoard:
             )
         with self._lock:
             self._messages.append(msg)
+        hook = self._post_hook
+        if hook is not None:
+            try:
+                hook(msg)
+            except Exception as exc:
+                logger.exception("bulletin post hook failed for %s signal from %s", msg.type, msg.agent_id)
+                self._record_pending_action(msg)
+                raise SignalActionFailure(msg) from exc
         return msg
+
+    def snapshot(self) -> list[BulletinMessage]:
+        """Return an ordered copy of every message currently on the board.
+
+        Used by the clearance-gate coordinator to derive the ordered journal
+        prefix a blocker projection is computed against (#2556).
+        """
+        with self._lock:
+            return self._messages.copy()
 
     def read_since(self, ts: float) -> list[BulletinMessage]:
         """Return all messages with timestamp strictly greater than *ts*.
@@ -528,23 +720,105 @@ class BulletinBoard:
             f.writelines(json.dumps(asdict(msg), default=str) + "\n" for msg in messages)
         return len(messages)
 
-    def summary(self, limit: int = 10) -> str:
-        """Return the last *limit* messages as a human-readable string.
+    def summary(
+        self,
+        limit: int = 10,
+        *,
+        horizon: int | None = None,
+        max_per_author: int | None = None,
+        per_author_cap: int | None = None,
+        step_size: int = 5,
+        step_decay: float = 0.1,
+        type_weights: Mapping[str, float] | None = None,
+        current_sequence: int | None = None,
+        current_tick: int | None = None,
+    ) -> str:
+        """Return a formatted summary of recent messages with age bounding and weighting.
 
-        Useful for injecting recent team activity into an agent's prompt.
+        Filters messages within a configurable horizon (measured in sequence
+        distance / tick offset), weights messages stepwise by age and message type,
+        applies an optional per-author cap to avoid single-agent starvation, and
+        returns the top *limit* messages ordered by (weight, recency).
 
         Args:
-            limit: Maximum number of messages to include (most recent first).
+            limit: Maximum number of messages to include in the summary.
+            horizon: Maximum sequence age (ticks/sequence distance) to consider.
+                Messages older than this horizon are excluded. If ``None``, all
+                messages are eligible.
+            max_per_author: Maximum number of messages from a single agent.
+            per_author_cap: Alias for *max_per_author*.
+            step_size: Number of sequence steps per age degradation step.
+            step_decay: Weight reduction per age step.
+            type_weights: Mapping of message type to base weight. Defaults to
+                :data:`DEFAULT_MESSAGE_TYPE_WEIGHTS`.
+            current_sequence: Explicit current sequence counter. Defaults to the
+                total number of messages on the board.
+            current_tick: Alias for *current_sequence*.
 
         Returns:
-            Multi-line string, one message per line, or empty string if the
-            board is empty.
+            Multi-line string with one formatted message per line, or an empty
+            string if no messages match.
         """
-        with self._lock:
-            recent = self._messages[-limit:]
-        if not recent:
+        if limit <= 0:
             return ""
-        lines = [f"- {m.agent_id}: {m.content}" for m in recent]
+
+        effective_cap = max_per_author if max_per_author is not None else per_author_cap
+        if effective_cap is not None and effective_cap <= 0:
+            return ""
+
+        if horizon is not None and horizon <= 0:
+            return ""
+
+        with self._lock:
+            messages = list(self._messages)
+
+        if not messages:
+            return ""
+
+        total = len(messages)
+        cur_seq = (
+            current_sequence if current_sequence is not None else (current_tick if current_tick is not None else total)
+        )
+        if cur_seq < total:
+            cur_seq = total
+
+        weights_map = type_weights if type_weights is not None else DEFAULT_MESSAGE_TYPE_WEIGHTS
+        step_sz = max(1, step_size)
+
+        candidates: list[tuple[float, int, BulletinMessage]] = []
+        for i, msg in enumerate(messages):
+            age = cur_seq - 1 - i
+            if age < 0:
+                continue
+            if horizon is not None and age >= horizon:
+                continue
+            step = age // step_sz
+            base_w = weights_map.get(msg.type, 1.0)
+            weight = base_w - (step * step_decay)
+            candidates.append((weight, i, msg))
+
+        if not candidates:
+            return ""
+
+        # Order by (weight, recency/sequence_index) descending
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+        author_counts: dict[str, int] = {}
+        selected: list[BulletinMessage] = []
+        for _, _, msg in candidates:
+            if effective_cap is not None:
+                count = author_counts.get(msg.agent_id, 0)
+                if count >= effective_cap:
+                    continue
+            selected.append(msg)
+            author_counts[msg.agent_id] = author_counts.get(msg.agent_id, 0) + 1
+            if len(selected) >= limit:
+                break
+
+        if not selected:
+            return ""
+
+        lines = [f"- {m.agent_id}: {m.content}" for m in selected]
         return "\n".join(lines)
 
     def post_file_created(
@@ -747,8 +1021,8 @@ class ChannelQuery:
             content=str(d.get("content", "")),
             target_agent=cast(_CAST_STR_NONE, d.get("target_agent")),
             target_role=cast(_CAST_STR_NONE, d.get("target_role")),
-            timestamp=float(d.get("timestamp", 0.0) or 0.0),
-            expires_at=float(d.get("expires_at", 0.0) or 0.0),
+            timestamp=float(cast(_CAST_NUMERIC, d.get("timestamp", 0.0)) or 0.0),
+            expires_at=float(cast(_CAST_NUMERIC, d.get("expires_at", 0.0)) or 0.0),
             resolved=bool(d.get("resolved", False)),
         )
 
@@ -789,7 +1063,7 @@ class ChannelResponse:
             query_id=str(d.get("query_id", "")),
             responder_agent=str(d.get("responder_agent", "")),
             content=str(d.get("content", "")),
-            timestamp=float(d.get("timestamp", 0.0) or 0.0),
+            timestamp=float(cast(_CAST_NUMERIC, d.get("timestamp", 0.0)) or 0.0),
         )
 
 

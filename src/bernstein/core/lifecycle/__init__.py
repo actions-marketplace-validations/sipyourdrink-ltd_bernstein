@@ -4,8 +4,8 @@ Provides a unified registry that fans events out to pluggy hook
 implementations, Python callables, and shell scripts declared in
 ``bernstein.yaml``.
 
-Historically ``bernstein.core.lifecycle`` resolved — via the in-tree
-core-redirect finder — to :mod:`bernstein.core.tasks.lifecycle`, the
+Historically ``bernstein.core.lifecycle`` resolved - via the in-tree
+core-redirect finder - to :mod:`bernstein.core.tasks.lifecycle`, the
 task/agent governance FSM. Turning it into a package (so we could
 land new modules like :mod:`.hooks` and :mod:`.pluggy_bridge`) would
 normally break that redirect because real packages win over meta-path
@@ -19,6 +19,24 @@ including module-level attribute writes used by their tests.
 from __future__ import annotations
 
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # The ``sys.modules`` remap at the bottom of this file is invisible to
+    # static analysis, so type checkers see this package rather than the FSM
+    # module it aliases to and report the FSM's public names as missing.
+    # Re-export them (explicit-alias form) so the checker agrees with what
+    # ``from bernstein.core.lifecycle import ...`` actually resolves to at
+    # runtime. Type-only: nothing here executes.
+    from bernstein.core.tasks.lifecycle import (
+        IllegalTransitionError as IllegalTransitionError,
+    )
+    from bernstein.core.tasks.lifecycle import (
+        transition_agent as transition_agent,
+    )
+    from bernstein.core.tasks.lifecycle import (
+        transition_task as transition_task,
+    )
 
 from bernstein.core.lifecycle.hooks import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -56,7 +74,7 @@ for _name, _value in _hook_exports.items():
         setattr(_task_lifecycle, _name, _value)
 
 # Preserve package discovery for ``bernstein.core.lifecycle.hooks`` and
-# ``bernstein.core.lifecycle.pluggy_bridge`` after the alias — the real
+# ``bernstein.core.lifecycle.pluggy_bridge`` after the alias - the real
 # package object carries ``__path__``; copy it onto the FSM module so
 # import of our submodules still works post-alias.
 if not hasattr(_task_lifecycle, "__path__"):

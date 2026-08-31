@@ -2,7 +2,7 @@
 
 The watcher is the **top** of Bernstein's three-layer architecture
 ("deterministic orchestrator below, immutable HMAC chain in the middle,
-LLM observer above" — see ticket
+LLM observer above" - see ticket
 ``2026-05-07-feat-llm-watcher-haiku-observer.md``).
 
 Read-only contract
@@ -12,9 +12,9 @@ The watcher is structurally read-only:
 1. The public ``observe`` API only accepts an immutable, frozen
    ``WatcherEvent`` snapshot.  It receives **no** orchestrator handle,
    no task store, no agent spawner, no filesystem path.  There is no
-   capability inside this module to mutate orchestrator state — the
+   capability inside this module to mutate orchestrator state - the
    omission is the enforcement.
-2. The return type is ``list[Suggestion]`` — pure advisory data.
+2. The return type is ``list[Suggestion]`` - pure advisory data.
    Suggestions are advisory.  The orchestrator decides whether to log,
    surface, or persist them.  The watcher itself never writes to
    ``.sdd/backlog/``, ``.sdd/runtime/state/``, or any source file.
@@ -26,7 +26,7 @@ Off-by-default
 --------------
 The watcher is disabled by default.  The orchestrator emits zero
 events and makes zero LLM calls unless ``WatcherConfig.enabled`` is
-explicitly set to ``True`` — for example via
+explicitly set to ``True`` - for example via
 ``BERNSTEIN_LLM_WATCHER_ENABLED=1`` or a future
 ``.sdd/config/watcher.yaml``.
 
@@ -42,7 +42,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ class Suggestion:
         severity: Advisory severity (``info`` | ``warning`` |
             ``critical``).
         rationale: Short human-readable explanation.
-        proposed_action: Suggested next step (informational only —
+        proposed_action: Suggested next step (informational only -
             never executed automatically).
         cost_usd: Estimated USD cost of the LLM call that produced this
             suggestion.  ``0.0`` when the watcher short-circuits.
@@ -185,7 +185,7 @@ LLMCaller = Callable[..., Awaitable[str]]
 #: Synchronous detector signature.  Detectors are pure functions that
 #: receive a frozen :class:`WatcherEvent` and return zero or more
 #: :class:`Suggestion` records.  They never mutate orchestrator state
-#: and never make network calls — that's reserved for the LLM observer.
+#: and never make network calls - that's reserved for the LLM observer.
 DetectorFn = Callable[[WatcherEvent], list["Suggestion"]]
 
 
@@ -205,7 +205,7 @@ class LLMWatcher:
     * receives no orchestrator/task-store handle in its constructor;
     * never imports task / agent / filesystem-mutation modules;
     * catches every exception from the underlying LLM caller and
-      degrades to an empty signal list — the orchestrator is never
+      degrades to an empty signal list - the orchestrator is never
       crashed by watcher failure.
 
     Disabled-by-default
@@ -284,7 +284,7 @@ class LLMWatcher:
             A list of :class:`Suggestion` records.  Empty when the
             watcher is disabled, when the LLM call fails, when it
             times out, or when the model produces no advisory signal.
-            **Never raises** to the caller — orchestrator stability is
+            **Never raises** to the caller - orchestrator stability is
             non-negotiable.
 
         Notes:
@@ -337,7 +337,7 @@ class LLMWatcher:
         for detector in self._detectors:
             try:
                 emitted.extend(detector(event))
-            except Exception:  # pragma: no cover — defensive
+            except Exception:  # pragma: no cover - defensive
                 logger.warning(
                     "watcher detector %s failed for event=%s run=%s",
                     getattr(detector, "__name__", "<detector>"),
@@ -470,7 +470,7 @@ def _default_llm_caller() -> LLMCaller:
 
     Importing :func:`bernstein.core.llm.call_llm` at module top-level
     would pull in pydantic-settings, the OpenAI client, and the rest
-    of the routing stack on every Bernstein boot — even when the
+    of the routing stack on every Bernstein boot - even when the
     watcher is disabled.  Deferring the import keeps the
     off-by-default path free of side effects.
 
@@ -498,12 +498,12 @@ def _default_llm_caller() -> LLMCaller:
 # immutable snapshot that the LLM observer sees.  Failures are isolated
 # by ``LLMWatcher._run_detectors``.
 
-#: Default budget (USD) — used by ``cost_runaway_detector`` when the
+#: Default budget (USD) - used by ``cost_runaway_detector`` when the
 #: event payload omits ``run_budget_usd``.  Conservative, biased toward
 #: false-positives over silent overrun.
 _DEFAULT_RUN_BUDGET_USD: Final[float] = 10.0
 
-#: Hard ceiling — a single task burning more than this in 5 minutes is
+#: Hard ceiling - a single task burning more than this in 5 minutes is
 #: always escalated regardless of the run-level budget.
 _TASK_HARD_CEILING_USD: Final[float] = 2.0
 
@@ -511,11 +511,11 @@ _TASK_HARD_CEILING_USD: Final[float] = 2.0
 #: but emitted no completion / audit traffic for this long is suspect.
 _STUCK_SPAWN_TIMEOUT_S: Final[float] = 30 * 60
 
-#: Repeated-failure threshold — the same task failing N times in a row
+#: Repeated-failure threshold - the same task failing N times in a row
 #: with the same exit signature.
 _REPEATED_FAILURE_LIMIT: Final[int] = 3
 
-#: Tool-mask threshold — masking more than this fraction of available
+#: Tool-mask threshold - masking more than this fraction of available
 #: tools is unusual enough to surface as a configuration smell.
 _TOOL_MASK_FRACTION_THRESHOLD: Final[float] = 0.5
 
@@ -539,11 +539,11 @@ def cost_runaway_detector(event: WatcherEvent) -> list[Suggestion]:
 
     Reads the following payload fields when present:
 
-    * ``task_cost_usd`` — USD spent on the current task in the last
+    * ``task_cost_usd`` - USD spent on the current task in the last
       5 minutes (orchestrator-side aggregate).
-    * ``run_cost_usd`` — total USD spent on the run so far.
-    * ``run_budget_usd`` — operator-set ceiling for the run.
-    * ``task_id`` — task identifier (informational).
+    * ``run_cost_usd`` - total USD spent on the run so far.
+    * ``run_budget_usd`` - operator-set ceiling for the run.
+    * ``task_id`` - task identifier (informational).
 
     Both legs of the OR are evaluated; the more severe leg wins.
 
@@ -555,9 +555,9 @@ def cost_runaway_detector(event: WatcherEvent) -> list[Suggestion]:
         present or no threshold is breached.
     """
     payload = event.payload
-    task_cost = float(payload.get("task_cost_usd") or 0.0)
-    run_cost = float(payload.get("run_cost_usd") or 0.0)
-    run_budget = float(payload.get("run_budget_usd") or _DEFAULT_RUN_BUDGET_USD)
+    task_cost = float(cast(float, payload.get("task_cost_usd") or 0.0))
+    run_cost = float(cast(float, payload.get("run_cost_usd") or 0.0))
+    run_budget = float(cast(float, payload.get("run_budget_usd") or _DEFAULT_RUN_BUDGET_USD))
     task_id = str(payload.get("task_id") or "?")
 
     breached_task = task_cost > _TASK_HARD_CEILING_USD
@@ -606,8 +606,8 @@ def stuck_spawn_detector(event: WatcherEvent) -> list[Suggestion]:
     payload = event.payload
     claim_confirmed = bool(payload.get("claim_confirmed"))
     task_completed = bool(payload.get("task_completed"))
-    audit_emissions = int(payload.get("audit_emissions") or 0)
-    time_in_state = float(payload.get("time_in_state_s") or 0.0)
+    audit_emissions = int(cast(int, payload.get("audit_emissions") or 0))
+    time_in_state = float(cast(float, payload.get("time_in_state_s") or 0.0))
     task_id = str(payload.get("task_id") or "?")
 
     if not claim_confirmed or task_completed:
@@ -649,7 +649,7 @@ def repeated_failure_detector(event: WatcherEvent) -> list[Suggestion]:
         Zero or one :class:`Suggestion`.
     """
     payload = event.payload
-    failure_count = int(payload.get("failure_count") or 0)
+    failure_count = int(cast(int, payload.get("failure_count") or 0))
     exit_signature = str(payload.get("exit_signature") or "").strip()
     task_id = str(payload.get("task_id") or "?")
     if not exit_signature:
@@ -666,7 +666,7 @@ def repeated_failure_detector(event: WatcherEvent) -> list[Suggestion]:
             rationale=rationale,
             proposed_action=(
                 "Stop re-spawning. The deterministic retry loop is masking "
-                "a structural defect — investigate the exit signature and "
+                "a structural defect - investigate the exit signature and "
                 "patch the underlying code path before another retry."
             ),
             cost_usd=0.0,
@@ -677,8 +677,8 @@ def repeated_failure_detector(event: WatcherEvent) -> list[Suggestion]:
 def suspicious_tool_mask_detector(event: WatcherEvent) -> list[Suggestion]:
     """Fire when ``mask_tools`` removed >50% of the available tool surface.
 
-    Reads ``available_tools`` (int — pre-mask count) and
-    ``masked_tools`` (int — number removed by the mask) from the
+    Reads ``available_tools`` (int - pre-mask count) and
+    ``masked_tools`` (int - number removed by the mask) from the
     payload.  A tool mask that removes more than half of the tools is
     almost certainly a misconfigured policy and warrants review.
 
@@ -689,14 +689,14 @@ def suspicious_tool_mask_detector(event: WatcherEvent) -> list[Suggestion]:
         Zero or one :class:`Suggestion`.
     """
     payload = event.payload
-    available = int(payload.get("available_tools") or 0)
-    masked = int(payload.get("masked_tools") or 0)
+    available = int(cast(int, payload.get("available_tools") or 0))
+    masked = int(cast(int, payload.get("masked_tools") or 0))
     if available <= 0:
         return []
     fraction = masked / available
     if fraction <= _TOOL_MASK_FRACTION_THRESHOLD:
         return []
-    rationale = f"tool masking removed {masked}/{available} tools ({fraction:.0%}) — policy may be over-restrictive"
+    rationale = f"tool masking removed {masked}/{available} tools ({fraction:.0%}) - policy may be over-restrictive"
     return [
         Suggestion(
             suggestion_id=_suggestion_id(event, "suspicious_tool_mask"),
@@ -720,7 +720,7 @@ def audit_chain_break_detector(event: WatcherEvent) -> list[Suggestion]:
     ``expected_prev_hmac`` (the HMAC of the chain tail the orchestrator
     captured before appending) from the payload.  When both are present
     and disagree, the chain has been tampered with or there has been a
-    write race — either is an immediate critical signal.
+    write race - either is an immediate critical signal.
 
     Args:
         event: Frozen event snapshot.

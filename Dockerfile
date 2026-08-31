@@ -1,6 +1,6 @@
 # Stage 1: build
 # python:3.13-slim
-FROM python:3.13-slim@sha256:e544a7fcbdf8555eceda66bf86cafb006c736339f76141918bcb812f3174c00a AS build
+FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a AS build
 
 WORKDIR /app
 COPY . /app
@@ -10,11 +10,12 @@ RUN pip install --no-cache-dir hatchling==1.29.0 && \
 
 # Stage 2: runtime
 # python:3.13-slim
-FROM python:3.13-slim@sha256:e544a7fcbdf8555eceda66bf86cafb006c736339f76141918bcb812f3174c00a
+FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a
 
 LABEL org.opencontainers.image.title="bernstein" \
-      org.opencontainers.image.description="Declarative agent orchestration for engineering teams" \
-      org.opencontainers.image.source="https://github.com/bernstein-ai/bernstein"
+      org.opencontainers.image.description="The open-source governance layer for AI agents (runs Claude Code, Codex, Gemini CLI, and 40+ more). No model in the coordination loop, so parallel runs in per-task git worktrees replay byte-identically." \
+      org.opencontainers.image.source="https://github.com/sipyourdrink-ltd/bernstein" \
+      io.modelcontextprotocol.server.name="io.github.sipyourdrink-ltd/bernstein"
 
 # Install git (required for git_ops) and curl (healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,8 +31,14 @@ RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl && \
     useradd -m -u 1000 bernstein && chown bernstein:bernstein /workspace
 USER bernstein
 
-# Bernstein state directory (mount a volume here for persistence)
-VOLUME ["/workspace/.sdd"]
+# Bernstein state lives in /workspace/.sdd. For persistence, bind-mount your
+# project directory at /workspace (the documented default) or mount an explicit
+# volume at /workspace/.sdd.
+#
+# Deliberately NOT declared as a VOLUME: an anonymous volume at this path is
+# created root-owned (0755) by the daemon while the container runs as uid 1000,
+# so every first run failed with "Permission denied" when creating the
+# worktree under /workspace/.sdd. Do not re-add a VOLUME line here.
 
 # Task server HTTP + gRPC ports
 EXPOSE 8052 50051
@@ -42,9 +49,13 @@ EXPOSE 8052 50051
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl --fail --silent --show-error http://127.0.0.1:8052/health || exit 1
 
-# Default: all-in-one mode (reads bernstein.yaml, starts server + agents)
-# Override CMD in docker-compose / Helm to run individual components:
-#   Server only:     python -m uvicorn bernstein.core.server:app --host 0.0.0.0 --port 8052
-#   Orchestrator:    python -m bernstein.core.orchestrator
+# Default: run the task server in the foreground so PID 1 stays alive and the
+# container can host a long-lived central/coordinator node whose /health
+# endpoint (probed above) stays reachable. Bind all interfaces and enable
+# cluster endpoints via env, e.g.:
+#   docker run -e BERNSTEIN_BIND_HOST=0.0.0.0 -e BERNSTEIN_CLUSTER_ENABLED=1 \
+#     -p 8052:8052 ghcr.io/sipyourdrink-ltd/bernstein
+# Override CMD in docker-compose / Helm to run other components, e.g.:
+#   Orchestrated run: bernstein run plan.yaml --remote
 ENTRYPOINT ["bernstein"]
-CMD ["conduct"]
+CMD ["serve"]

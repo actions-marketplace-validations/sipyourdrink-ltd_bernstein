@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,10 @@ import pytest
 from bernstein.core.protocols.mcp_catalog.fetcher import (
     CatalogFetcher,
     HTTPResponse,
+    _UrllibTransport,
 )
 from bernstein.core.protocols.mcp_catalog.manifest import CatalogValidationError
+from bernstein.core.security.url_allowlist import UrlSchemeError
 
 
 def _good_catalog() -> dict[str, Any]:
@@ -45,6 +48,9 @@ class _FakeTransport:
         self.queue.append(resp)
 
     def get(self, url: str, *, headers: dict[str, str]) -> HTTPResponse:
+        from bernstein.core.security.url_allowlist import ensure_public_http_url
+
+        ensure_public_http_url(url, allow_http=True, source="mcp_catalog.fetcher")
         self.calls.append((url, headers.copy()))
         if not self.queue:
             raise AssertionError(f"unexpected request to {url}")
@@ -61,7 +67,16 @@ def _build_fetcher(tmp_path: Path, transport: _FakeTransport, **kwargs: Any) -> 
     )
 
 
-def test_first_fetch_caches_with_etag(tmp_path: Path) -> None:
+def _resolves_to(*addresses: str) -> Callable[[str], list[str]]:
+    """A resolver that answers with fixed addresses, so no DNS is needed."""
+    return lambda _host: list(addresses)
+
+
+def test_first_fetch_caches_with_etag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "bernstein.core.security.url_allowlist._default_resolver",
+        _resolves_to("93.184.216.34"),
+    )
     transport = _FakeTransport()
     body = json.dumps(_good_catalog()).encode()
     transport.push(HTTPResponse(status=200, body=body, etag='"abc"'))
@@ -76,7 +91,11 @@ def test_first_fetch_caches_with_etag(tmp_path: Path) -> None:
     assert cache["catalog"]["entries"][0]["id"] == "fs-readonly"
 
 
-def test_fresh_cache_skips_network(tmp_path: Path) -> None:
+def test_fresh_cache_skips_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "bernstein.core.security.url_allowlist._default_resolver",
+        _resolves_to("93.184.216.34"),
+    )
     transport = _FakeTransport()
     body = json.dumps(_good_catalog()).encode()
     transport.push(HTTPResponse(status=200, body=body, etag='"abc"'))
@@ -89,7 +108,11 @@ def test_fresh_cache_skips_network(tmp_path: Path) -> None:
     assert len(transport.calls) == 1
 
 
-def test_stale_cache_revalidates_and_handles_304(tmp_path: Path) -> None:
+def test_stale_cache_revalidates_and_handles_304(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "bernstein.core.security.url_allowlist._default_resolver",
+        _resolves_to("93.184.216.34"),
+    )
     transport = _FakeTransport()
     body = json.dumps(_good_catalog()).encode()
     transport.push(HTTPResponse(status=200, body=body, etag='"abc"'))
@@ -110,7 +133,11 @@ def test_stale_cache_revalidates_and_handles_304(tmp_path: Path) -> None:
     assert headers["If-None-Match"] == '"abc"'
 
 
-def test_5xx_falls_back_to_mirror(tmp_path: Path) -> None:
+def test_5xx_falls_back_to_mirror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "bernstein.core.security.url_allowlist._default_resolver",
+        _resolves_to("93.184.216.34"),
+    )
     transport = _FakeTransport()
     transport.push(HTTPResponse(status=502, body=b"", etag=None))
     body = json.dumps(_good_catalog()).encode()
@@ -122,7 +149,11 @@ def test_5xx_falls_back_to_mirror(tmp_path: Path) -> None:
     assert result.from_cache is False
 
 
-def test_invalid_payload_preserves_cache(tmp_path: Path) -> None:
+def test_invalid_payload_preserves_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "bernstein.core.security.url_allowlist._default_resolver",
+        _resolves_to("93.184.216.34"),
+    )
     transport = _FakeTransport()
     # First successful fetch primes the cache.
     transport.push(HTTPResponse(status=200, body=json.dumps(_good_catalog()).encode(), etag='"v1"'))
@@ -147,10 +178,96 @@ def test_invalid_payload_preserves_cache(tmp_path: Path) -> None:
     assert after["catalog"]["entries"][0]["id"] == "fs-readonly"
 
 
-def test_fetch_raises_when_no_cache_and_4xx(tmp_path: Path) -> None:
+def test_fetch_raises_when_no_cache_and_4xx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "bernstein.core.security.url_allowlist._default_resolver",
+        _resolves_to("93.184.216.34"),
+    )
     transport = _FakeTransport()
     transport.push(HTTPResponse(status=404, body=b"", etag=None))
     fetcher = _build_fetcher(tmp_path, transport)
     with pytest.raises(RuntimeError, match="HTTP 404"):
         fetcher.fetch()
     assert not fetcher.cache_path.exists()
+
+
+def test_hostile_url_loopback_https_rejected() -> None:
+    """A loopback destination must be rejected before any network I/O.
+
+    The catalog URL is third-party-derived content, so the transport must
+    refuse to aim at an internal address (SSRF protection).
+    """
+    with pytest.raises(UrlSchemeError):
+        _UrllibTransport().get("https://127.0.0.1/catalog.json", headers={})
+
+
+def test_hostile_url_link_local_http_rejected() -> None:
+    """A link-local (cloud metadata) destination must be rejected.
+
+    ``allow_http=True`` is preserved, so the scheme passes; the host
+    restriction is what rejects the link-local address.
+    """
+    with pytest.raises(UrlSchemeError):
+        _UrllibTransport().get("http://169.254.169.254/latest/meta-data/", headers={})
+
+
+@pytest.mark.parametrize(
+    "internal_ip",
+    [
+        "127.0.0.1",
+        "::1",
+        "169.254.169.254",
+        "10.0.0.5",
+        "192.168.1.100",
+        "fe80::1",
+        "fc00::1",
+    ],
+)
+def test_mcp_catalog_fetcher_rejects_internal_ip_addresses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, internal_ip: str
+) -> None:
+    """MCP catalog fetcher must reject catalog URLs pointing to internal addresses."""
+    monkeypatch.setattr(
+        "bernstein.core.security.url_allowlist._default_resolver",
+        _resolves_to(internal_ip),
+    )
+
+    transport = _FakeTransport()
+    fetcher = _build_fetcher(
+        tmp_path,
+        transport,
+        primary_url="https://mcp.internal/mcp.json",
+    )
+    with pytest.raises(UrlSchemeError, match="internal address"):
+        fetcher.fetch()
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    "internal_ip",
+    [
+        "127.0.0.1",
+        "::1",
+        "169.254.169.254",
+    ],
+)
+def test_mcp_catalog_fetcher_rejects_internal_ip_from_mirror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, internal_ip: str
+) -> None:
+    """MCP catalog fetcher must reject mirror URLs pointing to internal addresses."""
+    monkeypatch.setattr(
+        "bernstein.core.security.url_allowlist._default_resolver",
+        _resolves_to(internal_ip),
+    )
+
+    transport = _FakeTransport()
+    fetcher = _build_fetcher(
+        tmp_path,
+        transport,
+        primary_url="https://primary.example/mcp.json",
+        mirror_url="https://mirror.internal/mcp.json",
+    )
+    transport.push(HTTPResponse(status=502, body=b"", etag=None))
+    with pytest.raises(UrlSchemeError, match="internal address"):
+        fetcher.fetch()
+    assert transport.calls == []

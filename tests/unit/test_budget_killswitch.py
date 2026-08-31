@@ -1,10 +1,10 @@
-"""Regression tests for audit-056 — budget kill-switch terminates in-flight agents.
+"""Regression tests for audit-056 - budget kill-switch terminates in-flight agents.
 
 Covers :meth:`Orchestrator._enforce_budget_killswitch`:
 
 * First transition: SHUTDOWN signal is sent to every live agent and a single
   ``budget.exhaust`` event is emitted with the final spend.
-* During the configured grace window, no SIGKILL is issued — agents are
+* During the configured grace window, no SIGKILL is issued - agents are
   allowed to commit WIP.
 * After the grace window expires, remaining live sessions are SIGKILLed via
   ``spawner.kill``; each session is only killed once.
@@ -111,7 +111,7 @@ class TestBudgetKillSwitchTransition:
 
         # Kill-switch state is now armed.
         assert stub._budget_stop_fired_at is not None
-        # No SIGKILL yet — grace period still in effect.
+        # No SIGKILL yet - grace period still in effect.
         stub._spawner.kill.assert_not_called()
 
     def test_dead_sessions_skipped(self, tmp_path: Path) -> None:
@@ -156,7 +156,7 @@ class TestBudgetKillSwitchGracePeriod:
         stub._enforce_budget_killswitch()
         assert stub._send_shutdown_signals.call_count == 1
 
-        # Tick 2 (immediately after): still within grace window — no kill.
+        # Tick 2 (immediately after): still within grace window - no kill.
         stub._enforce_budget_killswitch()
         stub._spawner.kill.assert_not_called()
         # SHUTDOWN is not re-sent on later ticks.
@@ -211,7 +211,7 @@ class TestBudgetKillSwitchRearm:
         stub._enforce_budget_killswitch()
         assert stub._budget_stop_fired_at is not None
 
-        # Operator bumps the budget (hot-reload path) — spend ratio drops.
+        # Operator bumps the budget (hot-reload path) - spend ratio drops.
         stub._cost_tracker.budget_usd = 100.0
         assert stub._cost_tracker.status().should_stop is False
 
@@ -219,3 +219,35 @@ class TestBudgetKillSwitchRearm:
 
         assert stub._budget_stop_fired_at is None
         assert stub._budget_stop_killed_agents == set()
+
+
+class TestBudgetKillSwitchHeartbeatReap:
+    """Forced SIGKILL must also reap the session's heartbeat shell loop."""
+
+    def test_sigkill_reaps_heartbeat_loop_per_agent(self, tmp_path: Path) -> None:
+        """Every forced-kill path must call the Defect-10 heartbeat reaper so
+        the backgrounded heartbeat shell loop does not outlive the agent it
+        was monitoring (regression: the budget kill-switch SIGKILL path used
+        to call ``spawner.kill`` without reaping)."""
+        from unittest.mock import patch
+
+        sessions = [_session("A-1"), _session("A-2")]
+        stub = _build_orch_stub(
+            tmp_path,
+            sessions,
+            budget_usd=1.0,
+            kill_grace_period_s=30,
+        )
+        stub._cost_tracker.record("A-0", "T-0", "opus", 0, 0, cost_usd=1.5)
+
+        stub._enforce_budget_killswitch()
+        stub._budget_stop_fired_at = time.time() - 31
+
+        with patch("bernstein.core.agents.heartbeat._reap_session_heartbeat_loop") as reap:
+            stub._enforce_budget_killswitch()
+
+        assert stub._spawner.kill.call_count == 2
+        assert reap.call_count == 2
+        reaped_ids = {c.args[1].id for c in reap.call_args_list}
+        assert reaped_ids == {"A-1", "A-2"}
+        assert all(c.kwargs["reason"] == "budget_killswitch" for c in reap.call_args_list)

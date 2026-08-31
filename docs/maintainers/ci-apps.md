@@ -1,4 +1,4 @@
-# CI apps & integrations — one-time operator playbook
+# CI apps & integrations - one-time operator playbook
 
 Forward-looking install guide for free OSS-tier GitHub Apps and platform features
 that benefit the `sipyourdrink-ltd/bernstein` repo. Each section is a single
@@ -20,41 +20,37 @@ Steps:
 - Confirm.
 
 Risk: CodeQL produces some false positives on first scan. Autofix proposes
-patches as PR suggestions — it never auto-merges. Triage as normal review work.
+patches as PR suggestions - it never auto-merges. Triage as normal review work.
 
 ---
 
-## 2. Install CodeRabbit GitHub App
+## 2. CodeRabbit and Sourcery - retired
 
-Free Pro tier for OSS repos. URL: <https://github.com/apps/coderabbitai>.
+Both apps are retired and no longer in use on this repository. Their repo
+configuration is gone: `.coderabbit.yaml`, `.sourcery.yaml`, and the advisory
+CLI lane `.github/workflows/code-review-bots-ci.yml` were removed.
 
-Steps:
-- Click **Install** → authorize on `sipyourdrink-ltd/bernstein`.
-- No repo secret required.
-- Tuned `.coderabbit.yaml` lives at the repo root (path-aware instructions,
-  Pro features enabled, duplicate-CI tools disabled).
-- Companion `.sourcery.yaml` lives alongside it; the Sourcery CLI runs as an
-  advisory PR lane in `.github/workflows/code-review-bots-ci.yml`.
-- Secrets required: `CODERABBIT_API_KEY` (chat-only, optional) and
-  `SOURCERY_API_KEY` (used by the CLI lane).
+Remaining operator actions (owner-only, browser):
 
-Risk: adds 1 reviewer comment per PR. Rate-limit is 4 reviews/hr/PR; bursty
-force-pushes will queue.
+- Org **Settings** → **GitHub Apps** → uninstall **CodeRabbit** and
+  **Sourcery** if still installed.
+- Delete the stale repo secrets `CODERABBIT_API_KEY` and `SOURCERY_API_KEY`
+  (**Settings** → **Secrets and variables** → **Actions**); nothing reads
+  them any more.
 
 ---
 
 ## 3. Install Gemini Code Assist GitHub App
 
-Free tier: 240 review sessions/day (2026). URL:
-<https://github.com/marketplace/gemini-code-assist>.
+Free tier: 240 review sessions/day (2026). Install the Gemini Code Assist app from the GitHub Marketplace.
 
 Steps:
 - **Install** → authorize on `sipyourdrink-ltd/bernstein`.
 - Auth flows through the maintainer's Google account; no repo secret needed.
 
-Risk: doubles AI-reviewer noise alongside CodeRabbit. Worth keeping for
-cross-check on security-sensitive PRs; consider disabling per-PR if signal/noise
-degrades.
+Risk: adds a second AI-reviewer lane next to the one already reviewing PRs.
+Worth keeping for cross-check on security-sensitive PRs; consider disabling
+per-PR if signal/noise degrades.
 
 ---
 
@@ -63,7 +59,7 @@ degrades.
 Free, no install. Path: **Repo → Insights → Actions**.
 
 Use as a 30-day "main CI green/red" gauge and per-workflow runtime trend. No
-configuration needed — the tab populates from existing workflow runs.
+configuration needed - the tab populates from existing workflow runs.
 
 ---
 
@@ -92,12 +88,12 @@ Steps: **Repo → Settings → Branches** → edit `main` branch protection rule
 enable **Merge queue**.
 
 Caveats:
-- Pair with `required_status_checks.strict: false` — merge queue is
+- Pair with `required_status_checks.strict: false` - merge queue is
   incompatible with "require branches to be up to date".
 - Required workflows must trigger on `merge_group`:
   `on: merge_group: types: [checks_requested]`.
 - Verify after [#1277](https://github.com/sipyourdrink-ltd/bernstein/pull/1277)
-  lands — that PR adds the `merge_group` trigger to required workflows.
+  lands - that PR adds the `merge_group` trigger to required workflows.
 
 ---
 
@@ -125,7 +121,7 @@ Dependabot PR noise becomes a problem. No action required now.
 
 ---
 
-## 9. Homebrew tap — wire up `HOMEBREW_TAP_TOKEN`
+## 9. Homebrew tap - wire up `HOMEBREW_TAP_TOKEN`
 
 **Status:** ⚠️ tap stuck at `1.4.1`. `publish-homebrew.yml` runs on every
 release but the "Push to homebrew-tap repo" step silently no-ops because the
@@ -181,7 +177,7 @@ gh api repos/chernistry/homebrew-tap/contents/Formula/bernstein.rb \
 
 ### Risk
 
-- PAT scope is repo-narrow and Contents-only — minimum needed for `git push`
+- PAT scope is repo-narrow and Contents-only - minimum needed for `git push`
   to `homebrew-tap`. Don't broaden it.
 - 90-day rotation reminder: add to the operator's calendar; expired PAT
   silently regresses to the same broken state.
@@ -191,174 +187,30 @@ gh api repos/chernistry/homebrew-tap/contents/Formula/bernstein.rb \
 
 ---
 
-## 10. COPR / RPM — kill or fix decision
+## 10. COPR / RPM - resolved
 
-**Status:** ❌ broken since March 2026. Last successful build was `1.4.11`.
-Every build since fails in Fedora chroots — `copr-cli buildpypi` cannot
-resolve 30+ Python `python3dist(...)` dependencies (`beartype >= 0.21`,
-`crosshair-tool`, `openai-agents`, etc.) because they are not packaged for
-Fedora.
+**Status:** ✅ wired into the release chain (#3325).
 
-The wrapper-spec workaround landed in `packaging/rpm/bernstein.spec`
-(`1.4.11-1`) but it is unused: `publish.yml` calls `copr-cli buildpypi`,
-which **ignores** the in-repo spec and synthesizes its own from PyPI
-metadata. That regenerated spec is what pulls in the missing
-`python3dist(...)` BuildRequires.
+The channel was broken from March 2026 to August 2026 because the release
+chain called `copr-cli buildpypi`, which ignores the in-repo spec and
+synthesizes its own from PyPI metadata. That generated spec pulls in 30+
+`python3dist(...)` BuildRequires that Fedora does not package, so every
+chroot build failed. The last successful build was `1.4.11`.
 
-The operator has to pick one of two paths. Both are docs-only here — the
-actual workflow / docs edits land in a follow-up PR.
+The fix keeps the channel and drops `buildpypi`. The first replacement spec
+shipped a launcher that resolved the package through `pipx`/`uvx` at run time;
+that made the RPM version describe nothing and the package unusable offline
+(#3558), so `packaging/rpm/bernstein.spec` now installs the release and its
+dependency closure into a private virtualenv at RPM build time. Nothing has to
+be packaged for Fedora - the closure comes from the released wheels - and
+nothing resolves at run time. `scripts/build_copr_srpm.py` binds the spec to
+the release tag, `rpm-install-smoke` installs the built RPM per chroot family
+and runs it with networking disabled, and `publish-copr` in
+`.github/workflows/publish.yml` submits the SRPM only after that smoke passes
+(#3559).
 
-### Option A — Kill the channel
-
-Lowest-effort, recommended if COPR install volume is < 5% of downloads.
-
-Diff for `.github/workflows/publish.yml`:
-
-```diff
--  # COPR RPM rebuild — triggers a new build from the updated PyPI release.
--  trigger-copr:
--    name: Trigger COPR rebuild
--    runs-on: ubuntu-latest
--    needs: build
--    timeout-minutes: 10
--    permissions: {}
--    steps:
--      - name: Harden runner (audit mode)
--        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
--        with:
--          egress-policy: audit
--      - name: Trigger COPR build
--        run: |
--          pip install copr-cli
--          mkdir -p ~/.config
--          cat > ~/.config/copr << EOF
--          [copr-cli]
--          login = ${{ secrets.COPR_LOGIN }}
--          username = alexchernysh
--          token = ${{ secrets.COPR_TOKEN }}
--          copr_url = https://copr.fedorainfracloud.org
--          EOF
--          copr-cli buildpypi --packagename bernstein alexchernysh/bernstein --nowait
-```
-
-Then strip the COPR install path from:
-
-- `docs/getting-started/install.md` (the `Fedora / RHEL (dnf)` tab)
-- `docs/getting-started/install-linux.md` (`## Fedora / RHEL via COPR`)
-- `docs/index.html` (FAQ schema mentions `dnf copr`)
-- `docs/llms-full.txt`
-- All `docs/i18n/README.*.md` install matrix rows
-- `packaging/rpm/bernstein.spec` (delete the file; no longer published)
-- Repo secrets: delete `COPR_LOGIN` and `COPR_TOKEN`.
-
-Recommend a redirect notice: point Fedora users at `pipx install bernstein`
-or `uv tool install bernstein` — both work on Fedora 41/42 out of the box.
-
-### Option B — Fix the spec
-
-Keep COPR alive. Stop relying on `buildpypi`'s auto-generated spec; ship the
-in-repo spec and let `%pyproject_buildrequires --generate-extras` discover
-Python deps from `pyproject.toml` at build time, falling back to bundled
-wheels for anything Fedora can't resolve.
-
-Diff for `packaging/rpm/bernstein.spec` (replaces the entire current file):
-
-```diff
--Name:           bernstein
--Version:        1.4.11
--Release:        1%{?dist}
--Summary:        Multi-agent orchestration for AI coding agents
--License:        Apache-2.0
--URL:            https://github.com/sipyourdrink-ltd/bernstein
--BuildArch:      noarch
--Requires:       python3 >= 3.12
--
--%description
--Orchestrate parallel AI coding agents. Runs Claude Code, Codex, Gemini CLI
--and others in parallel with git worktree isolation and quality gates.
--
--%install
--mkdir -p %{buildroot}%{_bindir}
--cat > %{buildroot}%{_bindir}/bernstein << 'WRAPPER'
--#!/bin/bash
--if command -v pipx &>/dev/null; then
--    exec pipx run bernstein "$@"
--elif command -v uvx &>/dev/null; then
--    exec uvx bernstein "$@"
--else
--    exec python3 -m pip install --user bernstein &>/dev/null && exec python3 -m bernstein "$@"
--fi
--WRAPPER
--chmod 755 %{buildroot}%{_bindir}/bernstein
--
--%files
--%{_bindir}/bernstein
-+%global pypi_name bernstein
-+
-+Name:           bernstein
-+Version:        2.0.1
-+Release:        1%{?dist}
-+Summary:        Multi-agent orchestration for AI coding agents
-+License:        Apache-2.0
-+URL:            https://github.com/sipyourdrink-ltd/bernstein
-+Source0:        %{pypi_source %{pypi_name}}
-+BuildArch:      noarch
-+
-+BuildRequires:  python3-devel >= 3.12
-+BuildRequires:  pyproject-rpm-macros
-+
-+%description
-+Orchestrate parallel AI coding agents. Runs Claude Code, Codex, Gemini CLI
-+and others in parallel with git worktree isolation and quality gates.
-+
-+%prep
-+%autosetup -n %{pypi_name}-%{version}
-+
-+%generate_buildrequires
-+# --generate-extras lets pyproject-rpm-macros discover optional deps from
-+# pyproject.toml so missing python3dist(...) Fedora packages don't block
-+# the build. Anything not available in Fedora is pulled from bundled wheels
-+# via %pyproject_wheel.
-+%pyproject_buildrequires -r --generate-extras
-+
-+%build
-+%pyproject_wheel
-+
-+%install
-+%pyproject_install
-+%pyproject_save_files %{pypi_name}
-+
-+%files -f %{pypi_name}.files
-+%license LICENSE
-+%doc README.md
-+%{_bindir}/bernstein
-```
-
-Then change `publish.yml` to upload the in-repo spec instead of using
-`buildpypi`:
-
-```diff
--          copr-cli buildpypi --packagename bernstein alexchernysh/bernstein --nowait
-+          copr-cli build --nowait alexchernysh/bernstein packaging/rpm/bernstein.spec
-```
-
-Expect 2–3 iterations: each rebuild reveals the next missing
-`python3dist(...)` that needs to either land in Fedora or get vendored via a
-`Source1:` wheel bundle.
-
-### Recommendation
-
-**Option A (kill).** Reasoning:
-
-- `pipx`/`uv tool install` covers Fedora natively and is the upstream
-  Python recommendation; COPR is duplicate surface.
-- Option B's "2–3 iterations" is optimistic — `crosshair-tool` and
-  `openai-agents` have transitive deps that Fedora has historically taken
-  6+ months to package. Realistic timeline is months of maintenance for
-  marginal install volume.
-- Killing COPR also frees the operator from rotating `COPR_LOGIN` /
-  `COPR_TOKEN` and from monitoring a chronically red build.
-
-Pick Option B only if a downstream consumer (gov / regulated org) has a
-hard requirement for a signed `.rpm` from a Fedora-trusted source. That
-requirement should be documented before reopening the channel.
+Operator details - secret name, project URL, local build commands, and the
+single-channel republish path - live in
+[`docs/operations/release.md`](../operations/release.md#rpm-channel-copr).
+The channel is in the `reconcile-release.yml` comparison set, so a version the
+RPM channel never received opens a `release-drift` issue.

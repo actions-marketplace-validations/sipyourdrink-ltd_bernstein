@@ -1,8 +1,8 @@
 """WEB-012: Dashboard task detail view with live log streaming via SSE.
 
-GET /dashboard/tasks/{task_id} — task detail JSON
-GET /dashboard/tasks/{task_id}/logs/stream — SSE log stream
-GET /dashboard/tasks/{task_id}/diff — task diff (unified + structured)
+GET /dashboard/tasks/{task_id} - task detail JSON
+GET /dashboard/tasks/{task_id}/logs/stream - SSE log stream
+GET /dashboard/tasks/{task_id}/diff - task diff (unified + structured)
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
+from bernstein.core.routes._sse import SSE_RESPONSES
 from bernstein.core.server import TaskResponse, TaskStore, read_log_tail, task_to_response
 
 if TYPE_CHECKING:
@@ -37,6 +38,14 @@ class TaskDetailResponse(BaseModel):
     log_size: int
     progress_entries: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
     agent_status: str = ""
+    #: Agent-posted, journal-anchored artifacts with per-version verification
+    #: state (#2553). A version whose stored blob fails its hash check is marked
+    #: unverified with no content -- the surface renders it tampered, not as
+    #: content.
+    artifacts: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
+    #: The chain-computed progress vector (#2553): a projection of journaled
+    #: work, never self-reported. ``None`` until the task has journaled work.
+    progress: dict[str, Any] | None = None
 
 
 def _get_store(request: Request) -> TaskStore:
@@ -77,6 +86,11 @@ def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
     task = _get_store(request).get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+    # Enforce tenant-scoped task access before exposing any task detail,
+    # including verified artifact content and the progress projection (#2553).
+    from bernstein.core.routes.task_crud import _require_task_access
+
+    _require_task_access(task, request)
 
     runtime_dir = _get_runtime_dir(request)
     log_tail = ""
@@ -100,13 +114,39 @@ def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
         for entry in task.progress_log
     ]
 
+    artifacts, progress = _artifacts_and_progress(request, task_id)
+
     return TaskDetailResponse(
         task=task_to_response(task),
         log_tail=log_tail,
         log_size=log_size,
         progress_entries=progress_entries,
         agent_status=agent_status,
+        artifacts=artifacts,
+        progress=progress,
     )
+
+
+def _get_sdd_dir(request: Request) -> Path | None:
+    return getattr(request.app.state, "sdd_dir", None)
+
+
+def _artifacts_and_progress(request: Request, task_id: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Project a task's agent-posted artifacts and chain-computed progress (#2553).
+
+    Both surfaces are read-only projections of on-disk chain records. A missing
+    ``.sdd`` directory or an empty journal yields ``([], None)``.
+    """
+    sdd_dir = _get_sdd_dir(request)
+    if sdd_dir is None:
+        return [], None
+    from bernstein.core.routes.task_artifacts import build_artifact_views, build_progress_response
+
+    artifacts = [view.model_dump() for view in build_artifact_views(sdd_dir, task_id)]
+    progress: dict[str, Any] | None = None
+    if artifacts or (sdd_dir / "runs").is_dir():
+        progress = build_progress_response(sdd_dir, task_id).model_dump()
+    return artifacts, progress
 
 
 def _try_read_session_log(
@@ -124,7 +164,11 @@ def _try_read_session_log(
     return read_fn(log_path, last_size)
 
 
-@router.get("/dashboard/tasks/{task_id}/logs/stream", responses={404: {"description": "Task not found"}})
+@router.get(
+    "/dashboard/tasks/{task_id}/logs/stream",
+    response_class=StreamingResponse,
+    responses={**SSE_RESPONSES, 404: {"description": "Task not found"}},
+)
 async def task_log_stream(request: Request, task_id: str) -> StreamingResponse:
     """Stream agent logs for a task via Server-Sent Events.
 
@@ -135,6 +179,12 @@ async def task_log_stream(request: Request, task_id: str) -> StreamingResponse:
     task = store.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+    # Same gate the task-detail route applies: the stream carries agent log
+    # content, so the task must sit in the caller's scope before it opens.
+    from bernstein.core.routes.task_crud import _require_task_access
+
+    _require_task_access(task, request)
 
     runtime_dir = _get_runtime_dir(request)
 
@@ -418,7 +468,7 @@ def _resolve_branch_for_task(workdir: Path, assigned_agent: str | None) -> str |
     rc, _, _ = _run_git(["rev-parse", "--verify", candidate], workdir, timeout=5)
     if rc == 0:
         return candidate
-    # Fall back to a refs/heads/agent/* glob match — the session prefix may
+    # Fall back to a refs/heads/agent/* glob match - the session prefix may
     # not be a complete branch name.
     rc, out, _ = _run_git(
         ["for-each-ref", "--format=%(refname:short)", "refs/heads/agent/"],
@@ -460,6 +510,14 @@ async def task_diff(request: Request, task_id: str) -> TaskDiffResponse:
     task = _get_store(request).get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+    # The same gate the task-detail and log-stream routes apply.  The task is
+    # what resolves the working branch below, and the response carries that
+    # branch's contents, so an ungated read hands over the source changes as
+    # well as the row.
+    from bernstein.core.routes.task_crud import _require_task_access
+
+    _require_task_access(task, request)
 
     workdir = _get_workdir(request)
     base_ref = await asyncio.to_thread(_resolve_base_ref, workdir)

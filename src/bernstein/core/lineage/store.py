@@ -3,7 +3,7 @@
 ``LineageStore`` owns the on-disk layout described in ADR-009 §4:
 
   ``.sdd/lineage/``
-    ├── ``log.jsonl``                 — source of truth, append-only
+    ├── ``log.jsonl``                 - source of truth, append-only
     ├── ``by-artefact/<aa>/<full>.jsonl``
     ├── ``tips/<full>.json``
     └── ``signatures/<aa>/<full>/<entry-hash>.jws``
@@ -35,12 +35,12 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 # ``fcntl`` is POSIX-only. On Windows the module doesn't exist; the lock
 # context manager below becomes a no-op (Windows CI runs are single-process
 # so cross-process serialisation isn't load-bearing for our tests). Real
-# multi-process safety on Windows would route through ``msvcrt.locking`` —
+# multi-process safety on Windows would route through ``msvcrt.locking`` -
 # wire that in when the orchestrator actually runs on Windows in anger.
 if sys.platform == "win32":
     fcntl = None  # type: ignore[assignment]
@@ -61,7 +61,7 @@ _SIGNATURES_DIR = "signatures"
 def _hash_path(artefact_path: str) -> tuple[str, str]:
     """Return (shard, full-hex) for ``sha256(artefact_path.utf-8)``.
 
-    The shard is the first two hex characters — keeps directory fanout bounded
+    The shard is the first two hex characters - keeps directory fanout bounded
     even when a repo has many artefacts.
     """
     h = hashlib.sha256(artefact_path.encode("utf-8")).hexdigest()
@@ -72,7 +72,7 @@ def _atomic_write_text(target: Path, payload: str) -> None:
     """Write ``payload`` to ``target`` via tempfile + ``os.replace``.
 
     The tempfile lives in the same directory so ``os.replace`` is a same-fs
-    rename — atomic on POSIX. ``fsync`` is called on the tempfile before
+    rename - atomic on POSIX. ``fsync`` is called on the tempfile before
     rename so the rename either reveals fully-written bytes or nothing at all.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -94,14 +94,14 @@ def _atomic_write_text(target: Path, payload: str) -> None:
 def _exclusive_lock(path: Path) -> Iterator[int]:
     """Yield an fd holding ``flock(LOCK_EX)`` on ``path``.
 
-    The lock fd is distinct from the file we ultimately write to — this keeps
+    The lock fd is distinct from the file we ultimately write to - this keeps
     the lock lifecycle clean even when the writer opens the log in append
     mode multiple times for fsync.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # ``os.open`` with ``O_CREAT`` to make the lockfile if absent. We lock the
     # log file itself (per the spec), so re-opening the same path here is fine.
-    # 0o600 — lineage log holds signed audit entries; operator-only readable.
+    # 0o600 - lineage log holds signed audit entries; operator-only readable.
     # CodeQL py/overly-permissive-file flags 0o644 as world-readable.
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -121,9 +121,9 @@ def _compute_tips_from_entries(entry_hashes_in_order: list[tuple[str, list[str]]
 
     Semantics (ADR-009 §4, §6):
 
-      * ``open`` — heads of the DAG: entries that no other entry has named as
+      * ``open`` - heads of the DAG: entries that no other entry has named as
         a parent.
-      * ``merged`` — entries that were *fork siblings* (i.e. became unresolved
+      * ``merged`` - entries that were *fork siblings* (i.e. became unresolved
         tips at some point) and are now subsumed by a multi-parent merge
         entry. A normal linear successor does not populate ``merged``.
 
@@ -149,7 +149,7 @@ def _compute_tips_from_entries(entry_hashes_in_order: list[tuple[str, list[str]]
                 seen_open.discard(p)
                 # Only record as ``merged`` when a multi-parent merge entry
                 # consumed it. A plain linear successor just demotes the
-                # parent silently — it was never a fork.
+                # parent silently - it was never a fork.
                 if is_merge and p not in seen_merged:
                     merged_set.append(p)
                     seen_merged.add(p)
@@ -160,7 +160,7 @@ def _compute_tips_from_entries(entry_hashes_in_order: list[tuple[str, list[str]]
 class LineageStore:
     """File-backed lineage store rooted at ``root`` (typically ``.sdd/lineage/``).
 
-    The store is safe to share across threads and across processes — all
+    The store is safe to share across threads and across processes - all
     state-modifying operations take ``flock(LOCK_EX)`` over ``log.jsonl``.
     """
 
@@ -263,7 +263,7 @@ class LineageStore:
         tip_path = self._tip_path(artefact_path)
         if tip_path.exists():
             with contextlib.suppress(json.JSONDecodeError):
-                return json.loads(tip_path.read_text(encoding="utf-8"))
+                return cast("dict[str, list[str]]", json.loads(tip_path.read_text(encoding="utf-8")))
         return self._recompute_tips_for(artefact_path)
 
     def reindex(self) -> None:
@@ -315,7 +315,7 @@ class LineageStore:
         """Walk the by-artefact projection and recompute the tip set.
 
         ``also_include`` lets ``append`` factor in the just-added entry before
-        its bytes have been re-read from disk — saves a redundant read.
+        its bytes have been re-read from disk - saves a redundant read.
         """
         proj = self._projection_path(artefact_path)
         sequence: list[tuple[str, list[str]]] = []
@@ -327,7 +327,7 @@ class LineageStore:
                 entry = _entry_from_dict(payload)
                 h = entry_hash(entry)
                 if also_include is not None and h == also_include[0]:
-                    # Already represented by the in-memory tuple — skip the dupe.
+                    # Already represented by the in-memory tuple - skip the dupe.
                     continue
                 sequence.append((h, list(entry.parent_hashes)))
         if also_include is not None:
@@ -335,22 +335,41 @@ class LineageStore:
         return _compute_tips_from_entries(sequence)
 
 
+def _optional_str_list(raw: object) -> list[str] | None:
+    """Coerce an optional JSON list field into ``list[str] | None``.
+
+    An absent field reads back as ``None``, which canonicalises to the exact
+    bytes that were read, so the entry hash round-trips for entries written
+    before the field existed.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError(f"expected a list, got {type(raw).__name__}")
+    return [str(item) for item in cast("list[object]", raw)]
+
+
 def _entry_from_dict(payload: dict[str, object]) -> LineageEntry:
     """Reconstruct a ``LineageEntry`` from its JSON dict form."""
     # All canonical-field names map 1:1 onto the dataclass kwargs. Cast through
     # ``asdict`` of a dataclass would be cyclic; we do it manually.
     return LineageEntry(
-        v=int(payload["v"]),  # type: ignore[arg-type]
+        v=int(cast(int, payload["v"])),
         artefact_path=str(payload["artefact_path"]),
         artefact_kind=str(payload["artefact_kind"]),
         content_hash=str(payload["content_hash"]),
-        parent_hashes=list(payload["parent_hashes"]),  # type: ignore[arg-type]
+        parent_hashes=list(cast("list[str]", payload["parent_hashes"])),
         agent_id=str(payload["agent_id"]),
         agent_card_kid=str(payload["agent_card_kid"]),
         tool_call_id=str(payload["tool_call_id"]),
         span_id=str(payload["span_id"]),
-        ts_ns=int(payload["ts_ns"]),  # type: ignore[arg-type]
+        ts_ns=int(cast(int, payload["ts_ns"])),
         operator_hmac=str(payload["operator_hmac"]),
+        # Additive (issue #2513): absent on pre-feature entries -> None, which
+        # canonicalises back to the exact bytes read, so entry_hash round-trips.
+        trust_class=(None if payload.get("trust_class") is None else str(payload["trust_class"])),
+        # Additive (issue #1797), same absent -> None round-trip rule.
+        attachment_digests=_optional_str_list(payload.get("attachment_digests")),
     )
 
 

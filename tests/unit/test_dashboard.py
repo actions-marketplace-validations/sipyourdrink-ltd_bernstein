@@ -21,6 +21,7 @@ from bernstein.cli.dashboard import (
     _summarize_agent_errors,
     _task_retry_count,
 )
+from bernstein.core.routes.route_table import iter_route_paths
 from bernstein.core.server import create_app
 
 if TYPE_CHECKING:
@@ -54,45 +55,21 @@ async def client(app) -> AsyncClient:  # type: ignore[no-untyped-def]
         yield c  # type: ignore[misc]
 
 
-# -- GET /dashboard ---------------------------------------------------------
+# -- GET /dashboard (legacy route removed in #4395) --------------------------
 
 
 @pytest.mark.anyio
-async def test_dashboard_returns_200(client: AsyncClient) -> None:
-    """GET /dashboard returns 200 with HTML content."""
+async def test_legacy_dashboard_route_is_removed(client: AsyncClient) -> None:
+    """GET /dashboard is removed in favor of /ui and returns 404."""
     resp = await client.get("/dashboard")
-    assert resp.status_code == 200
-    assert "text/html" in resp.headers["content-type"]
+    assert resp.status_code == 404
 
 
 @pytest.mark.anyio
-async def test_dashboard_contains_key_elements(client: AsyncClient) -> None:
-    """Dashboard HTML contains the task table, agent section, and stats bar."""
-    resp = await client.get("/dashboard")
-    html = resp.text
-    assert "Bernstein" in html
-    assert "task" in html.lower()
-    assert "agent" in html.lower()
-    assert "cost" in html.lower() or "stat" in html.lower()
-
-
-@pytest.mark.anyio
-async def test_dashboard_contains_script(client: AsyncClient) -> None:
-    """Dashboard HTML includes JavaScript for auto-refresh."""
-    resp = await client.get("/dashboard")
-    html = resp.text
-    assert "<script" in html.lower()
-
-
-@pytest.mark.anyio
-async def test_dashboard_contains_cost_analytics_sections(client: AsyncClient) -> None:
-    """Dashboard HTML exposes the cost analytics view required by WEB-016."""
-    resp = await client.get("/dashboard")
-    html = resp.text
-    assert "Cost by Model" in html
-    assert "Cost Over Time" in html
-    assert "By Agent" in html
-    assert "budget" in html.lower()
+async def test_legacy_dashboard_static_route_is_removed(client: AsyncClient) -> None:
+    """GET /dashboard/static/... is removed and returns 404."""
+    resp = await client.get("/dashboard/static/alpinejs-3.14.8.min.js")
+    assert resp.status_code == 404
 
 
 # -- GET /events (SSE) ------------------------------------------------------
@@ -109,7 +86,7 @@ async def test_events_returns_sse_content_type(app) -> None:  # type: ignore[no-
     from bernstein.core.server import SSEBus
 
     # Verify the /events route is registered
-    routes = [r.path for r in app.routes if hasattr(r, "path")]  # type: ignore[union-attr]
+    routes = [path for path, _route in iter_route_paths(app)]
     assert "/events" in routes
 
     # Verify the SSE bus works correctly
@@ -298,7 +275,7 @@ async def test_task_gate_report_endpoint_annotates_generated_at_and_status(
     assert isinstance(data.get("generated_at"), str)
     assert data["generated_at"].endswith("Z")
     assert isinstance(data.get("task_status"), str)
-    # New task hasn't been claimed — should report an open-ish lifecycle status.
+    # New task hasn't been claimed - should report an open-ish lifecycle status.
     assert data["task_status"] in {"open", "planned", "queued", "pending_approval"}
 
 

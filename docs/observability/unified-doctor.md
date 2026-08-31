@@ -1,19 +1,16 @@
 # Unified observability doctor
 
-`bernstein doctor observe` aggregates the four observability backends that
-Bernstein integrates with into a single operator-facing table: Sonar,
-GlitchTip, Dependency-Track, and GitHub Code Scanning.
+`bernstein doctor observe` aggregates the observability backends that
+Bernstein integrates with into a single operator-facing table: GitHub
+Code Scanning.
 
 ## TL;DR
 
 | Command | What it does |
 | --- | --- |
-| `bernstein doctor observe` | Run all four backends, render one Rich table |
+| `bernstein doctor observe` | Run all backends, render one Rich table |
 | `bernstein doctor observe --json` | Same data as JSON for jq / CI consumption |
 | `bernstein doctor observe --watch` | Refresh every 60s until Ctrl-C |
-| `bernstein doctor sonar` | Sonar-only deep dive (when wired) |
-| `bernstein doctor glitchtip` | GlitchTip-only deep dive (when wired) |
-| `bernstein doctor dt` | Dependency-Track-only deep dive |
 | `bernstein doctor code-scanning` | GitHub Code Scanning-only deep dive |
 
 Backends that are not configured soft-fail to `SKIPPED`, so a fresh
@@ -26,9 +23,6 @@ you have; missing ones soft-fail without error.
 
 | Backend | Required env-vars | Optional env-vars |
 | --- | --- | --- |
-| `sonar` | `SONAR_HOST_URL`, `SONAR_TOKEN` | `SONAR_PROJECT_KEY` |
-| `glitchtip` | `BERNSTEIN_GLITCHTIP_TOKEN` | `BERNSTEIN_GLITCHTIP_BASE_URL`, `BERNSTEIN_GLITCHTIP_ORG` |
-| `dt` | `DTRACK_URL`, `DTRACK_TOKEN`, `DTRACK_PROJECT` | - |
 | `code-scanning` | `GITHUB_TOKEN`, `GITHUB_REPOSITORY` | `GITHUB_API_URL` |
 
 The `GITHUB_TOKEN` used for `code-scanning` must carry
@@ -42,11 +36,9 @@ Every probe contributes rows to a single table:
 
 ```
 backend         metric             value     delta    threshold   status
-sonar           coverage_pct       87.5%     +0.4     80.0%       ok
-sonar           code_smells        42        +3       50          ok
-glitchtip       issues_24h         3         -2       0           warn
-dt              critical_vulns     0         0        0           ok
 code-scanning   open_alerts        1         new      0           warn
+code-scanning   critical_alerts    0         0        0           ok
+code-scanning   high_alerts        2         +1       0           warn
 ```
 
 The `delta` column is computed against a tiny snapshot cache at
@@ -59,16 +51,16 @@ the write (handy in CI). Delete the file to reset the baseline.
 
 ```json
 {
-  "summary": {"ok": 1, "warn": 1, "fail": 0, "skipped": 2, "error": 0},
+  "summary": {"ok": 1, "warn": 0, "fail": 0, "skipped": 0, "error": 0},
   "backends": [
     {
-      "backend": "sonar",
+      "backend": "code-scanning",
       "status": "ok",
-      "detail": "project bernstein",
+      "detail": "0 open alert(s)",
       "error": null,
       "metrics": [
-        {"name": "coverage_pct", "value": "87.5%", "numeric": 87.5,
-         "threshold": "80.0%", "threshold_status": "ok", "delta": "+0.4"}
+        {"name": "open_alerts", "value": "0", "numeric": 0.0,
+         "threshold": "0", "threshold_status": "ok", "delta": "0"}
       ]
     }
   ]
@@ -83,15 +75,23 @@ is warn/fail/error.
 Two workflows ship alongside the command:
 
 - `.github/workflows/pr-observability-summary.yml`: posts a sticky
-  comment on every pull request with the observe table and any
-  branch-tagged GlitchTip issues. Triggered on
+  comment on every pull request with the observe table. Triggered on
   `pull_request: [opened, synchronize, reopened]` and via
   `workflow_dispatch` for backfills.
-- `.github/workflows/docs-observability-snapshot.yml`: cron job at
-  06:00 UTC that writes today's snapshot to
-  `docs/observability/snapshots/<YYYY-MM-DD>.json` and re-renders
-  `docs/observability/trends.md` with the last 30 days as unicode
-  sparklines.
+- `.github/workflows/docs-observability-snapshot.yml`: `workflow_dispatch`
+  only (manual, see #2856) - writes the dispatch-day snapshot to
+  `docs/_internal/observability/snapshots/<YYYY-MM-DD>.json` and
+  re-renders `docs/observability/trends.md` with the last 30 captured
+  snapshots as unicode sparklines, including a staleness line for the
+  newest one. After the render it runs `scripts/observability/gate.py`,
+  which diffs the newest snapshot against the previous one - stating
+  the elapsed gap between them, since dispatches are sporadic - and
+  reports regressions by reading each row's `threshold_status` and
+  computing the numeric delta from the two files. It flags a status
+  flip for the worse (`ok -> warn`, `* -> fail`), a new or increased
+  security finding, and a backend that lost its credentials.
+  Regressions are recorded in the run summary; the snapshot pull
+  request still opens regardless.
 
 ## Local watch mode
 
@@ -99,9 +99,8 @@ Two workflows ship alongside the command:
 Rich table in place. Useful while triaging an incident:
 
 ```sh
-SONAR_HOST_URL=https://sonar.example.com \
-SONAR_TOKEN=$(pass sonar/token) \
-BERNSTEIN_GLITCHTIP_TOKEN=$(pass glitchtip/read) \
+GITHUB_TOKEN=$(pass github/token) \
+GITHUB_REPOSITORY=<owner>/<repo> \
 bernstein doctor observe --watch --interval 30
 ```
 
@@ -115,4 +114,4 @@ Ctrl-C stops the loop and exits 0.
 | `status: error` with HTTP 401 | token expired or missing scope | regenerate; for code-scanning ensure `security_events: read` |
 | `delta: new` on every row | first run, or `.sdd/observability/` deleted | expected; the next run computes signed deltas |
 | Sticky PR comment not posted | `pull-requests: write` permission missing | the workflow already requests it; verify the repository allows write actions in PRs |
-| Trends document is empty | no daily snapshots have been captured yet | wait for the next 06:00 UTC cron, or trigger it manually |
+| Trends document is empty | no snapshots have been captured yet | trigger the snapshot workflow manually |

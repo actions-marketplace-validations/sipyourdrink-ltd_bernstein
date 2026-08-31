@@ -1,15 +1,25 @@
-"""Automated vulnerability disclosure program with bug bounty integration.
+"""Coordinated vulnerability disclosure per the project's SECURITY.md policy.
 
 Provides structured vulnerability report handling, triage workflows,
 coordinated disclosure timelines, and RFC 9116 security.txt generation.
-Integrates with bug bounty platforms (HackerOne, Bugcrowd) for reward
-management and researcher communication.
+
+Recognition is non-monetary and uniform: every valid, first-reported issue
+gets the same credit - name/handle/link in the release notes of the fixing
+release, plus reporter credit on the published GitHub Security Advisory
+(which may carry a CVE). There is no severity-based recognition ladder and
+no bug bounty.
+
+There is no fix deadline. Severity sets the order reports are worked on, not
+a promised delivery date. The only date this module commits to is the first
+substantive response, due within ``response_sla_hours`` of submission (up to
+90 days per SECURITY.md), and the public-disclosure date, which the reporter
+may exercise unilaterally regardless of fix status.
 
 Usage::
 
     from bernstein.core.security.vuln_disclosure import (
         VulnReport,
-        BountyScope,
+        DisclosureScope,
         VulnerabilityDisclosureManager,
         generate_security_txt,
     )
@@ -62,6 +72,19 @@ class ReportStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class RecognitionTier(StrEnum):
+    """Non-monetary recognition granted for a disclosure.
+
+    Recognition does not vary by severity: every valid, first-reported issue
+    receives the same credit (release notes plus GitHub Security Advisory
+    credit). A report that is rejected, or that is not the first report of
+    a duplicate, receives none.
+    """
+
+    NONE = "none"
+    CREDITED = "credited"
+
+
 @dataclass(frozen=True)
 class VulnReport:
     """A vulnerability report submitted by a security researcher.
@@ -90,48 +113,42 @@ class VulnReport:
 
 
 @dataclass(frozen=True)
-class BountyScope:
-    """Scope definition for the bug bounty program.
+class DisclosureScope:
+    """Scope definition for the coordinated disclosure program.
 
     Attributes:
         in_scope: Components or endpoints that are in scope.
         out_of_scope: Components explicitly out of scope.
-        rewards: Mapping from severity level to USD reward amount.
-        response_sla_hours: Maximum hours before initial triage response.
-        max_reward: Absolute cap on any single bounty payout.
+        response_sla_hours: Maximum hours before the first substantive
+            response. SECURITY.md states this as "up to 90 days"
+            (``90 * 24 = 2160`` hours); this is a maintained-alone project's
+            outer bound, not a target most reports will take that long.
     """
 
-    in_scope: tuple[str, ...]
+    in_scope: tuple[str, ...] = ()
     out_of_scope: tuple[str, ...] = ()
-    rewards: dict[str, float] = field(
-        default_factory=lambda: {
-            "low": 100.0,
-            "medium": 500.0,
-            "high": 1500.0,
-            "critical": 5000.0,
-        }
-    )
-    response_sla_hours: int = 48
-    max_reward: float = 10000.0
+    response_sla_hours: int = 2160
 
 
 @dataclass(frozen=True)
 class DisclosureTimeline:
     """Coordinated disclosure timeline milestones.
 
+    There is no fix-deadline milestone: SECURITY.md promises a first
+    response, not a fix date.
+
     Attributes:
         report_id: The associated vulnerability report.
-        triage_date: When the report was initially triaged.
         vendor_notified: When the vendor was first notified.
-        fix_deadline: Expected date for a fix to be available.
-        public_disclosure: Date when the vulnerability will be publicly disclosed.
+        first_response_due: Deadline for the first substantive response.
+        public_disclosure: Date the reporter may disclose unilaterally,
+            with or without a shipped fix.
         milestones: All milestone dates with labels.
     """
 
     report_id: str
-    triage_date: datetime
     vendor_notified: datetime
-    fix_deadline: datetime
+    first_response_due: datetime
     public_disclosure: datetime
     milestones: dict[str, datetime] = field(default_factory=dict)
 
@@ -157,7 +174,7 @@ def generate_security_txt(
 
     Args:
         contact: Contact URI (e.g. ``mailto:security@example.com`` or
-                 ``https://hackerone.com/example``).
+                 ``https://github.com/example/repo/security/advisories``).
         policy_url: URL to the full security/vulnerability policy.
         expires: Date when this file expires (ISO 8601). Defaults to 1 year.
         encryption: URL pointing to a PGP public key for encrypted reports.
@@ -207,14 +224,14 @@ class VulnerabilityDisclosureManager:
     """Manages the full lifecycle of vulnerability disclosure.
 
     Handles report submission, triage, fix tracking, and coordinated
-    disclosure timelines. Provides reward calculation based on bounty scope.
+    disclosure timelines. Recognition is a single uniform credit path -
+    there is no severity-based tier to classify into.
 
     Usage::
 
         mgr = VulnerabilityDisclosureManager(
-            scope=BountyScope(
+            scope=DisclosureScope(
                 in_scope=("/api/v1/*", "/api/v2/*"),
-                rewards={"low": 100, "medium": 500, "high": 2000, "critical": 10000},
             ),
         )
         report_id = mgr.submit_report(report)
@@ -223,21 +240,17 @@ class VulnerabilityDisclosureManager:
 
     def __init__(
         self,
-        scope: BountyScope | None = None,
+        scope: DisclosureScope | None = None,
         *,
-        triage_sla_hours: int = 48,
-        fix_deadline_days: int = 90,
-        disclosure_delay_days: int = 30,
+        disclosure_days: int = 90,
     ) -> None:
-        self._scope = scope or BountyScope()
+        self._scope = scope or DisclosureScope()
         self._reports: dict[str, VulnReport] = {}
-        self._triage_sla_hours = triage_sla_hours
-        self._fix_deadline_days = fix_deadline_days
-        self._disclosure_delay_days = disclosure_delay_days
+        self._disclosure_days = disclosure_days
 
     @property
-    def scope(self) -> BountyScope:
-        """Return the current bounty scope configuration."""
+    def scope(self) -> DisclosureScope:
+        """Return the current disclosure scope configuration."""
         return self._scope
 
     @property
@@ -394,12 +407,15 @@ class VulnerabilityDisclosureManager:
     def generate_disclosure_timeline(self, report_id: str) -> DisclosureTimeline:
         """Generate a coordinated disclosure timeline for a report.
 
-        Computes milestones based on the SLA and deadline configuration:
+        Computes milestones directly from the submission date. There is no
+        fix-deadline milestone: SECURITY.md promises a first response, not a
+        fix date.
 
-        1. **Triage** — within ``triage_sla_hours`` of submission.
-        2. **Vendor notified** — at submission time.
-        3. **Fix deadline** — ``fix_deadline_days`` after submission.
-        4. **Public disclosure** — ``disclosure_delay_days`` after fix deadline.
+        1. **Vendor notified** - at submission time.
+        2. **First response due** - within ``response_sla_hours`` of
+           submission.
+        3. **Public disclosure** - ``disclosure_days`` after submission,
+           available to the reporter regardless of fix status.
 
         Args:
             report_id: Tracking ID of the report.
@@ -415,40 +431,38 @@ class VulnerabilityDisclosureManager:
             raise KeyError(f"Report {report_id!r} not found")
 
         submitted = report.submitted_at
-        triage_date = submitted + timedelta(hours=self._triage_sla_hours)
-        fix_deadline = submitted + timedelta(days=self._fix_deadline_days)
-        public_disclosure = fix_deadline + timedelta(days=self._disclosure_delay_days)
+        first_response_due = submitted + timedelta(hours=self._scope.response_sla_hours)
+        public_disclosure = submitted + timedelta(days=self._disclosure_days)
 
         milestones = {
             "submitted": submitted,
-            "triage": triage_date,
             "vendor_notified": submitted,
-            "fix_deadline": fix_deadline,
+            "first_response_due": first_response_due,
             "public_disclosure": public_disclosure,
         }
 
         return DisclosureTimeline(
             report_id=report_id,
-            triage_date=triage_date,
             vendor_notified=submitted,
-            fix_deadline=fix_deadline,
+            first_response_due=first_response_due,
             public_disclosure=public_disclosure,
             milestones=milestones,
         )
 
-    # -- Reward calculation ---------------------------------------------------
+    # -- Recognition classification -------------------------------------------
 
-    def calculate_reward(self, report_id: str) -> float:
-        """Calculate the bounty reward for a triaged report.
+    def classify_recognition(self, report_id: str) -> str:
+        """Classify a report into its (uniform) recognition state.
 
-        Looks up the severity in the bounty scope's reward table.
-        Returns 0.0 if the severity is not in the table.
+        Recognition does not depend on severity: every report that has not
+        been rejected is credited the same way (release notes plus GitHub
+        Security Advisory credit). A rejected report gets none.
 
         Args:
             report_id: Tracking ID of the report.
 
         Returns:
-            The calculated reward amount in USD.
+            The recognition tier value (see :class:`RecognitionTier`).
 
         Raises:
             KeyError: If the report does not exist.
@@ -457,20 +471,25 @@ class VulnerabilityDisclosureManager:
         if report is None:
             raise KeyError(f"Report {report_id!r} not found")
 
-        reward = self._scope.rewards.get(report.severity, 0.0)
-        return min(reward, self._scope.max_reward)
+        if report.status == ReportStatus.REJECTED.value:
+            return RecognitionTier.NONE.value
+        return RecognitionTier.CREDITED.value
 
     # -- SLA compliance -------------------------------------------------------
 
     def check_sla_compliance(self, report_id: str) -> dict[str, bool]:
-        """Check whether SLA deadlines are met for a report.
+        """Check whether the first-response SLA has been met.
+
+        There is no fix deadline to check against - only the first
+        substantive response is a commitment SECURITY.md makes.
 
         Args:
             report_id: Tracking ID of the report.
 
         Returns:
-            Dictionary with keys ``triage_within_sla``, ``fix_within_sla``,
-            and ``disclosure_within_sla``, each a boolean.
+            Dictionary with key ``response_within_sla``: ``True`` if the
+            report has moved past ``new`` (i.e. a response has occurred) or
+            the response SLA window has not yet elapsed.
 
         Raises:
             KeyError: If the report does not exist.
@@ -480,15 +499,9 @@ class VulnerabilityDisclosureManager:
             raise KeyError(f"Report {report_id!r} not found")
 
         now = datetime.now(UTC)
-        fix_deadline = report.submitted_at + timedelta(days=self._fix_deadline_days)
+        response_deadline = report.submitted_at + timedelta(hours=self._scope.response_sla_hours)
+        responded = report.status != ReportStatus.NEW.value
 
         return {
-            "triage_within_sla": True,
-            "fix_within_sla": report.status
-            in (
-                ReportStatus.RESOLVED.value,
-                ReportStatus.DISCLOSED.value,
-            )
-            or now <= fix_deadline,
-            "disclosure_within_sla": True,  # disclosure is future-dated
+            "response_within_sla": responded or now <= response_deadline,
         }

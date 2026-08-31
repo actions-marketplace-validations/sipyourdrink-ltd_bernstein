@@ -29,9 +29,8 @@ operator with a verifiable email address must register the project.
    answers are mechanical.
 4. Copy the assigned project ID (a numeric string) from the project
    page URL.
-5. Replace `<PROJECT_ID>` in `README.md` (look for the
-   `TODO(operator): register at bestpractices.dev` marker).
-6. Tick the CII checkbox in #1482 and link the README change.
+5. Add the bestpractices.dev badge with the assigned project ID to
+   `README.md` (alongside the existing badges at the top of the file).
 
 ### Self-assessment cross-walk
 
@@ -44,22 +43,21 @@ existing artefacts in this repository.
 | Project website and discussion channel | `https://bernstein.run`, GitHub Issues, GitHub Discussions. |
 | Documented contribution process | `CONTRIBUTING.md`. |
 | OSI-approved license, license file present | `LICENSE` (Apache-2.0). |
-| Documented build instructions | `README.md` "install" section; `docs/getting-started/install.md`. |
-| Cryptographically signed releases | `release-please` + signed PyPI uploads; `SECURITY.md`. |
+| Documented build instructions | `README.md` "install in 30 seconds" section; `docs/getting-started/install.md`. |
+| Cryptographically signed releases | Tag-based `.github/workflows/auto-release.yml` hands off to `publish.yml` (Sigstore build-provenance attestation) + signed PyPI uploads; `SECURITY.md`. |
 | Vulnerability reporting process | `SECURITY.md`. |
 | Documented secure development knowledge for at least one committer | `docs/operations/security-and-identity.md`; CONTRIBUTING checklist. |
 | Public bug tracker | GitHub Issues. |
-| Test suite invocable with a documented command | `pytest`; `README.md` "Build & test" block. |
-| Static analysis (SAST) in CI | CodeQL (`.github/workflows/codeql.yml`), Bandit (`.github/workflows/bandit-scan.yml`), Semgrep (`.github/workflows/semgrep.yml`). |
-| Dynamic analysis / fuzzing | Hypothesis property tests in `tests/`; ClusterFuzzLite at `.clusterfuzzlite/` + `.github/workflows/cifuzz-pr.yml`. |
+| Test suite invocable with a documented command | `pytest`; `AGENTS.md` "Build & test" block. |
+| Static analysis (SAST) in CI | CodeQL (`.github/workflows/codeql.yml`); Bandit and Semgrep jobs in `.github/workflows/ci.yml`; `.github/workflows/static-analysis-extended.yml`. |
+| Dynamic analysis / fuzzing | Hypothesis property tests in `tests/`; ClusterFuzzLite at `.clusterfuzzlite/` + `.github/workflows/cifuzz-weekly.yml`. |
 | Dependency vulnerability scanning | Dependabot, OSV via Scorecard, `.github/workflows/dependency-review.yml`. |
 | Cryptographic primitives are well-known | HMAC-SHA256, Ed25519/EdDSA, JWS detached. See module map in `CLAUDE.md` under `src/bernstein/core/security/`. |
 
 ### Re-evaluation cadence
 
-Re-run Scorecard after replacing `<PROJECT_ID>` to confirm the
-CIIBestPracticesID signal flips from 0 to a positive score. Update
-#1482 with the new score.
+Re-run Scorecard after the badge lands in `README.md` to confirm the
+CIIBestPracticesID signal flips from 0 to a positive score.
 
 ## Fuzzing harness (OSSF-recognized)
 
@@ -73,11 +71,12 @@ ClusterFuzzLite gives OSSF Scorecard a signal it recognizes. Files:
 - `.clusterfuzzlite/requirements.txt` -- hash-pinned PyYAML for the
   build step.
 - `.clusterfuzzlite/fuzz_seed_parser.py` -- minimal entry point against
-  `yaml.safe_load`, the parser primitive `bernstein.core.config.seed_parser`
-  sits on top of (the OSS-Fuzz base-builder-python image ships Python
-  3.11; bernstein requires 3.12+, so the harness targets the underlying
-  YAML primitive instead of importing the full package).
-- `.github/workflows/cifuzz-pr.yml` -- per-PR run via
+  `yaml.safe_load`, the parser primitive that
+  `bernstein.core.config.seed_parser` sits on top of. The OSS-Fuzz
+  base-builder-python image ships Python 3.11 and bernstein requires
+  3.12+, so the harness targets the underlying YAML primitive instead of
+  importing the full package.
+- `.github/workflows/cifuzz-weekly.yml` -- weekly batch run via
   `google/clusterfuzzlite/actions/run_fuzzers` (SHA-pinned). Job-level
   token permissions are kept read-only (Scorecard `TokenPermissionsID`);
   SARIF upload is intentionally disabled so the elevated
@@ -91,9 +90,7 @@ exists so Scorecard's `Fuzzing` check finds something it understands.
 ## MaintainedID 90-day self-resolve
 
 Scorecard's `MaintainedID` returns 0 for any repo younger than 90 days.
-This repo was migrated to `sipyourdrink-ltd/bernstein` recently, so
-the signal will self-resolve once the repository crosses the threshold.
-
-Automated re-check: `.github/workflows/scorecard-90d-check.yml` runs
-weekly. Once the repo passes 90 days, it runs Scorecard and posts the
-result to issue #1482 so an operator can close the checkpoint.
+The repository has now passed the 90-day threshold, so the signal has
+self-resolved. Issue #1482 tracked the checkpoint and is closed; the
+one-shot re-check workflow that watched for the threshold has been
+removed now that it has served its purpose.

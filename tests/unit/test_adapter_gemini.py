@@ -30,6 +30,13 @@ from bernstein.adapters.gemini import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+# Every spawn() call below arms a watchdog Timer thread by default. Under
+# the isolated test runner's high process concurrency the OS thread ceiling
+# can be hit, surfacing as "RuntimeError: can't start new thread" on an
+# otherwise-trivial test. Disable the watchdog suite-wide, matching the
+# other adapter test modules (rovo, auggie, clm, ralphex).
+pytestmark = pytest.mark.usefixtures("no_watchdog_threads")  # suite-wide guard, see module docstring
+
 # Parametrisation surface: both supported binary names. Every spawn-side
 # test runs against both so a regression in either path is caught.
 ALL_BINARIES = (ANTIGRAVITY_BINARY, LEGACY_GEMINI_BINARY)
@@ -418,13 +425,25 @@ class TestBinaryDiscoveryCascade:
         with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
             assert resolve_google_cli_binary(which=only_legacy) == LEGACY_GEMINI_BINARY
 
-    def test_neither_raises_binary_not_installed(self) -> None:
-        """When neither resolves the operator gets a typed error."""
+    def test_neither_raises_binary_not_installed_in_strict_mode(self) -> None:
+        """Strict mode (used by ``adapters check``) raises a typed error
+        when neither cascade entry resolves. The spawn path uses the
+        non-strict default and lets ``subprocess.Popen`` raise.
+        """
         with (
             patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
             pytest.raises(BinaryNotInstalledError, match="antigravity"),
         ):
-            resolve_google_cli_binary(which=lambda _name: None)
+            resolve_google_cli_binary(which=lambda _name: None, strict=True)
+
+    def test_neither_returns_default_in_non_strict_mode(self) -> None:
+        """Non-strict mode returns the first cascade entry as fallback
+        so ``subprocess.Popen`` raises the natural ``FileNotFoundError``
+        instead of the resolver raising eagerly. Matches the codex /
+        aider adapter posture.
+        """
+        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+            assert resolve_google_cli_binary(which=lambda _name: None) == ANTIGRAVITY_BINARY
 
     def test_env_override_wins_over_cascade(self) -> None:
         """``BERNSTEIN_GEMINI_BINARY`` short-circuits the cascade."""
@@ -436,12 +455,12 @@ class TestBinaryDiscoveryCascade:
             assert resolve_google_cli_binary(which=both_present) == "vendor-cli"
 
     def test_env_override_missing_binary_raises(self) -> None:
-        """An override that does not resolve is a hard error."""
+        """An override that does not resolve is a hard error regardless of strict."""
         with (
             patch.dict("os.environ", {"PATH": "/usr/bin", BINARY_ENV_VAR: "vendor-cli"}, clear=True),
             pytest.raises(BinaryNotInstalledError, match=BINARY_ENV_VAR),
         ):
-            resolve_google_cli_binary(which=lambda _name: None)
+            resolve_google_cli_binary(which=lambda _name: None, strict=False)
 
     def test_empty_env_override_falls_through_to_cascade(self) -> None:
         """A blank override behaves as if unset (no surprise pinning)."""
@@ -474,13 +493,13 @@ class TestGeminiIsAlive:
 class TestGeminiKill:
     def test_calls_killpg(self) -> None:
         adapter = GeminiAdapter()
-        with patch("bernstein.adapters.base.kill_process_group_graceful") as mock_killpg:
+        with patch("bernstein.adapters.base.reap_process_group") as mock_killpg:
             adapter.kill(555)
         mock_killpg.assert_called_once_with(555)
 
     def test_does_not_raise_on_oserror(self) -> None:
         adapter = GeminiAdapter()
-        with patch("bernstein.adapters.base.kill_process_group_graceful", return_value=False):
+        with patch("bernstein.adapters.base.reap_process_group", return_value=False):
             adapter.kill(556)  # must not raise
 
 

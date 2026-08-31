@@ -13,6 +13,8 @@ from bernstein.adapters.plugin_sdk import (
     AdapterPluginInfo,
     PluginAdapter,
     PluginRegistry,
+    SamplingParamsRefusal,
+    ensure_sampling_params_supported,
     validate_plugin,
 )
 
@@ -23,7 +25,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Helpers — concrete PluginAdapter for testing
+# Helpers - concrete PluginAdapter for testing
 # ---------------------------------------------------------------------------
 
 
@@ -149,6 +151,14 @@ class TestAdapterCapability:
             "RATE_LIMIT_DETECTION",
             "STRUCTURED_OUTPUT",
             "BATCH_MODE",
+            "SUPPORTS_SAMPLING_PARAMS",
+            # PR3: narrow per-sampling-field capabilities so adapters that
+            # only wire a subset of SAMPLING_PARAM_KEYS via real CLI flags
+            # (ollama/qwen/mistral) don't have to fake the coarse flag.
+            "SUPPORTS_TEMPERATURE",
+            "SUPPORTS_TOP_P",
+            "SUPPORTS_TOP_K",
+            "SUPPORTS_MAX_TOKENS",
         }
         assert set(AdapterCapability.__members__.keys()) == expected
 
@@ -163,6 +173,7 @@ class TestAdapterCapability:
         assert AdapterCapability.RATE_LIMIT_DETECTION.value == "rate_limit_detection"
         assert AdapterCapability.STRUCTURED_OUTPUT.value == "structured_output"
         assert AdapterCapability.BATCH_MODE.value == "batch_mode"
+        assert AdapterCapability.SUPPORTS_SAMPLING_PARAMS.value == "supports_sampling_params"
 
 
 # ---------------------------------------------------------------------------
@@ -383,3 +394,237 @@ class TestPluginRegistry:
 
         assert count == 1
         assert registry.get("prebuilt") is instance
+
+
+# ---------------------------------------------------------------------------
+# Sampling params capability gate
+# ---------------------------------------------------------------------------
+
+
+class _SamplingStubAdapter(_StubPluginAdapter):
+    """Stub adapter that declares SUPPORTS_SAMPLING_PARAMS."""
+
+    def plugin_info(self) -> AdapterPluginInfo:
+        return AdapterPluginInfo(
+            name="sampling-stub",
+            version="1.0.0",
+            capabilities=(AdapterCapability.SUPPORTS_SAMPLING_PARAMS,),
+        )
+
+
+class TestEnsureSamplingParamsSupported:
+    """Tests for the spawn-time sampling/endpoint capability gate."""
+
+    def test_none_config_passes(self) -> None:
+        ensure_sampling_params_supported(_StubPluginAdapter(), None)
+
+    def test_config_without_sampling_keys_passes(self) -> None:
+        ensure_sampling_params_supported(
+            _StubPluginAdapter(),
+            {"sandbox_provider": "e2b", "tools": []},
+        )
+
+    def test_raises_for_non_supporting_adapter(self) -> None:
+        with pytest.raises(SamplingParamsRefusal, match="temperature"):
+            ensure_sampling_params_supported(_StubPluginAdapter(), {"temperature": 0.2})
+
+    def test_raises_for_max_tokens_without_capability(self) -> None:
+        with pytest.raises(SamplingParamsRefusal) as excinfo:
+            ensure_sampling_params_supported(_StubPluginAdapter(), {"max_tokens": 4096})
+        assert excinfo.value.requested_keys == ("max_tokens",)
+
+    def test_error_names_adapter_and_keys(self) -> None:
+        with pytest.raises(SamplingParamsRefusal) as excinfo:
+            ensure_sampling_params_supported(
+                _StubPluginAdapter(),
+                {"top_k": 40, "base_url": "http://localhost:8000/v1"},
+            )
+        assert excinfo.value.adapter_name == "stub"
+        assert excinfo.value.requested_keys == ("top_k", "base_url")
+
+    def test_passes_for_supporting_adapter(self) -> None:
+        ensure_sampling_params_supported(
+            _SamplingStubAdapter(),
+            {"temperature": 0.2, "top_p": 0.9, "api_key_env": "MY_PROXY_KEY"},
+        )
+
+    def test_caching_wrapper_forwards_supporting_capability(self, tmp_path: Path) -> None:
+        """A CachingAdapter must not hide the inner adapter's capability."""
+        from bernstein.adapters.caching_adapter import CachingAdapter
+
+        wrapped = CachingAdapter(_SamplingStubAdapter(), tmp_path)
+        ensure_sampling_params_supported(
+            wrapped,
+            {"base_url": "http://localhost:8000/v1", "api_key_env": "MY_PROXY_KEY"},
+        )
+
+    def test_caching_wrapper_still_refuses_non_supporting_inner(self, tmp_path: Path) -> None:
+        """Wrapping must not grant a capability the inner adapter lacks."""
+        from bernstein.adapters.caching_adapter import CachingAdapter
+
+        wrapped = CachingAdapter(_StubPluginAdapter(), tmp_path)
+        with pytest.raises(SamplingParamsRefusal, match="base_url"):
+            ensure_sampling_params_supported(
+                wrapped,
+                {"base_url": "http://localhost:8000/v1"},
+            )
+
+
+class _TemperatureOnlyStubAdapter(_StubPluginAdapter):
+    """Stub adapter that only declares the narrow SUPPORTS_TEMPERATURE
+    capability - mirrors the ollama/mistral shape shipped in PR3."""
+
+    def plugin_info(self) -> AdapterPluginInfo:
+        return AdapterPluginInfo(
+            name="temperature-only-stub",
+            version="1.0.0",
+            capabilities=(AdapterCapability.SUPPORTS_TEMPERATURE,),
+        )
+
+
+class _TemperatureAndTopPStubAdapter(_StubPluginAdapter):
+    """Stub adapter declaring SUPPORTS_TEMPERATURE + SUPPORTS_TOP_P - mirrors
+    the qwen shape shipped in PR3."""
+
+    def plugin_info(self) -> AdapterPluginInfo:
+        return AdapterPluginInfo(
+            name="temp-and-top-p-stub",
+            version="1.0.0",
+            capabilities=(AdapterCapability.SUPPORTS_TEMPERATURE, AdapterCapability.SUPPORTS_TOP_P),
+        )
+
+
+class TestCoarseSamplingCapabilityAssertion:
+    """Assert that adapters declaring the coarse SUPPORTS_SAMPLING_PARAMS
+    capability also declare every narrow capability in _SAMPLING_KEY_CAPABILITY.
+
+    ``ensure_sampling_params_supported`` short-circuits on the coarse flag
+    without checking narrow capabilities, so a coarse declarer that omits a
+    narrow cap silently promises more than it delivers.  This test guards
+    against that drift as SAMPLING_PARAM_KEYS grows.
+    """
+
+    def test_sampling_key_capability_values_are_valid_enum_members(self) -> None:
+        """Every value in _SAMPLING_KEY_CAPABILITY must be a real AdapterCapability."""
+        from bernstein.adapters.plugin_sdk import _SAMPLING_KEY_CAPABILITY
+
+        for key, cap in _SAMPLING_KEY_CAPABILITY.items():
+            assert isinstance(cap, AdapterCapability), (
+                f"_SAMPLING_KEY_CAPABILITY[{key!r}] = {cap!r} is not an AdapterCapability member"
+            )
+
+    def test_openai_agents_has_all_narrow_caps(self) -> None:
+        """openai_agents is the sole real coarse declarer; verify it owns every narrow cap."""
+        from bernstein.adapters.openai_agents import OpenAIAgentsAdapter
+        from bernstein.adapters.plugin_sdk import _SAMPLING_KEY_CAPABILITY
+
+        adapter = OpenAIAgentsAdapter()
+        caps = adapter.plugin_info().capabilities
+        missing = [cap for cap in _SAMPLING_KEY_CAPABILITY.values() if cap not in caps]
+        assert not missing, (
+            f"Adapter {adapter.name()!r} declares coarse SUPPORTS_SAMPLING_PARAMS "
+            f"but is missing narrow capabilities: {missing}"
+        )
+
+    def test_stub_coarse_declarer_without_narrow_caps_fails(self) -> None:
+        """A _StubPluginAdapter that declares coarse but not narrow caps must fail the assertion."""
+
+        class _CoarseOnlyStubAdapter(_StubPluginAdapter):
+            """Stub that claims the coarse capability but skips the narrow ones."""
+
+            def plugin_info(self) -> AdapterPluginInfo:
+                return AdapterPluginInfo(
+                    name="coarse-only-stub",
+                    version="1.0.0",
+                    capabilities=(AdapterCapability.SUPPORTS_SAMPLING_PARAMS,),
+                )
+
+        from bernstein.adapters.plugin_sdk import _SAMPLING_KEY_CAPABILITY
+
+        adapter = _CoarseOnlyStubAdapter()
+        caps = adapter.plugin_info().capabilities
+        missing = [cap for cap in _SAMPLING_KEY_CAPABILITY.values() if cap not in caps]
+        assert missing, (
+            "Expected assertion to detect missing narrow capabilities; assertion passed when it should have failed"
+        )
+
+    def test_narrow_declarer_with_all_narrow_caps_passes(self) -> None:
+        """An adapter that declares every narrow cap (but not the coarse cap) also passes."""
+
+        from bernstein.adapters.plugin_sdk import _SAMPLING_KEY_CAPABILITY
+
+        # Derived from the map rather than listed by hand: a new sampling key
+        # adds a capability here the moment it is registered, so this fixture
+        # cannot fall behind the set it claims to cover.
+        _all_narrow = tuple(_SAMPLING_KEY_CAPABILITY.values())
+
+        class _AllNarrowStubAdapter(_StubPluginAdapter):
+            def plugin_info(self) -> AdapterPluginInfo:
+                return AdapterPluginInfo(
+                    name="all-narrow-stub",
+                    version="1.0.0",
+                    capabilities=_all_narrow,
+                )
+
+        adapter = _AllNarrowStubAdapter()
+        caps = adapter.plugin_info().capabilities
+        missing = [cap for cap in _SAMPLING_KEY_CAPABILITY.values() if cap not in caps]
+        assert not missing, (
+            f"Adapter {adapter.name()!r} declares all narrow capabilities "
+            f"but assertion still reports missing: {missing}"
+        )
+
+
+class TestEnsureSamplingParamsSupportedNarrowCapabilities:
+    """PR3: an adapter that declares only a narrow per-field capability
+    (not the coarse SUPPORTS_SAMPLING_PARAMS) should be allowed to honour
+    exactly the keys it declares, and refused only for the rest."""
+
+    def test_narrow_capability_passes_for_covered_key(self) -> None:
+        ensure_sampling_params_supported(
+            _TemperatureOnlyStubAdapter(),
+            {"temperature": 0.2},
+        )
+
+    def test_narrow_capability_refuses_uncovered_key(self) -> None:
+        with pytest.raises(SamplingParamsRefusal) as excinfo:
+            ensure_sampling_params_supported(
+                _TemperatureOnlyStubAdapter(),
+                {"top_p": 0.9},
+            )
+        assert excinfo.value.requested_keys == ("top_p",)
+
+    def test_narrow_capability_partial_request_refuses_only_uncovered_subset(self) -> None:
+        """Requesting both a covered and an uncovered key must refuse with
+        ONLY the uncovered key, not the full requested set - this is the
+        behavior change from the pre-PR3 all-or-nothing gate."""
+        with pytest.raises(SamplingParamsRefusal) as excinfo:
+            ensure_sampling_params_supported(
+                _TemperatureOnlyStubAdapter(),
+                {"temperature": 0.2, "top_k": 40},
+            )
+        assert excinfo.value.requested_keys == ("top_k",)
+
+    def test_narrow_capability_never_covers_base_url_or_api_key_env(self) -> None:
+        """base_url/api_key_env have no narrow capability - only the coarse
+        SUPPORTS_SAMPLING_PARAMS flag covers an endpoint override."""
+        with pytest.raises(SamplingParamsRefusal) as excinfo:
+            ensure_sampling_params_supported(
+                _TemperatureOnlyStubAdapter(),
+                {"temperature": 0.2, "base_url": "http://localhost:8000/v1"},
+            )
+        assert excinfo.value.requested_keys == ("base_url",)
+
+    def test_two_narrow_capabilities_both_covered(self) -> None:
+        ensure_sampling_params_supported(
+            _TemperatureAndTopPStubAdapter(),
+            {"temperature": 0.2, "top_p": 0.9},
+        )
+
+    def test_coarse_capability_still_wins_over_all_keys(self) -> None:
+        """Backward-compat: an adapter with the coarse flag is unaffected
+        by the narrow-capability gate logic."""
+        ensure_sampling_params_supported(
+            _SamplingStubAdapter(),
+            {"temperature": 0.2, "top_p": 0.9, "top_k": 40, "base_url": "x", "api_key_env": "Y"},
+        )

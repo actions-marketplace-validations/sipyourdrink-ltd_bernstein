@@ -1,4 +1,4 @@
-"""Tests for bernstein.core.platform_compat — cross-platform process helpers."""
+"""Tests for bernstein.core.platform_compat - cross-platform process helpers."""
 
 from __future__ import annotations
 
@@ -98,19 +98,6 @@ class TestKillProcess:
     def test_kill_negative_pid_returns_false(self) -> None:
         assert kill_process(-1) is False
 
-    @pytest.mark.skipif(IS_WINDOWS, reason="SIGKILL not available on Windows")
-    def test_kill_with_sigkill(self) -> None:
-        """SIGKILL should forcefully terminate a process."""
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        result = kill_process(proc.pid, signal.SIGKILL)
-        assert result is True
-        proc.wait(timeout=5)
-        assert process_alive(proc.pid) is False
-
 
 # ---------------------------------------------------------------------------
 # kill_process_group
@@ -126,29 +113,14 @@ class TestKillProcessGroup:
     def test_kill_group_negative_returns_false(self) -> None:
         assert kill_process_group(-1) is False
 
-    @pytest.mark.skipif(IS_WINDOWS, reason="Process groups not supported on Windows")
-    def test_kill_process_group_terminates_session(self) -> None:
-        """kill_process_group should terminate a process started in its own session."""
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        assert process_alive(proc.pid) is True
-        result = kill_process_group(proc.pid, signal.SIGTERM)
-        assert result is True
-        proc.wait(timeout=5)
-        assert process_alive(proc.pid) is False
-
 
 # ---------------------------------------------------------------------------
-# kill_process_group_graceful — audit-011
+# kill_process_group_graceful - audit-011
 # ---------------------------------------------------------------------------
 
 
 class TestKillProcessGroupGraceful:
-    """Tests for kill_process_group_graceful() — SIGTERM→poll→SIGKILL."""
+    """Tests for kill_process_group_graceful() - SIGTERM→poll→SIGKILL."""
 
     def test_zero_pgid_returns_false(self) -> None:
         assert kill_process_group_graceful(0) is False
@@ -182,37 +154,92 @@ class TestKillProcessGroupGraceful:
                 return_value=True,
             ) as mock_kpg,
             patch(
-                "bernstein.core.config.platform_compat.process_alive",
+                "bernstein.core.config.platform_compat.process_group_alive",
                 side_effect=_alive,
             ),
         ):
             assert kill_process_group_graceful(12345, grace_seconds=1.0, poll_interval=0.01) is True
 
-        # Only the SIGTERM call — no SIGKILL escalation.
+        # Only the SIGTERM call - no SIGKILL escalation.
         assert mock_kpg.call_count == 1
         assert mock_kpg.call_args_list[0].args[1] == signal.SIGTERM
 
-    @pytest.mark.skipif(IS_WINDOWS, reason="SIGKILL not available on Windows")
-    def test_escalates_to_sigkill_when_process_survives_term(self) -> None:
-        """If the group never exits, SIGKILL must be sent after the grace period."""
+    def test_escalates_to_force_signal_when_process_survives_term(self) -> None:
+        """If the group never exits, a force-kill must follow the grace period.
+
+        No platform skip: the escalation path is fully mocked at the
+        ``kill_process_group`` / ``process_group_alive`` boundary, so it runs
+        on the Windows lane too. The force tier is the POSIX ``SIGKILL`` where
+        importable and the numeric ``9`` fallback on Windows (where
+        ``signal.SIGKILL`` does not exist) - keyed off the platform so the
+        assertion holds on both.
+        """
+        force_sig = getattr(signal, "SIGKILL", 9)
         with (
             patch(
                 "bernstein.core.config.platform_compat.kill_process_group",
                 return_value=True,
             ) as mock_kpg,
             patch(
-                "bernstein.core.config.platform_compat.process_alive",
+                "bernstein.core.config.platform_compat.process_group_alive",
                 return_value=True,
             ),
         ):
             assert kill_process_group_graceful(12345, grace_seconds=0.05, poll_interval=0.01) is True
 
-        # Expect two calls — SIGTERM first, then SIGKILL.
+        # Expect two calls - SIGTERM first, then the platform force signal.
         assert mock_kpg.call_count == 2
         assert mock_kpg.call_args_list[0].args == (12345, signal.SIGTERM)
-        assert mock_kpg.call_args_list[1].args == (12345, signal.SIGKILL)
+        assert mock_kpg.call_args_list[1].args == (12345, force_sig)
 
-    @pytest.mark.skipif(IS_WINDOWS, reason="Requires POSIX process groups + SIGTERM trap")
+
+# ---------------------------------------------------------------------------
+# Real-kernel POSIX reap coverage
+#
+# These three cases spawn a real child process and deliver real signals to a
+# real process group; mocking the kernel boundary would defeat the whole
+# point (they exist to prove SIGKILL is actually delivered, a process group
+# is actually reaped, and a SIGTERM-trapping child is actually escalated).
+# There is no Windows kernel to deliver POSIX signals to, so the *whole
+# group* carries a single justified class-level skip rather than three
+# separate markers. The Windows equivalents of these paths are covered
+# without a runner by test_platform_win_process_branch.py (taskkill / tree
+# termination / reap-receipt projection).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="Delivers real POSIX signals to a real process group; no Windows kernel equivalent"
+)
+class TestRealKernelPosixReap:
+    """Real-process, real-signal reaps that require a POSIX kernel."""
+
+    def test_kill_with_sigkill(self) -> None:
+        """SIGKILL should forcefully terminate a process."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        result = kill_process(proc.pid, signal.SIGKILL)
+        assert result is True
+        proc.wait(timeout=5)
+        assert process_alive(proc.pid) is False
+
+    def test_kill_process_group_terminates_session(self) -> None:
+        """kill_process_group should terminate a process started in its own session."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        assert process_alive(proc.pid) is True
+        result = kill_process_group(proc.pid, signal.SIGTERM)
+        assert result is True
+        proc.wait(timeout=5)
+        assert process_alive(proc.pid) is False
+
     def test_reaps_wedged_process_that_traps_sigterm(self) -> None:
         """End-to-end: a child that traps SIGTERM must still be killed."""
         # Spawn a child that ignores SIGTERM via Python's signal module and
@@ -486,13 +513,18 @@ class TestIsSignalSupported:
         """A made-up signal name should return False."""
         assert is_signal_supported("SIGFAKE_DOES_NOT_EXIST") is False
 
-    @pytest.mark.skipif(IS_WINDOWS, reason="SIGKILL exists on Unix")
-    def test_sigkill_supported_on_unix(self) -> None:
-        assert is_signal_supported("SIGKILL") is True
+    def test_sigkill_support_matches_platform(self) -> None:
+        """SIGKILL exists on POSIX and is reported unsupported on Windows.
 
-    @pytest.mark.skipif(IS_WINDOWS, reason="SIGUSR1 exists on Unix")
-    def test_sigusr1_supported_on_unix(self) -> None:
-        assert is_signal_supported("SIGUSR1") is True
+        Written as a platform-neutral projection (value keyed off
+        ``IS_WINDOWS``) so it carries no skip marker and runs on the
+        Windows lane too.
+        """
+        assert is_signal_supported("SIGKILL") is (not IS_WINDOWS)
+
+    def test_sigusr1_support_matches_platform(self) -> None:
+        """SIGUSR1 exists on POSIX and is reported unsupported on Windows."""
+        assert is_signal_supported("SIGUSR1") is (not IS_WINDOWS)
 
     @patch("bernstein.core.config.platform_compat.IS_WINDOWS", True)
     def test_sigkill_not_supported_on_windows(self) -> None:
@@ -630,9 +662,14 @@ class TestSkipOnWindows:
 
         assert callable(dummy_test)
 
-    @pytest.mark.skipif(IS_WINDOWS, reason="Only tests skip logic on non-Windows")
-    def test_does_not_skip_on_unix(self) -> None:
-        """On Unix, the decorated test should execute normally."""
+    def test_direct_call_bypasses_marker(self) -> None:
+        """A direct call runs the function on every platform.
+
+        ``skip_on_windows`` only attaches a pytest collection marker; it
+        does not wrap the body. Calling the decorated function directly
+        therefore executes it regardless of platform, so this assertion
+        holds on the Windows lane too and needs no skip marker.
+        """
         executed = False
 
         @skip_on_windows("should not skip")
@@ -641,8 +678,6 @@ class TestSkipOnWindows:
             executed = True
             return True
 
-        # On Unix, the decorator does not prevent execution —
-        # it only adds a pytest marker. Direct calls still work.
         result = inner()
         assert result is True
         assert executed

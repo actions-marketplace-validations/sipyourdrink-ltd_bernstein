@@ -1,4 +1,4 @@
-"""MCP server sandboxing — optional container isolation for untrusted servers.
+"""MCP server sandboxing - optional container isolation for untrusted servers.
 
 Provides configuration dataclasses and command-building helpers to wrap
 MCP server subprocesses in Docker/Podman containers with resource limits,
@@ -21,10 +21,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
+from bernstein.core.security.sandbox import CONTAINER_RUNTIME_NAMES
+
 if TYPE_CHECKING:
     from pathlib import Path
 
-_VALID_RUNTIMES = frozenset({"docker", "podman"})
+#: Issue #3039: derived from the single runtime declaration rather than a
+#: second hand-maintained literal, so an MCP server sandbox accepts exactly
+#: the runtimes the rest of the codebase does.
+_VALID_RUNTIMES = CONTAINER_RUNTIME_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +240,7 @@ def load_sandbox_config(yaml_path: Path | None = None) -> SandboxConfig:
     if yaml_path is None:
         return SandboxConfig()
 
-    import yaml  # lazy import — only needed when a path is provided
+    import yaml  # lazy import - only needed when a path is provided
 
     try:
         with open(yaml_path) as fh:

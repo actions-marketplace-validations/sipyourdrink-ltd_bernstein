@@ -1,4 +1,4 @@
-"""Tests for bernstein.core.researcher — web research for evolve mode."""
+"""Tests for bernstein.core.researcher - web research for evolve mode."""
 
 from __future__ import annotations
 
@@ -99,9 +99,9 @@ class TestFormatResearchContext:
         )
         result = format_research_context(report)
         assert "## Market Research" in result
-        assert "Competitor landscape" in result
+        assert "Tooling landscape" in result
         assert "Competitor A is great" in result
-        assert "Build features no competitor has" in result
+        assert "Address the gaps this research surfaced" in result
 
     def test_all_categories(self) -> None:
         report = ResearchReport(
@@ -110,7 +110,7 @@ class TestFormatResearchContext:
             trending=[ResearchResult(query="q3", content="trend info", timestamp=1.0)],
         )
         result = format_research_context(report)
-        assert "Competitor landscape" in result
+        assert "Tooling landscape" in result
         assert "User pain points" in result
         assert "Trending features" in result
         assert "comp data" in result
@@ -143,7 +143,7 @@ class TestRunResearch:
             mock_search.return_value = "Search result"
             await run_research(tmp_path)
 
-            # Second run should use cache exclusively — zero new API calls
+            # Second run should use cache exclusively - zero new API calls
             mock_search.reset_mock()
             await run_research(tmp_path)
             assert mock_search.call_count == 0

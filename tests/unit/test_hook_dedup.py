@@ -5,7 +5,20 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from bernstein.plugins.manager import CommandHook
+
+
+@pytest.fixture(autouse=True)
+def _trusted_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise hook-execution mechanics against a trusted workspace.
+
+    Trust gating (untrusted / indeterminate workspaces) is owned by
+    tests/unit/test_plugins.py; these suites assume trust has been granted.
+    """
+    monkeypatch.setattr("bernstein.plugins.manager.is_workspace_trusted", lambda _root: True)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -111,7 +124,7 @@ class TestHookDedupByPluginRoot:
         # Both are different paths so both should pass
         assert not hook_a._is_duplicate("on_task_created", script_a)
         assert not hook_b._is_duplicate("on_task_created", script_b)
-        # Now re-register script_a — should be duplicate
+        # Now re-register script_a - should be duplicate
         assert hook_a._is_duplicate("on_task_created", script_a) is True
 
     def test_run_command_skips_duplicate_scripts(self, tmp_path: Path) -> None:
@@ -144,7 +157,7 @@ class TestHookDedupByPluginRoot:
 
         # First registration
         hook._is_duplicate("on_task_completed", script)
-        # Second — duplicate
+        # Second - duplicate
         with caplog.at_level(logging.DEBUG):
             hook._is_duplicate("on_task_completed", script)
         # Check that duplicate was detected (logging happens in _run_command not _is_duplicate)

@@ -7,6 +7,7 @@ are verified on every registration and heartbeat request.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 from dataclasses import dataclass
@@ -43,21 +44,39 @@ class ClusterAuthError(Exception):
     """Raised when cluster authentication fails."""
 
 
+class ClusterAuthScopeError(ClusterAuthError):
+    """Raised when a verified credential lacks the scope a call requires.
+
+    Split out from the generic failure so a caller can tell "this credential
+    is not valid" from "this credential is valid but not allowed here". HTTP
+    collapses both onto 401; gRPC has distinct codes (``UNAUTHENTICATED`` vs
+    ``PERMISSION_DENIED``) and must not report a scope refusal as a bad
+    credential -- a worker would respond by re-minting a token that would be
+    refused identically.
+    """
+
+
 @dataclass(frozen=True)
 class ClusterAuthConfig:
     """Configuration for cluster JWT authentication.
 
     Attributes:
-        secret: Shared secret for JWT signing.
+        secret: Shared secret for JWT signing. Also accepted verbatim as a
+            worker bearer credential (see ``verify_request``).
         token_expiry_hours: How long node tokens remain valid.
         require_auth: Whether authentication is mandatory.
         allowed_scopes: Set of scopes that grant registration access.
+        shared_secrets: Additional raw bearer values accepted as a full-scope
+            worker credential (e.g. the operator's API bearer token when it
+            differs from ``secret``). Lets one credential satisfy both the
+            outer API middleware and the inner cluster layer (issue #2805).
     """
 
     secret: str
     token_expiry_hours: int = 24
     require_auth: bool = True
     allowed_scopes: tuple[str, ...] = (SCOPE_NODE_REGISTER, SCOPE_NODE_HEARTBEAT, SCOPE_NODE_ADMIN)
+    shared_secrets: tuple[str, ...] = ()
 
 
 class ClusterAuthenticator:
@@ -153,6 +172,24 @@ class ClusterAuthenticator:
             _record_admission_failure("invalid_token")
             raise ClusterAuthError("Token has been revoked")
 
+        # Shared-secret path: a worker may present the raw cluster secret (or
+        # the operator's API bearer token) instead of a minted node JWT. This
+        # is the single worker-join credential story (#2805): the same token
+        # the outer API middleware accepts also authenticates node
+        # registration and heartbeat, so no separate JWT issuance surface is
+        # needed. Constant-time compared against every configured secret; a
+        # match grants the full node scope set.
+        for candidate in (self._config.secret, *self._config.shared_secrets):
+            if candidate and hmac.compare_digest(token, candidate):
+                now = time.time()
+                return JWTPayload(
+                    session_id="cluster-shared-secret",
+                    user_id=None,
+                    issued_at=now,
+                    expires_at=now + self._config.token_expiry_hours * 3600,
+                    scopes=list(self._config.allowed_scopes),
+                )
+
         payload = self._jwt.verify_token(token)
         if payload is None:
             _record_admission_failure("invalid_token")
@@ -161,7 +198,7 @@ class ClusterAuthenticator:
         # Check required scope
         if required_scope not in payload.scopes:
             _record_admission_failure("scope_denied")
-            raise ClusterAuthError(f"Token lacks required scope '{required_scope}' (has: {payload.scopes})")
+            raise ClusterAuthScopeError(f"Token lacks required scope '{required_scope}' (has: {payload.scopes})")
 
         return payload
 

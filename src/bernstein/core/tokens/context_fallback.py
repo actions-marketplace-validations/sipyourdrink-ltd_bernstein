@@ -47,7 +47,7 @@ class CompactionResult:
 
 
 # ---------------------------------------------------------------------------
-# Individual compaction strategies — sourced from bernstein.core.defaults.TOKEN
+# Individual compaction strategies - sourced from bernstein.core.defaults.TOKEN
 # ---------------------------------------------------------------------------
 
 #: Maximum lines in a fenced code block before it is truncated.
@@ -64,8 +64,7 @@ _FENCED_CODE_RE = re.compile(
 
 #: Regex for traceback blocks (Python-style).
 _TRACEBACK_RE = re.compile(
-    r"(Traceback \(most recent call last\):.*?)(?=\n\n|\Z)",
-    re.DOTALL,
+    r"(Traceback \(most recent call last\):(?:\n(?!\n).*)*)(?=\n\n|\Z)",
 )
 
 

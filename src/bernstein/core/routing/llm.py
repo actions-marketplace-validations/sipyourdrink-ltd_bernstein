@@ -107,7 +107,9 @@ _CLI_FLAGS: dict[str, tuple[str, str, list[str]]] = {
     "gemini": ("-p", "-m", []),
     "qwen": ("-y", "--model", []),
     "codex": ("--prompt", "--model", []),
-    "goose": ("--prompt", "--model", []),
+    # goose takes the prompt under its ``run`` subcommand; ``--prompt`` is not
+    # a flag it defines, and without ``run`` there is no subcommand to parse.
+    "goose": ("run --text", "--model", []),
     "aider": ("--message", "--model", []),
     "claude": ("--print -p", "--model", ["--output-format", "text", "--max-turns", "1"]),
 }
@@ -165,7 +167,7 @@ async def _call_cli_provider(prompt: str, model: str, provider: str) -> str:
     except TimeoutError as exc:
         raise RuntimeError(f"{cli_binary} CLI timed out after 120s") from exc
     except FileNotFoundError as exc:
-        raise RuntimeError(f"{cli_binary} CLI not found — install it first") from exc
+        raise RuntimeError(f"{cli_binary} CLI not found - install it first") from exc
     except RuntimeError:
         raise
     except Exception as exc:
@@ -238,14 +240,31 @@ async def call_llm(
     Raises:
         RuntimeError: If the API call fails.
     """
-    from bernstein.core.deterministic import get_active_store
+    from bernstein.core.orchestration.deterministic import get_active_store
 
     _store = get_active_store()
-    if _store is not None:
-        _replay = _store.get_replay(prompt, model)
+    if _store is not None and _store.is_replay:
+        # ``get_replay`` raises ReplayMissError on a miss in strict mode
+        # (the default), keeping replay hermetic - we never reach the live
+        # provider below. In the opt-in non-strict mode it returns ``None``
+        # and we log a warning before falling through to the live call.
+        _replay = _store.get_replay(
+            prompt,
+            model,
+            provider=provider,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         if _replay is not None:
             logger.debug("DeterministicStore: replaying cached response for model=%s", model)
             return _replay
+        logger.warning(
+            "DeterministicStore: replay miss for model=%s provider=%s temperature=%s; "
+            "falling through to live provider (non-strict mode)",
+            model,
+            provider,
+            temperature,
+        )
 
     # API-based providers go through the OpenAI-compatible client.
     _API_PROVIDERS = {"openrouter", "openrouter_free", "oxen", "together", "g4f"}
@@ -256,7 +275,7 @@ async def call_llm(
         result = await _call_cli_provider(prompt, model, provider)
 
     if _store is not None:
-        _store.record(prompt, model, result)
+        _store.record(prompt, model, result, provider=provider, temperature=temperature, max_tokens=max_tokens)
     return result
 
 
@@ -348,7 +367,7 @@ async def preconnect_api(
         # ``base_url`` is operator-supplied; require http(s).
         ensure_http_url(base_url, allow_http=True, source="routing.llm.preconnect")
     except UrlSchemeError as exc:
-        logger.debug("API preconnect refused (bad scheme): %s — %s", base_url, exc)
+        logger.debug("API preconnect refused (bad scheme): %s - %s", base_url, exc)
         return False
 
     try:
@@ -364,7 +383,7 @@ async def preconnect_api(
         logger.debug("API preconnect succeeded: %s", base_url)
         return True
     except Exception as exc:
-        logger.debug("API preconnect failed (non-fatal): %s — %s", base_url, exc)
+        logger.debug("API preconnect failed (non-fatal): %s - %s", base_url, exc)
         return False
 
 

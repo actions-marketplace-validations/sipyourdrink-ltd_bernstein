@@ -2,7 +2,7 @@
 
 The previous ``bernstein.core.tasks.task_completion`` module was an orphan
 duplicate of ``collect_completion_data`` that lived in
-``bernstein.core.tasks.task_lifecycle``.  It was deleted in audit-018 — these
+``bernstein.core.tasks.task_lifecycle``.  It was deleted in audit-018 - these
 tests now import directly from ``task_lifecycle`` and guard against the shim
 re-appearing.
 """
@@ -172,8 +172,18 @@ def test_process_completed_tasks_creates_fix_task_for_cross_model_review(tmp_pat
         process_completed_tasks(orch, [task], result)
 
     assert result.verification_failures == [("T-review", ["cross_model_review:Add regression coverage"])]
-    payload = orch._client.post.call_args.kwargs["json"]
-    assert payload["title"].startswith("[REVIEW-FIX] Refine prompt")
+    # The janitor-verdict action posts a /reopen after the fix-task creation,
+    # so locate the fix-task POST among all calls instead of assuming last.
+    posted_urls = [call.args[0] for call in orch._client.post.call_args_list if call.args]
+    fix_task_payloads = [
+        call.kwargs["json"]
+        for call in orch._client.post.call_args_list
+        if call.args and call.args[0].endswith("/tasks")
+    ]
+    assert fix_task_payloads, f"no fix-task POST found among {posted_urls}"
+    assert fix_task_payloads[0]["title"].startswith("[REVIEW-FIX] Refine prompt")
+    # Failed janitor verdict must also reopen the task (bounded).
+    assert any(url.endswith("/tasks/T-review/reopen") for url in posted_urls)
 
 
 def test_process_completed_tasks_blocks_on_formal_verification_violation(tmp_path: Path, make_task: Any) -> None:
@@ -233,7 +243,7 @@ def test_process_completed_tasks_routes_merge_conflicts_to_resolver(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
-# audit-018 regression guards — prove the orphan/duplicate module is gone
+# audit-018 regression guards - prove the orphan/duplicate module is gone
 # ---------------------------------------------------------------------------
 
 

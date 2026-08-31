@@ -90,7 +90,7 @@ class SBOMComponent:
 
     name: str
     version: str
-    purl: str  # Package URL — pkg:pypi/requests@2.28.0
+    purl: str  # Package URL - pkg:pypi/requests@2.28.0
     component_type: str = "library"  # library | framework | application | container
     description: str = ""
     licenses: list[str] = field(default_factory=list)
@@ -260,7 +260,7 @@ class SBOMGateError(Exception):
 
     def __init__(self, findings: list[SBOMVulnFinding]) -> None:
         self.findings = findings
-        counts = {}
+        counts: dict[str, int] = {}
         for f in findings:
             counts[f.severity.value] = counts.get(f.severity.value, 0) + 1
         summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
@@ -394,7 +394,7 @@ class SBOMGenerator:
                     return result
             if shutil.which("grype"):
                 return self._scan_with_grype(sbom, sbom_path)
-            # Neither scanner available — return empty result with warning
+            # Neither scanner available - return empty result with warning
             logger.warning("Neither osv-scanner nor grype is available; SBOM scan skipped")
             return SBOMScanResult(
                 sbom_serial=sbom.serial_number,

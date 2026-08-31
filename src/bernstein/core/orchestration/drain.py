@@ -1,4 +1,4 @@
-"""Graceful drain coordinator — 6-phase shutdown with work preservation.
+"""Graceful drain coordinator - 6-phase shutdown with work preservation.
 
 Executes a controlled shutdown sequence: freeze task assignment, signal agents,
 wait for clean exits, auto-commit unsaved work, merge completed branches via
@@ -333,7 +333,7 @@ class DrainCoordinator:
         """Cancel the drain.
 
         Only effective during phases 1-2 (freeze/signal).  Later phases
-        cannot be cancelled — use Ctrl+C to force-quit instead.
+        cannot be cancelled - use Ctrl+C to force-quit instead.
         """
         if not self.cancellable:
             logger.warning("Cannot cancel drain during phase %d", self._current_phase)
@@ -368,7 +368,7 @@ class DrainCoordinator:
     # ------------------------------------------------------------------
 
     async def _phase_freeze(self) -> None:
-        """Phase 1: Freeze — disable new task assignment."""
+        """Phase 1: Freeze - disable new task assignment."""
         phase = self._phases[0]
         phase.detail = "Disabling new task assignment"
 
@@ -378,7 +378,7 @@ class DrainCoordinator:
                 resp.raise_for_status()
                 logger.info("Task server set to draining mode")
             except httpx.HTTPError:
-                # Server unreachable — fall back to flag file.
+                # Server unreachable - fall back to flag file.
                 flag = self._workdir / ".sdd" / "runtime" / "draining"
                 flag.parent.mkdir(parents=True, exist_ok=True)
                 flag.write_text("draining", encoding="utf-8")
@@ -387,14 +387,14 @@ class DrainCoordinator:
         phase.detail = "New task spawning disabled"
 
     async def _phase_signal(self) -> None:
-        """Phase 2: Signal — write SHUTDOWN to all live agents.
+        """Phase 2: Signal - write SHUTDOWN to all live agents.
 
         Discovers agents from multiple sources (HTTP API, PID files, worktrees)
         since agents.json may not exist.
         """
         phase = self._phases[1]
 
-        # Source 1: HTTP API — most reliable when server is running.
+        # Source 1: HTTP API - most reliable when server is running.
         await self._discover_agents_from_api()
         # Source 2: PID files in .sdd/runtime/pids/.
         self._discover_agents_from_pid_files()
@@ -411,7 +411,7 @@ class DrainCoordinator:
         logger.info("Sent SHUTDOWN signal to %d agents", count)
 
     async def _phase_wait(self) -> None:
-        """Phase 3: Wait — poll agents until they exit or timeout."""
+        """Phase 3: Wait - poll agents until they exit or timeout."""
         phase = self._phases[2]
 
         if not self._agents:
@@ -424,10 +424,11 @@ class DrainCoordinator:
         while remaining and time.monotonic() < deadline:
             self._poll_agent_statuses(remaining)
             remaining = [a for a in self._agents if a.status == "running"]
-            exited = [a for a in self._agents if a.status == "exited"]
+            exited_agents = [a for a in self._agents if a.status == "exited"]
             elapsed = self._config.wait_timeout_s - (deadline - time.monotonic())
             phase.detail = (
-                f"{len(exited)} exited, {len(remaining)} waiting ({int(elapsed)}s/{self._config.wait_timeout_s}s)"
+                f"{len(exited_agents)} exited, {len(remaining)} waiting "
+                f"({int(elapsed)}s/{self._config.wait_timeout_s}s)"
             )
             if self._callback is not None:
                 self._callback(phase, self._agents)
@@ -492,7 +493,7 @@ class DrainCoordinator:
                 self._branches_ahead.append(branch)
 
     async def _phase_commit(self) -> None:
-        """Phase 4: Commit — auto-save dirty worktrees."""
+        """Phase 4: Commit - auto-save dirty worktrees."""
         await asyncio.sleep(0)  # Async interface requirement
         phase = self._phases[3]
 
@@ -511,7 +512,7 @@ class DrainCoordinator:
         )
 
     async def _phase_merge(self) -> None:
-        """Phase 5: Merge — spawn an Opus agent to cherry-pick branches."""
+        """Phase 5: Merge - spawn an Opus agent to cherry-pick branches."""
         phase = self._phases[4]
 
         if not self._branches_ahead:
@@ -559,7 +560,7 @@ class DrainCoordinator:
             logger.exception("Merge agent failed")
 
     async def _phase_cleanup(self) -> None:
-        """Phase 6: Cleanup — remove worktrees, branches, update tickets."""
+        """Phase 6: Cleanup - remove worktrees, branches, update tickets."""
         phase = self._phases[5]
 
         # Stop long-lived infrastructure first so the watchdog cannot
@@ -568,7 +569,7 @@ class DrainCoordinator:
 
         worktrees_removed = await self._remove_all_worktrees()
 
-        # Prune worktree registry BEFORE deleting branches — this
+        # Prune worktree registry BEFORE deleting branches - this
         # unregisters removed worktrees so branch -D succeeds.
         _run_git(["worktree", "prune"], cwd=self._workdir)
 
@@ -625,7 +626,9 @@ class DrainCoordinator:
         return _rmtree_windows_safe(entry)
 
     def _delete_agent_branches(self) -> int:
-        """Delete agent/* branches and return count of branches deleted."""
+        """Delete agent/* branches safely with rescue refs for unmerged work (#4677)."""
+        from bernstein.core.git.git_hygiene import safe_force_delete_branch
+
         branch_result = _run_git(["branch", "--list", "agent/*"], cwd=self._workdir)
         if branch_result.returncode != 0:
             return 0
@@ -634,15 +637,13 @@ class DrainCoordinator:
             branch_name = line.strip().lstrip("*+ ")
             if not branch_name:
                 continue
-            del_result = _run_git(["branch", "-D", branch_name], cwd=self._workdir)
-            if del_result.returncode == 0:
+            success, _rescue_ref = safe_force_delete_branch(
+                self._workdir,
+                branch_name,
+                run_id=getattr(self, "_run_id", None),
+            )
+            if success:
                 deleted += 1
-            elif "not found" not in del_result.stderr:
-                logger.warning(
-                    "Failed to delete branch %s: %s",
-                    branch_name,
-                    del_result.stderr.strip(),
-                )
         return deleted
 
     async def _cancel_drain_mode(self) -> None:
@@ -655,7 +656,7 @@ class DrainCoordinator:
             logger.debug("Could not cancel drain on server (may be already stopped)")
 
     # ------------------------------------------------------------------
-    # Internal helpers — agent polling and escalation
+    # Internal helpers - agent polling and escalation
     # ------------------------------------------------------------------
 
     def _poll_agent_statuses(self, remaining: list[AgentDrainStatus]) -> None:
@@ -698,7 +699,7 @@ class DrainCoordinator:
                 agent.status = "exited"
 
     # ------------------------------------------------------------------
-    # Internal helpers — agent discovery
+    # Internal helpers - agent discovery
     # ------------------------------------------------------------------
 
     async def _discover_agents_from_api(self) -> None:
@@ -757,7 +758,7 @@ class DrainCoordinator:
             raw_pid = entry.get("pid", 0)
             pid = int(raw_pid) if isinstance(raw_pid, (int, str, float)) else 0
             worktree = str(entry.get("worktree_path", ""))
-            if session_id and pid:
+            if session_id and pid and _is_process_alive(pid):
                 self._agents.append(
                     AgentDrainStatus(
                         session_id=session_id,

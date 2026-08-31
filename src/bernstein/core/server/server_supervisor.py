@@ -1,4 +1,4 @@
-"""Server supervisor — auto-restart task server on crash.
+"""Server supervisor - auto-restart task server on crash.
 
 Wraps the uvicorn server process with a restart loop. If the server
 crashes, it's restarted automatically (up to MAX_RESTARTS within
@@ -23,8 +23,10 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import suppress
 from typing import TYPE_CHECKING
+
+import httpx
+from httpx import ConnectError, ReadTimeout
 
 from bernstein.core.platform_compat import kill_process
 from bernstein.core.process_utils import is_process_alive
@@ -55,7 +57,7 @@ def supervised_server(
     """Launch the task server with automatic restart on crash.
 
     Returns the PID of the supervisor thread's current server process.
-    The supervisor runs as a daemon thread — it dies when the main
+    The supervisor runs as a daemon thread - it dies when the main
     process exits.
     """
     state = _SupervisorState(
@@ -165,7 +167,7 @@ def _launch_server(state: _SupervisorState) -> int:
     # triggers a uvicorn restart, which drops in-flight HTTP connections,
     # races on the bind port ("Address already in use"), and replays the WAL
     # with duplicate task claims. Evolve cycles already restart via the
-    # supervisor on real crashes — auto-reload is never wanted here.
+    # supervisor on real crashes - auto-reload is never wanted here.
     # ``state.evolve_mode`` is intentionally not consulted when building the
     # uvicorn argv; if you're tempted to re-add --reload, read
     # first.
@@ -207,10 +209,22 @@ def _supervisor_loop(state: _SupervisorState) -> None:
         if _is_alive(pid):
             continue
 
-        # Server died — attempt restart
+        # Server died - attempt restart
         logger.warning("Server process %d died. Attempting restart...", pid)
 
-        # Check restart budget
+        # Check for bind failure (EADDRINUSE) without consuming restart budget
+        log_path = state.workdir / ".sdd" / "runtime" / "server.log"
+        try:
+            log_content = log_path.read_text()
+        except Exception:
+            log_content = ""
+        if "Address already in use" in log_content:
+            logger.info("Bind failure detected (EADDRINUSE); will retry without consuming restart budget.")
+            # Simple backoff before retry, similar to normal delay but not counted
+            time.sleep(RESTART_DELAY_S)
+            continue
+
+        # Normal restart budget handling
         now = time.monotonic()
         with state.lock:
             # Prune old timestamps outside window
@@ -218,7 +232,7 @@ def _supervisor_loop(state: _SupervisorState) -> None:
 
             if len(state.restart_timestamps) >= MAX_RESTARTS:
                 logger.error(
-                    "Server crashed %d times in %ds — giving up. Check .sdd/runtime/server.log for root cause.",
+                    "Server crashed %d times in %ds - giving up. Check .sdd/runtime/server.log for root cause.",
                     MAX_RESTARTS,
                     RESTART_WINDOW_S,
                 )
@@ -250,8 +264,6 @@ def _supervisor_loop(state: _SupervisorState) -> None:
 
 def _health_check_loop(state: _SupervisorState) -> None:
     """Periodically check server health via HTTP."""
-    import httpx
-
     url = f"http://127.0.0.1:{state.port}/health"
 
     # Wait for initial startup
@@ -263,24 +275,43 @@ def _health_check_loop(state: _SupervisorState) -> None:
         if state.stopped:
             return
 
-        with suppress(Exception):
+        # Perform health check with explicit handling for ConnectError and ReadTimeout
+        try:
             resp = httpx.get(url, timeout=HEALTH_CHECK_TIMEOUT_S)
             if resp.status_code == 200:
+                # Successful health check, reset failure counter
                 with state.lock:
                     state.consecutive_health_failures = 0
                 continue
+            else:
+                # Non-200 response counts as a failure
+                raise Exception(f"Unexpected status {resp.status_code}")
+        except ConnectError as e:
+            # Connection error (e.g., server not listening) counts as a failure
+            logger.debug("Health check ConnectError: %s", e)
+            with state.lock:
+                state.consecutive_health_failures += 1
+        except ReadTimeout as e:
+            # Read timeout does NOT count as a failure; just log and continue
+            logger.debug("Health check ReadTimeout (ignored): %s", e)
+            # Do not increment failure counter
+            continue
+        except Exception as e:
+            # Any other exception counts as a failure
+            logger.debug("Health check exception: %s", e)
+            with state.lock:
+                state.consecutive_health_failures += 1
 
-        # Health check failed
+        # After handling, check if we exceeded consecutive failures
         with state.lock:
-            state.consecutive_health_failures += 1
             failures = state.consecutive_health_failures
 
         if failures >= MAX_CONSECUTIVE_FAILURES:
             pid = state.current_pid
             if _is_alive(pid):
-                # Server alive but unresponsive — kill it so supervisor restarts
+                # Server alive but unresponsive - kill it so supervisor restarts
                 logger.warning(
-                    "Server unresponsive for %ds (PID %d) — killing for restart",
+                    "Server unresponsive for %ds (PID %d) - killing for restart",
                     failures * HEALTH_CHECK_INTERVAL_S,
                     pid,
                 )

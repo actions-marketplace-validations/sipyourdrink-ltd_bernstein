@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -11,17 +12,19 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 if TYPE_CHECKING:
     from rich.text import Text
+    from textual.timer import Timer
 
 from contextlib import suppress
 
 import httpx
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Static
 
 from bernstein.tui.accessibility import AccessibilityConfig, detect_accessibility
 from bernstein.tui.command_palette import DEFAULT_PALETTE_COMMANDS, CommandPalette, CommandPaletteScreen, PaletteCommand
+from bernstein.tui.event_stream import JournalStreamConsumer, stream_enabled
 from bernstein.tui.keybinding_config import resolve_all_bindings as _resolve_all_bindings
 from bernstein.tui.layout_persistence import LayoutConfig, load_layout, save_layout
 from bernstein.tui.notification_badge import NotificationCenterPanel, NotificationHistory
@@ -62,7 +65,7 @@ _AGENTS_JSON_PATH = ".sdd/runtime/agents.json"
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_ANY = "dict[str, Any]"
+type _CAST_DICT_STR_ANY = dict[str, Any]
 
 
 def _build_app_bindings() -> list[BindingType]:
@@ -254,6 +257,12 @@ class BernsteinApp(App[None]):
         """
         super().__init__()
         self._poll_interval = poll_interval
+        # Issue #2297: when the SSE stream drives the hot path, the timer
+        # poll loop is not started; the journal stream consumer refreshes
+        # reactively instead. The flag keeps a polling fallback for
+        # constrained terminals.
+        self._stream_consumer = JournalStreamConsumer()
+        self._use_stream = stream_enabled()
         self._start_ts = time.time()
         self._action_bar_visible = False
         self._layout = load_layout()
@@ -265,14 +274,16 @@ class BernsteinApp(App[None]):
         self._palette_action_labels: dict[str, str] = {}
         self._recent_palette_actions: list[str] = []
         self._log_offsets: dict[str, int] = {}  # session_id → last-read byte offset
-        self._resize_timer: object | None = None  # debounce timer handle (TUI-001)
+        self._resize_timer: Timer | None = None  # debounce timer handle (TUI-001)
         # TUI-013: detect accessibility mode from environment
         self.accessibility: AccessibilityConfig = AccessibilityConfig.from_level(detect_accessibility())
         # TUI-008: split-pane state
         self._split = SplitPaneState()
         # TUI-009: toast notification manager
         self._toasts = ToastManager()
-        self._notifications = NotificationHistory()
+        # Not ``_notifications``: Textual's ``App.__init__`` owns that name for
+        # its own toast queue, and shadowing it silently breaks ``self.notify``.
+        self._notification_history = NotificationHistory()
         self._recordings_dir = Path(".sdd/recordings/tui")
         self._session_recorder: SessionRecorder | None = None
         self._recording_started_at = 0.0
@@ -280,10 +291,10 @@ class BernsteinApp(App[None]):
         self._replay_frames: list[RecordingFrame] = []
         self._replay_index = 0
         self._selected_replay_path: Path | None = None
-        self._replay_timer: object | None = None
+        self._replay_timer: Timer | None = None
         # Track seen task IDs to detect completions
         self._seen_done: set[str] = set()
-        # TUI-011: theme — load persisted preference, fall back to auto-detect
+        # TUI-011: theme - load persisted preference, fall back to auto-detect
         self._theme_mode: ThemeMode = load_theme_config()
         # TUI-010: cached task progress entries for aggregate run bar
         self._task_progresses: list[TaskProgress] = []
@@ -295,7 +306,9 @@ class BernsteinApp(App[None]):
         yield StatusBar(id="top-bar")
         # TUI-008: Horizontal container to support split-pane layout
         with Horizontal(id="main-body"):
-            with Vertical(id="left-pane"):
+            # Scroll each pane as one ordered column. Per-widget scrollbars would
+            # make navigation ambiguous while changing the existing composition.
+            with VerticalScroll(id="left-pane"):
                 yield TaskSearchInput(id="task-search")
                 yield TaskListWidget(id="task-list")
                 yield TaskTimeline(id="task-timeline")
@@ -305,7 +318,7 @@ class BernsteinApp(App[None]):
                 yield ApprovalPanel(id="approval-panel")
                 yield ToolObserverWidget(id="tool-observer")
                 yield ActionBar(id="action-bar")
-            with Vertical(id="right-pane"):
+            with VerticalScroll(id="right-pane"):
                 yield TaskContextPanel(id="task-context")
                 yield RuntimeHealthPanel(id="runtime-health")
                 yield NotificationCenterPanel(id="notification-center")
@@ -359,7 +372,12 @@ class BernsteinApp(App[None]):
         self._refresh_session_recorder_panel()
 
         self._load_historical_logs()
-        self.set_interval(self._poll_interval, self.action_refresh)
+        # Issue #2297: the hot path is driven by the audit-chain SSE stream
+        # when enabled; only fall back to the timer poll loop otherwise.
+        if not self._use_stream:
+            self.set_interval(self._poll_interval, self.action_refresh)
+        else:
+            self.run_worker(self._consume_thread_stream(), exclusive=False)
         # TUI-009: prune expired toasts and refresh toast overlay every second
         self.set_interval(1.0, self._tick_toasts)
 
@@ -394,7 +412,7 @@ class BernsteinApp(App[None]):
             event: The Textual Resize event.
         """
         if self._resize_timer is not None:
-            self._resize_timer.stop()  # type: ignore[union-attr]
+            self._resize_timer.stop()
         self._resize_timer = self.set_timer(
             self.RESIZE_DEBOUNCE_S,
             self._apply_resize,
@@ -521,6 +539,34 @@ class BernsteinApp(App[None]):
         # Update timeline if visible
         if self.query_one(_TASK_TIMELINE_SELECTOR, TaskTimeline).display:
             self.run_worker(self._refresh_timeline())
+
+    async def _consume_thread_stream(self) -> None:
+        """Drive the hot path from the audit-chain SSE stream (issue #2297).
+
+        Replaces the timer poll loop: each hash-anchored journal frame that
+        the server projects triggers a single refresh, so the rendered view
+        is an attestable projection of the executed thread rather than a
+        polled snapshot. On a dropped connection the loop reconnects with
+        ``Last-Event-ID`` so it resumes from the last journal index without
+        missing or duplicating an entry (AC5). The rendering path is
+        unchanged - only the data source is swapped.
+        """
+        while True:
+            try:
+                headers = _auth_headers() | self._stream_consumer.reconnect_headers()
+                async with (
+                    httpx.AsyncClient(timeout=None) as client,
+                    client.stream("GET", f"{SERVER_URL}/events", headers=headers) as response,
+                ):
+                    async for block in response.aiter_text():
+                        if not block.strip():
+                            continue
+                        delivered = list(self._stream_consumer.consume(block))
+                        if delivered:
+                            self.action_refresh()
+            except Exception:
+                logger.debug("thread stream disconnected, will reconnect", exc_info=True)
+                await asyncio.sleep(self._poll_interval)
 
     def _apply_task_filter(self) -> None:
         """Apply the current structured task filter to the cached task rows."""
@@ -658,7 +704,7 @@ class BernsteinApp(App[None]):
 
     def action_acknowledge_notifications(self) -> None:
         """Mark all notification-center entries as read."""
-        self._notifications.mark_all_read()
+        self._notification_history.mark_all_read()
         self._refresh_notification_center()
 
     def _ensure_panel_visible(self, panel_id: str) -> None:
@@ -742,7 +788,7 @@ class BernsteinApp(App[None]):
     def _stop_replay(self) -> None:
         """Stop the active playback preview timer, if one exists."""
         if self._replay_timer is not None:
-            self._replay_timer.stop()  # type: ignore[union-attr]
+            self._replay_timer.stop()
             self._replay_timer = None
 
     def _refresh_session_recorder_panel(self) -> None:
@@ -1073,7 +1119,7 @@ class BernsteinApp(App[None]):
 
     def _remember_toast(self, toast: Toast) -> None:
         """Mirror a toast into persistent notification history and refresh the UI."""
-        self._notifications.add(
+        self._notification_history.add(
             toast.message,
             level=toast.level.value,
             source=toast.source,
@@ -1085,7 +1131,8 @@ class BernsteinApp(App[None]):
     def _refresh_notification_center(self) -> None:
         """Render the latest notification history into the side panel."""
         self.query_one("#notification-center", NotificationCenterPanel).set_history(
-            self._notifications.get_history(limit=5), self._notifications.get_unread_count()
+            self._notification_history.get_history(limit=5),
+            self._notification_history.get_unread_count(),
         )
 
     @staticmethod

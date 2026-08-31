@@ -1,14 +1,19 @@
+---
+search:
+  boost: 2
+---
+
 # Deployment Guide
 
 How to run Bernstein in different environments. Each section is self-contained with complete configuration examples.
 
 **Jump to:**
 - [Local development](#local-development)
-- [CI/CD — GitHub Actions](#cicd--github-actions)
-- [CI/CD — GitLab CI](#cicd--gitlab-ci)
+- [CI/CD - GitHub Actions](#cicd-github-actions)
+- [CI/CD - GitLab CI](#cicd-gitlab-ci)
 - [Docker single-host](#docker-single-host)
 - [Docker Compose cluster](#docker-compose-cluster)
-- [Kubernetes / Helm](#kubernetes--helm)
+- [Kubernetes / Helm](#kubernetes-helm)
 - [Cloudflare cloud deployment](#cloudflare-cloud-deployment)
 - [Team shared server (bare metal)](#team-shared-server)
 - [Environment variable reference](#environment-variables)
@@ -33,11 +38,11 @@ How to run Bernstein in different environments. Each section is self-contained w
 ### Install
 
 ```bash
-# With uv (recommended — faster, handles virtualenvs automatically)
+# With uv (recommended - faster, handles virtualenvs automatically)
 uv pip install bernstein
 
 # Or install from source
-git clone https://github.com/bernstein-ai/bernstein
+git clone https://github.com/sipyourdrink-ltd/bernstein
 cd bernstein
 uv pip install -e .
 
@@ -104,14 +109,18 @@ bernstein status        # shows task server state
 Run the zero-config demo to confirm everything works end-to-end before using it on real code:
 
 ```bash
-bernstein quickstart --keep    # runs 3 tasks on a demo project, keeps output
+bernstein demo --flask-todo --keep    # runs 3 tasks on a demo project, keeps output
 ```
 
 Expected: all 3 tasks complete and a summary table prints with elapsed time and cost.
 
+`bernstein quickstart` remains a deprecated alias for the 3.x line and is
+unregistered in 4.0.0. The two spellings differ on adapter selection — see
+[the demo page](../getting-started/quickstart-demo.md#cost).
+
 ---
 
-## CI/CD — GitHub Actions
+## CI/CD - GitHub Actions
 
 ### Single-shot plan execution
 
@@ -154,7 +163,7 @@ jobs:
       - name: Install Claude Code (or your preferred CLI agent)
         run: npm install -g @anthropic-ai/claude-code
         # Alternatively:
-        # run: pip install openai-codex
+        # run: npm install -g @openai/codex
 
       - name: Run plan
         run: |
@@ -177,16 +186,16 @@ jobs:
 
       - name: Post summary
         if: always()
-        run: bernstein report --format markdown >> $GITHUB_STEP_SUMMARY
+        run: bernstein report >> $GITHUB_STEP_SUMMARY
 ```
 
-### Using the official GitHub Action
+### Running Bernstein from a workflow
 
-If the Bernstein GitHub Action is available in the marketplace:
+Install Bernstein with `pip` and invoke the CLI directly in a run step:
 
 ```yaml
 # .github/workflows/bernstein-action.yml
-name: Bernstein (Action)
+name: Bernstein
 on:
   push:
     branches: [main]
@@ -196,12 +205,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bernstein-ai/bernstein-action@v1
+      - uses: actions/setup-python@v5
         with:
-          plan: plans/ci-tasks.yaml
-          max-agents: 2
-          budget: 5.00
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          python-version: "3.12"
+      - name: Install Bernstein
+        run: pip install bernstein
+      - name: Run plan
+        run: bernstein run plans/ci-tasks.yaml --max-agents 2 --budget 5.00
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
 See `docs/integrations/github-action.md` for the full parameter reference.
@@ -228,7 +240,7 @@ If the job fails with a non-zero exit, check the "Run plan" step logs. The most 
 
 ---
 
-## CI/CD — GitLab CI
+## CI/CD - GitLab CI
 
 ### Basic pipeline stage
 
@@ -288,7 +300,7 @@ bernstein:
 ### Multi-project pipeline (scheduled)
 
 ```yaml
-# .gitlab-ci.yml — runs nightly
+# .gitlab-ci.yml - runs nightly
 weekly-refactor:
   image: python:3.12-slim
   stage: maintenance
@@ -384,9 +396,11 @@ The included `docker-compose.yaml` runs a full cluster: task server, orchestrato
 ### Setup
 
 ```bash
-# Copy and edit the env file
-cp .env.example .env
-# Edit .env: set ANTHROPIC_API_KEY and BERNSTEIN_AUTH_TOKEN
+# Create the env file: set ANTHROPIC_API_KEY and BERNSTEIN_AUTH_TOKEN
+cat > .env <<'EOF'
+BERNSTEIN_AUTH_TOKEN=change-me
+ANTHROPIC_API_KEY=sk-ant-...
+EOF
 
 # Start the full stack
 docker compose up -d
@@ -397,6 +411,101 @@ docker compose up -d --scale bernstein-worker=4
 # View logs
 docker compose logs -f bernstein-server
 docker compose logs -f bernstein-orchestrator
+```
+
+> **Single-worker task server.** Only `bernstein-worker` replicas scale
+> horizontally. The `bernstein-server` container must run with **exactly one
+> uvicorn worker** - the in-process `TaskStore` holds state in memory and
+> guards mutations with `asyncio.Lock`. Running `uvicorn --workers N` (or
+> setting `WEB_CONCURRENCY>1` / `BERNSTEIN_WORKERS>1`) interleaves JSONL
+> appends and lets two workers claim the same task. The server refuses to
+> boot when multi-worker mode is requested; use a horizontal pool of
+> `bernstein-worker` replicas (or migrate to the SQLite/Redis backends -
+> separate ticket) for parallelism.
+
+### Container sandbox isolation (`--sandbox docker`)
+
+Per-agent container isolation runs each agent in its own container instead of a
+git worktree. It is requested **only** through the sandbox configuration - there
+are exactly three sources, and they are independent of every other setting:
+
+| Source | Example |
+|---|---|
+| The `sandbox:` section of `bernstein.yaml` | `sandbox: {enabled: true, runtime: docker}` |
+| The `--sandbox` CLI flag | `bernstein run plan.yaml --sandbox docker` |
+| The `BERNSTEIN_SANDBOX_RUNTIME` env var | `BERNSTEIN_SANDBOX_RUNTIME=docker` (set by `--sandbox`) |
+
+> **Compliance presets do not change your isolation boundary.** The
+> `regulated` preset (like the other presets - `development`, `standard`,
+> `hipaa`) controls audit logging, the HMAC audit chain, signed WAL, data
+> residency, SBOM generation, approval gates, mandatory human review, and
+> evidence-bundle export. It has **no** isolation or sandbox setting:
+> `compliance` and `sandbox` are parsed as separate sections and neither reads
+> the other. A `regulated` run uses whatever `sandbox:` specifies - which, if you
+> have not set it, is the default worktree isolation. If you want container
+> isolation, request it explicitly with `sandbox:` or `--sandbox`; selecting a
+> compliance preset will not do it for you.
+
+Inside the published `ghcr.io/sipyourdrink-ltd/bernstein` image the docker
+backend is **not available by default** - the image is intentionally lean and
+ships none of the three things it needs:
+
+1. **A container-runtime CLI** on `PATH` inside the container (`docker` or
+   `podman`).
+2. **The Python Docker SDK** - install the `docker` extra
+   (`pip install "bernstein[docker]"`, i.e. `pip install docker`).
+3. **A mounted Docker socket** so the in-container client can reach the host
+   daemon: bind-mount `/var/run/docker.sock`.
+
+Provide all three and the backend attaches and runs each agent in a sibling
+container. The shipped `docker-compose.yaml` includes a ready-to-uncomment
+socket mount on the worker/orchestrator services; you still need an image that
+contains the CLI + `docker` extra (build a thin layer on top of the base image
+rather than baking docker into the base image).
+
+> **macOS / Docker Desktop.** Docker Desktop restricts which host paths can be
+> bind-mounted into containers; a socket or workspace mount outside the shared
+> paths fails with "mounts denied". This is a Docker Desktop file-sharing
+> constraint, not a Bernstein limitation - add the path under Docker Desktop →
+> Settings → Resources → File sharing, or run the cluster on Linux.
+
+**What happens when the runtime is unavailable.** Container isolation that
+cannot be provided never silently becomes worktree isolation:
+
+| How isolation was requested | Runtime missing |
+|---|---|
+| `--sandbox docker` **or** `--sandbox podman` - any explicitly named container runtime | **refuses** - a `SandboxSelectionError` naming the runtime and the cause. The check runs at wiring time, so a missing runtime CLI, a missing Docker SDK, or a dead daemon aborts the run *before any agent spawns*; if the runtime attaches but a per-agent sandbox cannot be started, the spawn refuses rather than dropping to a worktree or host spawn |
+| A container request configured without `--sandbox` (e.g. `sandbox:` in `bernstein.yaml`) | **downgrades to worktree isolation, surfaced and audited** |
+| The legacy `--container` flag (no `--sandbox`) | **downgrades to no isolation, surfaced and audited** - the agent runs on the host |
+
+> **An explicitly requested container runtime never silently degrades - for
+> every supported runtime.** The refusal is gated on "the operator named a
+> container runtime with `--sandbox` / `BERNSTEIN_SANDBOX_RUNTIME`", not on
+> which runtime was named, so `podman` and `docker` behave identically. If you
+> pin a runtime, the run either gets that boundary or stops. Non-container
+> `--sandbox` choices (`worktree` and the cloud backends) are unaffected: they
+> keep their own selection and fallback semantics.
+
+A downgrade is no longer a log-only event. It is recorded in the end-of-run
+summary (`summary.json` → `isolation_downgrades`, plus an "Isolation downgrade"
+row on the summary card) and as a `sandbox.isolation_downgrade` entry in the
+HMAC-chained audit log carrying the requested and actual isolation modes. An
+operator who asked for a stronger boundary can therefore see at run level that a
+weaker one was used - and prove it from the audit chain afterwards.
+
+If your posture requires the run to *fail closed* rather than continue on a
+weaker boundary, pin the backend with `--sandbox docker` or `--sandbox podman`
+and confirm the run aborts when no runtime is present. Note that a downgrade is
+reported per agent session, so a run that spawns several agents on a
+runtime-less host records one entry per affected session.
+
+### Backing up state
+
+`.sdd/` is mounted as a named volume (`sdd-data`). To back it up:
+
+```bash
+docker run --rm -v bernstein_sdd-data:/data -v $(pwd):/backup \
+  alpine tar czf /backup/sdd-backup.tar.gz /data
 ```
 
 ### Service endpoints
@@ -444,6 +553,13 @@ Expected health response:
 - `kubectl` configured for your cluster
 - Persistent storage (EBS, NFS, local-path provisioner, etc.)
 
+Add the Bitnami repo first - the chart's PostgreSQL and Redis sub-charts depend on it:
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+```
+
 ### Install with Helm
 
 ```bash
@@ -470,7 +586,7 @@ kubectl create secret generic bernstein-provider-keys \
   --from-literal=OPENAI_API_KEY="sk-..."
 ```
 
-### `values.yaml` — complete example
+### `values.yaml` - complete example
 
 ```yaml
 # my-values.yaml
@@ -548,6 +664,92 @@ kubectl port-forward -n bernstein svc/bernstein-server 8052:8052
 ```
 
 For the full Helm chart parameter reference, see `docs/operations/HELM_DEPLOYMENT.md`.
+
+### Common overrides
+
+**Scale workers:**
+```bash
+helm upgrade bernstein ./deploy/helm/bernstein \
+  --namespace bernstein \
+  --set worker.replicaCount=8
+```
+
+**Disable HPA (fixed worker count):**
+```bash
+--set worker.autoscaling.enabled=false
+```
+
+**Expose the task server via ingress:**
+```bash
+--set ingress.enabled=true \
+--set ingress.className=nginx \
+--set "ingress.hosts[0].host=bernstein.example.com" \
+--set "ingress.hosts[0].paths[0].path=/" \
+--set "ingress.hosts[0].paths[0].pathType=Prefix"
+```
+
+**Use external PostgreSQL/Redis (e.g. managed cloud services):**
+```bash
+--set postgresql.enabled=false \
+--set redis.enabled=false \
+--set externalDatabase.url="postgresql://user:pass@host:5432/bernstein" \
+--set externalRedis.url="redis://host:6379/0"
+```
+
+### Architecture
+
+```
+                          ┌─────────────────┐
+                          │  Ingress (opt.)  │
+                          └────────┬────────┘
+                                   │
+                    ┌──────────────▼──────────────┐
+                    │      bernstein-server        │
+                    │   Deployment + Service       │
+                    │   (ClusterIP :8052)          │
+                    └──┬──────────────────────┬───┘
+                       │                      │
+         ┌─────────────▼─────────┐   ┌────────▼────────────┐
+         │  bernstein-orchestrat │   │  bernstein-worker    │
+         │  Deployment (1 pod)   │   │  StatefulSet (N pods)│
+         │  run --remote         │   │  worker --server ... │
+         └───────────────────────┘   └─────────────────────┘
+                       │                      │
+              ┌────────▼────────┐   ┌─────────▼──────────┐
+              │   PostgreSQL    │   │       Redis          │
+              │  (bitnami chart)│   │  (bitnami chart)    │
+              └─────────────────┘   └────────────────────┘
+```
+
+### Resource sizing guide
+
+| Role | Replicas | CPU req | Mem req | Notes |
+|---|---|---|---|---|
+| server | 1 | 100m | 256Mi | Stateful - single replica |
+| orchestrator | 1 | 100m | 128Mi | Reads backlog, no heavy compute |
+| worker | 2-20 | 500m | 512Mi | Scale based on task throughput |
+
+Workers make outbound calls to LLM APIs and run `claude`/`codex`/`gemini` CLI binaries. They do **not** need GPUs.
+
+### Secrets management
+
+Never put API keys in `values.yaml`. Use one of:
+
+- **Kubernetes Secrets** (`kubectl create secret`) - simplest
+- **External Secrets Operator** - sync from AWS Secrets Manager, Vault, GCP Secret Manager
+- **Sealed Secrets** - encrypted secrets committed to git
+
+### Health checks
+
+```bash
+# Task server health
+kubectl exec -n bernstein deploy/bernstein-server -- \
+  curl -s http://localhost:8052/health
+
+# Live task queue
+kubectl exec -n bernstein deploy/bernstein-server -- \
+  curl -s http://localhost:8052/status
+```
 
 ### Raw Kubernetes manifests (without Helm)
 
@@ -660,8 +862,9 @@ Bernstein can execute agents on Cloudflare's edge infrastructure instead of loca
 npm install -g wrangler
 wrangler login
 
-# 2. Deploy the agent Worker
-bernstein cloud deploy --worker-name bernstein-agent
+# 2. Scaffold the agent Worker, set account_id in wrangler.toml, then deploy it
+bernstein cloud init --worker-name bernstein-agent
+npx wrangler deploy
 
 # 3. Authenticate with Bernstein Cloud
 bernstein cloud login
@@ -669,6 +872,12 @@ bernstein cloud login
 # 4. Run orchestration in the cloud
 bernstein cloud run "Add OAuth2 authentication" --max-agents 5 --budget 25.00
 ```
+
+`cloud login`, `cloud run`, `cloud status`, and `cloud cost` target the
+experimental, currently-unavailable `api.bernstein.run`; `cloud init` runs
+locally against your own Cloudflare account, and step 2's `wrangler deploy`
+talks to Cloudflare directly. Steps 3 and 4 do not work until the hosted
+service exists.
 
 ### What runs where
 
@@ -678,7 +887,6 @@ bernstein cloud run "Add OAuth2 authentication" --max-agents 5 --budget 25.00
 | Agent execution | Cloudflare Workers / Sandboxes | Code generation, testing |
 | Workspace files | Cloudflare R2 | File sync between local and cloud agents |
 | Analytics / billing | Cloudflare D1 | Usage metering, quota enforcement |
-| LLM response cache | Cloudflare Vectorize | Semantic prompt deduplication |
 | Internal LLM (planning) | Cloudflare Workers AI | Free-tier models for task decomposition |
 
 ### Environment variables for Cloudflare
@@ -686,10 +894,10 @@ bernstein cloud run "Add OAuth2 authentication" --max-agents 5 --budget 25.00
 | Variable | Description |
 |----------|-------------|
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account identifier |
-| `CLOUDFLARE_API_TOKEN` | API token with Workers, R2, D1, Vectorize permissions |
+| `CLOUDFLARE_API_TOKEN` | API token with Workers, R2, D1 permissions |
 | `BERNSTEIN_CLOUD_API_KEY` | API key for bernstein.run hosted service |
 
-For the full Cloudflare setup guide including R2 buckets, D1 databases, and Vectorize indexes, see the [Cloudflare Setup](cloudflare-setup.md) documentation.
+For the full Cloudflare setup guide including R2 buckets and D1 databases, see the [Cloudflare Setup](../cloudflare/cloudflare-setup.md) documentation.
 
 ---
 
@@ -726,13 +934,13 @@ User=bernstein
 Group=bernstein
 WorkingDirectory=/opt/bernstein/workspace
 
-ExecStart=/opt/bernstein/venv/bin/bernstein conduct
+ExecStart=/opt/bernstein/venv/bin/bernstein start
 ExecStop=/opt/bernstein/venv/bin/bernstein stop --hard
 
 Restart=on-failure
 RestartSec=10
 
-# Secrets — set via EnvironmentFile in production
+# Secrets - set via EnvironmentFile in production
 EnvironmentFile=/etc/bernstein/env
 Environment=BERNSTEIN_SDD_DIR=/var/lib/bernstein/.sdd
 Environment=BERNSTEIN_BIND_HOST=0.0.0.0
@@ -776,7 +984,7 @@ server_url: http://bernstein.internal:8052
 
 ```bash
 # Submit tasks to the shared server without running a local orchestrator
-bernstein task add "Implement login page" --role frontend --priority 2
+bernstein add-task "Implement login page" --role frontend --priority 2
 bernstein status   # see what the shared server is running
 bernstein ps       # list active agents
 ```
@@ -810,6 +1018,24 @@ server {
 }
 ```
 
+**Caddy alternative (automatic HTTPS):**
+```caddyfile
+# /etc/caddy/Caddyfile
+bernstein.internal {
+    reverse_proxy 127.0.0.1:8052
+}
+```
+Caddy automatically obtains and renews a Let's Encrypt certificate: `systemctl start caddy`.
+
+Once TLS is in place, point remote workers at the `https://` URL and pair the
+bearer token with TLS so it is never transmitted in the clear:
+
+```bash
+BERNSTEIN_SERVER_URL=https://bernstein.internal \
+  BERNSTEIN_AUTH_TOKEN=<secret> \
+  bernstein worker
+```
+
 ### Multi-project setup
 
 Run separate orchestrators on different ports for project isolation:
@@ -817,7 +1043,7 @@ Run separate orchestrators on different ports for project isolation:
 ```bash
 # /etc/systemd/system/bernstein@.service  (template unit)
 [Unit]
-Description=Bernstein Orchestrator — %i
+Description=Bernstein Orchestrator - %i
 After=network.target
 
 [Service]
@@ -825,7 +1051,7 @@ Type=simple
 User=bernstein
 WorkingDirectory=/opt/bernstein/projects/%i
 EnvironmentFile=/etc/bernstein/%i.env
-ExecStart=/opt/bernstein/venv/bin/bernstein conduct
+ExecStart=/opt/bernstein/venv/bin/bernstein start
 
 [Install]
 WantedBy=multi-user.target
@@ -843,26 +1069,25 @@ sudo systemctl start bernstein@project-b
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | Claude API key |
-| `OPENAI_API_KEY` | — | OpenAI / Codex API key |
-| `GOOGLE_API_KEY` | — | Gemini API key |
+| `ANTHROPIC_API_KEY` | - | Claude API key |
+| `OPENAI_API_KEY` | - | OpenAI / Codex API key |
+| `GOOGLE_API_KEY` | - | Gemini API key |
 | `BERNSTEIN_SERVER_URL` | `http://127.0.0.1:8052` | Task server URL (for remote workers) |
 | `BERNSTEIN_BIND_HOST` | `127.0.0.1` | Server bind address |
 | `BERNSTEIN_PORT` | `8052` | Server port |
 | `BERNSTEIN_MAX_AGENTS` | `6` | Max concurrent agents |
-| `BERNSTEIN_AUTH_TOKEN` | — | Inter-node auth secret (cluster mode) |
-| `BERNSTEIN_DASHBOARD_PASSWORD` | — | Dashboard HTTP auth password |
+| `BERNSTEIN_AUTH_TOKEN` | - | Inter-node auth secret (cluster mode) |
+| `BERNSTEIN_DASHBOARD_PASSWORD` | - | Dashboard HTTP auth password |
 | `BERNSTEIN_STORAGE_BACKEND` | `memory` | `memory`, `postgres`, or `redis` |
-| `BERNSTEIN_DATABASE_URL` | — | PostgreSQL DSN (e.g. `postgresql://user:pass@host/db`) |
-| `BERNSTEIN_REDIS_URL` | — | Redis URL (e.g. `redis://localhost:6379/0`) |
+| `BERNSTEIN_DATABASE_URL` | - | PostgreSQL DSN (e.g. `postgresql://user:pass@host/db`) |
+| `BERNSTEIN_REDIS_URL` | - | Redis URL (e.g. `redis://localhost:6379/0`) |
 | `BERNSTEIN_CLUSTER_ENABLED` | `false` | Enable multi-node cluster mode |
 | `BERNSTEIN_LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 | `BERNSTEIN_LOG_JSON` | `false` | Emit JSON log lines (for log aggregators) |
-| `BERNSTEIN_BUDGET` | — | Hard spending cap in USD |
-| `BERNSTEIN_TICK_INTERVAL` | `5` | Orchestrator tick interval in seconds |
-| `BERNSTEIN_SKIP_GATES` | — | Skip quality gates (requires `BERNSTEIN_SKIP_GATE_REASON`) |
-| `BERNSTEIN_NO_TUI` | — | Disable interactive TUI (useful in CI) |
-| `BERNSTEIN_QUIET` | — | Suppress all non-error output |
+| `BERNSTEIN_BUDGET` | - | Hard spending cap in USD |
+| `BERNSTEIN_SKIP_GATES` | - | Skip quality gates (requires `BERNSTEIN_SKIP_GATE_REASON`) |
+| `BERNSTEIN_NO_TUI` | - | Disable interactive TUI (useful in CI) |
+| `BERNSTEIN_QUIET` | - | Suppress all non-error output |
 
 ---
 
@@ -883,7 +1108,7 @@ On `switch_traffic()`, the `.sdd/` symlink is atomically re-pointed at `.sdd-gre
 
 ```python
 from pathlib import Path
-from bernstein.core.blue_green import BlueGreenConfig, BlueGreenDeployment
+from bernstein.core.orchestration.blue_green import BlueGreenConfig, BlueGreenDeployment
 
 cfg = BlueGreenConfig(
     health_check_url="http://127.0.0.1:8052/status",
@@ -900,9 +1125,9 @@ green_path = deploy.prepare_green("2.1.0")
 
 # 3. Check health
 if deploy.health_check():
-    deploy.switch_traffic()   # symlink: .sdd/ → .sdd-green/
+    deploy.switch_traffic()  # symlink: .sdd/ → .sdd-green/
 else:
-    deploy.rollback()         # stays on blue; green is discarded
+    deploy.rollback()  # stays on blue; green is discarded
 ```
 
 ### Upgrade procedure (bare metal)
@@ -913,7 +1138,7 @@ pip install bernstein==2.1.0 --target /opt/bernstein/v2.1.0
 
 # 2. Start the new server on a staging port
 BERNSTEIN_PORT=8053 BERNSTEIN_SDD_DIR=.sdd-green \
-  /opt/bernstein/v2.1.0/bin/bernstein conduct &
+  /opt/bernstein/v2.1.0/bin/bernstein start &
 
 # 3. Verify it is healthy
 curl http://127.0.0.1:8053/status
@@ -921,7 +1146,7 @@ curl http://127.0.0.1:8053/status
 # 4. Switch traffic via the Python API or CLI
 python3 -c "
 from pathlib import Path
-from bernstein.core.blue_green import BlueGreenConfig, BlueGreenDeployment
+from bernstein.core.orchestration.blue_green import BlueGreenConfig, BlueGreenDeployment
 cfg = BlueGreenConfig(health_check_url='http://127.0.0.1:8053/status')
 BlueGreenDeployment(cfg, Path('.')).switch_traffic()
 "
@@ -934,10 +1159,10 @@ kill $(cat .sdd-blue/runtime/server.pid)
 
 ```python
 status = deploy.status()
-print(status.active)         # "blue" or "green"
-print(status.blue_version)   # "2.0.0"
+print(status.active)  # "blue" or "green"
+print(status.blue_version)  # "2.0.0"
 print(status.green_version)  # "2.1.0"
-print(status.healthy)        # True / False
+print(status.healthy)  # True / False
 ```
 
 ---
@@ -949,7 +1174,7 @@ print(status.healthy)        # True / False
 3. Install the new version: `pip install --upgrade bernstein`
 4. Start: `bernstein run`
 
-State format is forward-compatible between minor versions. For major version upgrades, check `docs/migrations/migration-guides.md` for breaking changes.
+State format is forward-compatible between minor versions. For major version upgrades, check [`operations/migrations.md`](migrations.md) for breaking changes.
 
 To roll back: `pip install bernstein==<previous-version>` and restore `.sdd.backup/`.
 
@@ -991,10 +1216,10 @@ kubectl logs -n bernstein deploy/bernstein-server
 **Check 1: Auth token mismatch.** Every node must share the same `BERNSTEIN_AUTH_TOKEN`:
 
 ```bash
-# Docker Compose — inspect worker env
+# Docker Compose - inspect worker env
 docker compose exec bernstein-worker env | grep AUTH_TOKEN
 
-# Kubernetes — decode the secret
+# Kubernetes - decode the secret
 kubectl get secret bernstein-auth -n bernstein -o jsonpath='{.data.BERNSTEIN_AUTH_TOKEN}' | base64 -d
 ```
 
@@ -1019,7 +1244,7 @@ curl http://localhost:8052/tasks?status=open
 A previous Bernstein session did not shut down cleanly. Find and stop it:
 
 ```bash
-# Local — use Bernstein's own stop command
+# Local - use Bernstein's own stop command
 bernstein stop --force
 
 # Or find the PID manually
@@ -1035,8 +1260,8 @@ lsof -ti:8052 | xargs kill -9
 Agents exit when they have no work or cannot authenticate. Check logs:
 
 ```bash
-bernstein logs -f                       # follow all agent output
-bernstein logs -a claude                # filter by agent name
+bernstein logs tail -f                  # follow all agent output
+bernstein logs tail -a claude           # filter by agent name
 tail -f .sdd/runtime/logs/*.log         # raw log files
 ```
 
@@ -1095,7 +1320,7 @@ kubectl patch storageclass <name> -p '{"metadata": {"annotations":{"storageclass
 Check that Prometheus is scraping the task server:
 
 ```bash
-# Docker Compose — open Prometheus targets page
+# Docker Compose - open Prometheus targets page
 open http://localhost:9090/targets
 
 # Kubernetes
@@ -1107,6 +1332,6 @@ If `bernstein-server` shows as `DOWN`, the metrics endpoint is not reachable. Ve
 
 ### Still stuck?
 
-1. Run `bernstein doctor` — it checks the most common issues automatically.
+1. Run `bernstein doctor` - it checks the most common issues automatically.
 2. Check the [Troubleshooting guide](TROUBLESHOOTING.md) for agent-level issues (API errors, quality gate failures, cost overruns).
 3. Open an issue at [sipyourdrink-ltd/bernstein](https://github.com/sipyourdrink-ltd/bernstein/issues) with the output of `bernstein doctor --json`.

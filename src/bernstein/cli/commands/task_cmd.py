@@ -24,6 +24,7 @@ from bernstein.cli.helpers import (
     server_get,
     server_post,
 )
+from bernstein.core.tasks.artifacts import ArtifactKind
 
 # This will be populated by main.py after it creates the CLI group
 _cli: Any = None
@@ -82,7 +83,7 @@ def claim_backlog(
             project=project,
             role=role,
             capability=capability,
-            completed_ids=set(completed_ids),
+            completed_ids=frozenset(completed_ids),
             max_attempts=max_attempts,
         ),
     )
@@ -94,6 +95,62 @@ def claim_backlog(
         console.print("[dim]No eligible task.[/dim]")
         return
     console.print(claimed.id)
+
+
+@backlog_group.command("verify-claim")
+@click.option(
+    "--receipt",
+    "receipt_path",
+    default="-",
+    metavar="PATH",
+    help="Claim receipt JSON to verify ('-' reads stdin).",
+)
+@click.option(
+    "--backlog",
+    "backlog_path",
+    default=Path(".sdd/runtime/task-backlog.json"),
+    show_default=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the shared JSON backlog to reproject from.",
+)
+@click.option(
+    "--audit-dir",
+    "audit_dir",
+    default=Path(".sdd/audit"),
+    show_default=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Audit chain directory the claim event was mirrored into.",
+)
+def verify_claim(receipt_path: str, backlog_path: Path, audit_dir: Path) -> None:
+    """Verify a claim receipt offline against the backlog and audit chain.
+
+    Reprojects the backlog head from the on-disk backlog, checks the receipt
+    signature, verifies the audit chain, and confirms a matching
+    ``task.claim_receipt`` event sits at the receipt's embedded chain head -
+    the same chain ``bernstein audit verify`` walks. Exits non-zero when the
+    receipt does not verify.
+    """
+    import sys
+
+    from bernstein.core.protocols.mcp.claim_receipt import ClaimReceipt, verify_claim_receipt
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.server.dashboard_tokens import resolve_dashboard_hmac_key
+    from bernstein.core.tasks.claim import Backlog
+
+    raw = sys.stdin.read() if receipt_path == "-" else Path(receipt_path).read_text(encoding="utf-8")
+    receipt = ClaimReceipt.from_wire(json.loads(raw))
+    rows = [entry.to_dict() for entry in Backlog.load(backlog_path).entries]
+    chain = AuditChainStore(audit_dir, key=resolve_dashboard_hmac_key(audit_dir.parent))
+
+    ok, reason = verify_claim_receipt(receipt, rows, chain)
+    if is_json():
+        print_json({"verified": ok, "reason": reason, "task_id": receipt.task_id, "granted": receipt.granted})
+    elif ok:
+        console.print(f"[green]OK[/green] claim receipt verifies (task_id={receipt.task_id or '<refused>'})")
+    else:
+        console.print(f"[red]FAIL[/red] {reason}")
+    if not ok:
+        raise SystemExit(1)
 
 
 @click.command("compose", hidden=True)
@@ -132,6 +189,53 @@ def claim_backlog(
     ),
 )
 @click.option(
+    "--mode",
+    "mode",
+    default=None,
+    type=click.Choice(["verbose", "balanced", "terse", "fast", "smart", "deep"]),
+    help=(
+        "Response-style profile for the worker handling this task. Accepts a "
+        "style name (verbose/balanced/terse) or a mode-profile name "
+        "(fast/smart/deep); stamped as metadata['mode'], the top-priority "
+        "input of the spawn-time style resolution."
+    ),
+)
+@click.option(
+    "--artifact-kind",
+    "artifact_kind",
+    default=None,
+    # Every kind the shared parser accepts except ``code_diff`` - see the note
+    # below on why a task must never silently complete as one. Derived rather
+    # than listed: the literal list was two kinds behind ``ArtifactKind``.
+    type=click.Choice([k.value for k in ArtifactKind if k is not ArtifactKind.CODE_DIFF]),
+    help=(
+        "Declare the artifact contract this task produces (issue #3110). The "
+        "task then completes on a signed lineage receipt instead of a git "
+        "commit. Requires --artifact-output. Omit for a normal coding task."
+    ),
+)
+@click.option(
+    "--artifact-output",
+    "artifact_output",
+    default=None,
+    metavar="PATH",
+    help=(
+        "Workdir-relative path the agent writes the declared artifact to. "
+        "Required with --artifact-kind; absolute paths and '..' are refused."
+    ),
+)
+@click.option(
+    "--artifact-criterion",
+    "artifact_criteria",
+    multiple=True,
+    metavar="TYPE:VALUE",
+    help=(
+        "Typed criterion evaluated against the artifact bytes, as TYPE:VALUE "
+        "split on the first colon (types: schema_valid, criteria_match, "
+        "hash_stable). Repeatable. Requires --artifact-kind."
+    ),
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="Print the JSON payload that would be sent without actually calling the API.",
@@ -147,6 +251,10 @@ def add_task(
     complexity: str,
     depends_on: tuple[str, ...],
     criterion_profile: str | None,
+    mode: str | None,
+    artifact_kind: str | None,
+    artifact_output: str | None,
+    artifact_criteria: tuple[str, ...],
     dry_run: bool,
 ) -> None:
     """Add a task to the running server.
@@ -162,6 +270,33 @@ def add_task(
         "complexity": complexity,
         "depends_on": list(depends_on),
     }
+
+    # Issue #3110: the declared artifact contract, validated early by the one
+    # strict parser every declaration surface shares, so operator typos
+    # surface here rather than after the payload leaves the CLI. Fail-closed:
+    # a malformed declaration is a usage error naming the offending field,
+    # never a task that silently completes as code_diff.
+    if artifact_kind is None and (artifact_output is not None or artifact_criteria):
+        raise click.UsageError("--artifact-output / --artifact-criterion require --artifact-kind.")
+    if artifact_kind is not None:
+        from bernstein.core.tasks.artifacts import ArtifactSpecError, parse_artifact_spec
+
+        criteria: list[dict[str, str]] = []
+        for raw in artifact_criteria:
+            ctype, sep, cvalue = raw.partition(":")
+            if not sep:
+                raise click.UsageError(
+                    f"--artifact-criterion {raw!r}: expected TYPE:VALUE "
+                    "(types: schema_valid, criteria_match, hash_stable)."
+                )
+            criteria.append({"type": ctype.strip(), "value": cvalue})
+        raw_spec: dict[str, Any] = {"kind": artifact_kind, "output_path": artifact_output or ""}
+        if criteria:
+            raw_spec["criteria"] = criteria
+        try:
+            payload["artifact_spec"] = parse_artifact_spec(raw_spec).to_dict()
+        except ArtifactSpecError as exc:
+            raise click.UsageError(str(exc)) from None
     if criterion_profile is not None:
         # Validate early so operator typos surface before the payload
         # leaves the CLI.  The server simply forwards metadata blindly.
@@ -175,6 +310,9 @@ def add_task(
         except CriterionProfileError as exc:
             raise click.UsageError(f"--criterion-profile {criterion_profile!r}: {exc}") from None
         payload.setdefault("metadata", {})["criterion_profile"] = criterion_profile
+
+    if mode is not None:
+        payload.setdefault("metadata", {})["mode"] = mode
 
     if dry_run:
         if is_json():
@@ -287,12 +425,43 @@ def cancel(task_id: str, reason: str) -> None:
     default=False,
     help="Print the resolved pipeline without spawning agents or hitting any LLM.",
 )
+@click.option(
+    "--fix",
+    is_flag=True,
+    default=False,
+    help="Run a fix pass between review passes, fed the verdict and the failing checks' logs.",
+)
+@click.option(
+    "--until-checks-green",
+    "until_checks_green",
+    is_flag=True,
+    default=False,
+    help="Withhold approval until the PR's check rollup is green.",
+)
+@click.option(
+    "--max-passes",
+    "max_passes",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Review budget; the contour stops with a needs-operator outcome once it is spent.",
+)
+@click.option(
+    "--fix-command",
+    "fix_command",
+    default=None,
+    help="Command the fix pass runs, given the rendered prompt's path as its last argument.",
+)
 def review_cmd(
     workdir: str,
     pipeline_path: str | None,
     pr_number: int | None,
     validate_only: bool,
     dry_run: bool,
+    fix: bool,
+    until_checks_green: bool,
+    max_passes: int,
+    fix_command: str | None,
 ) -> None:
     """Trigger a manager queue review or run a YAML review pipeline.
 
@@ -305,15 +474,21 @@ def review_cmd(
     verdict table.  ``--validate-only`` exits after schema validation;
     ``--dry-run`` prints the resolved pipeline without spawning any agent.
 
+    With ``--fix`` / ``--until-checks-green``: runs review, fix and re-check
+    in a loop bounded by ``--max-passes``, emits one chained review receipt
+    per pass, and exits non-zero with a ``needs-operator`` outcome rather
+    than an approval when the budget is spent.
+
     \b
     Examples:
       bernstein review
       bernstein review --pipeline review.yaml --validate-only
       bernstein review --pipeline review.yaml --pr 42 --dry-run
       bernstein review --pipeline templates/review/default-3-phase.yaml --pr 42
+      bernstein review --pipeline review.yaml --pr 42 --fix --until-checks-green --max-passes 3
     """
     if pipeline_path is not None or validate_only or dry_run or pr_number is not None:
-        # Lazy import — keep the legacy fast path zero-cost.
+        # Lazy import - keep the legacy fast path zero-cost.
         from bernstein.cli.commands.review_pipeline_cmd import run_review_pipeline_cli
 
         exit_code = run_review_pipeline_cli(
@@ -322,6 +497,10 @@ def review_cmd(
             validate_only=validate_only,
             dry_run=dry_run,
             workdir=workdir,
+            fix=fix,
+            until_checks_green=until_checks_green,
+            max_passes=max_passes,
+            fix_command=fix_command,
         )
         raise SystemExit(exit_code)
 
@@ -527,15 +706,15 @@ def plan(ctx: click.Context, export_file: str | None, status_filter: str | None,
     for t in tasks:
         raw_status: str = t.get("status", "open")
         color = STATUS_COLORS.get(raw_status, "white")
-        depends = ", ".join(d[:8] for d in cast("list[str]", t.get("depends_on", []))) or "—"
+        depends = ", ".join(d[:8] for d in cast("list[str]", t.get("depends_on", []))) or "-"
         table.add_row(
-            str(t.get("id", "—"))[:8],
+            str(t.get("id", "-"))[:8],
             f"[{color}]{raw_status}[/{color}]",
-            str(t.get("role", "—")),
-            str(t.get("title", "—")),
+            str(t.get("role", "-")),
+            str(t.get("title", "-")),
             depends,
-            str(t.get("model") or "—"),
-            str(t.get("effort") or "—"),
+            str(t.get("model") or "-"),
+            str(t.get("effort") or "-"),
         )
 
     console.print(table)
@@ -686,10 +865,412 @@ def list_tasks(status_filter: str | None, role: str | None, as_json: bool) -> No
         raw_status = t.get("status", "open")
         color = STATUS_COLORS.get(raw_status, "white")
         table.add_row(
-            t.get("id", "—"),
-            t.get("title", "—"),
-            t.get("role", "—"),
+            t.get("id", "-"),
+            t.get("title", "-"),
+            t.get("role", "-"),
             f"[{color}]{raw_status}[/{color}]",
             str(t.get("priority", 2)),
+        )
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Durable suspend / resume (#2552)
+# ---------------------------------------------------------------------------
+
+
+@click.group("task")
+def task_group() -> None:
+    """Durable task lifecycle: suspend and resume long-running sessions.
+
+    A task that must wait on a human (a mid-flight approval, an external
+    review, a credential rotation, a dependency landing) can PARK: the park
+    emits an attested receipt that releases the seat, sandbox, and budget
+    envelope, and ``bernstein task resume`` restores from that receipt
+    deterministically.
+    """
+
+
+def _suspension_context(workdir: str, task_id: str) -> tuple[Path, Any, Any]:
+    """Return ``(sdd_dir, audit_chain, work_ledger)`` for a task park/resume."""
+    from bernstein.core.persistence.work_ledger import WorkLedger, run_ledger_dir
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.tasks.checkpoint_retry import task_run_id
+
+    sdd_dir = Path(workdir) / ".sdd"
+    chain = AuditChainStore(sdd_dir / "audit")
+    ledger = WorkLedger.open(run_ledger_dir(sdd_dir, task_run_id(task_id)))
+    return sdd_dir, chain, ledger
+
+
+@task_group.command("complete")
+@click.argument("task_id")
+@click.option(
+    "--summary",
+    "-s",
+    "summary",
+    required=True,
+    help="Result summary recorded on the task (free-form, max 2000 chars).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Print the server's task payload as JSON.")
+def task_complete(task_id: str, summary: str, as_json: bool) -> None:
+    """Mark a task complete on the running task server.
+
+    First-class replacement for hand-assembling a completion ``curl`` (#3015).
+    The command resolves the task-server URL and the session token itself -
+    from ``BERNSTEIN_SERVER_URL`` / ``.sdd/runtime/server.port`` and
+    ``BERNSTEIN_AUTH_TOKEN`` / the persisted run-token file - so the agent
+    never nests a Bearer header and a JSON body inside one shell string.
+
+    \b
+    Example:
+      bernstein task complete T-abc123 --summary "Created hello.txt and committed"
+    """
+    from bernstein.cli.helpers import ServerAuthError
+
+    try:
+        data = server_post(
+            f"/tasks/{task_id}/complete",
+            {"result_summary": summary},
+            raise_on_auth_error=True,
+            # The server may briefly restart during hot-reload (evolve mode);
+            # retry only on connection refused, never on a 4xx like 409.
+            connect_retries=3,
+            retry_delay=2.0,
+        )
+    except ServerAuthError:
+        console.print(
+            "[red]Task server rejected credentials.[/red] Ensure BERNSTEIN_AUTH_TOKEN is set "
+            "(or run inside the workspace that holds the run token) and retry."
+        )
+        raise SystemExit(1) from None
+
+    if data is None:
+        from bernstein.cli.errors import server_unreachable
+
+        server_unreachable().print()
+        raise SystemExit(1)
+
+    if as_json or is_json():
+        print_json(data)
+        return
+
+    title = data.get("title", task_id)
+    status = data.get("status", "done")
+    console.print(f"[green]Completed:[/green] [bold]{task_id}[/bold] {title} ([dim]status={status}[/dim])")
+
+
+@task_group.command("suspend")
+@click.argument("task_id")
+@click.option("--workdir", default=".", help="Project root directory (parent of .sdd/).", type=click.Path())
+@click.option("--adapter", default=None, help="Adapter owning the session (defaults to the latest checkpoint).")
+@click.option("--session-id", default=None, help="Native session id (defaults to the latest checkpoint).")
+@click.option("--worktree", default=None, help="Worktree to hash (defaults to the checkpoint worktree or cwd).")
+@click.option("--envelope", default="subscription", show_default=True, help="Quota envelope whose headroom is freed.")
+@click.option("--reserved-usd", default=0.0, type=float, help="Envelope headroom reserved for the task.")
+@click.option("--spent-usd", default=0.0, type=float, help="Spend recorded against the reservation at park time.")
+@click.option(
+    "--until",
+    "until",
+    type=click.Choice(["approval"]),
+    default=None,
+    help="Compose with the approval sentinel: resume only when 'bernstein approve <task-id>' lands.",
+)
+@click.option("--role", default=None, help="Agent role to bind the checkpoint grant to (defaults to the task's role).")
+@click.option("--parent-run-id", default=None, help="Run that owns the task (defaults to $BERNSTEIN_RUN_ID).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Print the park result as JSON.")
+def task_suspend(
+    task_id: str,
+    workdir: str,
+    adapter: str | None,
+    session_id: str | None,
+    worktree: str | None,
+    envelope: str,
+    reserved_usd: float,
+    spent_usd: float,
+    until: str | None,
+    role: str | None,
+    parent_run_id: str | None,
+    as_json: bool,
+) -> None:
+    """Durably park a running task, releasing its seat, sandbox, and budget.
+
+    The park appends a suspend row to the task journal, binds its hash into the
+    HMAC audit chain *before* any release, then returns the seat, tears down the
+    sandbox, reaps the process, and releases unspent envelope headroom -- each
+    referencing the suspend receipt hash. The SUSPENDED state is persisted to
+    the work ledger so the park survives an orchestrator restart.
+
+    \b
+    Example:
+      bernstein task suspend T-abc123 --reserved-usd 10 --spent-usd 2.5
+      bernstein task suspend T-abc123 --until approval
+    """
+    from bernstein.core.instrumentation import RUN_ID_ENV_VAR
+    from bernstein.core.orchestration.approval_gate import write_pending_sentinel
+    from bernstein.core.tasks.checkpoint_retry import latest_checkpoint
+    from bernstein.core.tasks.models import ApprovalSpec
+    from bernstein.core.tasks.suspension import (
+        WAKE_APPROVAL,
+        UnsafeTaskIdError,
+        park_task,
+        resolve_task_role,
+        validate_task_id,
+    )
+
+    # The park derives filesystem names (the journal run dir, and the approval
+    # sentinel under --until approval) from the task id, so it is checked as an
+    # identifier before anything is written.
+    try:
+        validate_task_id(task_id)
+    except UnsafeTaskIdError as exc:
+        console.print(f"[red]Refusing to park:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    sdd_dir, chain, ledger = _suspension_context(workdir, task_id)
+
+    checkpoint = latest_checkpoint(sdd_dir, task_id)
+    if adapter is None:
+        adapter = checkpoint.adapter if checkpoint else ""
+    if session_id is None:
+        session_id = checkpoint.session_id if checkpoint else ""
+    if worktree is None:
+        worktree = checkpoint.worktree_path if checkpoint and checkpoint.worktree_path else workdir
+
+    wake_condition = WAKE_APPROVAL if until == "approval" else ""
+    # The checkpoint the park writes is grant-bound: its hash is recomputed
+    # from the role at resume, so the role has to come from where it is
+    # genuinely recorded. ``CheckpointRef`` never carried one -- the task log
+    # does -- and the run id is process context the CLI is handed by the
+    # orchestrator that spawned it. Either can be pinned explicitly.
+    if role is None:
+        role = resolve_task_role(sdd_dir, task_id)
+    if parent_run_id is None:
+        parent_run_id = os.environ.get(RUN_ID_ENV_VAR, "")
+
+    result = park_task(
+        sdd_dir=sdd_dir,
+        task_id=task_id,
+        adapter=adapter,
+        session_id=session_id,
+        worktree_path=Path(worktree),
+        envelope=envelope,
+        reserved_usd=reserved_usd,
+        spent_usd=spent_usd,
+        chain=chain,
+        ledger=ledger,
+        wake_condition=wake_condition,
+        role=role,
+        parent_run_id=parent_run_id,
+    )
+
+    if wake_condition == WAKE_APPROVAL:
+        write_pending_sentinel(
+            Path(workdir),
+            task_id,
+            ApprovalSpec(prompt=f"Resume parked task {task_id}?"),
+        )
+
+    released = {resource: detail for resource, detail in result.release.rows}
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "status": "suspended",
+        "suspend_event_hash": result.suspend_row.event_hash,
+        "suspend_receipt_hash": result.suspend_receipt_hash,
+        "workspace_hash": result.suspend_row.workspace_hash,
+        "released_usd": result.release.released_usd,
+        "released_resources": sorted(released),
+        "wake_condition": wake_condition,
+        "ledger_entry_hash": result.ledger_entry_hash,
+    }
+    if as_json:
+        print_json(payload)
+        return
+    console.print(f"[green]Suspended:[/green] task [bold]{task_id}[/bold]")
+    console.print(f"[dim]parked-at:[/dim] {result.suspend_row.event_hash[:16]}")
+    console.print(f"[dim]receipt:[/dim] {result.suspend_receipt_hash[:16]}")
+    console.print(f"[dim]released:[/dim] {', '.join(sorted(released))} (${result.release.released_usd:.4f} headroom)")
+    if wake_condition == WAKE_APPROVAL:
+        console.print(f"[cyan]Wake gate:[/cyan] run 'bernstein approve {task_id}' to resume.")
+
+
+@task_group.command("resume")
+@click.argument("task_id")
+@click.option("--workdir", default=".", help="Project root directory (parent of .sdd/).", type=click.Path())
+@click.option("--worktree", default=None, help="Re-materialized worktree to hash (defaults to the parked path).")
+@click.option(
+    "--mode",
+    type=click.Choice(["warm", "fork", "cold"]),
+    default="warm",
+    show_default=True,
+    help="Requested continuation mode; downgraded (never upgraded) on drift.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Print the resume result as JSON.")
+def task_resume(task_id: str, workdir: str, worktree: str | None, mode: str, as_json: bool) -> None:
+    """Durably resume a parked task from its attested suspend receipt.
+
+    Reads the latest verified suspend row, re-derives the continuation mode
+    deterministically (warm when the workspace hash still matches, otherwise a
+    recorded fork/cold downgrade), and records the resume receipt binding the
+    suspend receipt it continued from. When the park was '--until approval' the
+    resume refuses until 'bernstein approve <task-id>' has landed its decision.
+
+    \b
+    Example:
+      bernstein task resume T-abc123
+    """
+    from bernstein.core.tasks.suspension import (
+        WAKE_APPROVAL,
+        ReleaseWithoutReceiptError,
+        ResumeApprovalRequiredError,
+        SuspendReceiptMismatchError,
+        SuspensionAlreadySettledError,
+        UnsafeTaskIdError,
+        approval_decision_ref,
+        find_suspension_receipt,
+        latest_suspension,
+        resume_task,
+        validate_task_id,
+        write_resume_marker,
+    )
+
+    try:
+        validate_task_id(task_id)
+    except UnsafeTaskIdError as exc:
+        console.print(f"[red]Refusing to resume:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    sdd_dir, chain, ledger = _suspension_context(workdir, task_id)
+
+    suspend_row = latest_suspension(sdd_dir, task_id)
+    if suspend_row is None:
+        console.print(f"[red]No verified suspension found for task[/red] [bold]{task_id}[/bold].")
+        raise SystemExit(1)
+
+    approval_ref = ""
+    if suspend_row.wake_condition == WAKE_APPROVAL:
+        approval_ref = approval_decision_ref(Path(workdir), task_id)
+        if not approval_ref:
+            console.print(f"[yellow]Parked until approval:[/yellow] run 'bernstein approve {task_id}' before resuming.")
+            raise SystemExit(1)
+
+    # The suspend receipt is selected by identity, not by recency: it must be
+    # the receipt that binds *this* suspend row's hash and journal index. A task
+    # parked more than once therefore never resumes against another park's
+    # receipt, and a substituted receipt has nothing to match.
+    receipt = find_suspension_receipt(chain=chain, task_id=task_id, suspend_row=suspend_row)
+    if receipt is None:
+        console.print(
+            f"[red]No suspend receipt binds the parked row for task[/red] [bold]{task_id}[/bold] "
+            f"([dim]parked-at {suspend_row.event_hash[:16]}[/dim])."
+        )
+        raise SystemExit(1)
+
+    new_worktree = Path(worktree) if worktree else Path(suspend_row.worktree_path or workdir)
+    try:
+        result = resume_task(
+            sdd_dir=sdd_dir,
+            suspend_row=suspend_row,
+            new_worktree_path=new_worktree,
+            chain=chain,
+            suspend_receipt_hash=receipt.hmac,
+            requested_mode=mode,
+            ledger=ledger,
+            approval_ref=approval_ref,
+        )
+    except (
+        ReleaseWithoutReceiptError,
+        ResumeApprovalRequiredError,
+        SuspendReceiptMismatchError,
+        SuspensionAlreadySettledError,
+        UnsafeTaskIdError,
+    ) as exc:
+        console.print(f"[red]Refusing to resume:[/red] {exc}")
+        raise SystemExit(1) from exc
+    if approval_ref:
+        write_resume_marker(Path(workdir), task_id, result.resume_receipt_hash)
+
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "status": "resumed",
+        "effective_mode": str(result.decision.effective_mode),
+        "requested_mode": str(result.decision.requested_mode),
+        "workspace_match": result.decision.workspace_match,
+        "downgrade_reason": result.decision.downgrade_reason,
+        "decision_hash": result.decision.decision_hash,
+        "continued_from": suspend_row.event_hash,
+        "resume_receipt_hash": result.resume_receipt_hash,
+        "approval_ref": approval_ref,
+    }
+    if as_json:
+        print_json(payload)
+        return
+    mode_str = str(result.decision.effective_mode)
+    console.print(f"[green]Resumed:[/green] task [bold]{task_id}[/bold] ([bold]{mode_str}[/bold])")
+    if result.decision.downgrade_reason:
+        console.print(f"[yellow]downgrade:[/yellow] {result.decision.downgrade_reason}")
+    console.print(f"[dim]continued-from:[/dim] {suspend_row.event_hash[:16]}")
+    console.print(f"[dim]decision:[/dim] {result.decision.decision_hash[:16]}")
+
+
+@task_group.command("list-suspended")
+@click.option("--workdir", default=".", help="Project root directory (parent of .sdd/).", type=click.Path())
+@click.option("--json", "as_json", is_flag=True, default=False, help="Print the parked tasks as JSON.")
+def task_list_suspended(workdir: str, as_json: bool) -> None:
+    """List durably-parked tasks with their parked-at hash and freed resources.
+
+    Reads every per-task work ledger under ``.sdd/runtime/ledger`` and surfaces
+    the tasks whose latest transition is ``task.suspended``, joined with the
+    released headroom and the parked-at journal hash from the suspend row.
+    """
+    from bernstein.core.persistence.work_ledger import (
+        LedgerReader,
+        default_ledger_root,
+        replay_state,
+    )
+    from bernstein.core.tasks.suspension import latest_suspension
+
+    sdd_dir = Path(workdir) / ".sdd"
+    ledger_root = default_ledger_root(sdd_dir)
+
+    parked: list[dict[str, Any]] = []
+    for run_dir in sorted(p for p in ledger_root.iterdir() if p.is_dir()) if ledger_root.exists() else []:
+        reader = LedgerReader(run_dir)
+        if not reader.exists():
+            continue
+        state = replay_state(reader.entries())
+        for task_id in state.suspended_tasks:
+            row = latest_suspension(sdd_dir, task_id)
+            parked.append(
+                {
+                    "task_id": task_id,
+                    "parked_at": row.event_hash if row else "",
+                    "workspace_hash": row.workspace_hash if row else "",
+                    "released_usd": row.released_usd if row else 0.0,
+                    "wake_condition": row.wake_condition if row else "",
+                }
+            )
+
+    if as_json:
+        print_json({"suspended": parked})
+        return
+    if not parked:
+        console.print("[dim]No suspended tasks.[/dim]")
+        return
+
+    from rich.table import Table
+
+    table = Table(show_lines=False, header_style="bold cyan")
+    table.add_column("Task", style="dim", min_width=10)
+    table.add_column("Parked-at", min_width=18)
+    table.add_column("Released $", justify="right")
+    table.add_column("Wake", min_width=8)
+    for entry in parked:
+        wake = str(entry["wake_condition"]) or "operator"
+        table.add_row(
+            str(entry["task_id"]),
+            str(entry["parked_at"])[:16],
+            f"{float(entry['released_usd']):.4f}",
+            wake,
         )
     console.print(table)

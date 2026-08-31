@@ -27,7 +27,7 @@ call, no I/O, and no global locks; it is safe to run on every tool result.
 | Band       | Range            | Action                                                    |
 |------------|------------------|-----------------------------------------------------------|
 | benign     | `score <= 0.7`   | no action; histogram observation only                     |
-| suspicious | `0.7 < score`    | `WARN` log line with task id, adapter, tool, source URL   |
+| suspicious | `0.7 < score <= 0.9` | `WARN` log line with task id, adapter, tool, source URL |
 | malicious  | `0.9 < score`    | lifecycle event so plugins can subscribe-and-abort        |
 
 `PromptwareScore.is_warn` and `.is_abort` are the canonical predicates -
@@ -57,6 +57,7 @@ registered with `HookRegistry.register_callable`) can react and raise
 ```python
 from bernstein.core.lifecycle.hooks import HookFailure, LifecycleContext, LifecycleEvent
 
+
 def abort_on_promptware(ctx: LifecycleContext) -> None:
     if ctx.data.get("promptware_abort"):
         raise HookFailure(
@@ -65,6 +66,7 @@ def abort_on_promptware(ctx: LifecycleContext) -> None:
             exit_code=1,
             stderr="promptware detected; refusing to spawn next agent",
         )
+
 
 registry.register_callable(LifecycleEvent.POST_TASK, abort_on_promptware)
 ```

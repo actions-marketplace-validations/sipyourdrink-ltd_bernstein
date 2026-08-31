@@ -2,7 +2,7 @@
 
 Scans code diffs and file contents produced by agents before merge to catch
 leaked secrets, API keys, passwords, and PII.  Designed to run as a quality
-gate — returns structured findings that hard-block merge when secrets are found.
+gate - returns structured findings that hard-block merge when secrets are found.
 
 Regex-only (no network calls, no LLM).  Patterns cover:
 - Cloud provider keys (AWS, GCP, Azure)
@@ -27,6 +27,8 @@ import logging
 import re
 from dataclasses import dataclass
 from fnmatch import fnmatch
+
+from bernstein.core.security.luhn import luhn_check
 
 logger = logging.getLogger(__name__)
 
@@ -225,20 +227,21 @@ def _has_mixed_case_and_digits(text: str) -> bool:
 
 
 def _looks_like_credit_card(match_text: str) -> bool:
-    """Return True if a candidate number passes a Luhn checksum."""
-    digits = [int(char) for char in match_text if char.isdigit()]
-    if len(digits) < 13 or len(digits) > 19:
+    """Return True if a candidate number passes a Luhn checksum.
+
+    Both length bounds are this call site's own: the rule matches a labelled
+    13-19 digit run, so it needs each end. Only the checksum is shared.
+
+    The forward walk this replaced doubled ``index % 2 == len(digits) % 2``,
+    which is the same rule as the shared helper's reverse walk doubling the
+    odd indices - forward index ``i`` is reverse index ``n-1-i``, and
+    ``n-1-i`` is odd exactly when ``i % 2 == n % 2``. Spelling it once removes
+    the need to re-derive that in order to compare the two.
+    """
+    digits = "".join(char for char in match_text if char.isdigit())
+    if not (13 <= len(digits) <= 19):
         return False
-    checksum = 0
-    parity = len(digits) % 2
-    for index, digit in enumerate(digits):
-        value = digit
-        if index % 2 == parity:
-            value *= 2
-            if value > 9:
-                value -= 9
-        checksum += value
-    return checksum % 10 == 0
+    return luhn_check(digits)
 
 
 def _is_allowlisted(line: str, allowlist_prefixes: list[str] | None = None) -> bool:
@@ -281,7 +284,7 @@ def _check_rule_match(
 
 
 def _build_redacted_excerpt(line: str, m: re.Match[str]) -> str:
-    """Build a redacted excerpt around a regex match — never stores raw secrets."""
+    """Build a redacted excerpt around a regex match - never stores raw secrets."""
     start = max(0, m.start() - 10)
     end = min(len(line), m.end() + 10)
     raw_excerpt = line[start:end]
@@ -304,7 +307,7 @@ def _scan_line(
 
     Deduplication keys on ``(rule, line_num, match_start, match_end)`` so that
     multiple distinct secrets of the same rule (e.g. two different AWS keys) are
-    each reported, while exact duplicates (same rule hitting the same span —
+    each reported, while exact duplicates (same rule hitting the same span -
     possible if scans ever overlap) are not counted twice. This prevents the
     scanner-evasion bug where a single rule's dedup would silently drop the
     second/third secret of the same type.
@@ -369,7 +372,7 @@ def scan_diff(
     """Scan a unified diff for secrets and PII in added lines only.
 
     Only lines starting with ``+`` (additions) are checked.  Removed lines
-    (``-``) and context lines are ignored — we only care about new secrets
+    (``-``) and context lines are ignored - we only care about new secrets
     being introduced.
 
     Args:
@@ -409,5 +412,5 @@ def format_findings(findings: list[SecretFinding]) -> str:
 
     lines = [f"PII/Secret gate: {len(findings)} finding(s)"]
     for f in findings:
-        lines.append(f"  [{f.severity.upper()}] {f.rule} (line {f.line_number}): {f.description} — {f.redacted_match}")
+        lines.append(f"  [{f.severity.upper()}] {f.rule} (line {f.line_number}): {f.description} - {f.redacted_match}")
     return "\n".join(lines)

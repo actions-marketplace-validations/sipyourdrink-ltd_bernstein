@@ -2,8 +2,8 @@
 
 The WAL gives Bernstein crash recovery. The **action cache** sits one
 layer above it and gives Bernstein **deterministic replay without
-paying the LLM bill**. Every action — prompt, model output, tool
-call, tool result — is content-addressed by `(model_id,
+paying the LLM bill**. Every action - prompt, model output, tool
+call, tool result - is content-addressed by `(model_id,
 normalized_prompt, tool_name, tool_args)` and stored under
 `.sdd/runtime/action_cache/<sha256>.json`. On replay, cache hits
 return the recorded result; misses fall through to the live model and
@@ -30,10 +30,10 @@ Pick a mode and run:
 # Record (default in normal runs once enabled)
 bernstein run plan.yaml --cache record
 
-# Replay-only — fail-loud on cache miss instead of calling the model
+# Replay-only - fail-loud on cache miss instead of calling the model
 bernstein run plan.yaml --cache replay
 
-# Hybrid — replay on hit, fall through to live model on miss, append result
+# Hybrid - replay on hit, fall through to live model on miss, append result
 bernstein run plan.yaml --cache hybrid
 
 # Re-execute a past run against its cache; emit a diff report on drift
@@ -73,11 +73,22 @@ Metrics:
 - Replay is byte-comparison strict. A different timestamp in a
   recorded log is a "drift" finding even if functionally equivalent.
 
+## Cache policy engine
+
+`derive_key` here is input-only and intentionally survives Bernstein code
+changes. When a task declares a `cache_policy` on its spec, its cache decisions
+route through the shared [cache policy engine](cache-policy.md): keys are
+composed over an ingredient recipe that also folds in the model version, adapter
+version, base worktree commit, and tool schema hash; staleness becomes a pure
+drift verdict over repo state; and eviction is transitive over `served_from`
+lineage edges. Tasks with no declared policy behave exactly as described above.
+
 ## Related
 
 - Source: `src/bernstein/core/persistence/action_cache.py`
 - Layered on: `src/bernstein/core/persistence/fingerprint.py` (memo
   store)
+- Policy engine: `src/bernstein/core/persistence/cache_policy.py`
 - CLI: `src/bernstein/cli/commands/cache_cmd.py`,
   `replay_filter_cmd.py`
 - PR #999

@@ -1,17 +1,19 @@
-"""GitHub and GitLab webhook routes and alerts endpoint."""
+"""GitHub and GitLab webhook routes, the automation bridge, and alerts endpoint."""
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import os
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from bernstein.core.difficulty_estimator import estimate_difficulty, minutes_for_level
+from bernstein.core.routes._unconfigured import UNCONFIGURED_STATUS
 from bernstein.core.server import (
     TaskCreate,
     TaskStore,
@@ -22,6 +24,11 @@ from bernstein.core.server import (
 from bernstein.core.tenanting import request_tenant_id
 from bernstein.core.webhook_signatures import verify_hmac_sha256
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from bernstein.core.trigger_sources.receipt import TriggerAdmission
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -30,7 +37,7 @@ _GENERIC_WEBHOOK_SIGNATURE_HEADER = "x-bernstein-webhook-signature-256"
 _GENERIC_WEBHOOK_TIMESTAMP_HEADER = "x-bernstein-timestamp"
 # Replay window: reject requests whose timestamp drifts more than this
 # many seconds from the server clock. Five minutes matches
-# the Slack v0 and AWS SigV4 recommendations — short enough to bound
+# the Slack v0 and AWS SigV4 recommendations - short enough to bound
 # replay risk while tolerating modest clock skew between sender and
 # receiver.
 _WEBHOOK_TIMESTAMP_MAX_SKEW_SECONDS = 300
@@ -43,7 +50,7 @@ def _get_store(request: Request) -> TaskStore:
 def _parse_timestamp_header(raw: str) -> int | None:
     """Parse a decimal Unix-seconds timestamp header, or return ``None``.
 
-    Accepts only non-negative integers — leading whitespace is stripped
+    Accepts only non-negative integers - leading whitespace is stripped
     but decimals, scientific notation, or signs are rejected so a
     malformed header cannot be confused with a missing one.
     """
@@ -57,7 +64,7 @@ def _parse_timestamp_header(raw: str) -> int | None:
         return None
 
 
-def _verify_generic_webhook_secret(request: Request, body: bytes) -> JSONResponse | None:
+def _verify_generic_webhook_secret(request: Request, body: bytes) -> tuple[JSONResponse, str] | None:
     """Verify the HMAC signature + timestamp freshness for POST ``/webhook``.
 
     Fail-closed semantics ( + ): when
@@ -65,62 +72,188 @@ def _verify_generic_webhook_secret(request: Request, body: bytes) -> JSONRespons
     disabled and every POST returns 503.  When a secret *is*
     configured, callers MUST supply:
 
-    * ``X-Bernstein-Timestamp`` — Unix seconds; rejected if the skew
+    * ``X-Bernstein-Timestamp`` - Unix seconds; rejected if the skew
       from the server clock exceeds five minutes (replay protection).
-    * ``X-Bernstein-Webhook-Signature-256`` — HMAC-SHA256 of
+    * ``X-Bernstein-Webhook-Signature-256`` - HMAC-SHA256 of
       ``f"{timestamp}.".encode() + body`` using the shared secret,
       prefixed with ``sha256=``.  The timestamp is bound into the
       signature so an attacker cannot rewrite the header after
       capturing a valid pair.
 
     The plaintext ``X-Bernstein-Webhook-Secret`` fallback has been
-    removed — there is no remaining code path that
+    removed - there is no remaining code path that
     compares the raw secret against a request header.
+
+    Returns:
+        ``None`` when the request authenticates, else the refusal response
+        paired with a canonical refusal reason for the trigger receipt (#2512).
+        The unconfigured-endpoint case is a deployment fault, not a refused
+        trigger, and carries an empty reason so no receipt is minted for it.
     """
+    from bernstein.core.trigger_sources.receipt import (
+        REFUSAL_STALE_TIMESTAMP,
+        REFUSAL_UNAUTHENTICATED,
+    )
 
     configured_secret = os.environ.get(_GENERIC_WEBHOOK_SECRET_ENV, "")
     if not configured_secret:
+        # Fully literal message, matching the GitHub/GitLab handlers: no
+        # binding flows into the logging call, so no secret-shaped value
+        # can ever reach a persisted log sink (#2763).
         logger.error(
-            "Rejecting POST /webhook: %s is not configured. "
-            "Set the env var to enable the endpoint; unsigned "
+            "Rejecting POST /webhook: BERNSTEIN_WEBHOOK_SECRET is not "
+            "configured. Set the env var to enable the endpoint; unsigned "
             "webhooks are not accepted.",
-            _GENERIC_WEBHOOK_SECRET_ENV,
         )
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": (
-                    "Webhook endpoint is not configured: set "
-                    f"{_GENERIC_WEBHOOK_SECRET_ENV} to the shared "
-                    "secret used by the caller."
-                ),
-            },
+        return (
+            JSONResponse(
+                status_code=UNCONFIGURED_STATUS,
+                content={
+                    "detail": (
+                        "Webhook endpoint is not configured: set "
+                        f"{_GENERIC_WEBHOOK_SECRET_ENV} to the shared "
+                        "secret used by the caller."
+                    ),
+                },
+            ),
+            "",
         )
 
     timestamp_header = request.headers.get(_GENERIC_WEBHOOK_TIMESTAMP_HEADER, "")
     timestamp = _parse_timestamp_header(timestamp_header)
     if timestamp is None:
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Missing or malformed X-Bernstein-Timestamp header"},
+        return (
+            JSONResponse(
+                status_code=401,
+                content={"detail": "Missing or malformed X-Bernstein-Timestamp header"},
+            ),
+            REFUSAL_STALE_TIMESTAMP,
         )
     if abs(int(time.time()) - timestamp) > _WEBHOOK_TIMESTAMP_MAX_SKEW_SECONDS:
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Stale or future-dated X-Bernstein-Timestamp header"},
+        return (
+            JSONResponse(
+                status_code=401,
+                content={"detail": "Stale or future-dated X-Bernstein-Timestamp header"},
+            ),
+            REFUSAL_STALE_TIMESTAMP,
         )
 
     provided_signature = request.headers.get(_GENERIC_WEBHOOK_SIGNATURE_HEADER, "")
     if not provided_signature:
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Missing X-Bernstein-Webhook-Signature-256 header"},
+        return (
+            JSONResponse(
+                status_code=401,
+                content={"detail": "Missing X-Bernstein-Webhook-Signature-256 header"},
+            ),
+            REFUSAL_UNAUTHENTICATED,
         )
 
     signed_payload = f"{timestamp}.".encode() + body
     if verify_hmac_sha256(signed_payload, provided_signature, configured_secret, prefix="sha256="):
         return None
-    return JSONResponse(status_code=401, content={"detail": "Invalid webhook signature"})
+    return (
+        JSONResponse(status_code=401, content={"detail": "Invalid webhook signature"}),
+        REFUSAL_UNAUTHENTICATED,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Automation bridge (#2512)
+# ---------------------------------------------------------------------------
+
+
+def _bridge_paths(request: Request) -> tuple[Path, Path] | None:
+    """Return ``(bridge_root, audit_dir)`` for this install, or ``None``.
+
+    ``None`` means the app carries no ``.sdd`` layout, so there is nowhere to
+    anchor a receipt; callers degrade to the pre-bridge behaviour rather than
+    failing a request over bookkeeping.
+    """
+    from bernstein.core.trigger_sources.receipt import bridge_root
+
+    sdd_dir = getattr(request.app.state, "sdd_dir", None)
+    if sdd_dir is None:
+        return None
+    return bridge_root(sdd_dir / "automation-bridge"), sdd_dir / "audit"
+
+
+def _fallback_trigger_id(request: Request, body: bytes) -> str:
+    """Derive a replay nonce when the caller named none.
+
+    Binds the signed timestamp to the payload digest, so a byte-identical
+    request replayed inside the signature window collides with its own earlier
+    admission and is refused -- which is exactly the request a captured
+    delivery reproduces.
+    """
+    timestamp = request.headers.get(_GENERIC_WEBHOOK_TIMESTAMP_HEADER, "").strip()
+    digest = hashlib.sha256(body).hexdigest()
+    return f"derived-{hashlib.sha256(f'{timestamp}.{digest}'.encode()).hexdigest()[:32]}"
+
+
+def _mint_trigger_receipt(
+    request: Request,
+    body: bytes,
+    *,
+    authenticated: bool,
+    refusal_reason: str = "",
+    task_ids: tuple[str, ...] = (),
+) -> TriggerAdmission | None:
+    """Admit or refuse the inbound trigger and mint its signed receipt.
+
+    Returns ``None`` when the bridge has nowhere to anchor a receipt, or when
+    minting failed; the caller keeps its existing behaviour in that case, and
+    the failure is logged rather than swallowed.
+    """
+    from bernstein.core.trigger_sources.automation_platforms import normalise_trigger
+    from bernstein.core.trigger_sources.receipt import RefusalBudget, admit_trigger
+
+    paths = _bridge_paths(request)
+    if paths is None:
+        return None
+    root, audit_dir = paths
+
+    try:
+        import json as _json
+
+        decoded = _json.loads(body) if body else {}
+    except (ValueError, UnicodeDecodeError):
+        decoded = {}
+    payload = decoded if isinstance(decoded, dict) else {}
+
+    headers = dict(request.headers)
+    platform, intent, trigger_id = normalise_trigger(payload=payload, headers=headers)
+    # Replay refusal is only sound against a caller-supplied nonce. A derived id
+    # cannot tell a captured replay apart from a legitimate re-fire of the same
+    # goal, so we record the weaker regime on the receipt instead of refusing.
+    enforce_replay = bool(trigger_id)
+    if not trigger_id:
+        trigger_id = _fallback_trigger_id(request, body)
+
+    from bernstein.core.trigger_sources.automation_platforms import adapter_for
+
+    try:
+        from bernstein.core.security.audit import load_or_create_audit_key
+
+        return admit_trigger(
+            root=root,
+            audit_dir=audit_dir,
+            hmac_key=load_or_create_audit_key(),
+            platform=platform,
+            request_path=request.url.path,
+            trigger_id=trigger_id,
+            body=body,
+            scope=adapter_for(platform).scope,
+            timestamp=int(time.time()),
+            authenticated=authenticated,
+            refusal_reason=refusal_reason,
+            enforce_replay=enforce_replay,
+            budget=RefusalBudget(root),
+            intent=intent,
+            task_ids=task_ids,
+        )
+    except (OSError, RuntimeError, ValueError):
+        logger.exception("automation bridge: could not mint a trigger receipt for %s", request.url.path)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +265,7 @@ def _verify_generic_webhook_secret(request: Request, body: bytes) -> JSONRespons
 def get_alerts(request: Request) -> JSONResponse:
     """Return current dashboard alerts as JSON.
 
-    Builds alerts from the live task/agent state — failed tasks, blocked
+    Builds alerts from the live task/agent state - failed tasks, blocked
     tasks, stale agents, and budget thresholds.  Intended for dashboard
     polling or external monitoring.
 
@@ -166,11 +299,32 @@ async def generic_webhook(body: WebhookTaskCreate, request: Request) -> WebhookT
     ``f"{timestamp}.".encode() + body``. The plaintext
     ``X-Bernstein-Webhook-Secret`` fallback has been removed; callers
     relying on it must upgrade to the HMAC + timestamp flow.
+
+    Automation bridge (#2512): an admitted trigger returns a signed,
+    chain-anchored trigger receipt in ``receipt`` so the calling platform holds
+    a proof of what it asked for rather than a bare task reference. A trigger
+    that fails authentication, or that replays a trigger id already admitted,
+    is refused with its own signed refusal receipt (HTTP 401 and 409
+    respectively) -- the negative path leaves a record, never a silent drop.
     """
     raw_body = await request.body()
     denied = _verify_generic_webhook_secret(request, raw_body)
     if denied is not None:
-        return denied
+        response, refusal_reason = denied
+        if not refusal_reason:
+            return response
+        refusal = _mint_trigger_receipt(request, raw_body, authenticated=False, refusal_reason=refusal_reason)
+        return _with_receipt(response, refusal)
+
+    admission = _mint_trigger_receipt(request, raw_body, authenticated=True)
+    if admission is not None and not admission.admitted:
+        return _with_receipt(
+            JSONResponse(
+                status_code=409,
+                content={"detail": f"Trigger refused: {admission.refusal_reason}"},
+            ),
+            admission,
+        )
 
     store = _get_store(request)
     effective_body = body.model_copy(update={"tenant_id": request_tenant_id(request)})
@@ -178,15 +332,32 @@ async def generic_webhook(body: WebhookTaskCreate, request: Request) -> WebhookT
         score = estimate_difficulty(effective_body.description)
         effective_body.estimated_minutes = minutes_for_level(score.level)
     task = await store.create(effective_body)
-    return WebhookTaskResponse(task=task_to_response(task))
+    receipt = admission.receipt.to_dict() if admission is not None and admission.receipt is not None else None
+    return WebhookTaskResponse(task=task_to_response(task), receipt=receipt)
 
 
-def _count_ci_fix_attempts(store: TaskStore, head_branch: str) -> int:
+def _with_receipt(response: JSONResponse, admission: TriggerAdmission | None) -> JSONResponse:
+    """Attach a refusal receipt to a refusal response, preserving its status.
+
+    The response is returned unchanged when no receipt was minted -- an install
+    with no ``.sdd`` layout, or a refusal that exceeded the refusal budget. The
+    trigger is refused either way; only the per-request receipt is absent.
+    """
+    if admission is None or admission.receipt is None:
+        return response
+    import json as _json
+
+    body: dict[str, Any] = _json.loads(bytes(response.body))
+    body["receipt"] = admission.receipt.to_dict()
+    return JSONResponse(status_code=response.status_code, content=body)
+
+
+def _count_ci_fix_attempts(store: TaskStore, head_branch: str, tenant_id: str) -> int:
     """Count active ci-fix tasks for *head_branch* to enforce the retry cap.
 
     A task is "active" (counts toward the retry budget) when it is in any
     non-terminal status: ``open``, ``claimed``, ``in_progress``, or ``failed``.
-    Tasks that are ``done`` or ``cancelled`` are excluded — a successful fix
+    Tasks that are ``done`` or ``cancelled`` are excluded - a successful fix
     clears the budget so the branch can accumulate failures again.
 
     Args:
@@ -204,7 +375,7 @@ def _count_ci_fix_attempts(store: TaskStore, head_branch: str) -> int:
         TaskStatus.IN_PROGRESS,
         TaskStatus.FAILED,
     }
-    tasks = store.list_tasks()
+    tasks = store.list_tasks(tenant_id=tenant_id)
     return sum(
         1 for t in tasks if t.title.startswith("[ci-fix]") and head_branch in t.description and t.status in _ACTIVE
     )
@@ -241,7 +412,7 @@ def _handle_comment(event: Any) -> list[dict[str, Any]]:
     return [review_task] if review_task is not None else []
 
 
-def _handle_workflow_run(event: Any, store: TaskStore) -> list[dict[str, Any]] | JSONResponse:
+def _handle_workflow_run(event: Any, store: TaskStore, tenant_id: str) -> list[dict[str, Any]] | JSONResponse:
     """Map a GitHub ``workflow_run/completed`` event to task payloads.
 
     Returns a JSONResponse early when the retry cap is reached.
@@ -254,11 +425,11 @@ def _handle_workflow_run(event: Any, store: TaskStore) -> list[dict[str, Any]] |
         return []
 
     head_branch: str = run.get("head_branch", "")
-    retry_count = _count_ci_fix_attempts(store, head_branch)
+    retry_count = _count_ci_fix_attempts(store, head_branch, tenant_id)
     if retry_count >= MAX_CI_RETRIES:
         safe_branch = head_branch.replace("\n", "").replace("\r", "")[:200]
         logger.warning(
-            "CI fix retry cap reached for branch %r (%d/%d) — skipping",
+            "CI fix retry cap reached for branch %r (%d/%d) - skipping",
             safe_branch,
             retry_count,
             MAX_CI_RETRIES,
@@ -276,7 +447,7 @@ def _handle_workflow_run(event: Any, store: TaskStore) -> list[dict[str, Any]] |
     return list(workflow_run_to_task(event, retry_count=retry_count))
 
 
-def _dispatch_github_event(event: Any, store: TaskStore) -> list[dict[str, Any]] | JSONResponse:
+def _dispatch_github_event(event: Any, store: TaskStore, tenant_id: str) -> list[dict[str, Any]] | JSONResponse:
     """Route a parsed GitHub webhook event to the appropriate handler."""
     from bernstein.github_app.mapper import push_to_tasks
 
@@ -290,7 +461,7 @@ def _dispatch_github_event(event: Any, store: TaskStore) -> list[dict[str, Any]]
         case ("push", _):
             return list(push_to_tasks(event))
         case ("workflow_run", "completed"):
-            return _handle_workflow_run(event, store)
+            return _handle_workflow_run(event, store, tenant_id)
     return []
 
 
@@ -302,7 +473,7 @@ async def github_webhook(request: Request) -> JSONResponse:
     - ``issues`` (opened / labeled)
     - ``pull_request_review_comment`` / ``issue_comment``
     - ``push``
-    - ``workflow_run`` (completed + failure) — creates a ci-fix task, capped at
+    - ``workflow_run`` (completed + failure) - creates a ci-fix task, capped at
       ``MAX_CI_RETRIES`` active attempts per branch.
 
     Reads ``GITHUB_WEBHOOK_SECRET`` from environment for HMAC verification.
@@ -311,7 +482,7 @@ async def github_webhook(request: Request) -> JSONResponse:
     never accepted.
     Replay protection: if the caller includes an
     ``X-Bernstein-Timestamp`` header the request is additionally
-    checked for freshness — drift greater than five minutes returns
+    checked for freshness - drift greater than five minutes returns
     401.  Real GitHub deliveries omit this header and continue to
     work; the check is there so bernstein-internal relays cannot be
     replayed after capture.
@@ -322,9 +493,10 @@ async def github_webhook(request: Request) -> JSONResponse:
     from bernstein.github_app.webhooks import parse_webhook, verify_signature
 
     store = _get_store(request)
+    tenant_id = request_tenant_id(request)
     body = await request.body()
 
-    # Verify HMAC signature — secret MUST be configured.
+    # Verify HMAC signature - secret MUST be configured.
     gh_webhook_secret = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
     if not gh_webhook_secret:
         logger.error(
@@ -333,7 +505,7 @@ async def github_webhook(request: Request) -> JSONResponse:
             "unsigned webhooks are not accepted.",
         )
         return JSONResponse(
-            status_code=503,
+            status_code=UNCONFIGURED_STATUS,
             content={
                 "detail": (
                     "GitHub webhook endpoint is not configured: set "
@@ -372,7 +544,7 @@ async def github_webhook(request: Request) -> JSONResponse:
             content={"detail": "Bad webhook payload"},
         )
 
-    result = _dispatch_github_event(event, store)
+    result = _dispatch_github_event(event, store, tenant_id)
     if isinstance(result, JSONResponse):
         return result
     task_payloads = result
@@ -400,7 +572,7 @@ async def github_webhook(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-def _count_gitlab_ci_fix_attempts(store: TaskStore, ref: str) -> int:
+def _count_gitlab_ci_fix_attempts(store: TaskStore, ref: str, tenant_id: str) -> int:
     """Count active ci-fix tasks for *ref* to enforce the retry cap.
 
     Args:
@@ -418,7 +590,7 @@ def _count_gitlab_ci_fix_attempts(store: TaskStore, ref: str) -> int:
         TaskStatus.IN_PROGRESS,
         TaskStatus.FAILED,
     }
-    tasks = store.list_tasks()
+    tasks = store.list_tasks(tenant_id=tenant_id)
     return sum(1 for t in tasks if t.title.startswith("[ci-fix]") and ref in t.description and t.status in _ACTIVE)
 
 
@@ -490,7 +662,7 @@ def _verify_gitlab_token(request: Request) -> JSONResponse | None:
     unsigned / unauthenticated GitLab webhooks are never accepted.
     Missing / mismatched tokens return 401.  Replay protection
     : when the caller includes ``X-Bernstein-Timestamp`` the
-    request is rejected if its drift exceeds five minutes — GitLab
+    request is rejected if its drift exceeds five minutes - GitLab
     itself never sends this header, so real deliveries are unaffected;
     the check hardens bernstein-internal relays.
     """
@@ -502,7 +674,7 @@ def _verify_gitlab_token(request: Request) -> JSONResponse | None:
             "unauthenticated webhooks are not accepted.",
         )
         return JSONResponse(
-            status_code=503,
+            status_code=UNCONFIGURED_STATUS,
             content={
                 "detail": (
                     "GitLab webhook endpoint is not configured: set "
@@ -516,7 +688,7 @@ def _verify_gitlab_token(request: Request) -> JSONResponse | None:
         return JSONResponse(status_code=401, content={"detail": "Missing GitLab webhook token"})
     if not hmac.compare_digest(provided_token, gitlab_token):
         return JSONResponse(status_code=401, content={"detail": "Invalid GitLab webhook token"})
-    # opt-in timestamp freshness check — mirrors the generic
+    # opt-in timestamp freshness check - mirrors the generic
     # webhook.  Real GitLab deliveries never send this header; internal
     # relays may and, when they do, we fail closed on stale timestamps.
     ts_raw = request.headers.get(_GENERIC_WEBHOOK_TIMESTAMP_HEADER, "")
@@ -530,7 +702,9 @@ def _verify_gitlab_token(request: Request) -> JSONResponse | None:
     return None
 
 
-def _handle_gitlab_pipeline(data: dict[str, Any], store: TaskStore) -> list[dict[str, Any]] | JSONResponse:
+def _handle_gitlab_pipeline(
+    data: dict[str, Any], store: TaskStore, tenant_id: str
+) -> list[dict[str, Any]] | JSONResponse:
     """Handle a GitLab pipeline-failed event, enforcing the retry cap."""
     from bernstein.github_app.ci_router import MAX_CI_RETRIES
 
@@ -539,11 +713,11 @@ def _handle_gitlab_pipeline(data: dict[str, Any], store: TaskStore) -> list[dict
         return []
 
     ref = data.get("object_attributes", {}).get("ref", "")
-    retry_count = _count_gitlab_ci_fix_attempts(store, ref)
+    retry_count = _count_gitlab_ci_fix_attempts(store, ref, tenant_id)
     if retry_count >= MAX_CI_RETRIES:
         safe_ref = ref.replace("\n", "").replace("\r", "")[:200]
         logger.warning(
-            "CI fix retry cap reached for ref %r (%d/%d) — skipping",
+            "CI fix retry cap reached for ref %r (%d/%d) - skipping",
             safe_ref,
             retry_count,
             MAX_CI_RETRIES,
@@ -605,15 +779,16 @@ async def gitlab_webhook(request: Request) -> JSONResponse:
     """Receive a GitLab CI webhook, verify token, and create ci-fix tasks.
 
     Handles the following event types:
-    - ``pipeline`` (failed) — creates a ci-fix task, capped at
+    - ``pipeline`` (failed) - creates a ci-fix task, capped at
       ``MAX_CI_RETRIES`` active attempts per branch.
-    - ``job`` (failed) — creates a ci-fix task for the specific job.
+    - ``job`` (failed) - creates a ci-fix task for the specific job.
 
     Reads ``GITLAB_WEBHOOK_TOKEN`` from environment. GitLab sends a simple
     plaintext token in the ``x-gitlab-token`` header.
     Returns 200 on success, 401 on bad/missing token.
     """
     store = _get_store(request)
+    tenant_id = request_tenant_id(request)
     body_bytes = await request.body()
     body = body_bytes.decode("utf-8") if body_bytes else ""
 
@@ -629,11 +804,11 @@ async def gitlab_webhook(request: Request) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": "Bad JSON payload"})
 
     event_type = data.get("object_kind", "")
-    raw_headers: dict[str, str] = {k: v for k, v in request.headers.items()}
+    raw_headers: dict[str, str] = dict(request.headers.items())
 
     match event_type:
         case "pipeline":
-            result = _handle_gitlab_pipeline(data, store)
+            result = _handle_gitlab_pipeline(data, store, tenant_id)
         case "job":
             result = _handle_gitlab_job(data)
         case "merge_request":
@@ -654,7 +829,6 @@ async def gitlab_webhook(request: Request) -> JSONResponse:
         )
 
     created_ids: list[str] = []
-    tenant_id = request_tenant_id(request)
     for payload_dict in task_payloads:
         task = await store.create(TaskCreate(**payload_dict, tenant_id=tenant_id))
         created_ids.append(task.id)

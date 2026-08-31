@@ -21,6 +21,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from bernstein.core.cost import _MODEL_COST_USD_PER_1K  # pyright: ignore[reportPrivateUsage]
+from bernstein.core.cost.model_prices import is_free_route
 from bernstein.core.defaults import COST, PLAN
 from bernstein.core.models import (
     Complexity,
@@ -30,11 +31,22 @@ from bernstein.core.models import (
     TaskCostEstimate,
     TaskPlan,
 )
+from bernstein.core.planning.plan_rendering import compute_plan_rendering
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+class PlanHashMismatchError(Exception):
+    """Raised when a plan's current rendering hash differs from the stored one.
+
+    The plan was modified after it was rendered for review, so the approval
+    decision cannot be bound to the content the human actually reviewed.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Risk classification
@@ -116,24 +128,49 @@ def _classify_risk(task: Task) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 # Average tokens per task by scope (empirical estimates).
-_TOKENS_BY_SCOPE: dict[str, int] = PLAN.tokens_by_scope
+_TOKENS_BY_SCOPE: Mapping[str, int] = PLAN.tokens_by_scope
 
 # Model selection heuristic by complexity (when no explicit model set).
-_DEFAULT_MODEL_BY_COMPLEXITY: dict[str, str] = PLAN.model_by_complexity
+_DEFAULT_MODEL_BY_COMPLEXITY: Mapping[str, str] = PLAN.model_by_complexity
 
 # Populated at plan creation time from the seed's role_model_policy.
 _ROLE_MODEL_OVERRIDES: dict[str, str] = {}
 _ROLE_CLI_OVERRIDES: dict[str, str] = {}
+# Seed-level defaults (global ``model:``/``cli:`` keys) captured at plan
+# creation. Used as the fallback model/adapter for tasks that carry no
+# per-task or per-role override, so the plan labels and prices the resolved
+# model instead of a hardcoded ``sonnet`` (issue #3013).
+_DEFAULT_MODEL: str | None = None
+_DEFAULT_CLI: str | None = None
 
 
-def configure_plan_models(role_model_policy: dict[str, dict[str, str]] | None) -> None:
-    """Set per-role model/CLI overrides from the seed config.
+def configure_plan_models(
+    role_model_policy: dict[str, dict[str, str]] | None,
+    *,
+    default_model: str | None = None,
+    default_cli: str | None = None,
+) -> None:
+    """Set per-role and seed-level model/CLI overrides from the seed config.
 
-    Called once at startup so _estimate_task_cost uses the correct
+    Called once at startup so :func:`_estimate_task_cost` uses the resolved
     adapter and model names instead of hardcoded Claude defaults.
+
+    Args:
+        role_model_policy: Per-role ``{role: {"cli": ..., "model": ...}}``
+            overrides from the seed.
+        default_model: The seed's global ``model:`` key. Used as the model
+            fallback for tasks with no per-task or per-role model so the plan
+            labels/prices the resolved model rather than ``sonnet`` when a
+            seed sets only a global model (issue #3013).
+        default_cli: The seed's global ``cli:`` key (ignored when ``"auto"``),
+            used as the adapter fallback so free-tier adapters are recognised
+            even without a ``role_model_policy``.
     """
+    global _DEFAULT_MODEL, _DEFAULT_CLI
     _ROLE_MODEL_OVERRIDES.clear()
     _ROLE_CLI_OVERRIDES.clear()
+    _DEFAULT_MODEL = default_model or None
+    _DEFAULT_CLI = default_cli or None
     if role_model_policy:
         for role, policy in role_model_policy.items():
             if "model" in policy:
@@ -148,22 +185,33 @@ def _estimate_task_cost(task: Task) -> TaskCostEstimate:
     Uses scope for token estimation and complexity for model selection,
     then applies the per-1k-token pricing from the cost module.
     """
-    # Determine model — prefer role-specific override, then task.model, then complexity default
-    model = (
+    # Determine model - prefer role override, then task.model, then the
+    # seed's global default model, then the complexity default. The seed
+    # default keeps the plan labelled with the resolved model instead of a
+    # hardcoded ``sonnet`` when a seed sets only a global model (issue #3013).
+    raw_model = (
         _ROLE_MODEL_OVERRIDES.get(task.role)
         or task.model
-        or _DEFAULT_MODEL_BY_COMPLEXITY.get(task.complexity.value, "sonnet")
+        or _DEFAULT_MODEL
+        or _DEFAULT_MODEL_BY_COMPLEXITY.get(task.complexity.value)
     )
-    cli = _ROLE_CLI_OVERRIDES.get(task.role)
-    if cli:
-        model = f"{cli}/{model}"
+    model = raw_model or "auto"
+    cli = _ROLE_CLI_OVERRIDES.get(task.role) or _DEFAULT_CLI
+    if cli and raw_model:
+        model = f"{cli}/{raw_model}"
+    elif cli and not raw_model:
+        model = f"{cli}/auto"
 
     # Estimate tokens
     estimated_tokens = _TOKENS_BY_SCOPE.get(task.scope.value, 80_000)
 
-    # Look up cost rate — free-tier adapters cost $0
+    # Look up cost rate - free-tier adapters and zero-cost model routes
+    # (``:free`` ids or models the run's own metering prices at $0) cost $0.
+    # Sharing ``is_free_route`` with the metering path keeps the plan
+    # estimate and the final ``total_cost`` on the same pricing source
+    # (issue #3013).
     _FREE_ADAPTERS = PLAN.free_adapters
-    if cli and cli.lower() in _FREE_ADAPTERS:
+    if (cli and cli.lower() in _FREE_ADAPTERS) or is_free_route(model):
         rate: float = 0.0
     else:
         rate = COST.fallback_cost_per_1k_tokens
@@ -195,12 +243,23 @@ def _estimate_task_cost(task: Task) -> TaskCostEstimate:
 # ---------------------------------------------------------------------------
 
 
-def create_plan(goal: str, tasks: list[Task]) -> TaskPlan:
+def create_plan(
+    goal: str,
+    tasks: list[Task],
+    *,
+    journal_path: Path | None = None,
+) -> TaskPlan:
     """Create a TaskPlan from a list of planned tasks with cost/risk estimates.
+
+    When a journal path is provided, verifies the journal chain and binds the
+    verification result (head and verified status) into the plan rendering.
 
     Args:
         goal: The original goal that produced these tasks.
         tasks: Tasks to include in the plan (should have status=PLANNED).
+        journal_path: Optional path to the run journal for chain verification.
+            When provided, the journal is verified and the result is bound into
+            the plan rendering for tamper detection.
 
     Returns:
         A populated TaskPlan ready for human review.
@@ -210,7 +269,7 @@ def create_plan(goal: str, tasks: list[Task]) -> TaskPlan:
     total_minutes = sum(t.estimated_minutes for t in tasks)
     high_risk = [e.task_id for e in estimates if e.risk_level in ("high", "critical")]
 
-    return TaskPlan(
+    plan = TaskPlan(
         id=uuid.uuid4().hex[:12],
         goal=goal,
         task_estimates=estimates,
@@ -219,11 +278,29 @@ def create_plan(goal: str, tasks: list[Task]) -> TaskPlan:
         high_risk_tasks=high_risk,
     )
 
+    # Verify journal if path provided
+    journal_head: str | None = None
+    journal_verified: bool | None = None
+    if journal_path is not None:
+        from bernstein.core.replay.journal import verify_journal
+
+        result = verify_journal(journal_path)
+        journal_head = result.head
+        # Journal is verified when chain is consistent and no discarded lines
+        journal_verified = result.chain_consistent and not result.discarded_line_indices
+
+    plan.rendering_hash = compute_plan_rendering(
+        plan,
+        journal_head=journal_head,
+        journal_verified=journal_verified,
+    ).rendering_hash
+    return plan
+
 
 class PlanStore:
     """Persists plans to .sdd/runtime/plans/ as JSON files.
 
-    Plans are lightweight — typically 1-20 per run — so individual
+    Plans are lightweight - typically 1-20 per run - so individual
     JSON files are fine (no JSONL needed).
     """
 
@@ -271,6 +348,30 @@ class PlanStore:
             plans = [p for p in plans if p.status == status]
         return sorted(plans, key=lambda p: p.created_at, reverse=True)
 
+    def verify_rendering_hash(self, plan_id: str) -> None:
+        """Verify a plan's current rendering matches the hash stored at creation.
+
+        This binds an approve/reject decision to the plan content that was
+        rendered for review: an edited goal, a re-priced estimate or an added
+        task changes the digest and the decision is refused.
+
+        Plans created before the rendering-hash gate shipped carry an empty
+        hash and are accepted without verification (backward compatibility).
+
+        Raises:
+            PlanHashMismatchError: If the plan was modified after it was
+                rendered for review.
+        """
+        plan = self._plans.get(plan_id)
+        if plan is None or not plan.rendering_hash:
+            return
+        current = compute_plan_rendering(plan).rendering_hash
+        if current != plan.rendering_hash:
+            safe_id = plan_id.replace("\n", "\\n").replace("\r", "\\r")
+            raise PlanHashMismatchError(
+                f"Plan {safe_id} rendering hash mismatch: stored {plan.rendering_hash}, current {current}"
+            )
+
     def approve_plan(self, plan_id: str, reason: str = "") -> TaskPlan | None:
         """Mark a plan as approved.
 
@@ -279,6 +380,7 @@ class PlanStore:
         plan = self._plans.get(plan_id)
         if plan is None:
             return None
+        self.verify_rendering_hash(plan_id)
         plan.status = PlanStatus.APPROVED
         plan.decided_at = time.time()
         plan.decision_reason = reason
@@ -298,6 +400,7 @@ class PlanStore:
         plan = self._plans.get(plan_id)
         if plan is None:
             return None
+        self.verify_rendering_hash(plan_id)
         plan.status = PlanStatus.REJECTED
         plan.decided_at = time.time()
         plan.decision_reason = reason

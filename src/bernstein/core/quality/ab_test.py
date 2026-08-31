@@ -34,7 +34,7 @@ class ABTestConfig:
         model_a: First model name (e.g. "opus").
         model_b: Second model name (e.g. "sonnet").
         role: Agent role to assign (default "backend").
-        scope: Task scope — small, medium, or large.
+        scope: Task scope - small, medium, or large.
         timeout_seconds: Max wait time before declaring the test timed-out.
     """
 
@@ -52,7 +52,7 @@ class ABTestResult:
 
     Attributes:
         model: Model name used for this variant.
-        variant: Which side of the test — "a" or "b".
+        variant: Which side of the test - "a" or "b".
         task_id: Task ID on the server.
         duration_seconds: Wall-clock seconds from creation to completion.
         cost_usd: Estimated cost reported by the server (0.0 if unavailable).
@@ -106,7 +106,7 @@ class ABTestReport:
         ra = self.result_a
         rb = self.result_b
         lines: list[str] = [
-            f"# A/B Test Report — {self.test_id}",
+            f"# A/B Test Report - {self.test_id}",
             "",
             f"**Task:** {self.config.task_description}",
             f"**Role:** {self.config.role}  **Scope:** {self.config.scope}",
@@ -121,7 +121,7 @@ class ABTestReport:
             f"| Input tokens | {ra.input_tokens:,} | {rb.input_tokens:,} |",
             f"| Output tokens | {ra.output_tokens:,} | {rb.output_tokens:,} |",
             "",
-            f"**Winner:** {self.winner.upper()} ({self._winner_model()}) — {self.reason}",
+            f"**Winner:** {self.winner.upper()} ({self._winner_model()}) - {self.reason}",
         ]
         if self.timed_out:
             lines.append("\n*Test timed out before both tasks completed.*")
@@ -197,9 +197,9 @@ def determine_winner(
     """Decide which variant wins.
 
     Priority order:
-      1. Quality — both must pass; if only one does, it wins.
-      2. Cost — lower cost wins (within 5% tolerance, move to speed).
-      3. Speed — lower duration wins.
+      1. Quality - both must pass; if only one does, it wins.
+      2. Cost - lower cost wins (within 5% tolerance, move to speed).
+      3. Speed - lower duration wins.
 
     Args:
         result_a: Metrics for variant A.
@@ -254,6 +254,14 @@ def _create_task(
         "metadata": {
             "ab_test_id": test_id,
             "ab_variant": variant,
+            # A/B tests intentionally pin two different models (often two
+            # different Claude tier names, e.g. --model-a opus --model-b
+            # sonnet) so they can be compared. The non-Claude-adapter tier
+            # coercion guard in spawner_core.py must not rewrite these to
+            # the adapter's single default model, or the two variants
+            # collapse into an A-vs-A test. See spawner_core.py's
+            # task_model_is_tier_name coercion check.
+            "pinned_model": True,
         },
     }
     resp = client.post(f"{server_url}/tasks", json=payload, timeout=10.0)
@@ -378,7 +386,7 @@ def run_ab_test(config: ABTestConfig, server_url: str) -> ABTestReport:
 
         start = time.monotonic()
 
-        # Poll both (sequentially — good enough for two tasks)
+        # Poll both (sequentially - good enough for two tasks)
         try:
             data_a = _poll_task(client, server_url, task_id_a, config.timeout_seconds)
         except TimeoutError:

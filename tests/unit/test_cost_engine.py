@@ -114,7 +114,7 @@ class TestBanditArm:
 
 
 # ---------------------------------------------------------------------------
-# EpsilonGreedyBandit — persistence
+# EpsilonGreedyBandit - persistence
 # ---------------------------------------------------------------------------
 
 
@@ -141,7 +141,7 @@ class TestEpsilonGreedyBanditPersistence:
 
 
 # ---------------------------------------------------------------------------
-# audit-071 — legacy state migration into unified BanditRouter
+# audit-071 - legacy state migration into unified BanditRouter
 # ---------------------------------------------------------------------------
 
 
@@ -252,7 +252,7 @@ class TestAudit071Migration:
         bandit.record(role="backend", model="sonnet", success=True, cost_usd=0.01)
         bandit.save(metrics_dir)
 
-        # Legacy file remains renamed — no new write there.
+        # Legacy file remains renamed - no new write there.
         assert not (metrics_dir / "bandit_state.json").exists()
         assert (metrics_dir / "bandit_state.json.bak").exists()
         # Routing file now reflects the new observation.
@@ -300,7 +300,7 @@ class TestAudit071Migration:
 
 
 # ---------------------------------------------------------------------------
-# EpsilonGreedyBandit — selection
+# EpsilonGreedyBandit - selection
 # ---------------------------------------------------------------------------
 
 
@@ -324,7 +324,7 @@ class TestEpsilonGreedyBanditSelect:
     def test_avoids_arm_below_quality_threshold(self) -> None:
         """haiku has <80% success rate; bandit should prefer sonnet."""
         bandit = EpsilonGreedyBandit(epsilon=0.0, min_observations=5, quality_threshold=0.8)
-        # haiku: 3/6 = 50% — below threshold
+        # haiku: 3/6 = 50% - below threshold
         for _ in range(6):
             bandit.record(
                 role="backend",
@@ -332,7 +332,7 @@ class TestEpsilonGreedyBanditSelect:
                 success=(_ < 3),
                 cost_usd=0.0004,
             )
-        # sonnet: 5/5 = 100% — above threshold
+        # sonnet: 5/5 = 100% - above threshold
         for _ in range(5):
             bandit.record(role="backend", model="sonnet", success=True, cost_usd=0.003)
 
@@ -411,7 +411,7 @@ class TestBanditArmPool:
         from bernstein.core.cost.cost import get_all_bandit_arms
 
         arms = get_all_bandit_arms()
-        # These were "new arms" flagged by audit-069 — the pool makes them
+        # These were "new arms" flagged by audit-069 - the pool makes them
         # visible to the bandit for explicit exploration once seeded, but
         # they cannot greedily win selection (success_rate is pessimistic).
         assert "gemini-3-flash" in arms
@@ -450,7 +450,8 @@ class TestRoutTaskBanditIntegration:
         assert config.model == "sonnet"
 
     def test_bandit_does_not_affect_manager_tasks(self, tmp_path: Path) -> None:
-        """Manager role always uses opus regardless of bandit data."""
+        """Manager role escalates to max effort on the configured default_model
+        regardless of bandit data (the haiku arm must not win)."""
         from bernstein.core.router import route_task
 
         metrics_dir = tmp_path / "metrics"
@@ -458,19 +459,21 @@ class TestRoutTaskBanditIntegration:
         _bandit_with_data(metrics_dir, "manager", "haiku", observations=10, successes=10)
 
         task = _task(role="manager")
-        config = route_task(task, bandit_metrics_dir=metrics_dir)
+        config = route_task(task, bandit_metrics_dir=metrics_dir, default_model="run-default")
 
-        assert config.model == "opus"
+        assert config.model == "run-default"
+        assert config.effort == "max"
 
     def test_route_task_without_bandit_uses_heuristics(self) -> None:
         """Without bandit_metrics_dir, route_task uses heuristics."""
         from bernstein.core.router import route_task
 
         task = _task(role="backend", complexity=Complexity.MEDIUM)
-        config = route_task(task, bandit_metrics_dir=None)
+        config = route_task(task, bandit_metrics_dir=None, default_model="run-default")
 
-        # Heuristic gives sonnet for medium backend tasks
-        assert config.model in ("sonnet", "haiku", "opus")
+        # Heuristic gives high effort on the default model for medium backend tasks
+        assert config.model == "run-default"
+        assert config.effort == "high"
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +499,8 @@ class TestSelectBatchConfigBanditIntegration:
         assert config.model == "sonnet"
 
     def test_manager_ignores_bandit(self, tmp_path: Path) -> None:
-        """Manager always gets opus even if bandit says haiku."""
+        """Manager always gets the configured default at max effort even if
+        bandit says haiku."""
         from bernstein.core.spawner import _select_batch_config
 
         metrics_dir = tmp_path / "metrics"
@@ -504,18 +508,20 @@ class TestSelectBatchConfigBanditIntegration:
         _bandit_with_data(metrics_dir, "manager", "haiku", observations=10, successes=10)
 
         tasks = [_task(role="manager")]
-        config = _select_batch_config(tasks, metrics_dir=metrics_dir)
+        config = _select_batch_config(tasks, metrics_dir=metrics_dir, default_model="run-default")
 
-        assert config.model == "opus"
+        assert config.model == "run-default"
+        assert config.effort == "max"
 
     def test_no_metrics_dir_falls_back_to_heuristics(self) -> None:
         """Without metrics_dir, uses heuristic routing."""
         from bernstein.core.spawner import _select_batch_config
 
         tasks = [_task(role="backend", complexity=Complexity.MEDIUM)]
-        config = _select_batch_config(tasks, metrics_dir=None)
+        config = _select_batch_config(tasks, metrics_dir=None, default_model="run-default")
 
-        assert config.model in ("sonnet", "opus")
+        assert config.model == "run-default"
+        assert config.effort == "high"
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +569,7 @@ class TestComputeSavingsVsOpus:
         assert compute_savings_vs_opus([]) == pytest.approx(0.0)
 
     def test_savings_for_haiku_task(self) -> None:
-        # 1000 tokens at haiku cost — opus would have cost much more
+        # 1000 tokens at haiku cost - opus would have cost much more
         records = [
             {
                 "model": "haiku",
@@ -717,3 +723,34 @@ class TestComputeSavingsVsManual:
         assert res["manual_cost_usd"] == pytest.approx(750.0)
         assert res["api_cost_usd"] == pytest.approx(4.0)
         assert res["savings_usd"] == pytest.approx(746.0)
+
+    def test_no_savings_when_no_task_completed(self) -> None:
+        # Issue #2797: a free-route run records real token usage but no
+        # ``status`` and ``$0`` cost, so nothing is "completed". The savings
+        # figure must reconcile with that instead of claiming manual hours
+        # for tasks that never completed.
+        from bernstein.core.cost import compute_savings_vs_manual
+
+        records = [
+            {"cost_usd": 0.0, "tokens_prompt": 5120, "tokens_completion": 880, "scope": "large"},
+            {"cost_usd": 0.0, "tokens_prompt": 1200, "tokens_completion": 340, "scope": "medium"},
+        ]
+        res = compute_savings_vs_manual(records)
+        assert res["manual_hours"] == pytest.approx(0.0)
+        assert res["savings_usd"] == pytest.approx(0.0)
+
+    def test_counts_only_done_status_records(self) -> None:
+        # Explicit status wins over the cost>0 fallback: a failed task with
+        # real spend must not contribute manual-savings hours.
+        from bernstein.core.cost import compute_savings_vs_manual
+
+        records = [
+            {"cost_usd": 0.0, "status": "done", "scope": "medium"},  # 1.5 hr
+            {"cost_usd": 2.0, "status": "failed", "scope": "large"},  # excluded
+        ]
+        res = compute_savings_vs_manual(records)
+        assert res["manual_hours"] == pytest.approx(1.5)
+        # Manual cost = 1.5 hr * $100 = $150; api_cost still sums real spend
+        # across all records (including the failed one) = $2.0.
+        assert res["api_cost_usd"] == pytest.approx(2.0)
+        assert res["savings_usd"] == pytest.approx(148.0)

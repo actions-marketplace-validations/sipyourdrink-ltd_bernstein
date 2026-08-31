@@ -1,10 +1,10 @@
 """Approval gates: configurable review step between janitor verification and merge.
 
 Three modes:
-  auto    — merge immediately after janitor passes (default, headless-friendly).
-  review  — write a pending approval file, block until the user writes a decision
+  auto    - merge immediately after janitor passes (default, headless-friendly).
+  review  - write a pending approval file, block until the user writes a decision
              file via ``bernstein approve <task_id>`` or ``bernstein reject <task_id>``.
-  pr      — push the agent branch and create a GitHub PR; skip local merge.
+  pr      - push the agent branch and create a GitHub PR; skip local merge.
 
 Because the orchestrator runs as a background subprocess (stdout redirected to
 log file), interactive terminal prompts are not viable. Instead, ``review`` mode
@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -91,9 +92,13 @@ def _default_poll_decision(
     Returns:
         ``"approved"`` or ``"rejected"``.
     """
+    from bernstein.core.orchestration.approval_gate import approval_path_in
+
+    # The same single implementation every other approvals sink resolves to,
+    # in the variant that takes the directory rather than a project root.
     deadline = time.monotonic() + max_wait_s
-    approved_path = approvals_dir / f"{task_id}.approved"
-    rejected_path = approvals_dir / f"{task_id}.rejected"
+    approved_path = approval_path_in(approvals_dir, task_id, ".approved")
+    rejected_path = approval_path_in(approvals_dir, task_id, ".rejected")
 
     while time.monotonic() < deadline:
         if approved_path.exists():
@@ -105,7 +110,7 @@ def _default_poll_decision(
         time.sleep(poll_interval_s)
 
     logger.warning(
-        "Approval gate: task %s timed out after %.0fs — defaulting to %s",
+        "Approval gate: task %s timed out after %.0fs - defaulting to %s",
         task_id,
         max_wait_s,
         "rejected" if reject_on_timeout else "approved",
@@ -237,6 +242,13 @@ class ApprovalGate:
         For ``pr``: immediately returns a non-approved, non-rejected result
             (caller should call :meth:`create_pr` separately).
 
+        FAIL-CLOSED: any unexpected exception raised while resolving the
+        decision (including inside ``_review``) is caught here, logged at
+        ERROR with the full traceback and the inputs under evaluation, and
+        turned into a REJECTED result. Callers must never see an exception
+        escape this method and must never treat "gate raised" as "gate
+        approved" -- see house lesson on ApprovalGate fail-open drift.
+
         Args:
             task: The completed task to review.
             session_id: Agent session ID (used for logging).
@@ -249,26 +261,65 @@ class ApprovalGate:
         Returns:
             :class:`ApprovalResult` describing the decision.
         """
-        if bypass_enabled:
-            logger.info("Approval gate: bypassing review for task %s", task.id)
-            return ApprovalResult(approved=True)
+        try:
+            if bypass_enabled:
+                logger.info(
+                    "Approval gate decision: task=%s session=%s decision=approved reason=bypass_enabled",
+                    task.id,
+                    session_id,
+                )
+                return ApprovalResult(approved=True)
 
-        mode = override_mode if override_mode is not None else self._mode
-        if mode == ApprovalMode.AUTO:
-            return ApprovalResult(approved=True)
+            mode = override_mode if override_mode is not None else self._mode
+            if mode == ApprovalMode.AUTO:
+                logger.info(
+                    "Approval gate decision: task=%s session=%s decision=approved reason=mode_auto",
+                    task.id,
+                    session_id,
+                )
+                return ApprovalResult(approved=True)
 
-        if mode == ApprovalMode.PR:
-            return ApprovalResult(approved=False, rejected=False)
+            if mode == ApprovalMode.PR:
+                logger.info(
+                    "Approval gate decision: task=%s session=%s decision=pending_pr reason=mode_pr",
+                    task.id,
+                    session_id,
+                )
+                return ApprovalResult(approved=False, rejected=False)
 
-        # REVIEW mode
-        return self._review(task, session_id=session_id, diff=diff, test_summary=test_summary, timeout_s=timeout_s)
+            # REVIEW mode
+            result = self._review(
+                task, session_id=session_id, diff=diff, test_summary=test_summary, timeout_s=timeout_s
+            )
+            logger.info(
+                "Approval gate decision: task=%s session=%s decision=%s reason=review_mode_poll",
+                task.id,
+                session_id,
+                "rejected" if result.rejected else "approved",
+            )
+            return result
+        except Exception:
+            logger.error(
+                "Approval gate evaluate() raised -- FAIL-CLOSED to rejected (not auto-merge). "
+                "task=%s session=%s override_mode=%s timeout_s=%s bypass_enabled=%s diff_len=%d "
+                "test_summary=%r\n%s",
+                task.id,
+                session_id,
+                override_mode,
+                timeout_s,
+                bypass_enabled,
+                len(diff),
+                test_summary,
+                traceback.format_exc(),
+            )
+            return ApprovalResult(approved=False, rejected=True)
 
     def create_pr(
         self,
         task: Task,
         *,
         worktree_path: Path,
-        session_id: str,
+        session_id: str = "",
         base_branch: str = "main",
         labels: list[str] | None = None,
         _role: str = "",
@@ -283,21 +334,78 @@ class ApprovalGate:
         then creates a PR with a structured body including task metadata, cost,
         test results, and the agent role/model.
 
+        NOTE ON PARAMETER NAMES: ``session_id``/``model``/``cost_usd`` are the
+        public keyword names accepted for logging/metadata parity with other
+        gate call sites; ``_role`` is underscore-prefixed by convention because
+        it is "part of the interface" but not required for PR construction
+        itself. Do NOT rename the public names without updating every caller --
+        a prior signature drift where this method briefly accepted
+        ``_session_id``/``_model``/``_cost_usd`` broke pre-existing callers and
+        tests that pass ``session_id``/``model``/``cost_usd`` with
+        ``TypeError: create_pr() got an unexpected keyword argument
+        'session_id'``. This method fail-closes internally (below) so that even
+        a *future* drift cannot escape as a bypass.
+
         Args:
             task: The task whose work should become a PR.
             worktree_path: Path to the agent's git worktree.
-            _session_id: Agent session ID (part of interface).
+            session_id: Agent session ID (part of interface).
             base_branch: Target branch for the PR.
             labels: GitHub labels to attach (defaults to ["bernstein", "auto-generated"]).
             _role: Agent role (part of interface).
-            _model: Model name (part of interface).
-            _cost_usd: Cost in USD (part of interface).
+            model: Model name (part of interface).
+            cost_usd: Cost in USD (part of interface).
             test_summary: One-line test result summary (e.g. ``"12 passed, 0 failed"``).
 
         Returns:
-            PR URL on success, empty string on failure.
+            PR URL on success, empty string on failure (failure -- including
+            an internal exception -- must NEVER be treated by the caller as
+            "approved"; it means no PR exists and merge must stay skipped).
         """
-        _ = session_id  # Part of interface
+        try:
+            return self._create_pr_inner(
+                task,
+                worktree_path=worktree_path,
+                session_id=session_id,
+                base_branch=base_branch,
+                labels=labels,
+                role=_role,
+                model=model,
+                cost_usd=cost_usd,
+                test_summary=test_summary,
+            )
+        except Exception:
+            logger.error(
+                "Approval gate create_pr() raised -- FAIL-CLOSED, returning no PR (caller must NOT "
+                "treat this as approved/auto-merge). task=%s session=%s role=%s model=%s cost_usd=%s "
+                "base_branch=%s worktree_path=%s\n%s",
+                task.id,
+                session_id,
+                _role,
+                model,
+                cost_usd,
+                base_branch,
+                worktree_path,
+                traceback.format_exc(),
+            )
+            return ""
+
+    def _create_pr_inner(
+        self,
+        task: Task,
+        *,
+        worktree_path: Path,
+        session_id: str,
+        base_branch: str,
+        labels: list[str] | None,
+        role: str,
+        model: str,
+        cost_usd: float,
+        test_summary: str,
+    ) -> str:
+        """Do the actual push+PR-creation work. Exceptions propagate to create_pr()."""
+        _ = session_id  # Part of interface (logging/metadata parity)
+        _ = role  # Part of interface
         _ = model  # Part of interface
         _ = cost_usd  # Part of interface
         from bernstein.core.git_ops import PullRequestResult, create_github_pr, push_head_as
@@ -306,19 +414,23 @@ class ApprovalGate:
         pr_branch = f"bernstein/task-{task.id}"
 
         # Use push_head_as so the local branch name (agent/{session_id}) does
-        # not matter — we publish the worktree HEAD as bernstein/task-{id}.
+        # not matter - we publish the worktree HEAD as bernstein/task-{id}.
         push_fn: _PushBranchFn = self._push_branch_fn or push_head_as
         create_fn = self._create_pr_fn or create_github_pr
 
         if _has_no_diff(worktree_path, base_branch):
             logger.info(
-                "Approval gate: no diff vs %s for task %s — skipping PR (agent made no changes)",
-                base_branch,
+                "Approval gate decision: task=%s decision=no_pr reason=no_diff_vs_%s",
                 task.id,
+                base_branch,
             )
             return ""
 
         if not _push_with_retry(push_fn, worktree_path, pr_branch, task.id):
+            logger.info(
+                "Approval gate decision: task=%s decision=no_pr reason=push_failed",
+                task.id,
+            )
             return ""
 
         diff_stats = self._get_diff_stats(worktree_path, base_branch)
@@ -332,10 +444,18 @@ class ApprovalGate:
             labels=effective_labels,
         )
         if not pr_result.success:
-            logger.warning("Approval gate: PR creation failed for task %s: %s", task.id, pr_result.error)
+            logger.warning(
+                "Approval gate decision: task=%s decision=no_pr reason=pr_create_failed error=%s",
+                task.id,
+                pr_result.error,
+            )
             return ""
 
-        logger.info("Approval gate: PR created for task %s: %s", task.id, pr_result.pr_url)
+        logger.info(
+            "Approval gate decision: task=%s decision=pr_created pr_url=%s",
+            task.id,
+            pr_result.pr_url,
+        )
         if self._auto_merge and pr_result.pr_url:
             _try_enable_auto_merge(self._workdir, pr_result.pr_url)
         return pr_result.pr_url
@@ -369,7 +489,7 @@ class ApprovalGate:
         }
         pending_file.write_text(json.dumps(payload, indent=2))
         logger.info(
-            "Approval gate: task %s pending review — run `bernstein approve %s` or `bernstein reject %s`",
+            "Approval gate: task %s pending review - run `bernstein approve %s` or `bernstein reject %s`",
             task.id,
             task.id,
             task.id,
@@ -495,5 +615,5 @@ class ApprovalGate:
         if test_summary:
             lines.extend(("## Tests", "", test_summary, ""))
 
-        lines.extend(("---", f"*Generated by Bernstein — task `{task.id}`*"))
+        lines.extend(("---", f"*Generated by Bernstein - task `{task.id}`*"))
         return "\n".join(lines)

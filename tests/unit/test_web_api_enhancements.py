@@ -55,7 +55,7 @@ class TestCORSConfiguration:
                 },
             )
             # Starlette CORSMiddleware with wildcard port patterns:
-            # unmatched origins get 400 on preflight — verify middleware is present
+            # unmatched origins get 400 on preflight - verify middleware is present
             assert resp.status_code in (200, 400)
 
     @pytest.mark.anyio
@@ -468,7 +468,6 @@ class TestOpenAPISpec:
 # ============================================================================
 
 
-@pytest.mark.skip(reason="/dashboard/auth/* routes not yet implemented")
 class TestDashboardAuth:
     """Test dashboard session-based authentication."""
 
@@ -522,6 +521,35 @@ class TestDashboardAuth:
         assert verify_password("", "") is False
         assert verify_password("something", "") is False
 
+    def test_verify_password_uses_unpredictable_salt(self) -> None:
+        """The digest salt is drawn fresh per call, so it must stay random.
+
+        A random per-call salt must not change the boolean result: equal
+        inputs always match and unequal inputs never do, across repeated
+        calls. The digest itself must vary with the salt so a fixed,
+        predictable value is never reused.
+        """
+        from bernstein.core.server.dashboard_auth import _password_digest, verify_password
+
+        # Result is stable across many independent calls despite the salt
+        # being regenerated on each one.
+        assert all(verify_password("secret", "secret") is True for _ in range(25))
+        assert all(verify_password("wrong", "secret") is False for _ in range(25))
+
+        # Different salts yield different digests for the same value; the same
+        # salt reproduces the digest (needed for the in-call comparison).
+        assert _password_digest("secret", b"\x00" * 16) != _password_digest("secret", b"\x11" * 16)
+        assert _password_digest("secret", b"\x00" * 16) == _password_digest("secret", b"\x00" * 16)
+
+    def test_password_digest_default_salt_is_drawn_fresh_per_call(self) -> None:
+        """``_password_digest`` with no explicit salt still derives from a
+        random source at the KDF call site itself, not just in a caller.
+        """
+        from bernstein.core.server.dashboard_auth import _password_digest
+
+        digests = {_password_digest("secret") for _ in range(20)}
+        assert len(digests) == 20
+
     def test_session_store_active_count(self) -> None:
         """active_count should reflect live sessions."""
         from bernstein.core.dashboard_auth import DashboardSessionStore
@@ -547,7 +575,7 @@ class TestDashboardAuth:
     async def test_dashboard_accessible_without_password(self, client: AsyncClient) -> None:
         """Dashboard should be accessible when no password is set."""
         resp = await client.get("/dashboard")
-        # May be 200 (HTML) or 500 (template not found in test env) — not 401
+        # May be 200 (HTML) or 500 (template not found in test env) - not 401
         assert resp.status_code != 401
 
     @pytest.mark.anyio
@@ -689,6 +717,5 @@ class TestIntegration:
         assert "/tasks" in paths
         assert "/health" in paths
         assert "/tasks/counts" in paths
-        # /dashboard/auth/* routes not yet implemented
-        # assert "/dashboard/auth/login" in paths
-        # assert "/dashboard/auth/status" in paths
+        assert "/dashboard/auth/login" in paths
+        assert "/dashboard/auth/status" in paths

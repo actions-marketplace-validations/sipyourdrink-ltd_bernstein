@@ -1,6 +1,32 @@
-"""Verify CLI -- WAL integrity, execution determinism, memory provenance, wheelhouse.
+"""Verify CLI -- run receipts, ladder receipts, WAL integrity, determinism, memory, wheelhouse.
 
-Five verification modes, each with a hard exit-code contract:
+``bernstein verify`` is a group. Two run-receipt verbs (issue #2924) and a
+ladder-receipt verb (issue #2927):
+
+* ``bernstein verify run <run-id>`` -- build the signed ``run-receipt.json``
+  binding the run's journal head, lineage-spine head, and (opt-in) an
+  audit-chain range under one Ed25519-signed subject with an embedded
+  public JWK.
+* ``bernstein verify receipt <path> [--public-key PEM] [--require-provenance]
+  [--json]`` -- verify a receipt **fully offline** from the file alone: no
+  HMAC key, no ``.sdd/``. A pass is one of two tiers: *integrity-only*
+  (no ``--public-key``) or *provenance* (embedded key pinned and matched).
+  Exit codes: ``0`` OK (either tier, unless ``--require-provenance``),
+  ``1`` empty/malformed input, ``2`` tamper detected (naming the first
+  divergent journal step index) or a ``--public-key`` pin mismatch, ``3``
+  ``--require-provenance`` was passed and only the integrity-only tier was
+  reached. ``--json`` adds a machine-readable ``tier`` field so a caller
+  need not parse the verdict prose.
+* ``bernstein verify ladder <receipt-hash>`` -- re-derive a pre-merge
+  verifier-ladder receipt: per-tier ``tier / config_hash / evidence_hash /
+  verdict`` plus the composite claim, re-checked against the
+  ``verifier-ladder`` lineage spine. Exit codes: ``0`` OK, ``1`` no readable
+  receipt, ``2`` re-derivation or anchor mismatch.
+
+The five legacy flag/positional modes are preserved verbatim under the
+default ``legacy`` subcommand -- any invocation whose first token is not a
+known subcommand routes there, so existing scripts keep their exact
+behaviour and exit codes:
 
 * ``bernstein verify <wheelhouse-path>`` -- verify air-gap wheelhouse
   manifest + signatures (cosign by default; GPG path supported).
@@ -14,11 +40,17 @@ Five verification modes, each with a hard exit-code contract:
 * ``bernstein verify --formal <task-id>`` -- spawn Z3 / Lean4 property
   checks against the task contract. The CLI surface is shipped; Z3 / Lean4
   binaries must be installed separately on PATH (no bundled extra).
+
+One routing edge: a wheelhouse directory literally named ``run``,
+``receipt``, ``ladder``, or ``legacy`` shadows the positional mode -- spell
+it ``./run`` (or use ``bernstein verify legacy run``) in that case.
 """
 
 from __future__ import annotations
 
+import json as _json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 from rich.panel import Panel
@@ -26,12 +58,56 @@ from rich.table import Table
 
 from bernstein.cli.helpers import console
 
+if TYPE_CHECKING:
+    from bernstein.core.wal import WALEntryDigest
+
 _GREEN_ZERO = "[green]0[/green]"
 
 SDD_DIR = Path(".sdd")
 
 
-@click.command("verify")
+class _DefaultSubcommandGroup(click.Group):
+    """A group that routes to a default subcommand when the first token is not
+    a known subcommand, so ``verify --wal-integrity ...`` and
+    ``verify <wheelhouse-path>`` still reach the legacy flag modes.
+
+    Same pattern as the compliance ``pack`` group
+    (:mod:`bernstein.cli.commands.compliance_cmd`).
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._default_cmd = kwargs.pop("default_cmd", None)
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        default = self._default_cmd
+        if isinstance(default, str):
+            if not args:
+                args = [default]
+            elif args[0] not in self.commands and args[0] not in ("--help", "-h"):
+                args = [default, *args]
+        return super().parse_args(ctx, args)
+
+
+@click.group("verify", cls=_DefaultSubcommandGroup, default_cmd="legacy")
+def verify_cmd() -> None:
+    """Verify run receipts, ladder receipts, WAL integrity, determinism, memory, or a wheelhouse.
+
+    \b
+      bernstein verify run <run-id>               Build the signed run receipt
+      bernstein verify receipt <path>             Verify a receipt offline (0/1/2)
+      bernstein verify ladder <receipt-hash>      Re-derive a verifier-ladder receipt (0/1/2)
+      bernstein verify <wheelhouse-path>          Verify air-gap wheelhouse signatures
+      bernstein verify --wal-integrity <run-id>   Validate hash chain
+      bernstein verify --determinism  <run-id>    Show execution fingerprint
+      bernstein verify --memory-audit             Audit lesson memory provenance
+      bernstein verify --formal <task-id>         Run Z3/Lean4 property checks
+
+    Flag and positional modes route to the ``legacy`` subcommand unchanged.
+    """
+
+
+@verify_cmd.command("legacy")
 @click.argument(
     "wheelhouse_path",
     required=False,
@@ -51,6 +127,20 @@ SDD_DIR = Path(".sdd")
     default=None,
     metavar="RUN_ID",
     help="Compute and display execution fingerprint for a run.",
+)
+@click.option(
+    "--expect",
+    "expect_fingerprint",
+    default=None,
+    metavar="FINGERPRINT",
+    help="Gate --determinism: exit non-zero unless the run's fingerprint equals this value.",
+)
+@click.option(
+    "--baseline",
+    "baseline_run_id",
+    default=None,
+    metavar="RUN_ID",
+    help="Gate --determinism: exit non-zero unless the run reproduces this baseline run's fingerprint.",
 )
 @click.option(
     "--memory-audit",
@@ -135,10 +225,12 @@ SDD_DIR = Path(".sdd")
     default=False,
     help="Promote a missing attestation to a hard failure. Implies --sigstore.",
 )
-def verify_cmd(
+def verify_legacy_cmd(
     wheelhouse_path: Path | None,
     wal_run_id: str | None,
     determinism_run_id: str | None,
+    expect_fingerprint: str | None,
+    baseline_run_id: str | None,
     memory_audit: bool,
     formal_task_id: str | None,
     ca_pubkey: Path | None,
@@ -154,13 +246,27 @@ def verify_cmd(
 ) -> None:
     """Verify WAL integrity, execution determinism, memory provenance, formal properties, or a wheelhouse.
 
+    The default subcommand: ``bernstein verify <args>`` routes here whenever
+    the first token is not ``run`` / ``receipt`` / ``ladder`` / ``legacy``,
+    so every pre-group invocation keeps its exact behaviour and exit codes.
+
     \b
       bernstein verify <wheelhouse-path>          Verify air-gap wheelhouse signatures
       bernstein verify --wal-integrity <run-id>   Validate hash chain
       bernstein verify --determinism  <run-id>    Show execution fingerprint
+      bernstein verify --determinism  <run-id> --expect <fp>     Gate on a recorded fingerprint
+      bernstein verify --determinism  <run-b> --baseline <run-a> Gate that run-b reproduces run-a
       bernstein verify --memory-audit             Audit lesson memory provenance
       bernstein verify --formal <task-id>         Run Z3/Lean4 property checks
     """
+    # --expect / --baseline only have meaning as a gate on --determinism, and
+    # they are mutually exclusive (an explicit digest XOR a baseline run). Reject
+    # ambiguous combinations rather than silently picking one.
+    if expect_fingerprint is not None and baseline_run_id is not None:
+        raise click.UsageError("--expect and --baseline are mutually exclusive; pass only one.")
+    if (expect_fingerprint is not None or baseline_run_id is not None) and determinism_run_id is None:
+        raise click.UsageError("--expect/--baseline require --determinism <run-id>.")
+
     if wheelhouse_path is wal_run_id is determinism_run_id is formal_task_id is None and not memory_audit:
         console.print(
             "[dim]Use <wheelhouse-path>, --wal-integrity <run-id>, --determinism <run-id>, "
@@ -190,7 +296,11 @@ def verify_cmd(
         exit_code |= _verify_wal_integrity(wal_run_id)
 
     if determinism_run_id is not None:
-        exit_code |= _verify_determinism(determinism_run_id)
+        exit_code |= _verify_determinism(
+            determinism_run_id,
+            expect=expect_fingerprint,
+            baseline_run_id=baseline_run_id,
+        )
 
     if memory_audit:
         exit_code |= _verify_memory_provenance()
@@ -369,7 +479,7 @@ def _verify_wheelhouse(
     table.add_row("Path", str(wheelhouse_path))
     table.add_row("Wheels verified", str(verified))
     table.add_row("Signatures present", str(signed))
-    table.add_row("CA pubkey", str(ca_pubkey) if ca_pubkey else "(none — checksum only)")
+    table.add_row("CA pubkey", str(ca_pubkey) if ca_pubkey else "(none - checksum only)")
     if customer_outcome.valid is True:
         table.add_row("Customer sig", f"ok (org={customer_outcome.matched_org})")
     elif customer_outcome.present:
@@ -571,8 +681,32 @@ def _verify_wal_integrity(run_id: str) -> int:
     return 0 if is_valid else 1
 
 
-def _verify_determinism(run_id: str) -> int:
-    """Compute and display execution fingerprint for *run_id*. Returns 0 always."""
+def _verify_determinism(
+    run_id: str,
+    *,
+    expect: str | None = None,
+    baseline_run_id: str | None = None,
+) -> int:
+    """Compute the execution fingerprint for *run_id*, optionally gating on it.
+
+    Three modes, selected by the optional arguments:
+
+    * Bare (``expect is None and baseline_run_id is None``): print the
+      fingerprint table and return 0. Output and exit code are unchanged
+      from the original observe-only behaviour.
+    * ``expect`` set: compare the run's fingerprint to the expected digest
+      in constant time. Return 0 on match, 2 on mismatch (printing both
+      digests).
+    * ``baseline_run_id`` set: compare the run's fingerprint to a second
+      run's. Return 0 on match, 2 on mismatch -- and on mismatch, name the
+      first diverging WAL entry from the shared hash chain.
+
+    A missing WAL (for either run) returns 1 with the existing
+    "WAL file not found" message.
+
+    Scope: a green gate proves the two WAL *decision traces* matched, not
+    that on-disk artefacts are byte-identical.
+    """
     from bernstein.core.wal import ExecutionFingerprint, WALReader
 
     reader = WALReader(run_id=run_id, sdd_dir=SDD_DIR)
@@ -581,49 +715,199 @@ def _verify_determinism(run_id: str) -> int:
     try:
         fp = ExecutionFingerprint.from_wal(reader)
     except FileNotFoundError:
-        console.print(
-            Panel(
-                f"[bold red]WAL file not found for run:[/bold red] {run_id}",
-                border_style="red",
-                expand=False,
-            )
-        )
-        console.print(f"[dim]Expected: {SDD_DIR}/runtime/wal/{run_id}.wal.jsonl[/dim]")
-        console.print()
-        return 1
+        return _wal_not_found(run_id)
 
     fingerprint = fp.compute()
 
-    # Count entries
-    entry_count = sum(1 for _ in WALReader(run_id=run_id, sdd_dir=SDD_DIR).iter_entries())
-
-    console.print(
-        Panel(
-            "[bold]Execution Determinism Fingerprint[/bold]",
-            border_style="blue",
-            expand=False,
+    if expect is None is baseline_run_id:
+        # Bare mode: observe-only, byte-identical to the original surface.
+        # The entry count is only displayed in this branch, so the second WAL
+        # scan stays scoped here rather than running for every gated call.
+        entry_count = sum(1 for _ in WALReader(run_id=run_id, sdd_dir=SDD_DIR).iter_entries())
+        console.print(
+            Panel(
+                "[bold]Execution Determinism Fingerprint[/bold]",
+                border_style="blue",
+                expand=False,
+            )
         )
-    )
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column("Key", style="dim", no_wrap=True, min_width=14)
-    table.add_column("Value")
-    table.add_row("Run ID", run_id)
-    table.add_row("Entries", str(entry_count))
-    table.add_row("Fingerprint", fingerprint)
-    console.print(table)
-    console.print("\n  [dim]Two runs with the same fingerprint made identical decisions in identical order.[/dim]")
-    console.print()
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value")
+        table.add_row("Run ID", run_id)
+        table.add_row("Entries", str(entry_count))
+        table.add_row("Fingerprint", fingerprint)
+        console.print(table)
+        console.print("\n  [dim]Two runs with the same fingerprint made identical decisions in identical order.[/dim]")
+        console.print()
+        return 0
+
+    if baseline_run_id is not None:
+        return _gate_against_baseline(run_id, fingerprint, baseline_run_id)
+    if expect is not None:
+        return _gate_against_expected(run_id, fingerprint, expect)
+    # Unreachable: bare mode returned above, and the caller guarantees at most
+    # one of expect/baseline is set. Belt-and-suspenders for the type checker.
     return 0
 
 
+def _wal_not_found(run_id: str) -> int:
+    """Print the canonical 'WAL file not found' panel and return 1."""
+    console.print(
+        Panel(
+            f"[bold red]WAL file not found for run:[/bold red] {run_id}",
+            border_style="red",
+            expand=False,
+        )
+    )
+    console.print(f"[dim]Expected: {SDD_DIR}/runtime/wal/{run_id}.wal.jsonl[/dim]")
+    console.print()
+    return 1
+
+
+# A gate proves the decision trace matched -- not that artefacts on disk are
+# identical. Surfaced verbatim under every gate result so a green check is not
+# mistaken for full on-disk reproducibility.
+_GATE_SCOPE_NOTE = (
+    "  [dim]Scope: this proves the WAL decision trace matched, not that on-disk artefacts are identical.[/dim]"
+)
+
+
+def _digest_lines(label_actual: str, actual: str, label_other: str, other: str) -> None:
+    """Print two digests on their own full-width lines (never truncated)."""
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+    table.add_column("Value", no_wrap=True, overflow="fold")
+    table.add_row(label_actual, actual)
+    table.add_row(label_other, other)
+    console.print(table)
+
+
+def _gate_against_expected(run_id: str, fingerprint: str, expect: str) -> int:
+    """Compare *fingerprint* to *expect* in constant time. Return 0 / 2."""
+    import hmac
+
+    matched = hmac.compare_digest(fingerprint, expect)
+
+    if matched:
+        console.print(
+            Panel(
+                "[bold green]Determinism Gate: PASSED[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        _digest_lines("Run ID", run_id, "Fingerprint", fingerprint)
+        console.print(f"\n{_GATE_SCOPE_NOTE}")
+        console.print()
+        return 0
+
+    console.print(
+        Panel(
+            "[bold red]Determinism Gate: FAILED[/bold red]",
+            border_style="red",
+            expand=False,
+        )
+    )
+    _digest_lines("Expected", expect, "Actual", fingerprint)
+    console.print(f"\n{_GATE_SCOPE_NOTE}")
+    console.print()
+    return 2
+
+
+def _gate_against_baseline(run_id: str, fingerprint: str, baseline_run_id: str) -> int:
+    """Compare *run_id* to *baseline_run_id*. Return 0 / 2 (1 if baseline WAL missing).
+
+    On mismatch, name the first WAL entry at which the two decision traces
+    diverged, derived from the existing hash-chain order via per-entry
+    cumulative digests.
+    """
+    import hmac
+
+    from bernstein.core.wal import ExecutionFingerprint, WALReader, first_divergence
+
+    baseline_reader = WALReader(run_id=baseline_run_id, sdd_dir=SDD_DIR)
+    try:
+        baseline_fp = ExecutionFingerprint.from_wal(baseline_reader).compute()
+    except FileNotFoundError:
+        return _wal_not_found(baseline_run_id)
+
+    if hmac.compare_digest(fingerprint, baseline_fp):
+        console.print(
+            Panel(
+                "[bold green]Determinism Gate: PASSED[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim", no_wrap=True, min_width=14)
+        table.add_column("Value", no_wrap=True, overflow="fold")
+        table.add_row("Run", run_id)
+        table.add_row("Baseline", baseline_run_id)
+        table.add_row("Fingerprint", fingerprint)
+        console.print(table)
+        console.print(f"\n{_GATE_SCOPE_NOTE}")
+        console.print()
+        return 0
+
+    # Mismatch: locate the first diverging WAL entry from the chain order.
+    run_digests = ExecutionFingerprint.entry_digests(WALReader(run_id=run_id, sdd_dir=SDD_DIR))
+    baseline_digests = ExecutionFingerprint.entry_digests(WALReader(run_id=baseline_run_id, sdd_dir=SDD_DIR))
+    idx = first_divergence(baseline_digests, run_digests)
+
+    console.print(
+        Panel(
+            "[bold red]Determinism Gate: FAILED[/bold red]",
+            border_style="red",
+            expand=False,
+        )
+    )
+    _digest_lines("Baseline", baseline_fp, "Actual", fingerprint)
+    if idx is not None:
+        console.print()
+        _print_divergence(idx, baseline_run_id, baseline_digests, run_id, run_digests)
+    console.print(f"\n{_GATE_SCOPE_NOTE}")
+    console.print()
+    return 2
+
+
+def _print_divergence(
+    idx: int,
+    baseline_run_id: str,
+    baseline_digests: list[WALEntryDigest],
+    run_id: str,
+    run_digests: list[WALEntryDigest],
+) -> None:
+    """Render the first diverging WAL entry (index + seq + decision type)."""
+
+    def _describe(digests: list[WALEntryDigest]) -> str:
+        if idx < len(digests):
+            d = digests[idx]
+            return f"seq {d.seq} ({d.decision_type})"
+        return "(no entry -- run ended earlier)"
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=20)
+    table.add_column("Value")
+    table.add_row("First divergence at", f"WAL entry index {idx}")
+    table.add_row(f"Baseline {baseline_run_id}", _describe(baseline_digests))
+    table.add_row(f"Run {run_id}", _describe(run_digests))
+    console.print(table)
+
+
 def _verify_memory_provenance() -> int:
-    """Audit the lesson memory provenance chain. Returns 0 on clean, 1 on failure."""
+    """Audit the lesson memory provenance chain and convention receipts. Returns 0 on clean, 1 on failure."""
+    from bernstein.core.knowledge.conventions import verify_conventions_audit
     from bernstein.core.memory_integrity import audit_provenance, verify_chain
 
     lessons_path = SDD_DIR / "memory" / "lessons.jsonl"
+    conventions_dir = SDD_DIR / "conventions" / "receipts"
+    has_lessons = lessons_path.exists()
+    has_conventions = conventions_dir.exists() and any(conventions_dir.glob("*.json"))
     console.print()
 
-    if not lessons_path.exists():
+    if not has_lessons and not has_conventions:
         console.print(
             Panel(
                 "[dim]No lesson memory found: nothing to audit.[/dim]",
@@ -634,9 +918,14 @@ def _verify_memory_provenance() -> int:
         console.print()
         return 0
 
-    chain_result = verify_chain(lessons_path)
+    chain_result = verify_chain(lessons_path) if has_lessons else None
+    conv_result = verify_conventions_audit(SDD_DIR)
 
-    if chain_result.valid:
+    lessons_valid = chain_result.valid if chain_result is not None else True
+    conv_valid = conv_result.valid
+    all_valid = lessons_valid and conv_valid
+
+    if all_valid:
         console.print(
             Panel(
                 "[bold green]Memory Provenance: CLEAN[/bold green]",
@@ -647,7 +936,10 @@ def _verify_memory_provenance() -> int:
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column("Key", style="dim", no_wrap=True, min_width=20)
         table.add_column("Value")
-        table.add_row("Entries verified", str(chain_result.entries_checked))
+        if chain_result is not None:
+            table.add_row("Entries verified", str(chain_result.entries_checked))
+        if conv_result.receipts_checked > 0:
+            table.add_row("Conventions verified", str(conv_result.receipts_checked))
         table.add_row("Chain", "intact")
         table.add_row("Tampering", "none detected")
         console.print(table)
@@ -662,35 +954,42 @@ def _verify_memory_provenance() -> int:
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column("Key", style="dim", no_wrap=True, min_width=20)
         table.add_column("Value")
-        table.add_row("Entries checked", str(chain_result.entries_checked))
-        table.add_row("First broken at", f"line {chain_result.broken_at}" if chain_result.broken_at > 0 else "N/A")
+        if chain_result is not None:
+            table.add_row("Entries checked", str(chain_result.entries_checked))
+            table.add_row("First broken at", f"line {chain_result.broken_at}" if chain_result.broken_at > 0 else "N/A")
+        if conv_result.receipts_checked > 0:
+            table.add_row("Conventions checked", str(conv_result.receipts_checked))
         console.print(table)
         console.print()
-        for err in chain_result.errors:
+        if chain_result is not None:
+            for err in chain_result.errors:
+                console.print(f"  [red]![/red] {err}")
+        for err in conv_result.errors:
             console.print(f"  [red]![/red] {err}")
 
-    # Show provenance trail summary
-    trail = audit_provenance(lessons_path)
-    if trail:
-        tampered = [e for e in trail if not e.hash_valid]
-        mispositioned = [e for e in trail if not e.chain_position_valid]
-        console.print()
-        table2 = Table(show_header=False, box=None, padding=(0, 2))
-        table2.add_column("Key", style="dim", no_wrap=True, min_width=20)
-        table2.add_column("Value")
-        table2.add_row("Total entries", str(len(trail)))
-        table2.add_row(
-            "Hash-tampered",
-            f"[red]{len(tampered)}[/red]" if tampered else _GREEN_ZERO,
-        )
-        table2.add_row(
-            "Chain-mispositioned",
-            f"[red]{len(mispositioned)}[/red]" if mispositioned else _GREEN_ZERO,
-        )
-        console.print(table2)
+    # Show provenance trail summary if lessons exist
+    if has_lessons:
+        trail = audit_provenance(lessons_path)
+        if trail:
+            tampered = [e for e in trail if not e.hash_valid]
+            mispositioned = [e for e in trail if not e.chain_position_valid]
+            console.print()
+            table2 = Table(show_header=False, box=None, padding=(0, 2))
+            table2.add_column("Key", style="dim", no_wrap=True, min_width=20)
+            table2.add_column("Value")
+            table2.add_row("Total entries", str(len(trail)))
+            table2.add_row(
+                "Hash-tampered",
+                f"[red]{len(tampered)}[/red]" if tampered else _GREEN_ZERO,
+            )
+            table2.add_row(
+                "Chain-mispositioned",
+                f"[red]{len(mispositioned)}[/red]" if mispositioned else _GREEN_ZERO,
+            )
+            console.print(table2)
 
     console.print()
-    return 0 if chain_result.valid else 1
+    return 0 if all_valid else 1
 
 
 def _verify_formal(task_id: str) -> int:
@@ -794,3 +1093,434 @@ def _verify_formal(task_id: str) -> int:
 
     console.print()
     return 0 if fv_result.passed else 1
+
+
+# ---------------------------------------------------------------------------
+# Run receipts (issue #2924)
+# ---------------------------------------------------------------------------
+
+
+@verify_cmd.command("run")
+@click.argument("run_id", required=True)
+@click.option(
+    "--workdir",
+    "-w",
+    type=click.Path(file_okay=False, exists=True),
+    default=".",
+    show_default=True,
+    help="Project root containing .sdd/.",
+)
+@click.option(
+    "--signing-key-path",
+    "signing_key_path",
+    default=None,
+    type=click.Path(dir_okay=False, exists=True, resolve_path=True),
+    help=(
+        "Path to the Ed25519 private key (PEM PKCS#8 or raw 32-byte) that signs "
+        "the receipt. Reuses the lineage / audit-receipt KMS key material "
+        "(see src/bernstein/core/security/lineage_kms.py). Mutually exclusive "
+        "with --signing-env-var. Falls back to $BERNSTEIN_RUN_RECEIPT_SIGNING_KEY_PATH "
+        "/ $BERNSTEIN_RUN_RECEIPT_SIGNING_ENV_VAR when neither flag is given."
+    ),
+)
+@click.option(
+    "--signing-env-var",
+    "signing_env_var",
+    default=None,
+    help="Env var carrying a PEM Ed25519 private key. Mutually exclusive with --signing-key-path.",
+)
+@click.option("--signing-key-id", "signing_key_id", default=None, help="Operator-stable JWK 'kid' for the receipt key.")
+@click.option(
+    "--include-audit-range",
+    is_flag=True,
+    default=False,
+    help=(
+        "Also embed a re-chained audit-chain slice (needs the operator audit "
+        "HMAC key at build time only, plus --audit-since/--audit-until)."
+    ),
+)
+@click.option("--audit-since", "audit_since", default=None, help="ISO-8601 inclusive lower bound of the audit window.")
+@click.option("--audit-until", "audit_until", default=None, help="ISO-8601 exclusive upper bound of the audit window.")
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Receipt destination (defaults to .sdd/runs/<run-id>/run-receipt.json).",
+)
+def verify_run_cmd(
+    run_id: str,
+    workdir: str,
+    signing_key_path: str | None,
+    signing_env_var: str | None,
+    signing_key_id: str | None,
+    include_audit_range: bool,
+    audit_since: str | None,
+    audit_until: str | None,
+    output_path: Path | None,
+) -> None:
+    """Build the signed run receipt for RUN_ID.
+
+    Binds the run's journal head (replay identity), lineage-spine head
+    (artifact provenance), and optionally an audit-chain range under one
+    Ed25519-signed subject with the public key embedded as a JWK. The
+    resulting ``run-receipt.json`` verifies fully offline with
+    ``bernstein verify receipt`` -- no HMAC key, no live ``.sdd/``.
+    """
+    from bernstein.core.persistence.lineage_signer import LineageSignerError
+    from bernstein.core.replay.journal import JournalPathError
+    from bernstein.core.replay.run_receipt import (
+        RunReceiptError,
+        build_run_receipt,
+        resolve_kms_adapter_from_env,
+    )
+    from bernstein.core.security.lineage_kms import EnvBasedKMSAdapter, FileBasedKMSAdapter
+
+    if signing_key_path and signing_env_var:
+        console.print("[red]--signing-key-path and --signing-env-var are mutually exclusive.[/red]")
+        raise SystemExit(2)
+
+    try:
+        if signing_key_path:
+            kms_adapter: object | None = FileBasedKMSAdapter(Path(signing_key_path), kid=signing_key_id)
+        elif signing_env_var:
+            kms_adapter = EnvBasedKMSAdapter(signing_env_var, kid=signing_key_id)
+        else:
+            kms_adapter = resolve_kms_adapter_from_env()
+    except (LineageSignerError, OSError, ValueError) as exc:
+        console.print(f"[red]Failed to load receipt signing key: {exc}[/red]")
+        raise SystemExit(1) from None
+    if kms_adapter is None:
+        console.print(
+            "[red]No signing key configured.[/red] Provide --signing-key-path or "
+            "--signing-env-var (or set $BERNSTEIN_RUN_RECEIPT_SIGNING_KEY_PATH / "
+            "$BERNSTEIN_RUN_RECEIPT_SIGNING_ENV_VAR)."
+        )
+        raise SystemExit(2)
+
+    audit_hmac_key: bytes | None = None
+    if include_audit_range:
+        if not audit_since or not audit_until:
+            console.print("[red]--include-audit-range requires --audit-since and --audit-until.[/red]")
+            raise SystemExit(2)
+        from bernstein.core.security.audit import load_or_create_audit_key
+
+        try:
+            audit_hmac_key = load_or_create_audit_key()
+        except OSError as exc:  # pragma: no cover - filesystem race
+            console.print(f"[red]Failed to load audit key: {exc}[/red]")
+            raise SystemExit(1) from None
+
+    sdd_dir = Path(workdir).resolve() / ".sdd"
+    try:
+        receipt = build_run_receipt(
+            run_id,
+            sdd_dir,
+            kms_adapter,
+            include_audit_range=include_audit_range,
+            audit_hmac_key=audit_hmac_key,
+            audit_since=audit_since,
+            audit_until=audit_until,
+            output_path=output_path,
+        )
+    except (RunReceiptError, JournalPathError, LineageSignerError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from None
+
+    console.print()
+    console.print(Panel("[bold green]Run Receipt: WRITTEN[/bold green]", border_style="green", expand=False))
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="dim", no_wrap=True, min_width=18)
+    table.add_column("Value")
+    table.add_row("Run ID", receipt.run_id)
+    table.add_row("Journal head", receipt.journal_head[:16] + "…")
+    table.add_row("Spine head", (receipt.spine_head[:16] + "…") if receipt.spine_head else "(no spine entries)")
+    if receipt.audit_head_sha256 is not None:
+        table.add_row("Audit range head", receipt.audit_head_sha256[:16] + "…")
+    table.add_row("Receipt SHA-256", receipt.sha256[:16] + "…")
+    if receipt.receipt_path is not None:
+        table.add_row("Receipt", str(receipt.receipt_path))
+    console.print(table)
+    console.print("\n  [dim]Verify offline with: bernstein verify receipt <path> [--public-key PEM][/dim]")
+    console.print()
+    raise SystemExit(0)
+
+
+@verify_cmd.command("receipt")
+@click.argument("receipt_path", type=click.Path(path_type=Path))
+@click.option(
+    "--public-key",
+    "public_key_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help=(
+        "Optional trusted Ed25519 public key (PEM) to pin. The key embedded "
+        "in the receipt must match it; default is trust-on-first-use of the "
+        "embedded JWK."
+    ),
+)
+@click.option(
+    "--require-provenance",
+    "require_provenance",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fail (exit 3) unless the pass reaches the provenance tier -- i.e. "
+        "--public-key was given and the embedded key matched it. Without this "
+        "flag both tiers exit 0, matching today's behaviour."
+    ),
+)
+@click.option(
+    "--json", "as_json", is_flag=True, default=False, help="Emit the verdict as JSON alongside the exit code."
+)
+def verify_receipt_cmd(
+    receipt_path: Path,
+    public_key_path: Path | None,
+    require_provenance: bool,
+    as_json: bool,
+) -> None:
+    """Verify a run receipt offline from RECEIPT_PATH.
+
+    Recomputes the journal head, the spine head, and (when present) the
+    audit-range head from the bytes embedded in the receipt, rebuilds the
+    signed subject from those recomputed values, and checks the Ed25519
+    signature. No HMAC key and no ``.sdd/`` are read.
+
+    What a pass proves depends on the key source, and the verdict says
+    which check ran. Without ``--public-key`` the signature is checked
+    against the key EMBEDDED in the receipt (trust-on-first-use), which
+    proves the file is internally consistent -- integrity only, not who
+    signed it: a forger controlling the whole file could re-sign with
+    their own key. With ``--public-key`` the embedded key must match the
+    pinned out-of-band key, which additionally proves provenance.
+
+    By default both tiers exit 0 -- a caller gating on provenance alone must
+    pass ``--require-provenance``, which turns an integrity-only pass into a
+    labelled failure instead of an indistinguishable ``0``. ``--json`` adds a
+    ``tier`` field (``"provenance"``, ``"integrity-only"``, or ``null`` when
+    the receipt did not verify at all) so a caller need not parse the verdict
+    prose to tell the tiers apart.
+
+    \b
+    Exit codes:
+      0  receipt verifies (either tier, unless --require-provenance)
+      1  empty or malformed input (unreadable file, missing ranges/fields)
+      2  tamper detected (the first divergent journal step index is named),
+         or a --public-key pin that does not match the embedded key
+      3  --require-provenance was given and only the integrity-only tier
+         was reached
+    """
+    from bernstein.core.replay.run_receipt import verify_run_receipt
+
+    def _emit_json(*, tier: str | None, exit_code: int) -> None:
+        console.print(
+            _json.dumps(
+                {
+                    "ok": result.ok,
+                    "status": result.status,
+                    "tier": tier,
+                    "run_id": result.run_id,
+                    "journal_events": result.journal_events,
+                    "spine_entries": result.spine_entries,
+                    "divergent_step": result.divergent_step,
+                    "errors": result.errors,
+                    "pinned_key": public_key_pem is not None,
+                    "require_provenance": require_provenance,
+                    "exit_code": exit_code,
+                },
+                indent=2,
+            )
+        )
+
+    try:
+        receipt_bytes = receipt_path.read_bytes()
+    except OSError as exc:
+        if as_json:
+            console.print(_json.dumps({"ok": False, "status": "malformed", "tier": None, "errors": [str(exc)]}))
+        else:
+            console.print(f"[red]Cannot read receipt:[/red] {exc}")
+        raise SystemExit(1) from None
+
+    public_key_pem: bytes | None = None
+    if public_key_path is not None:
+        try:
+            public_key_pem = public_key_path.read_bytes()
+        except OSError as exc:
+            if as_json:
+                console.print(_json.dumps({"ok": False, "status": "malformed", "tier": None, "errors": [str(exc)]}))
+            else:
+                console.print(f"[red]Cannot read --public-key:[/red] {exc}")
+            raise SystemExit(1) from None
+
+    result = verify_run_receipt(receipt_bytes, public_key_pem=public_key_pem)
+
+    if not as_json:
+        console.print()
+        console.print(
+            f"[bold]Run receipt[/bold] run={result.run_id or '(unknown)'} "
+            f"journal_events={result.journal_events} spine_entries={result.spine_entries}"
+        )
+
+    if result.ok:
+        # The tier a pass reached: "provenance" only when a key was pinned
+        # AND matched (a mismatch is caught earlier as status=="tampered",
+        # so reaching here with a pin means it held).
+        tier = "provenance" if public_key_pem is not None else "integrity-only"
+
+        if require_provenance and tier != "provenance":
+            if as_json:
+                _emit_json(tier=tier, exit_code=3)
+            else:
+                console.print(
+                    f"[red]REQUIRE-PROVENANCE NOT MET[/red] -- reached the [yellow]{tier}[/yellow] tier, "
+                    "which --require-provenance does not accept. Pin the worker key with --public-key."
+                )
+            raise SystemExit(3)
+
+        if as_json:
+            _emit_json(tier=tier, exit_code=0)
+        elif tier == "provenance":
+            console.print(
+                "[green]OK (provenance: pinned key)[/green] -- every head recomputes from the "
+                "embedded ranges and the signature verifies against the pinned public key."
+            )
+        else:
+            console.print(
+                "[green]OK (integrity-only: embedded key)[/green] -- every head recomputes from "
+                "the embedded ranges and the signature matches the key embedded in the receipt "
+                "(trust-on-first-use)."
+            )
+            console.print(
+                "  [dim]This proves the file is internally consistent, not who signed it: a forger "
+                "controlling the whole file could re-sign with their own key. Pass --public-key "
+                "with the operator's key for provenance.[/dim]"
+            )
+        raise SystemExit(0)
+
+    if result.status == "malformed":
+        if as_json:
+            _emit_json(tier=None, exit_code=1)
+        else:
+            console.print("[yellow]MALFORMED[/yellow] -- the receipt cannot be checked:")
+            for err in result.errors:
+                console.print(f"  - {err}")
+        raise SystemExit(1)
+
+    if as_json:
+        _emit_json(tier=None, exit_code=2)
+    else:
+        console.print("[red]TAMPER DETECTED[/red]:")
+        for err in result.errors:
+            console.print(f"  - {err}")
+        if result.divergent_step is not None:
+            console.print(f"  [red]first divergent journal step: {result.divergent_step}[/red]")
+    raise SystemExit(2)
+
+
+# ---------------------------------------------------------------------------
+# Verifier-ladder receipts (issue #2927)
+# ---------------------------------------------------------------------------
+
+
+@verify_cmd.command("ladder")
+@click.argument("receipt_hash", required=True)
+@click.option(
+    "--workdir",
+    "-w",
+    type=click.Path(file_okay=False, exists=True),
+    default=".",
+    show_default=True,
+    help="Project root containing .sdd/.",
+)
+def verify_ladder_cmd(receipt_hash: str, workdir: str) -> None:
+    """Re-derive and verify the verifier-ladder receipt RECEIPT_HASH.
+
+    The receipt is never trusted: the stored body is re-hashed, the
+    composite ``merge_eligible`` claim is re-derived from the stored tier
+    verdicts, and every tier's spine anchor is re-checked against the
+    ``verifier-ladder`` lineage spine's content hashes. Prints per-tier
+    ``tier / config_hash / evidence_hash / verdict`` plus the composite
+    result.
+
+    \b
+    Exit codes:
+      0  receipt verifies and its composite claim is entailed
+      1  no readable receipt for the hash
+      2  re-derivation or spine-anchor mismatch (tamper)
+    """
+    from bernstein.core.quality.verifier_ladder import verify_ladder_receipt
+    from bernstein.core.security.audit import load_or_create_audit_key
+
+    root = Path(workdir).resolve()
+    try:
+        hmac_key = load_or_create_audit_key()
+    except OSError as exc:
+        console.print(f"[red]Failed to load audit key: {exc}[/red]")
+        raise SystemExit(1) from None
+
+    result = verify_ladder_receipt(
+        workdir=root,
+        lineage_root=root / ".sdd" / "lineage",
+        hmac_key=hmac_key,
+        receipt_hash=receipt_hash,
+    )
+
+    console.print()
+    receipt = result.receipt
+    if receipt is not None:
+        table = Table(show_header=True, box=None, padding=(0, 2))
+        table.add_column("Tier", style="bold", no_wrap=True, min_width=13)
+        table.add_column("Verdict", no_wrap=True)
+        table.add_column("Config hash", no_wrap=True)
+        table.add_column("Evidence hash", no_wrap=True)
+        for record in receipt.records:
+            verdict_style = {"pass": "green", "fail": "red", "skip": "yellow"}.get(record.verdict, "red")
+            table.add_row(
+                record.tier.value,
+                f"[{verdict_style}]{record.verdict}[/{verdict_style}]",
+                record.config_hash[:16] + "…",
+                record.evidence_hash[:16] + "…",
+            )
+        console.print(table)
+        console.print()
+        eligible = "[green]yes[/green]" if receipt.merge_eligible else "[red]no[/red]"
+        console.print(f"  Task: {receipt.task_id}    Merge eligible (stored): {eligible}")
+
+    if result.ok:
+        console.print(
+            Panel(
+                "[bold green]Verifier Ladder: VERIFIED[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        console.print(
+            "  [dim]Composite claim re-derived from the stored tier verdicts; every tier's "
+            "spine anchor seals exactly its recorded evidence.[/dim]"
+        )
+        console.print()
+        raise SystemExit(0)
+
+    if result.status == "missing":
+        console.print(
+            Panel(
+                "[bold red]Verifier Ladder: NOT FOUND[/bold red]",
+                border_style="red",
+                expand=False,
+            )
+        )
+        console.print(f"  [red]![/red] {result.reason}")
+        console.print()
+        raise SystemExit(1)
+
+    console.print(
+        Panel(
+            "[bold red]Verifier Ladder: FAILED[/bold red]",
+            border_style="red",
+            expand=False,
+        )
+    )
+    console.print(f"  [red]![/red] {result.reason}")
+    console.print()
+    raise SystemExit(2)

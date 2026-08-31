@@ -5,7 +5,7 @@ run.  Groups changes by component, summarizes each change in plain English,
 flags breaking changes, and links back to the originating task.
 
 This is distinct from ``changelog_cmd.py`` (which generates changelogs from
-conventional commits for Bernstein itself) — this module generates changelogs
+conventional commits for Bernstein itself) - this module generates changelogs
 for the *target project* based on what agents actually changed.
 """
 
@@ -183,7 +183,8 @@ def _parse_metric_timestamp(ts: object) -> float:
 
         dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return dt.timestamp()
-    return float(ts)
+    # `ts` is an arbitrary JSON value; a non-numeric one is meant to raise.
+    return float(ts)  # type: ignore[arg-type]
 
 
 def _parse_metric_line(line: str, since_ts: float) -> dict[str, object] | None:

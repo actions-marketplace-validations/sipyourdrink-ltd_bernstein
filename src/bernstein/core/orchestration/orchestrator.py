@@ -9,9 +9,9 @@ introduced, reintroduce a non-blocking guard (see git history for the removed
 ``tick_guard`` / ``concurrency_guard`` modules).
 
 This module is the public facade. Heavy lifting lives in:
-- tick_pipeline.py   — task fetching, batching, server interaction, TypedDicts
-- task_lifecycle.py  — claim/spawn, completion processing, retry/decompose
-- agent_lifecycle.py — agent tracking, heartbeat, crash detection, reaping
+- tick_pipeline.py   - task fetching, batching, server interaction, TypedDicts
+- task_lifecycle.py  - claim/spawn, completion processing, retry/decompose
+- agent_lifecycle.py - agent tracking, heartbeat, crash detection, reaping
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from __future__ import annotations
 import collections
 import concurrent.futures
 import contextlib
+import hashlib
 import itertools
 import json
 import logging
@@ -45,11 +46,14 @@ from bernstein.core.agent_recycling import (
     send_shutdown_signals,
 )
 from bernstein.core.agent_signals import AgentSignalManager
+from bernstein.core.agents.context_attachments import CONTEXT_FILES_ATTACHED_EVENT
+from bernstein.core.agents.injected_skills_event import SKILLS_INJECTED_EVENT
 from bernstein.core.approval import ApprovalGate, ApprovalMode
 from bernstein.core.bandit_router import BanditRouter
 from bernstein.core.batch_api import ProviderBatchManager
-from bernstein.core.bulletin import BulletinBoard, BulletinMessage
+from bernstein.core.bulletin import BulletinBoard, BulletinMessage, SignalActionFailure
 from bernstein.core.cluster import NodeHeartbeatClient
+from bernstein.core.config.run_overlay import effective_mtime
 from bernstein.core.context import refresh_knowledge_base
 from bernstein.core.context_degradation_detector import (
     ContextDegradationConfig,
@@ -73,6 +77,7 @@ from bernstein.core.file_locks import FileLockManager
 from bernstein.core.hook_events import HookEvent
 from bernstein.core.incident import IncidentManager
 from bernstein.core.knowledge.task_graph import TaskGraph
+from bernstein.core.lineage import LineageSpine
 from bernstein.core.manifest import build_manifest, save_manifest
 from bernstein.core.memory_guard import MemoryGuard
 from bernstein.core.merge_queue import MergeQueue
@@ -91,7 +96,32 @@ from bernstein.core.models import (
 )
 from bernstein.core.notifications import NotificationManager, NotificationPayload, NotificationTarget
 from bernstein.core.orchestration.adaptive_parallelism import AdaptiveParallelism
+from bernstein.core.orchestration.controller_state import (
+    AdaptiveParallelismState,
+    ClaimConflictEntry,
+    _sidecar_path,
+)
+from bernstein.core.orchestration.controller_state import (
+    load as _load_controller_state,
+)
+from bernstein.core.orchestration.controller_state import (
+    save as _save_controller_state,
+)
 from bernstein.core.orchestration.evolution import EvolutionCoordinator
+from bernstein.core.orchestration.run_stall import (
+    ACTIVE_UNFINISHED_STATUSES,
+    STUCK_TASK_FAIL_REASON,
+    RunStallState,
+    evaluate_run_stall,
+    resolve_grace_s,
+    resolve_min_ticks,
+    resolve_planning_window_s,
+)
+from bernstein.core.orchestration.schedule_projection import (
+    SCHEDULE_PROJECTION_REV,
+    TaskNode,
+    canonical_graph_digest,
+)
 from bernstein.core.orchestration.tick_pipeline import (
     CompletionData,
     RuffViolation,
@@ -99,6 +129,7 @@ from bernstein.core.orchestration.tick_pipeline import (
     block_task,
     complete_task,
     fail_task,
+    fetch_active_holds,
     fetch_all_tasks,
     group_by_role,
     parse_backlog_file,
@@ -113,7 +144,7 @@ from bernstein.core.quality_gate_coalescer import QualityGateCoalescer
 from bernstein.core.quarantine import QuarantineStore
 from bernstein.core.quota_poller import QuotaPoller
 from bernstein.core.rate_limit_tracker import RateLimitTracker
-from bernstein.core.recorder import RunRecorder
+from bernstein.core.replay.journal import EventJournal, seal_journal_into_spine
 from bernstein.core.retrospective import generate_retrospective
 from bernstein.core.router import TierAwareRouter, load_model_policy_from_yaml, load_providers_from_yaml
 from bernstein.core.runbooks import RunbookEngine
@@ -125,9 +156,14 @@ from bernstein.core.runtime_state import (
     rotate_log_file,
     write_session_replay_metadata,
 )
+from bernstein.core.security.audit import load_or_create_audit_key
+from bernstein.core.security.run_closure import RunClosureOutcome
+from bernstein.core.security.sanitize import sanitize_log
+from bernstein.core.seed import parse_seed, resolve_seed_path
 from bernstein.core.semantic_cache import ResponseCacheManager
 from bernstein.core.signals import read_unresolved_pivots
-from bernstein.core.slo import SLOTracker, apply_error_budget_adjustments
+from bernstein.core.skills.provenance import record_usage
+from bernstein.core.slo import SLOTracker, apply_error_budget_adjustments, error_budget_from_task_board
 from bernstein.core.task_grouping import compact_small_tasks
 from bernstein.core.task_lifecycle import (
     auto_decompose_task,
@@ -150,6 +186,19 @@ from bernstein.evolution.risk import RiskScorer
 
 _BERNSTEIN_YAML = "bernstein.yaml"
 
+#: What an operator is told when no adapter resolves. Every flag it names has to
+#: be a flag of the ``bernstein`` command, because that is what the reader typed
+#: and what they will check against ``bernstein --help``. This module's own
+#: ``--adapter`` argparse flag belongs to the orchestrator subprocess and is not
+#: reachable from there; naming it sent readers looking for an option that does
+#: not exist (#3526). ``tests/unit/test_adapter_fatal_message.py`` resolves each
+#: flag here against the registered CLI, so the text cannot drift back.
+NO_ADAPTER_CONFIGURED = (
+    "FATAL: no adapter configured. Bernstein does not default to Claude - "
+    f"pass --cli (e.g. --cli codex), set BERNSTEIN_ADAPTER, or set 'cli' in {_BERNSTEIN_YAML}. "
+    "Run 'bernstein integrations list --installed' to see which adapters resolve here."
+)
+
 # Preserve underscore-prefixed aliases so existing test imports keep working
 _compute_total_spent = compute_total_spent
 _total_spent_cache = total_spent_cache
@@ -161,11 +210,66 @@ if TYPE_CHECKING:
     from bernstein.core.backlog_parser import ParsedBacklogTask
     from bernstein.core.container import ContainerConfig
     from bernstein.core.permission_mode import PermissionMode
+    from bernstein.core.protocols.cluster.mesh_coordinator import MeshCoordinator
     from bernstein.core.quality_gates import QualityGatesConfig
+    from bernstein.core.security.sandbox import SandboxRuntime
     from bernstein.core.spawner import AgentSpawner
     from bernstein.evolution.loop import EvolutionLoop
 
 logger = logging.getLogger(__name__)
+
+
+def start_cluster_coordinator(
+    cluster_cfg: ClusterConfig | None,
+    *,
+    sdd_dir: Path,
+) -> MeshCoordinator | None:
+    """Start the coordination path this cluster topology selects (#2558).
+
+    ``ClusterTopology.MESH`` was declared in the enum and accepted by config
+    but nothing ever branched on it, so a ``topology: mesh`` deployment silently
+    ran STAR. This is that branch.
+
+    * **STAR** (and ``hierarchical``, and cluster mode off) -> ``None``. The
+      central ``NodeRegistry`` and ``POST /cluster/steal`` remain the arbiter
+      and nothing about that path changes.
+    * **MESH** -> a :class:`MeshCoordinator` over the signed, Merkle-chained
+      claim journal. There is no central arbiter to consult: nodes self-claim
+      against the journal and converge by the deterministic ``entry_hash``
+      rule.
+
+    Provisioning the journal and the node signing identity happens here, at
+    startup, so a misconfigured MESH deployment fails at boot with one loud log
+    line rather than mid-run on the first claim.
+
+    Args:
+        cluster_cfg: The resolved cluster config, or ``None`` when cluster mode
+            is off.
+        sdd_dir: The project ``.sdd`` directory holding the journal and the
+            node signing identity.
+
+    Returns:
+        The MESH coordinator, or ``None`` for every non-MESH topology.
+    """
+    if cluster_cfg is None or cluster_cfg.topology is not ClusterTopology.MESH:
+        return None
+    from bernstein.core.protocols.cluster.mesh_coordinator import build_mesh_coordinator
+
+    coordinator = build_mesh_coordinator(cluster_cfg, sdd_dir=sdd_dir)
+    if coordinator is None:
+        logger.error(
+            "cluster.topology is 'mesh' but the claim journal could not be provisioned; "
+            "leaderless coordination is disabled",
+        )
+        return None
+    logger.info(
+        "MESH topology: leaderless claim journal at %s (node %s, %d gossip peer(s)); "
+        "the central node registry and /cluster/steal are not used",
+        coordinator.journal.path,
+        coordinator.node_id,
+        len(coordinator.peers),
+    )
+    return coordinator
 
 
 def _build_container_config(iso: ContainerIsolationConfig) -> ContainerConfig | None:
@@ -332,18 +436,68 @@ class Orchestrator:
         # Populated when a task completes; used by group_by_role to batch related work.
         self._agent_affinity: dict[str, str] = {}
         self._running = False
+        # Outcome recorded by the universal authenticated closure marker.
+        # Normal quiescence remains completed; explicit operator signals and
+        # internal fatal paths replace it before shutdown is journaled.
+        self._closure_outcome = RunClosureOutcome.COMPLETED
         self._tick_count = 0
         self._consecutive_server_failures: int = 0
+        # No-progress window for a quiescent run that produced zero terminal
+        # tasks (issue #3010). Carried across ticks by
+        # ``_check_zero_terminal_stall``; see core.orchestration.run_stall.
+        self._run_stall_state = RunStallState()
+        self._run_stall_stopped: bool = False
+        # No-progress window for the done>0 wedged-claim pattern (#4453).
+        # Separate from ``_run_stall_state`` because the two detectors
+        # have different preconditions (zero-terminal vs done>0).
+        self._progress_stall_state = RunStallState()
+        self._progress_stall_stopped: bool = False
         self._cached_critical_path_ids: set[str] = set()
-        self._dependency_scanner = DependencyVulnerabilityScanner(workdir)
+        self._dependency_scanner = DependencyVulnerabilityScanner(
+            workdir,
+            enabled=config.dependency_scan_enabled,
+        )
         # Track spawn failures per batch for backoff: task_ids -> (fail_count, last_fail_ts)
         self._spawn_failures: dict[frozenset[str], tuple[int, float]] = {}
         self._spawn_failure_history: dict[frozenset[str], list[Any]] = {}
+        # Bug 1 (2026-07-02, claim-conflict-churn): per-task-id claim-conflict
+        # episode counter + backoff deadline. A "conflict episode" is one
+        # tick's bounded burst of re-fetch-and-retry attempts against a 409
+        # (see task_lifecycle._claim_task_with_conflict_retry). Without this,
+        # a task stuck in perpetual 409 (stale file lock, unmet dependency,
+        # etc.) got re-attempted every tick forever -- 144 consecutive
+        # identical `claim?expected_version=1` -> 409 requests were observed
+        # from a single session in work/bernstein/proofs/d2/claim-loop-evidence.
+        # task_id -> (episode_count, backoff_until_epoch_s)
+        self._claim_conflict_state: dict[str, tuple[int, float]] = {}
         self._latest_tasks_by_id: dict[str, Task] = {}
         # Track last backlog replenishment timestamp
         self._last_replenish_ts: float = 0.0
         # Run completion summary state
         self._summary_written: bool = False
+        # One-shot latch (issue #4462): True once this run has scheduled its
+        # one bounded test-authoring follow-up task. Never reset for the
+        # life of this process, so the quiescence the follow-up task's OWN
+        # completion produces can never schedule a second one. See
+        # core.orchestration.test_followup and _maybe_schedule_test_followup.
+        self._test_followup_scheduled: bool = False
+        # Guards the FINAL (shutdown-final) retrospective regeneration so it
+        # only ever runs once per process, regardless of which terminal path
+        # triggers it (tick-loop drain in run(), or the tick-level
+        # quiescence self-stop in _tick_internal's "8b" block). See
+        # _regenerate_final_retrospective.
+        self._final_retrospective_regenerated: bool = False
+        # Defect 29 (2026-07-02, work/bernstein/proofs/d2/minimax/attempt-83808a8a):
+        # self-stop ordering race. The run-summary MUST NOT fire until the
+        # post-/complete chain (task_done -> reap_completed_agent ->
+        # merge_worktree_branch -> _apply_janitor_verdict_action) has drained
+        # for every completed task. We track each terminal task from the
+        # moment we first see it in done/failed state and only decrement the
+        # counter once the task has been through ``process_completed_tasks``
+        # AND its session is no longer alive. The 8b summary block gates
+        # ``_generate_run_summary`` on this counter reaching zero.
+        self._pending_post_complete_count: int = 0
+        self._post_complete_seen_task_ids: set[str] = set()
         self._run_start_ts: float = time.time()
         self._agent_failure_timestamps: dict[str, float] = {}  # adapter_name -> last failure ts
         self._shutting_down = threading.Event()
@@ -360,16 +514,26 @@ class Orchestrator:
             providers_yaml = workdir / ".sdd" / "config" / "providers.yaml"
             if providers_yaml.exists():
                 load_providers_from_yaml(providers_yaml, self._router)
-        # Load model policy — checked on every init so late-bound routers pick it up
+        # Load model policy - checked on every init so late-bound routers pick it up
         if self._router is not None:
             model_policy_yaml = workdir / ".sdd" / "config" / "model_policy.yaml"
             if model_policy_yaml.exists():
                 load_model_policy_from_yaml(model_policy_yaml, self._router)
             else:
-                # Fall back to bernstein.yaml model_policy section
-                seed_path = workdir / _BERNSTEIN_YAML
-                if seed_path.exists():
-                    load_model_policy_from_yaml(seed_path, self._router)
+                # Fall back to bernstein.yaml model_policy section. Resolve via
+                # resolve_seed_path() (explicit --seed-path / BERNSTEIN_SEED_PATH
+                # env / workdir default) instead of hardcoding workdir/bernstein.yaml
+                # -- otherwise role_model_policy is silently lost whenever the
+                # real seed lives elsewhere, and agents spawn on the default
+                # model instead of the configured one.
+                _seed_path_for_policy = resolve_seed_path(workdir)
+                logger.info(
+                    "Orchestrator.__init__: resolved seed_path=%s for model_policy fallback (exists=%s)",
+                    _seed_path_for_policy,
+                    _seed_path_for_policy.exists(),
+                )
+                if _seed_path_for_policy.exists():
+                    load_model_policy_from_yaml(_seed_path_for_policy, self._router)
             # Warn on startup if policy leaves no viable providers
             policy_issues = self._router.validate_policy()
             for issue in policy_issues:
@@ -381,15 +545,16 @@ class Orchestrator:
         init_telemetry(config.telemetry.otlp_endpoint if hasattr(config, "telemetry") else None)
 
         # Self-evolution feedback loop
+        self._evolution: EvolutionCoordinator | None
         if config.evolution_enabled:
             self._evolution = evolution or EvolutionCoordinator(
                 state_dir=workdir / ".sdd",
             )
         else:
-            self._evolution: EvolutionCoordinator | None = None
+            self._evolution = None
 
         # Adaptive governance: adjusts metric weights each evolution cycle.
-        # Always initialize the governor — it's lightweight and evolve mode
+        # Always initialize the governor - it's lightweight and evolve mode
         # can be activated at runtime via evolve.json even if not in config.
         self._governor = AdaptiveGovernor(state_dir=workdir / ".sdd")
 
@@ -460,8 +625,38 @@ class Orchestrator:
         # cap (set by ``bernstein run --hard-budget``). Attach a rolling
         # JSONL ledger so per-call attribution lands in
         # ``.sdd/cost/ledger.jsonl``.
-        run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        run_id = os.environ.get("BERNSTEIN_RUN_ID") or datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         self._run_id = run_id
+        # Wave 3 (per-agent instrumentation): export the run id onto the
+        # process environment so it threads through
+        # ``bernstein.adapters.env_isolation.build_filtered_env`` into every
+        # spawned agent subprocess, letting each agent's
+        # ``RunInstrumenter`` (bernstein.core.instrumentation) write its
+        # llm-calls/tool-calls/conversation JSONL under this same
+        # ``.sdd/runs/<run_id>/...`` tree wave 2's timing data lives in.
+        # Best-effort: os.environ writes essentially never fail, but this
+        # must never be allowed to abort orchestrator startup either way.
+        try:
+            os.environ["BERNSTEIN_RUN_ID"] = run_id
+            logger.info("Exported BERNSTEIN_RUN_ID=%s for spawned-agent instrumentation", run_id)
+        except Exception as exc:  # intentional-broad-except: defensive, must never block startup
+            logger.warning("Failed to export BERNSTEIN_RUN_ID=%s to process env: %s", run_id, exc)
+        # Issue #4330: the same worktree-vs-root split, for liveness. Adapters
+        # derive their runtime paths from the workdir they are spawned into --
+        # the agent's worktree -- while the probes below read heartbeats from
+        # this root. Export the root so ``build_worker_cmd`` can hand every
+        # wrapped adapter's worker the directory that is actually polled;
+        # without it the worker's heartbeat lands in the worktree, nothing
+        # advances the file the orchestrator reads, and a working agent is
+        # recycled on its own uptime.
+        from bernstein.adapters.base import HEARTBEAT_DIR_ENV
+
+        _heartbeat_dir = self._workdir / ".sdd" / "runtime" / "heartbeats"
+        try:
+            os.environ[HEARTBEAT_DIR_ENV] = str(_heartbeat_dir)
+            logger.info("Exported %s=%s for spawned workers", HEARTBEAT_DIR_ENV, _heartbeat_dir)
+        except Exception as exc:  # intentional-broad-except: defensive, must never block startup
+            logger.warning("Failed to export %s to process env: %s", HEARTBEAT_DIR_ENV, exc)
         hard_budget_usd = 0.0
         _raw_hard = os.environ.get("BERNSTEIN_HARD_BUDGET_USD", "").strip()
         if _raw_hard:
@@ -530,25 +725,76 @@ class Orchestrator:
             _ctx_raw if isinstance(_ctx_raw, ContextDegradationConfig) else ContextDegradationConfig(enabled=False)
         )
         self._context_degradation = ContextDegradationDetector(_ctx_cfg, workdir)
-        # Recovery context keyed by task_id — consumed by the replacement
+        # Recovery context keyed by task_id - consumed by the replacement
         # agent's prompt.  Populated when a degraded session is evicted.
         self._context_recovery: dict[str, str] = {}
 
-        # Deterministic replay recorder: appends events to
-        # .sdd/runs/{run_id}/replay.jsonl for post-hoc debugging.
-        self._recorder = RunRecorder(run_id=run_id, sdd_dir=workdir / ".sdd")
+        # Canonical Merkle-chained event journal: the single always-on
+        # recorder. Appends every run event to
+        # .sdd/runs/{run_id}/journal.jsonl where the head hash is the run
+        # identity. Records by default (issue #2293); size is bounded by
+        # BERNSTEIN_REPLAY_RETENTION over past runs rather than an on/off
+        # gate.
+        self._recorder = EventJournal(run_id=run_id, sdd_dir=workdir / ".sdd")
+
+        # Last ``plan.graph`` digest appended this run (issue #3613). Empty
+        # until the first normal tick records one. Held on the instance so a
+        # 60-tick run whose graph never moves writes one row, not sixty.
+        self._last_graph_digest: str = ""
+
+        # Run goal resolved from the seed config. Stored once at init so
+        # ``_record_plan_graph_full`` can bind the goal to the full-graph
+        # journal row without needing a fresh config parse each tick.
+        # Empty string when no seed/goal was supplied.
+        try:
+            _seed_path = resolve_seed_path(workdir)
+            _seed = parse_seed(_seed_path) if _seed_path.exists() else None
+            self._goal: str = (_seed.goal or "").strip() if _seed else ""
+        except Exception as exc:
+            logger.debug("Failed to resolve run goal from seed: %s", exc)
+            self._goal = ""
+
+        # Last ``plan.graph.full`` digest appended this run (issue #3613).
+        # Same "graph-changed" cadence as ``_last_graph_digest``: structural
+        # digests match means no new row; reworded titles do NOT emit a new
+        # full event because the digest only covers ``(task_id, role,
+        # sorted(depends_on))``.
+        self._last_full_graph_digest: str = ""
+
+        # Live OTLP export of the journal projection : each
+        # appended journal entry streams its journal-anchored span to the
+        # operator's collector. Default off -- attach_live_export returns
+        # None (constructing nothing, touching no network) unless
+        # BERNSTEIN_OTEL_ENDPOINT is set. Finalized in the stop path so
+        # the run's otel.projection audit event anchors the live trace.
+        from bernstein.core.observability.otel_bridge import attach_live_export
+
+        self._otel_stream = attach_live_export(self._recorder, workdir=workdir)
+
+        # Providers whose mutation-observability capability has been
+        # recorded into the journal this run (issue #2507). One
+        # ``provider_state_capability`` entry per provider per run keeps an
+        # absence of mutation entries distinguishable from an inability to
+        # observe them.
+        self._mutation_capability_recorded: set[str] = set()
+
+        # Lazily-built audit chain for mirroring provider-state mutations into
+        # the HMAC chain (issue #2646). Cached so the run's key is loaded once.
+        self._provider_audit_chain: Any | None = None
 
         # Replay gateway: captures LLM + tool dispatch responses into
         # .sdd/runs/{run_id}/events.jsonl so a run can be re-executed
-        # against recorded fixtures. OFF by default — opt in with
-        # BERNSTEIN_RECORD=1 to avoid bloating .sdd/ for casual runs.
+        # against recorded fixtures. This is the fixture-replay engine, a
+        # distinct concern from the canonical event journal above; it is
+        # OFF by default (opt in with BERNSTEIN_RECORD=1) and writes
+        # nothing on a normal run.
         from bernstein.core.replay import ReplayGateway as _ReplayGateway
 
         self._replay_gateway = _ReplayGateway(
             run_id=run_id,
             sdd_dir=workdir / ".sdd",
         )
-        _seed_path = workdir / _BERNSTEIN_YAML
+        _seed_path = resolve_seed_path(workdir)
         self._replay_metadata = SessionReplayMetadata(
             run_id=run_id,
             started_at=time.time(),
@@ -568,6 +814,7 @@ class Orchestrator:
         # held for interactive review, or pushed as a GitHub PR.
         # merge_strategy="pr" activates PR mode by default; "direct" forces auto.
         # An explicit approval override ("review" or "pr") takes precedence.
+        self._approval_gate: ApprovalGate | None
         if config.approval == "workflow":
             self._approval_gate = ApprovalGate(
                 mode=ApprovalMode.AUTO,  # base mode, overridden per-task in task_completion.py
@@ -584,7 +831,7 @@ class Orchestrator:
                 # merge_strategy="pr" (default) -> PR mode
                 _effective_approval = "pr"
             _approval_mode = ApprovalMode(_effective_approval)
-            self._approval_gate: ApprovalGate | None = (
+            self._approval_gate = (
                 ApprovalGate(
                     mode=_approval_mode,
                     workdir=workdir,
@@ -604,10 +851,13 @@ class Orchestrator:
         # detect when agents modify its own code and restart in-place.
         self._source_mtime: float = time.time()
 
-        # Config hot-reload: track bernstein.yaml mtime so mutable config
-        # fields (max_agents, budget_usd) are picked up without restart.
-        self._config_path: Path = workdir / _BERNSTEIN_YAML
-        self._config_mtime: float = self._config_path.stat().st_mtime if self._config_path.exists() else 0.0
+        # Config hot-reload: track the newest mtime across the committed
+        # bernstein.yaml and its untracked overlay, so mutable config fields
+        # (max_agents, budget_usd) are picked up without restart. Both layers
+        # count: an overlay write is the only kind of configuration write a
+        # run is allowed to make (issue #4485).
+        self._config_path: Path = resolve_seed_path(workdir)
+        self._config_mtime: float = effective_mtime(self._config_path)
 
         # Memory leak detection: sampled every few ticks
         self._memory_guard = MemoryGuard()
@@ -625,6 +875,10 @@ class Orchestrator:
         # orchestrator, so the hook is applied here via a setter.
         if hasattr(self._spawner, "set_merge_queue"):
             self._spawner.set_merge_queue(self._merge_queue)
+        if hasattr(self._spawner, "set_quality_gate_config"):
+            self._spawner.set_quality_gate_config(self._quality_gate_config)
+        if hasattr(self._spawner, "set_run_id"):
+            self._spawner.set_run_id(self._run_id)
 
         # Convergence guard: blocks spawn waves when merge queue, active
         # agent count, error rate, or spawn rate exceed safe thresholds.
@@ -633,7 +887,7 @@ class Orchestrator:
         self._convergence_guard = ConvergenceGuard(config.convergence)
 
         # AgentOps: SLO tracking, error budget, runbooks, incident response.
-        # Reset error budget AND metric collector each run — stale failure
+        # Reset error budget AND metric collector each run - stale failure
         # data from prior runs must not throttle a fresh run's agent capacity.
         self._slo_tracker = SLOTracker()
         # Clear prior-run task metrics so error budget starts at 0/0
@@ -644,7 +898,33 @@ class Orchestrator:
 
         # Adaptive parallelism: dynamically adjusts effective max_agents based
         # on error rate and CPU load.  See adaptive_parallelism.py.
-        self._adaptive_parallelism = AdaptiveParallelism(configured_max=config.max_agents)
+        # Sidecar persistence: restore state from a previous run when a sidecar
+        # exists.  ``load`` returns a zeroed naive state for an absent sidecar,
+        # so restoring it would start every fresh run at current_max=0 (which
+        # floors effective_max_agents far below configured_max).  Guard on the
+        # sidecar's presence so a missing file yields a clean AdaptiveParallelism
+        # (configured_max == current_max) instead.
+        if _sidecar_path(self._workdir).exists():
+            try:
+                _ap_state, _conflict_state = _load_controller_state(self._workdir)
+                self._adaptive_parallelism = AdaptiveParallelism.from_adaptive_parallelism_state(
+                    _ap_state, configured_max=config.max_agents
+                )
+                # Restore claim-conflict cooldowns (age-out is already applied in load).
+                for _tid, _entry in _conflict_state.items():
+                    self._claim_conflict_state[_tid] = (
+                        _entry.episode_count,
+                        _entry.backoff_until_epoch,
+                    )
+                logger.info(
+                    "Restored %d claim-conflict cooldown(s) from sidecar",
+                    len(self._claim_conflict_state),
+                )
+            except Exception:  # best-effort: never let a bad sidecar break startup
+                logger.warning("Controller sidecar load failed — starting fresh", exc_info=True)
+                self._adaptive_parallelism = AdaptiveParallelism(configured_max=config.max_agents)
+        else:
+            self._adaptive_parallelism = AdaptiveParallelism(configured_max=config.max_agents)
 
         # Governed workflow mode: when config.workflow is set (e.g. "governed"),
         # the executor drives the run through deterministic phases, filtering
@@ -665,7 +945,7 @@ class Orchestrator:
                     defn.phase_names(),
                 )
             else:
-                logger.warning("Unknown workflow %r — running in adaptive mode", config.workflow)
+                logger.warning("Unknown workflow %r - running in adaptive mode", config.workflow)
 
         # Run manifest: hashable configuration record for compliance (non-critical).
         self._manifest = None
@@ -737,12 +1017,12 @@ class Orchestrator:
         )
         if self._audit_mode:
             from bernstein.core.audit import AuditLog
-            from bernstein.core.lifecycle import set_audit_log
+            from bernstein.core.tasks.lifecycle import set_audit_log
 
             audit_dir = workdir / ".sdd" / "audit"
             self._audit_log = AuditLog(audit_dir)
             set_audit_log(self._audit_log)
-            logger.info("SOC 2 audit mode active — logging to %s", audit_dir)
+            logger.info("SOC 2 audit mode active - logging to %s", audit_dir)
         else:
             self._audit_log = None
 
@@ -784,11 +1064,11 @@ class Orchestrator:
         self._ci_autofix_pipeline: Any | None = None
         self._last_ci_poll_ts: float = 0.0
 
-        # LLM watcher (P1 — opt-in advisory observer above the deterministic
+        # LLM watcher (P1 - opt-in advisory observer above the deterministic
         # orchestrator).  Off by default; the watcher imports the LLM stack
         # only when ``BERNSTEIN_LLM_WATCHER_ENABLED`` is truthy.  It receives
-        # a frozen ``WatcherEvent`` snapshot only — no orchestrator handle,
-        # no task store, no spawner — so it is structurally read-only.  See
+        # a frozen ``WatcherEvent`` snapshot only - no orchestrator handle,
+        # no task store, no spawner - so it is structurally read-only.  See
         # ``bernstein.core.observability.llm_watcher`` for the full contract.
         from bernstein.core.observability.llm_watcher import build_watcher_from_env
 
@@ -843,7 +1123,7 @@ class Orchestrator:
         try:
             if not self._config_path.exists():
                 return False
-            current_mtime = self._config_path.stat().st_mtime
+            current_mtime = effective_mtime(self._config_path)
             if current_mtime <= self._config_mtime:
                 return False
         except OSError:
@@ -909,13 +1189,18 @@ class Orchestrator:
 
         from bernstein.core.bulletin import MessageType
 
-        self._bulletin.post(
-            BulletinMessage(
-                agent_id="orchestrator",
-                type=_cast("MessageType", msg_type),
-                content=content,
+        try:
+            self._bulletin.post(
+                BulletinMessage(
+                    agent_id="orchestrator",
+                    type=_cast("MessageType", msg_type),
+                    content=content,
+                )
             )
-        )
+        except SignalActionFailure:
+            # The message is on the board and queued for retry; an advisory
+            # bulletin post must not abort the orchestrator loop (#2648).
+            logger.exception("bulletin signal action pending retry for %s message", msg_type)
 
     def _check_task_deadlines(self, running_tasks: list[Task]) -> None:
         """Check deadlines on running tasks and escalate or notify.
@@ -1015,7 +1300,7 @@ class Orchestrator:
         result = apply_policy(self._budget_policy, status.percentage_used, tasks=tasks)
         if result.action != self._last_budget_action:
             logger.info(
-                "Budget policy transition: %s -> %s at %.1f%% spend (threshold %.0f%%) — %s",
+                "Budget policy transition: %s -> %s at %.1f%% spend (threshold %.0f%%) - %s",
                 self._last_budget_action.value,
                 result.action.value,
                 result.percentage_used * 100,
@@ -1037,6 +1322,103 @@ class Orchestrator:
             self._last_budget_action = result.action
         return result
 
+    def _evaluate_cost_policy_dispatch(
+        self,
+        batches: list[list[Task]],
+        cost_estimates: dict[str, float],
+    ) -> Any | None:
+        """Halt this tick's spawns before a USD cap is breached (#2354).
+
+        Consults the deterministic USD dispatch policy
+        (:func:`~bernstein.core.cost.scheduling.dispatch_gate.evaluate_run_dispatch`)
+        with the batches about to spawn, costed from ``cost_estimates`` and the
+        run's persisted spend ledger. Behaviour:
+
+        * **Fail-open (no-op)** when no ``cost_policy`` -- or no positive cap --
+          is configured: returns ``None`` without touching the ledger, so an
+          absent or disabled price policy never blocks a dispatch.
+        * **Fail-closed** when the projected next dispatch would breach a cap:
+          the halting :class:`DispatchDecision` is sealed into the lineage spine
+          and mirrored into the HMAC audit chain as a verifiable receipt, and
+          returned so the caller blocks the spawn.
+
+        Args:
+            batches: Role-grouped batches about to be claimed/spawned this tick.
+            cost_estimates: ``task_id -> estimated_cost_usd`` from this tick.
+
+        Returns:
+            The halting ``DispatchDecision`` (spawns must be blocked), or
+            ``None`` to proceed.
+        """
+        from bernstein.core.cost.scheduling.dispatch_gate import (
+            build_dispatch_candidates,
+            evaluate_run_dispatch,
+            resolve_cost_caps,
+            resolve_knob_matrix,
+            resolve_price_table,
+        )
+
+        caps = resolve_cost_caps(getattr(self._config, "cost_policy", None))
+        if caps is None or not batches:
+            return None  # fail-open: nothing to enforce
+
+        from bernstein.core.cost.spend_ledger import SpendLedger
+
+        now_ts = time.time()
+        day_key = datetime.now(UTC).strftime("%Y-%m-%d")
+        cost_policy = getattr(self._config, "cost_policy", None)
+        price_table = resolve_price_table(cost_policy)
+        knob_matrix = resolve_knob_matrix(cost_policy)
+        candidates = build_dispatch_candidates(
+            batches,
+            cost_estimates=cost_estimates,
+            run_id=self._run_id,
+            day_key=day_key,
+            knob_matrix=knob_matrix,
+        )
+        entries = SpendLedger.load_entries(self._spend_ledger.path)
+        outcome = evaluate_run_dispatch(
+            candidates=candidates,
+            entries=entries,
+            caps=caps,
+            price_table_hash=price_table.content_hash(),
+            now_ts=now_ts,
+        )
+        if outcome.halt is None:
+            return None  # admitted: within every configured cap
+
+        self._seal_cost_dispatch_halt(outcome.halt, timestamp=int(now_ts))
+        return outcome.halt
+
+    def _seal_cost_dispatch_halt(self, decision: Any, *, timestamp: int) -> None:
+        """Seal a cost-policy halt into the lineage spine + audit chain (#2354).
+
+        The halt receipt is the proof, not a decoration: sealing failures are
+        logged and swallowed so a missing key or IO error never crashes the run
+        (the spawn is still blocked). Only the exception type is logged on this
+        path because it touches the audit HMAC key.
+        """
+        try:
+            from bernstein.core.cost.scheduling.receipt import build_dispatch_receipt
+            from bernstein.core.security.audit import load_or_create_audit_key
+            from bernstein.core.security.audit_chain import AuditChainStore
+
+            hmac_key = load_or_create_audit_key()
+            chain = AuditChainStore(self._workdir / ".sdd" / "audit", key=hmac_key)
+            build_dispatch_receipt(
+                decision=decision,
+                workdir=self._workdir,
+                lineage_root=self._workdir / ".sdd" / "lineage",
+                hmac_key=hmac_key,
+                timestamp=timestamp,
+                chain=chain,
+            )
+        except Exception as exc:
+            # Sealing is a provenance aid; a failure must never crash the run
+            # (the spawn is still held). Log only the exception type: this path
+            # touches the audit HMAC key.
+            logger.warning("cost: failed to seal dispatch halt receipt: %s", type(exc).__name__)
+
     # -- Core tick -----------------------------------------------------------
 
     def tick(self) -> TickResult:
@@ -1050,6 +1432,134 @@ class Orchestrator:
         if tick_duration > 30.0:
             logger.warning("Tick took %.1fs (threshold 30s)", tick_duration)
         return result
+
+    def _record_plan_graph_digest(self, all_tasks: list[Task]) -> None:
+        """Append a ``plan.graph`` event when the executed graph changes.
+
+        The graph snapshot on disk is overwritten every normal tick and
+        carries no chain identity; this binds the graph to the run by
+        putting its digest in the Merkle-chained journal (issue #3613).
+
+        The digest comes from
+        :func:`~bernstein.core.orchestration.schedule_projection.canonical_graph_digest`,
+        the same canonical encoder the schedule projection hashes its own
+        node set with, so a later fold from journal events back to a graph
+        compares two byte-identical definitions rather than two encoders
+        that happen to disagree.
+
+        Only the structural triple ``(task_id, role, sorted(depends_on))``
+        carries identity here: ``title`` and ``description`` are pinned
+        empty so a reworded task description does not read as a graph
+        change. Ordering is irrelevant - the encoder sorts by ``task_id``.
+
+        Appends only on change, so a 60-tick run whose graph never moves
+        writes one row rather than sixty. A failed append leaves
+        ``_last_graph_digest`` untouched so the next normal tick retries,
+        and never propagates out of the tick.
+
+        Args:
+            all_tasks: Every task in the graph built for this tick.
+        """
+        try:
+            nodes = [
+                TaskNode(
+                    task_id=task.id,
+                    role=task.role,
+                    title="",
+                    description="",
+                    depends_on=tuple(task.depends_on),
+                )
+                for task in all_tasks
+            ]
+            digest = canonical_graph_digest(nodes)
+        except Exception as exc:
+            logger.debug("Failed to compute plan.graph digest: %s", exc)
+            return
+
+        if digest == self._last_graph_digest:
+            return
+
+        try:
+            self._recorder.record(
+                "plan.graph",
+                digest=digest,
+                rev=SCHEDULE_PROJECTION_REV,
+                task_count=len(all_tasks),
+            )
+        except Exception as exc:
+            logger.debug("Failed to record plan.graph digest: %s", exc)
+            return
+
+        self._last_graph_digest = digest
+
+    def _record_plan_graph_full(self, all_tasks: list[Task]) -> None:
+        """Append a ``plan.graph.full`` event when the executed graph changes.
+
+        Mirrors :meth:`_record_plan_graph_digest` but records every task's
+        title alongside the structural digest so a detached run or a review
+        board can render the whole graph with human-readable labels (issue
+        #3613 follow-on).
+
+        The digest is computed over the same structural triple
+        ``(task_id, role, sorted(depends_on))`` as ``plan.graph`` so the
+        two events share a single "graph changed" cadence: a reworded
+        title is ignored by both (neither emits a new row), and both
+        dedup on digest, so a 60-tick run whose graph never moves writes
+        one row each, not sixty. A failed append leaves
+        ``_last_full_graph_digest`` untouched so the next normal tick
+        retries, and the failure never propagates out of the tick.
+
+        The run goal is bound into the row so the review board (see
+        :func:`~bernstein.core.replay.review_board._fold_plan_graph_full`)
+        has the full picture without touching live state. The goal is never
+        logged at warning level (it may contain secrets); it is only written
+        to the journal row alongside the task list.
+
+        Args:
+            all_tasks: Every task in the graph built for this tick.
+        """
+        try:
+            digest = canonical_graph_digest(
+                [
+                    TaskNode(
+                        task_id=task.id,
+                        role=task.role,
+                        title="",
+                        description="",
+                        depends_on=tuple(task.depends_on),
+                    )
+                    for task in all_tasks
+                ]
+            )
+        except Exception as exc:
+            logger.debug("Failed to compute plan.graph.full digest: %s", exc)
+            return
+
+        if digest == self._last_full_graph_digest:
+            return
+
+        try:
+            self._recorder.record(
+                "plan.graph.full",
+                goal=self._goal,
+                nodes=[
+                    {
+                        "id": task.id,
+                        "role": task.role,
+                        "title": task.title,
+                        "depends_on": sorted(task.depends_on),
+                    }
+                    for task in sorted(all_tasks, key=lambda t: t.id)
+                ],
+                digest=digest,
+                rev=SCHEDULE_PROJECTION_REV,
+                task_count=len(all_tasks),
+            )
+        except Exception as exc:
+            logger.debug("Failed to record plan.graph.full: %s", exc)
+            return
+
+        self._last_full_graph_digest = digest
 
     def _tick_internal(self) -> TickResult:
         """Actual tick implementation (previously tick())."""
@@ -1096,7 +1606,7 @@ class Orchestrator:
         # 0. Ingest any new backlog files before fetching tasks.
         #    Rate-limited to 10 files/tick with title dedup to prevent
         #    server overload and duplicate task creation.
-        #    Gated behind _run_normal — no need to scan 300 files every tick.
+        #    Gated behind _run_normal - no need to scan 300 files every tick.
         if _run_normal:
             try:
                 from bernstein.core.roadmap_runtime import emit_roadmap_wave
@@ -1124,9 +1634,10 @@ class Orchestrator:
             self._consecutive_server_failures = getattr(self, "_consecutive_server_failures", 0) + 1
             if self._consecutive_server_failures >= ORCHESTRATOR.server_failure_threshold:
                 logger.critical(
-                    "Server unreachable for %d consecutive ticks — orchestrator stopping to prevent waste",
+                    "Server unreachable for %d consecutive ticks - orchestrator stopping to prevent waste",
                     self._consecutive_server_failures,
                 )
+                self._closure_outcome = RunClosureOutcome.FAILED
                 self._running = False
             elif self._consecutive_server_failures >= ORCHESTRATOR.server_failure_warn:
                 logger.warning(
@@ -1153,15 +1664,43 @@ class Orchestrator:
             len(tasks_by_status.get("failed", [])),
         )
 
+        # 1c. Build the task graph. Construction is deliberately un-gated:
+        #     the readiness filter just below and the critical-path claim
+        #     ordering in step 1c-ii both run on every tick and both need a
+        #     graph. A fast tick already paid for the identical construction
+        #     inside ``DependencyValidator.critical_path``, which is only
+        #     ``TaskGraph(tasks).critical_path()``, so building it once here
+        #     and reusing it costs a fast tick nothing and drops a normal
+        #     tick from two constructions to one. What stays gated behind
+        #     _run_normal is the expensive work built on top of the graph:
+        #     analyse(), full dependency validation, the snapshot write
+        #     (step 1c-ii) and warm-pool preparation (step 3).
+        all_tasks = list(itertools.chain.from_iterable(tasks_by_status.values()))
+        self._latest_tasks_by_id = {task.id: task for task in all_tasks}
+
+        task_graph = TaskGraph(all_tasks)
+        # A declared cycle is opened by dropping one edge, but the dropped
+        # edge stays in the dependent's depends_on. Without exempting it
+        # here every task on the cycle would fail the readiness filter
+        # forever and the board would stay wedged - the failure #4287
+        # describes. Keyed (dependent, dependency) to match the lookup below.
+        broken_deps = {(b.edge.target, b.edge.source) for b in task_graph.cycle_breaks}
+
         # The server returns tasks matching the requested status; apply the
         # dependency filter here for "open" tasks.
-        done_tasks = tasks_by_status["done"]
-        done_ids = {t.id for t in done_tasks}
+        done_tasks = tasks_by_status.get("done", [])
+        # A dependency is satisfied by any terminal-success status, not just
+        # "done": once a done task's agent is reaped and its branch merged,
+        # the task moves to "closed" (the store soft-archives via status).
+        # Checking "done" alone re-blocked dependents forever after that
+        # transition, so lower-priority independent tasks were claimed ahead
+        # of a high-priority task whose dependency had already completed.
+        done_ids = {t.id for t in done_tasks} | {t.id for t in tasks_by_status.get("closed", [])}
         now = time.time()
         open_tasks = [
             t
-            for t in tasks_by_status["open"]
-            if all(dep in done_ids for dep in t.depends_on)
+            for t in tasks_by_status.get("open", [])
+            if all(dep in done_ids or (t.id, dep) in broken_deps for dep in t.depends_on)
             # Skip tasks with future created_at (retry backoff)
             and t.created_at <= now
         ]
@@ -1188,7 +1727,7 @@ class Orchestrator:
         except OSError as exc:
             logger.warning("Failed to read pivot signals: %s", exc)
 
-        # 1b-i. Check task deadlines — warn or fail running tasks past deadline
+        # 1b-i. Check task deadlines - warn or fail running tasks past deadline
         try:
             self._check_task_deadlines(
                 tasks_by_status.get("claimed", []) + tasks_by_status.get("in_progress", []),
@@ -1240,15 +1779,11 @@ class Orchestrator:
             # Check for file-based approval grant
             self._check_workflow_approval()
 
-        # 1c. Build task graph and compute optimal parallelism
-        #     Graph analysis + dependency validation are expensive — gate behind
-        #     _run_normal. The all_tasks list and task ID cache are always needed.
-        all_tasks = list(itertools.chain.from_iterable(tasks_by_status.values()))
-        self._latest_tasks_by_id = {task.id: task for task in all_tasks}
-
-        task_graph: TaskGraph | None = None
+        # 1c-ii. Analyse the graph and validate dependencies. Both walk the
+        #        board repeatedly and the snapshot write touches disk, so
+        #        they are gated behind _run_normal; the graph they run on
+        #        was built above because every tick needs one.
         if _run_normal:
-            task_graph = TaskGraph(all_tasks)
             analysis = task_graph.analyse()
             dep_validator = DependencyValidator()
             dep_validation = dep_validator.validate(all_tasks)
@@ -1256,14 +1791,14 @@ class Orchestrator:
                 logger.error("Dependency cycle detected: %s", " -> ".join(cycle))
             for task_id, dep_id, dep_status in dep_validation.stuck_deps:
                 logger.warning(
-                    "Task %s depends on %s which is %s — task remains blocked",
+                    "Task %s depends on %s which is %s - task remains blocked",
                     task_id,
                     dep_id,
                     dep_status,
                 )
             for warning in dep_validation.warnings:
                 logger.warning("Dependency validation: %s", warning)
-            critical_path_ids = set(dep_validator.critical_path(all_tasks))
+            critical_path_ids = set(task_graph.critical_path())
             # Cache for use in fast ticks
             self._cached_critical_path_ids = critical_path_ids
 
@@ -1286,9 +1821,23 @@ class Orchestrator:
                 task_graph.save(self._workdir / ".sdd" / "runtime")
             except OSError as exc:
                 logger.debug("Failed to save task graph: %s", exc)
+
+            # The snapshot above is an overwritten file with no chain
+            # identity. Bind the graph that produced it to this run by
+            # appending its digest to the journal.
+            self._record_plan_graph_digest(all_tasks)
+            self._record_plan_graph_full(all_tasks)
         else:
-            # Fast tick: reuse cached critical path IDs from last normal tick
-            critical_path_ids = getattr(self, "_cached_critical_path_ids", set())
+            # Fast tick: skip the expensive graph analysis, validation and
+            # snapshot persistence, but still recompute the critical path -
+            # it is a cheap O(V+E) traversal and claim ordering depends on
+            # it. The very first tick is always a fast tick (_tick_count is
+            # incremented to 1 before the phase check, and 1 % phase != 0),
+            # so reusing only the cache from the last normal tick left the
+            # first spawn batch without the critical-path priority boost
+            # and served stale boosts to tasks created between normal ticks.
+            critical_path_ids = set(task_graph.critical_path())
+            self._cached_critical_path_ids = critical_path_ids
 
         # 3. Count alive agents, spawn if capacity (capped by graph parallel width)
         # 2b. Rate-limit recovery: restore providers whose throttle window expired.
@@ -1326,7 +1875,12 @@ class Orchestrator:
         alive_count = sum(1 for a in self._agents.values() if a.status != "dead")
         result.active_agents = alive_count
 
-        if task_graph is not None:
+        # Warm-pool preparation creates worktree and adapter capacity, so it
+        # is normal-tick work. It used to ride on ``task_graph is not None``,
+        # which only held on a normal tick back when the graph was built
+        # inside the gate; the condition is spelled out now that the graph is
+        # always available.
+        if _run_normal:
             prepare_speculative_warm_pool(self, task_graph, all_tasks)
 
         # 3a. Build alive-per-role map for task distribution prioritization.
@@ -1408,6 +1962,11 @@ class Orchestrator:
                 for _task in itertools.chain.from_iterable(batches):
                     if not _task.model or _task.model == _ap_override.from_model:
                         _task.model = _ap_override.to_model
+        # Cost-aware dispatch gate (#2354): consult the deterministic USD cost
+        # policy before claiming/spawning. When a configured cap would be
+        # breached by the next dispatch, the tick halts with a sealed,
+        # offline-verifiable receipt; no policy (or no cap) is a clean no-op.
+        cost_dispatch_halt = self._evaluate_cost_policy_dispatch(batches, cost_estimates)
         if self._config.dry_run:
             for batch in batches:
                 for task in batch:
@@ -1419,10 +1978,34 @@ class Orchestrator:
                         task.effort,
                     )
                     result.dry_run_planned.append((task.role, task.title, task.model, task.effort))
+        elif cost_dispatch_halt is not None:
+            # Fail-closed: the next dispatch would breach a configured USD cap.
+            # The halting decision is already sealed into the lineage spine +
+            # audit chain; hold every spawn this tick so the run stops before
+            # the cap is breached (issue #2354, AC1).
+            logger.warning(
+                "Cost policy HALT: next dispatch would breach the %s USD cap by $%.4f (run=%s); "
+                "holding spawns. Dispatch receipt %s",
+                cost_dispatch_halt.breached_dimension,
+                cost_dispatch_halt.projected_overrun_usd,
+                self._run_id,
+                cost_dispatch_halt.decision_hash,
+            )
+            self._notify(
+                "cost.dispatch.halt",
+                "Cost policy halt",
+                f"Next dispatch would breach the {cost_dispatch_halt.breached_dimension} USD cap by "
+                f"${cost_dispatch_halt.projected_overrun_usd:.4f}; spawns held. "
+                f"Dispatch receipt {cost_dispatch_halt.decision_hash}.",
+                breached_dimension=cost_dispatch_halt.breached_dimension,
+                projected_overrun_usd=round(cost_dispatch_halt.projected_overrun_usd, 6),
+                decision_hash=cost_dispatch_halt.decision_hash,
+            )
+            result.cost_dispatch_halt = cost_dispatch_halt.decision_hash
         elif budget_decision is not None and budget_decision.action == BudgetAction.ABORT:
             _bs = self._cost_tracker.status()
             logger.warning(
-                "Budget exhausted — $%.2f spent of $%.2f budget. "
+                "Budget exhausted - $%.2f spent of $%.2f budget. "
                 "Fix: increase budget with --budget N or wait for running tasks to complete",
                 _bs.spent_usd,
                 _bs.budget_usd,
@@ -1445,7 +2028,7 @@ class Orchestrator:
         elif budget_decision is not None and budget_decision.action == BudgetAction.PAUSE:
             _bs = self._cost_tracker.status()
             logger.warning(
-                "Budget policy PAUSE triggered at %.1f%% — holding spawns until approval",
+                "Budget policy PAUSE triggered at %.1f%% - holding spawns until approval",
                 _bs.percentage_used * 100,
             )
             # Fire a one-shot notification when the action first transitions.
@@ -1463,7 +2046,7 @@ class Orchestrator:
         process_completed_tasks(self, done_tasks, result)
 
         # 4x. Periodic git hygiene
-        # Gated behind _run_slow — git operations are IO-heavy.
+        # Gated behind _run_slow - git operations are IO-heavy.
         if _run_slow and len(done_tasks) > 0:
             with contextlib.suppress(Exception):
                 from bernstein.core.git_hygiene import run_hygiene
@@ -1472,7 +2055,7 @@ class Orchestrator:
                 run_hygiene(self._workdir, active_session_ids=active_ids)
 
         # 4x-ii. Periodic worktree garbage collection
-        # Gated behind _run_slow — worktree GC is IO-heavy.
+        # Gated behind _run_slow - worktree GC is IO-heavy.
         if _run_slow:
             try:
                 active_ids = {s.id for s in self._agents.values() if s.status != "dead"}
@@ -1527,12 +2110,12 @@ class Orchestrator:
             )
 
         # Run manager queue review when triggered (periodic correction pass)
-        # Gated behind _run_slow — manager review involves an LLM call.
+        # Gated behind _run_slow - manager review involves an LLM call.
         if _run_slow and self._should_trigger_manager_review(self._failures_since_review):
             self._run_manager_queue_review()
 
         # 4b.6 AgentOps: update SLOs, check error budget, detect incidents
-        # Gated behind _run_slow — SLO/incident tracking is expensive and
+        # Gated behind _run_slow - SLO/incident tracking is expensive and
         # doesn't need sub-minute granularity.
         if _run_slow:
             collector = get_collector()
@@ -1545,6 +2128,20 @@ class Orchestrator:
                 adjusted_max if adjusted_max != self._config.max_agents else None
             )
 
+            # Persist controller sidecar: adaptive parallelism state and
+            # claim-conflict cooldowns so they survive restarts.
+            try:
+                _ap_state = self._adaptive_parallelism.to_adaptive_parallelism_state()
+                _conflict_entries: dict[str, ClaimConflictEntry] = {}
+                for _tid, (_ep, _until) in self._claim_conflict_state.items():
+                    _conflict_entries[_tid] = ClaimConflictEntry(
+                        episode_count=int(_ep),
+                        backoff_until_epoch=float(_until),
+                    )
+                _save_controller_state(self._workdir, _ap_state, _conflict_entries)
+            except Exception:
+                logger.warning("Controller sidecar save failed — continuing", exc_info=True)
+
             # Track consecutive failures for incident detection
             if result.verified:
                 self._consecutive_failures = 0
@@ -1552,28 +2149,7 @@ class Orchestrator:
                 self._consecutive_failures += len([t for t in failed_tasks if t.id not in self._retried_task_ids])
 
             # Check for incidents
-            all_counted = self._slo_tracker.error_budget.total_tasks
-            failed_counted = self._slo_tracker.error_budget.failed_tasks
-            incident = self._incident_manager.check_for_incidents(
-                failed_task_count=failed_counted,
-                total_task_count=all_counted,
-                consecutive_failures=self._consecutive_failures,
-                error_budget_depleted=self._slo_tracker.error_budget.is_depleted,
-            )
-            self._incident_manager.save(self._workdir / ".sdd" / "runtime")
-
-            # Notify PagerDuty on SEV1/SEV2 incidents
-            if incident is not None and incident.severity in ("sev1", "sev2"):
-                self._notify(
-                    "incident.critical",
-                    f"Incident [{incident.severity.value.upper()}]: {incident.title}",
-                    incident.description,
-                    incident_id=incident.id,
-                    severity=incident.severity.value,
-                    failed_tasks=str(failed_counted),
-                    total_tasks=str(all_counted),
-                    consecutive_failures=str(self._consecutive_failures),
-                )
+            self._check_for_incidents(tasks_by_status)
 
         # 4c. Check heartbeat-based staleness; send WAKEUP/SHUTDOWN as needed
         check_stale_agents(self)
@@ -1588,7 +2164,7 @@ class Orchestrator:
         check_loops_and_deadlocks(self)
 
         # 4d-ii.6 Three-tier watchdog: mechanical checks -> AI triage -> human escalation
-        # Gated behind _run_slow — watchdog sync is heavyweight.
+        # Gated behind _run_slow - watchdog sync is heavyweight.
         if _run_slow:
             self._watchdog.sync(collect_watchdog_findings(self))
 
@@ -1605,13 +2181,13 @@ class Orchestrator:
         # 4d-ii.8 Self-healing liveness watchdog (#1224): periodic check for
         # stuck adapter sessions on pre-approved safety prompts. Off by
         # default; opt-in via BERNSTEIN_WATCHDOG_ENABLED=1. Complementary
-        # to the stalled-manager detector above — different failure mode,
+        # to the stalled-manager detector above - different failure mode,
         # different recovery action.
         if _run_slow:
             self._run_liveness_watchdog()
 
         # 4d-iii. Cost anomaly detection: burn rate projection, stop on budget overrun
-        # Gated behind _run_slow — anomaly detection doesn't need every-tick granularity.
+        # Gated behind _run_slow - anomaly detection doesn't need every-tick granularity.
         if _run_slow:
             for sig in self._anomaly_detector.check_tick(list(self._agents.values()), self._cost_tracker):
                 self._handle_anomaly_signal(sig)
@@ -1641,7 +2217,7 @@ class Orchestrator:
         # 4e-ii. Log-growth idle heuristic: catch agents wedged in a
         #     dead MCP/tool call that still emit heartbeats from a side thread but
         #     produce no log output or git activity. Complements recycle_idle_agents
-        #     (heartbeat-based) — gated behind _run_normal since the log tail scan
+        #     (heartbeat-based) - gated behind _run_normal since the log tail scan
         #     is IO-heavy and does not need every-tick granularity.
         if _run_normal:
             try:
@@ -1664,12 +2240,12 @@ class Orchestrator:
                 logger.warning("Pending push retry failed: %s", exc)
 
         # 6. Run evolution analysis cycle every N ticks
-        # Gated behind _run_slow — evolution analysis is heavyweight.
+        # Gated behind _run_slow - evolution analysis is heavyweight.
         if _run_slow and self._evolution is not None and self._tick_count % self._config.evolution_tick_interval == 0:
             self._run_evolution_cycle(result)
 
         # 6b. Refresh knowledge base every 5 evolution intervals
-        # Gated behind _run_slow — knowledge base refresh is IO-heavy.
+        # Gated behind _run_slow - knowledge base refresh is IO-heavy.
         if _run_slow and self._tick_count % (self._config.evolution_tick_interval * 5) == 0:
             try:
                 refresh_knowledge_base(self._workdir)
@@ -1682,13 +2258,283 @@ class Orchestrator:
         # 8. Replenish backlog in evolve mode when tasks run out
         self._replenish_backlog(result)
 
-        # 8b. Generate run completion summary for non-evolve runs (reuse cached tasks)
-        if (
-            not self._config.evolve_mode
-            and result.open_tasks == result.active_agents == 0
-            and not self._summary_written
-        ):
-            self._generate_run_summary(tasks_by_status["done"], tasks_by_status["failed"])
+        # 8b. Generate run completion summary for non-evolve runs.
+        #
+        # Bug (2026-07-02 D2 openrouter final leg,
+        # work/bernstein/proofs/d2/openrouter/attempt-final-f15a2a9e):
+        # `tasks_by_status` here is the snapshot fetched at the TOP of this
+        # tick (step 1, above), before `reap_dead_agents` (step 5, above)
+        # can synchronously auto-complete/fail a task within this SAME
+        # tick (e.g. an orphan auto-complete after its agent died mid-run).
+        # Passing that stale snapshot to `_generate_run_summary` made a
+        # task that had JUST been auto-completed look like it never
+        # happened: `compute_run_health([])` is vacuously HEALTHY with
+        # every TERMINATOR_* count at 0, even though spawner.log had
+        # already logged the `orphan_auto_complete` event for that exact
+        # task earlier in this same tick. Fix: refetch immediately before
+        # generating the summary so it reflects whatever reap_dead_agents
+        # just did.
+        # Regression (2026-07-02 D2 minimax leg,
+        # work/bernstein/proofs/d2/minimax/attempt-e938bd33): this block was
+        # previously ALSO gated on `not self._summary_written`. On that run,
+        # tick #7 detected quiescence, wrote the summary + interim
+        # retrospective (setting `_summary_written = True`), and the settle
+        # window then correctly said "run continues" (a retry task had
+        # appeared: open=1). But once `_summary_written` was True, every
+        # LATER quiescent tick skipped this entire block - so the
+        # tick-quiescence self-stop and its shutdown-final retrospective
+        # regeneration could never fire again. The run's final quiescence
+        # (last retry permanently failed at 01:57:15) passed silently and
+        # the process was torn down with the stale tick-7 INTERIM
+        # retrospective on disk (3 tasks/$0.0174 vs the real 5/$0.0375).
+        # Fix: the `_summary_written` one-shot guard now wraps ONLY the
+        # summary generation below; quiescence detection, the settle-window
+        # check, the self-stop, and shutdown-final regeneration re-run on
+        # every quiescent tick until confirmed.
+        _raw_open = len(tasks_by_status.get("open", []))
+        if not self._config.evolve_mode and result.open_tasks == result.active_agents == 0 and _raw_open == 0:
+            refreshed_tasks_by_status = tasks_by_status
+            try:
+                refreshed_tasks_by_status = fetch_all_tasks(self._client, base)
+                logger.info(
+                    "8b quiescence detected (tick #%d): refetched tasks before run-summary "
+                    "generation to capture any same-tick reap_dead_agents completions "
+                    "(done %d->%d, failed %d->%d)",
+                    self._tick_count,
+                    len(tasks_by_status["done"]),
+                    len(refreshed_tasks_by_status["done"]),
+                    len(tasks_by_status["failed"]),
+                    len(refreshed_tasks_by_status["failed"]),
+                )
+            except httpx.HTTPError:
+                logger.exception(
+                    "8b quiescence refetch failed (tick #%d) - falling back to the "
+                    "pre-reap snapshot for run-summary generation; the interim "
+                    "retrospective may undercount tasks reap_dead_agents completed "
+                    "this tick",
+                    self._tick_count,
+                )
+
+            # Defect 29 (2026-07-02, work/bernstein/proofs/d2/minimax/attempt-83808a8a):
+            # process_completed_tasks (the post-/complete chain) ran at step
+            # 1c above, BEFORE the refetch. Any task that became terminal
+            # during this same tick - e.g. via reap_dead_agents' orphan
+            # auto-complete at step 5, or via a /complete POST that landed
+            # between step 1 and step 8b - was NOT in process_completed_tasks'
+            # input list. Drive the chain for those newly-terminal tasks here
+            # so the 8b summary gate (``_pending_post_complete_count == 0``)
+            # can fire on this tick instead of waiting one full poll cycle.
+            _newly_terminal_for_chain: list[Task] = []
+            for bucket in ("done", "failed"):
+                for task in refreshed_tasks_by_status.get(bucket, []):
+                    if task.id not in self._processed_done_tasks:
+                        _newly_terminal_for_chain.append(task)
+            if _newly_terminal_for_chain:
+                logger.info(
+                    "8b pre-summary chain processing (tick #%d): %d newly-terminal "
+                    "task(s) added to process_completed_tasks: %s",
+                    self._tick_count,
+                    len(_newly_terminal_for_chain),
+                    ", ".join(t.id for t in _newly_terminal_for_chain),
+                )
+                try:
+                    _chain_result = TickResult()
+                    # Pass both done and failed - process_completed_tasks
+                    # filters to ``_processed_done_tasks`` itself so a
+                    # failed task gets registered the same way as a done
+                    # task. A pure done-only filter here would strand
+                    # failed tasks in the drain tracker.
+                    process_completed_tasks(
+                        self,
+                        _newly_terminal_for_chain.copy(),
+                        _chain_result,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "8b pre-summary process_completed_tasks raised (tick #%d): %s",
+                        self._tick_count,
+                        exc,
+                    )
+
+            # Defect 29: refresh the drain tracker against the latest snapshot,
+            # then log the run-end decision with all its inputs so a 2-minute
+            # diagnosis from logs alone is possible (house rule 2).
+            _pending_post_complete = self._refresh_drain_tracker(refreshed_tasks_by_status)
+            if _pending_post_complete > 0:
+                _still_pending = sorted(
+                    tid
+                    for tid in self._post_complete_seen_task_ids
+                    if tid not in set(self._processed_done_tasks.keys())
+                )
+                _action = "defer_summary"
+                logger.info(
+                    "run_end_check: tick=#%d open=%d active=%d pending_post_complete=%d "
+                    "summary_written=%s -> action=%s (waiting for post-/complete chain "
+                    "on tasks: %s)",
+                    self._tick_count,
+                    result.open_tasks,
+                    result.active_agents,
+                    _pending_post_complete,
+                    self._summary_written,
+                    _action,
+                    _still_pending or "<none>",
+                )
+            elif not self._summary_written:
+                _action = "fire_summary"
+                logger.info(
+                    "run_end_check: tick=#%d open=%d active=%d pending_post_complete=%d "
+                    "summary_written=%s -> action=%s (all terminal tasks drained)",
+                    self._tick_count,
+                    result.open_tasks,
+                    result.active_agents,
+                    _pending_post_complete,
+                    self._summary_written,
+                    _action,
+                )
+                self._generate_run_summary(
+                    refreshed_tasks_by_status["done"],
+                    refreshed_tasks_by_status["failed"],
+                    full_status_counts={status: len(tasks) for status, tasks in refreshed_tasks_by_status.items()},
+                )
+            else:
+                _action = "summary_already_written"
+                logger.info(
+                    "run_end_check: tick=#%d open=%d active=%d pending_post_complete=%d "
+                    "summary_written=%s -> action=%s (proceeding to settle-window "
+                    "self-stop check; shutdown-final regeneration still pending)",
+                    self._tick_count,
+                    result.open_tasks,
+                    result.active_agents,
+                    _pending_post_complete,
+                    self._summary_written,
+                    _action,
+                )
+
+            # Only self-stop once real work has actually happened (at least
+            # one task has reached a terminal state). A brand-new/empty
+            # backlog reading open=0/agents=0 on tick #1 is not "the run
+            # finished" - it's "nothing has been scheduled yet" (e.g. a
+            # server that hasn't ingested its seed task yet, or a test
+            # harness driving tick() directly against an empty transport).
+            # Self-stopping in that case would end the orchestrator before
+            # it ever does anything.
+            _had_any_terminal_task = bool(refreshed_tasks_by_status["done"] or refreshed_tasks_by_status["failed"])
+            if not _had_any_terminal_task:
+                logger.debug(
+                    "8b quiescence (tick #%d) with zero terminal tasks - not eligible "
+                    "for self-stop yet (nothing has actually run)",
+                    self._tick_count,
+                )
+                # ...but "not yet" must not mean "never". The self-stop below
+                # is gated on a terminal task existing, so a run that reaches
+                # quiescence having finished nothing has no exit at all and
+                # idles until the container tears it down, reporting HEALTHY
+                # and exit 0 for a goal it never met (issue #3010). The stall
+                # backstop supplies that missing terminal state, and only
+                # after the run has demonstrably stopped moving - see
+                # core.orchestration.run_stall for the criterion.
+                self._check_zero_terminal_stall(refreshed_tasks_by_status, base)
+            else:
+                # Real work finished, so any accumulated no-progress window is
+                # stale: the normal self-stop path below owns this run's end.
+                self._run_stall_state = RunStallState()
+
+            # Confirm this quiescence is real rather than a momentary gap
+            # before more child tasks appear (see the A5 stale-retrospective
+            # bug this module already guards against: a run reported
+            # 100%/HEALTHY at T+58s and 2 more tasks subsequently failed).
+            # A short settle window catches that race without waiting a
+            # full poll interval.
+            #
+            # This self-stop is also what makes shutdown-final retrospective
+            # regeneration actually fire for runs that end via a `--quiet` /
+            # wait-for-completion CLI path (cli/run_bootstrap.py's
+            # `_wait_for_run_completion`, which polls this process's HTTP
+            # server from a SEPARATE CLI process and never sends this
+            # process a stop signal). This orchestrator subprocess is
+            # launched detached (`start_new_session=True` in
+            # server_launch._start_spawner), so without self-stopping here
+            # it just idles until the container's PID-namespace teardown
+            # SIGKILLs it - unmaskable, no Python cleanup code runs, and
+            # `run()`'s post-tick-loop shutdown-final regeneration never
+            # gets a chance to execute.
+            if _had_any_terminal_task:
+                # Overridable via env var so tests (and any operator who
+                # wants a tighter/looser margin) don't have to eat a real
+                # 2s sleep per quiescent tick.
+                _settle_s = float(os.environ.get("BERNSTEIN_QUIESCENCE_SETTLE_S", "2.0"))
+                if _settle_s > 0:
+                    time.sleep(_settle_s)
+                try:
+                    settled = fetch_all_tasks(self._client, base)
+                except httpx.HTTPError:
+                    logger.exception(
+                        "Quiescence settle re-check failed (tick #%d) after %.1fs - not "
+                        "self-stopping; relying on the normal tick loop or an external "
+                        "stop signal instead",
+                        self._tick_count,
+                        _settle_s,
+                    )
+                    settled = None
+                if settled is not None:
+                    settled_open = len(settled["open"])
+                    settled_agents = sum(1 for a in self._agents.values() if a.status != "dead")
+                    if settled_open == settled_agents == 0:
+                        # Hold/release API (supplements the settle-timer
+                        # self-stop above): external callers can call
+                        # POST /orchestrator/holds to keep this orchestrator
+                        # alive even when it looks fully quiescent - e.g. a
+                        # dashboard mid-review, or an external scheduler about
+                        # to enqueue follow-up tasks that hasn't posted them
+                        # yet. Checked here, right before the actual
+                        # self-stop, so a hold acquired at any point up to
+                        # this instant still prevents the stop for this tick.
+                        try:
+                            _active_holds = fetch_active_holds(self._client, base)
+                        except Exception as exc:  # intentional-broad-except: must never crash the tick loop
+                            logger.warning(
+                                "fetch_active_holds raised during quiescence self-stop check (tick #%d): %s "
+                                "- treating as no active holds",
+                                self._tick_count,
+                                exc,
+                            )
+                            _active_holds = []
+                        if _active_holds:
+                            _hold_reasons = [sanitize_log(str(h.get("reason", "<no reason>"))) for h in _active_holds]
+                            logger.info(
+                                "Quiescence detected but %d active hold(s) present (tick #%d) - skipping self-stop: %s",
+                                len(_active_holds),
+                                self._tick_count,
+                                _hold_reasons,
+                            )
+                        elif self._maybe_schedule_test_followup(settled.get("done", [])):
+                            logger.info(
+                                "Quiescence confirmed after %.1fs settle window (tick #%d) but a "
+                                "bounded test-authoring follow-up was just scheduled - "
+                                "deferring self-stop",
+                                _settle_s,
+                                self._tick_count,
+                            )
+                        else:
+                            logger.info(
+                                "Quiescence confirmed after %.1fs settle window (tick #%d, "
+                                "open=%d agents=%d, no active holds) - self-stopping",
+                                _settle_s,
+                                self._tick_count,
+                                settled_open,
+                                settled_agents,
+                            )
+                            self._regenerate_final_retrospective(trigger_path="tick-quiescence-self-stop")
+                            self._running = False
+                    else:
+                        logger.info(
+                            "Quiescence NOT confirmed after %.1fs settle window (tick #%d): "
+                            "open=%d agents=%d - run continues",
+                            _settle_s,
+                            self._tick_count,
+                            settled_open,
+                            settled_agents,
+                        )
 
         # 9. Log summary
         self._log_summary(result)
@@ -1699,7 +2545,7 @@ class Orchestrator:
         # 12. LLM watcher (opt-in, off by default).  Single hook point that
         #     hands an immutable ``WatcherEvent`` snapshot to the watcher.
         #     The watcher receives no orchestrator handle and cannot mutate
-        #     state.  Failures are swallowed — orchestrator stability wins.
+        #     state.  Failures are swallowed - orchestrator stability wins.
         self._dispatch_watcher_events(result)
 
         return result
@@ -1710,7 +2556,7 @@ class Orchestrator:
         Called once at the end of ``_tick_internal``.  Builds a frozen
         snapshot per spawned/verified task and passes it to the watcher.
         The watcher receives no orchestrator handle, no task store, and
-        no spawner — only the snapshot.  This is the single, well-defined
+        no spawner - only the snapshot.  This is the single, well-defined
         hook required by the watcher's read-only contract.
 
         Args:
@@ -1788,7 +2634,7 @@ class Orchestrator:
                 inside_loop = False
 
             # If the tick ever runs inside an async context the watcher
-            # is skipped — the dispatcher refuses to nest event loops.
+            # is skipped - the dispatcher refuses to nest event loops.
             signals = asyncio.run(_drain()) if not inside_loop else []
 
             for sig in signals:
@@ -1819,6 +2665,413 @@ class Orchestrator:
                 reason=reason,
             )
             logger.info("Workflow approval granted for phase %r via file", phase_name)
+
+    def _check_zero_terminal_stall(
+        self,
+        refreshed_tasks_by_status: dict[str, list[Task]],
+        base: str,
+    ) -> None:
+        """Give a quiescent run that finished nothing a terminal state (#3010).
+
+        Called from the tick's step-8b quiescence handling, on the branch
+        where ``open_tasks == active_agents == 0`` **and** no task reached
+        ``done`` or ``failed``. That branch previously only logged: the
+        self-stop next to it is gated on a terminal task existing, so this
+        exact shape - the one where nothing ever finished, which is the one
+        an operator most needs terminated and reported - was the single case
+        with no exit from the tick loop.
+
+        The decision itself lives in
+        :func:`~bernstein.core.orchestration.run_stall.evaluate_run_stall`
+        (pure, unit-testable, documents which way it errs). This method owns
+        only the IO around it: the settle-window confirmation, the holds
+        check, failing the stuck tasks so the run's own reporting is honest,
+        and clearing ``_running``.
+
+        A stall is confirmed the same way an ordinary quiescence is - sleep
+        the settle window, refetch, and require the world to be unchanged -
+        so a momentary gap before more work appears can never be mistaken
+        for a dead run.
+
+        Args:
+            refreshed_tasks_by_status: Post-reap task snapshot for this tick.
+            base: Task-server base URL.
+
+        Side effects:
+            On a confirmed stall: fails every actively-unfinished task with
+            :data:`~bernstein.core.orchestration.run_stall.STUCK_TASK_FAIL_REASON`,
+            regenerates the final retrospective, and sets ``_running`` False.
+            Never raises - a backstop that can crash the tick loop is worse
+            than the idling it prevents.
+        """
+        if self._run_stall_stopped:
+            return
+
+        grace_s = resolve_grace_s(self._config.stalled_run_grace_s)
+        min_ticks = resolve_min_ticks(self._config.stalled_run_ticks)
+
+        self._run_stall_state, verdict = evaluate_run_stall(
+            self._run_stall_state,
+            refreshed_tasks_by_status,
+            now=time.time(),
+            grace_s=grace_s,
+            min_ticks=min_ticks,
+            planning_window_s=resolve_planning_window_s(self._config.planning_window_s),
+        )
+        if not verdict.stalled:
+            logger.debug(
+                "run_stall_check: tick=#%d -> continue (%s)",
+                self._tick_count,
+                verdict.reason,
+            )
+            return
+
+        # Confirmation pass. The cheap evaluation above runs against the
+        # snapshot this tick already fetched; before ending a run we pay for
+        # the same settle window the healthy self-stop uses, so a task that
+        # lands during the window aborts the stop.
+        _settle_s = float(os.environ.get("BERNSTEIN_QUIESCENCE_SETTLE_S", "2.0"))
+        if _settle_s > 0:
+            time.sleep(_settle_s)
+        try:
+            settled = fetch_all_tasks(self._client, base)
+        except httpx.HTTPError:
+            logger.exception(
+                "run_stall_check: settle re-check failed (tick #%d) - not stopping; "
+                "an unreachable server is the server-failure path's business, not a stall",
+                self._tick_count,
+            )
+            self._run_stall_state = RunStallState()
+            return
+
+        settled_agents = sum(1 for a in self._agents.values() if a.status != "dead")
+        if settled["done"] or settled["failed"] or len(settled["open"]) or settled_agents:
+            logger.info(
+                "run_stall_check: NOT confirmed after %.1fs settle window (tick #%d): "
+                "open=%d agents=%d done=%d failed=%d - run continues",
+                _settle_s,
+                self._tick_count,
+                len(settled["open"]),
+                settled_agents,
+                len(settled["done"]),
+                len(settled["failed"]),
+            )
+            self._run_stall_state = RunStallState()
+            return
+
+        # Take the tasks to fail from the POST-settle snapshot rather than
+        # the verdict's pre-settle one, so the run is only ever judged on
+        # the state it actually ends in.
+        _stuck_ids = sorted(
+            str(task.id) for status, tasks in settled.items() if status in ACTIVE_UNFINISHED_STATUSES for task in tasks
+        )
+        # An empty ledger has no task to fail, and that absence IS the
+        # verdict rather than a reason to doubt it: the planning task never
+        # landed a graph, so there is nothing to mark stuck and nothing that
+        # can arrive. Treating "no stuck task" as "run continues" here is
+        # what left that run ticking to its wall-clock timeout.
+        _ledger_empty = not any(settled.values())
+        if not _stuck_ids and not _ledger_empty:
+            logger.info(
+                "run_stall_check: no actively-unfinished task left after the %.1fs settle "
+                "window (tick #%d) - run continues",
+                _settle_s,
+                self._tick_count,
+            )
+            self._run_stall_state = RunStallState()
+            return
+
+        # Holds are an explicit "stay alive" from an external caller (a
+        # dashboard mid-review, a scheduler about to enqueue follow-ups).
+        # They outrank the stall backstop exactly as they outrank the
+        # ordinary self-stop.
+        try:
+            _active_holds = fetch_active_holds(self._client, base)
+        except Exception as exc:  # intentional-broad-except: must never crash the tick loop
+            logger.warning(
+                "fetch_active_holds raised during stall check (tick #%d): %s - treating as no active holds",
+                self._tick_count,
+                exc,
+            )
+            _active_holds = []
+        if _active_holds:
+            logger.info(
+                "run_stall_check: %d active hold(s) present (tick #%d) - not stopping: %s",
+                len(_active_holds),
+                self._tick_count,
+                [sanitize_log(str(h.get("reason", "<no reason>"))) for h in _active_holds],
+            )
+            return
+
+        logger.error(
+            "run_stall_check: STALLED (tick #%d) - %s. Stopping the run and reporting it as not having met its goal.",
+            self._tick_count,
+            verdict.reason,
+        )
+
+        # Fail the stuck tasks before writing the report. A task that will
+        # never run again must not be left frozen mid-flight: leaving it
+        # there is what let the run tally 0 done / 0 failed and read
+        # HEALTHY. Failing it here is both true and what makes every
+        # downstream surface - the retrospective's health verdict,
+        # `bernstein status`, the audit chain - say the same thing.
+        _failed_ids: list[str] = []
+        for task_id in _stuck_ids:
+            try:
+                fail_task(self._client, base, task_id, reason=STUCK_TASK_FAIL_REASON)
+                _failed_ids.append(task_id)
+            except Exception as exc:  # intentional-broad-except: keep stopping regardless
+                logger.warning(
+                    "run_stall_check: could not fail stuck task %s: %s",
+                    task_id,
+                    sanitize_log(str(exc)),
+                )
+        logger.error(
+            "run_stall_check: marked %d of %d unfinished task(s) failed: %s",
+            len(_failed_ids),
+            len(_stuck_ids),
+            ", ".join(_failed_ids) or "<none>",
+        )
+
+        with contextlib.suppress(Exception):
+            self._post_bulletin("alert", f"run_stalled: {verdict.reason}")
+        with contextlib.suppress(Exception):
+            self._recorder.record(
+                "run_stalled",
+                run_id=self._run_id,
+                tick=self._tick_count,
+                quiet_for_s=round(verdict.quiet_for_s, 3),
+                observed_ticks=verdict.observed_ticks,
+                stuck_task_ids=_stuck_ids,
+                failed_task_ids=_failed_ids,
+            )
+
+        self._run_stall_stopped = True
+        self._closure_outcome = RunClosureOutcome.FAILED
+        self._regenerate_final_retrospective(trigger_path="tick-stalled-run-self-stop")
+        self._running = False
+
+    def _maybe_schedule_test_followup(self, done_tasks: list[Task]) -> bool:
+        """Schedule one bounded test-authoring follow-up if this run needs it (#4462).
+
+        Called from the confirmed-quiescence self-stop branch of the tick's
+        step-8b handling, before the run would otherwise stop. Returns True
+        iff a follow-up task was just created - the caller must skip
+        self-stopping this tick when it is, since the run now has one more
+        bounded task to execute before it is actually finished.
+
+        The ``_test_followup_scheduled`` one-shot latch means a later
+        quiescence in this same orchestrator process - including the one the
+        follow-up task's own completion produces - never schedules a second
+        one (no loops), regardless of what that follow-up's own diff looks
+        like.
+        """
+        from bernstein.core.orchestration.test_followup import (
+            build_followup_goal,
+            diff_name_only,
+            evaluate_test_followup,
+            resolve_run_branch,
+            resolve_test_followup_enabled,
+        )
+
+        enabled = resolve_test_followup_enabled(self._config.test_followup_enabled)
+        branch: str | None = None
+        changed: tuple[str, ...] = ()
+        if enabled and not self._test_followup_scheduled:
+            try:
+                from bernstein.core.git.git_basic import resolve_default_branch
+
+                branch = resolve_run_branch(self._workdir, done_tasks)
+                if branch is not None:
+                    base_branch = resolve_default_branch(self._workdir)
+                    changed = diff_name_only(self._workdir, base_branch, branch)
+            except Exception:
+                logger.exception("test_followup: branch-diff lookup failed - skipping")
+                branch = None
+
+        decision = evaluate_test_followup(
+            enabled=enabled,
+            already_scheduled=self._test_followup_scheduled,
+            changed_files=changed,
+        )
+        if not decision.should_schedule:
+            logger.debug("test_followup: not scheduling (%s)", decision.reason)
+            return False
+        if branch is None:
+            # The diff shape says a follow-up is warranted, but no completed
+            # task in this run has a git branch left to diff (already merged
+            # and cleaned up, or a merge_strategy that never leaves one).
+            # Fail closed rather than guessing which branch to target.
+            logger.warning("test_followup: src-without-tests diff detected but no run branch was resolvable")
+            return False
+
+        goal = build_followup_goal(decision.src_files)
+        try:
+            response = self._client.post(
+                f"{self._config.server_url}/tasks",
+                json={
+                    "title": "Add tests for untested source change",
+                    "description": goal,
+                    "role": "qa",
+                    "priority": 2,
+                    "metadata": {"origin": "test_followup", "source_branch": branch},
+                },
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("test_followup: failed to create follow-up task: %s", exc)
+            return False
+
+        self._test_followup_scheduled = True
+        logger.info(
+            "test_followup: scheduled one bounded test-authoring follow-up on %s (%d src file(s) without tests)",
+            branch,
+            len(decision.src_files),
+        )
+        return True
+
+    def _regenerate_final_retrospective(self, trigger_path: str) -> None:
+        """Regenerate the FINAL retrospective and summary.json from final event state.
+
+        Idempotent and safe to call from more than one terminal path
+        (tick-loop drain, tick-level quiescence self-stop, future
+        interrupt/kill paths) - only the first caller actually writes;
+        later callers just log which path was skipped and why. This is the
+        single source of truth for "what triggered shutdown-final
+        regeneration" so a `grep` of the logs always finds an explicit
+        answer (logging-is-the-debugging-interface rule).
+
+        Also regenerates ``summary.json`` (issue #4223) alongside the
+        retrospective: both are written mid-run by the 8b quiescence path
+        under the same ``_summary_written`` one-shot latch, so both need
+        the same final-state overwrite at true shutdown.
+
+        Args:
+            trigger_path: Human-readable name of the terminal path that
+                invoked this (e.g. "tick-loop-drain",
+                "tick-quiescence-self-stop"). Logged at INFO so a run's
+                actual shutdown path is always visible in the logs.
+        """
+        if self._config.evolve_mode:
+            logger.warning(
+                "shutdown-final regeneration skipped via %s: evolve_mode is on",
+                trigger_path,
+            )
+            return
+        if self._final_retrospective_regenerated:
+            logger.info(
+                "shutdown-final regeneration already performed by an earlier terminal "
+                "path - skipping duplicate run triggered via %s",
+                trigger_path,
+            )
+            return
+        logger.info("shutdown-final regeneration triggered via %s", trigger_path)
+        try:
+            # Re-fetch FINAL event state here rather than reusing any
+            # previously-cached task snapshot. This is the fix for the
+            # sibling bug found alongside the "never fires" bug (same
+            # ground-truth run): the 8b tick-level mid-run summary was
+            # feeding generate_retrospective() a snapshot fetched BEFORE
+            # reap_dead_agents() (tick step 5) synchronously auto-completed
+            # an orphaned task within that same tick, so the retrospective
+            # vacuously reported 0 done / 0 failed / HEALTHY while
+            # spawner.log had already logged the orphan_auto_complete event.
+            # Fetching fresh here, at the moment of actual shutdown, is the
+            # only way to guarantee every such in-tick completion is
+            # reflected.
+            final_tasks = fetch_all_tasks(self._client, self._config.server_url)
+            status_histogram = {status: len(tasks) for status, tasks in final_tasks.items()}
+            runtime_dir = self._workdir / ".sdd" / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            final_done = final_tasks.get("done", [])
+            final_failed = final_tasks.get("failed", [])
+            collector = get_collector(self._workdir / ".sdd" / "metrics")
+            generate_retrospective(
+                done_tasks=final_done,
+                failed_tasks=final_failed,
+                collector=collector,
+                runtime_dir=runtime_dir,
+                run_start_ts=self._run_start_ts,
+                trigger_reason="shutdown-final",
+                full_status_counts=status_histogram,
+            )
+            # Issue #4223: summary.json has the same "written once at
+            # interim quiescence, never again" problem the retrospective
+            # above was already fixed for (A5). ``_generate_run_summary``'s
+            # 8b tick-level call into ``_emit_summary_card`` is the only
+            # writer, and it's gated by the ``_summary_written`` one-shot
+            # latch - so a run whose first quiescence fire caught a task
+            # mid-flight (e.g. one still in a deferred death judgment, per
+            # #4222) ships that stale done/failed/wall-clock snapshot
+            # forever, even though the journal keeps recording events for
+            # minutes afterward. Re-run the same summary_data assembly here,
+            # against the ``final_tasks`` this shutdown path just fetched,
+            # so the last write reflects the run's actual terminal state.
+            # The interim fire from 8b is left on disk until this point -
+            # this call is what supersedes it, exactly like the
+            # retrospective regeneration above.
+            self._emit_summary_card(
+                done_tasks=final_done,
+                failed_tasks=final_failed,
+                collector=collector,
+                wall_clock_s=time.time() - self._run_start_ts,
+                total_cost=collector.get_total_cost(),
+            )
+            self._final_retrospective_regenerated = True
+        except Exception:
+            logger.exception(
+                "Final retrospective regeneration failed at shutdown via %s (non-fatal)",
+                trigger_path,
+            )
+
+    def _finalization_marker(self, name: str) -> Path:
+        """Return the path of a finalization sentinel, creating its directory.
+
+        Under ``.sdd/runtime/`` with the rest of the signal files rather than
+        at the project root: these are runtime state, and the root is the
+        operator's tracked working copy.
+        """
+        signals_dir = self._workdir / ".sdd" / "runtime"
+        signals_dir.mkdir(parents=True, exist_ok=True)
+        return signals_dir / name
+
+    def _mark_finalization_started(self) -> None:
+        """Write the entry sentinel for demo teardown.
+
+        Written *before* the seal/receipt so teardown can detect that
+        finalization is in progress. Without this, teardown cannot
+        distinguish "finalization hasn't started yet" from "already done"
+        from "crashed" — all three present as "no completion marker exists."
+        """
+        try:
+            self._finalization_marker(".finalizing").touch()
+        except OSError as exc:
+            logger.warning("failed to write .finalizing marker: %s", exc)
+
+    def _mark_finalization_done(self) -> None:
+        """Write the completion sentinel for demo teardown.
+
+        Written in a finally so it appears on both success and failure.
+        A missing .finalized always means "still running", never "failed
+        silently" — that is what makes it safe to wait on.
+        """
+        try:
+            self._finalization_marker(".finalized").write_text(json.dumps({"ts": time.time()}))
+        except OSError as exc:
+            logger.warning("failed to write .finalized marker: %s", exc)
+
+    def _pace(self, seconds: float) -> None:
+        """Sleep between ticks. The run loop's only pacing seam.
+
+        ``time.sleep`` is one function object shared by the whole process,
+        so a test that patches it observes every sleep anything performs
+        while ``run()`` is on the stack - including CPython's own
+        ``subprocess.Popen`` reaping loop, whose 1ms/2ms/4ms/8ms busy-wait
+        lands in the record before the loop's first tick has paced at all.
+        Routing the loop's pacing through one method lets a test watch the
+        schedule this loop chooses and nothing else.
+        """
+        time.sleep(seconds)
 
     def run(self) -> None:
         """Run the orchestrator loop until stopped.
@@ -1858,13 +3111,24 @@ class Orchestrator:
             config_hash=self._replay_metadata.config_hash,
             **_run_started_extra,
         )
+        try:
+            from bernstein.core.orchestration.run_closure_owner import write_spawner_run_owner
+
+            write_spawner_run_owner(
+                sdd_dir=self._workdir / ".sdd",
+                run_id=self._run_id,
+                journal_head=self._recorder.fingerprint(),
+                journal_event_count=self._recorder.event_count(),
+            )
+        except OSError as exc:
+            logger.warning("Run owner record not written for %s: %s", self._run_id, sanitize_log(str(exc)))
         # WAL recovery: detect uncommitted entries from crashed previous runs.
         # Must run after WAL writer is initialized (in __init__) so that
         # acknowledgement entries are written to the current run's WAL.
         try:
             self._recover_from_wal()
         except Exception:
-            logger.exception("WAL recovery failed (non-fatal) — continuing startup")
+            logger.exception("WAL recovery failed (non-fatal) - continuing startup")
         # Audit log integrity check: verify the last N HMAC-chained entries.
         try:
             from bernstein.core.audit_integrity import verify_on_startup
@@ -1872,7 +3136,7 @@ class Orchestrator:
             _integrity = verify_on_startup(self._workdir / ".sdd")
             if not _integrity.valid:
                 logger.warning(
-                    "Audit integrity check found %d error(s) — review with 'bernstein audit verify'",
+                    "Audit integrity check found %d error(s) - review with 'bernstein audit verify'",
                     len(_integrity.errors),
                 )
             elif _integrity.entries_checked > 0:
@@ -1882,7 +3146,64 @@ class Orchestrator:
                     _integrity.duration_ms,
                 )
         except Exception:
-            logger.exception("Audit integrity check failed (non-fatal) — continuing startup")
+            logger.exception("Audit integrity check failed (non-fatal) - continuing startup")
+
+        # Run-scope code graph anchoring: build the graph once at run start
+        # and anchor its digest in the audit chain before any agents spawn.
+        # This ensures audit-chain integrity for graph-dependent operations
+        # and provides a verifiable record of the repository state at run time.
+        try:
+            from bernstein.core.knowledge.ast_symbol_graph import (
+                EDGE_ORIGIN_EXTRACTED,
+                EDGE_ORIGIN_INFERRED,
+                build_semantic_graph,
+                graph_digest,
+            )
+            from bernstein.core.orchestration.schedule_projection import SCHEDULE_PROJECTION_REV
+            from bernstein.core.security.audit import load_or_create_audit_key
+            from bernstein.core.security.audit_chain import AuditChainStore, record_code_graph_anchored
+
+            # Build the semantic graph once for this run (run-scoped cache)
+            graph = build_semantic_graph(self._workdir)
+            graph_digest_val = graph_digest(graph)
+            source_count = graph.source_file_count
+            indexed_count = graph.indexed_file_count
+            unparsed_count = len(getattr(graph, "unparsed_files", []))
+            all_edges = graph.edges
+            inferred_count = sum(1 for e in all_edges if e.origin == EDGE_ORIGIN_INFERRED)
+            extracted_count = sum(1 for e in all_edges if e.origin == EDGE_ORIGIN_EXTRACTED)
+
+            # Initialize provider audit chain if not already done
+            if self._provider_audit_chain is None:
+                hmac_key = load_or_create_audit_key(self._workdir / ".sdd")
+                self._provider_audit_chain = AuditChainStore(self._workdir / ".sdd" / "audit", key=hmac_key)
+
+            # Anchor the code graph digest in the audit chain
+            record_code_graph_anchored(
+                chain=self._provider_audit_chain,
+                run_id=self._run_id,
+                graph_digest=graph_digest_val,
+                graph_version=SCHEDULE_PROJECTION_REV,
+                source_file_count=source_count,
+                indexed_file_count=indexed_count,
+                unparsed_file_count=unparsed_count,
+                inferred_edge_count=inferred_count,
+                extracted_edge_count=extracted_count,
+                actor="orchestrator",
+            )
+            logger.info(
+                "Code graph anchored in audit chain: digest=%s, source=%d, indexed=%d, "
+                "unparsed=%d, inferred=%d, extracted=%d",
+                graph_digest_val[:16],
+                source_count,
+                indexed_count,
+                unparsed_count,
+                inferred_count,
+                extracted_count,
+            )
+        except Exception as exc:
+            logger.warning("Code graph anchoring failed (non-fatal): %s", sanitize_log(str(exc)))
+
         # Zombie cleanup: terminate orphaned agent processes from prior crashed runs.
         try:
             from bernstein.core.zombie_cleanup import scan_and_cleanup_zombies
@@ -1897,7 +3218,7 @@ class Orchestrator:
                     len(_zr.errors),
                 )
         except Exception:
-            logger.exception("Zombie cleanup failed (non-fatal) — continuing startup")
+            logger.exception("Zombie cleanup failed (non-fatal) - continuing startup")
         consecutive_failures = 0
         max_consecutive_failures = ORCHESTRATOR.max_consecutive_failures
         while self._running or self._has_active_agents():
@@ -1917,6 +3238,7 @@ class Orchestrator:
                         "Stopping after %d consecutive tick failures",
                         consecutive_failures,
                     )
+                    self._closure_outcome = RunClosureOutcome.FAILED
                     break
             if self._config.dry_run:
                 break
@@ -1925,15 +3247,15 @@ class Orchestrator:
             server_failures = getattr(self, "_consecutive_server_failures", 0)
             if server_failures > 0:
                 # Backoff: 5s, 10s, 15s, 20s, 30s (capped)
-                time.sleep(min(5.0 * server_failures, 30.0))
+                self._pace(min(5.0 * server_failures, 30.0))
             elif tick_result is not None and (
                 tick_result.spawned or tick_result.verified or tick_result.retried or tick_result.open_tasks > 0
             ):
                 self._idle_multiplier = 1
-                time.sleep(self._config.poll_interval_s)
+                self._pace(self._config.poll_interval_s)
             else:
                 self._idle_multiplier = min(self._idle_multiplier * 2, 8)
-                time.sleep(min(self._config.poll_interval_s * self._idle_multiplier, 30.0))
+                self._pace(min(self._config.poll_interval_s * self._idle_multiplier, 30.0))
 
             # Hot-reload bernstein.yaml config (mutable fields only)
             self._maybe_reload_config()
@@ -1954,19 +3276,208 @@ class Orchestrator:
                 return  # _restart calls os.execv, but just in case
 
         self._drain_before_cleanup()
+        # Persist controller state one last time before cleanup so a
+        # clean exit always leaves a usable sidecar for the next run.
+        self._persist_controller_sidecar()
         self._cleanup()
+
+        # A5 fix: unconditionally regenerate the FINAL retrospective here, at
+        # true orchestrator shutdown (the tick loop has actually exited),
+        # overwriting any earlier "mid-run" snapshot written by
+        # _generate_run_summary()'s tick-level "queue looks empty" heuristic.
+        # This is the only point where every task has had the chance to
+        # reach a terminal state, so it's the only point a HEALTHY verdict
+        # can be trusted (see canary A5 stale-retrospective bug: a run
+        # reported 100%/HEALTHY at T+58s while 2 of 3 tasks subsequently
+        # failed, and the report was never refreshed).
+        #
+        # Regression (2026-07-02 D2 openrouter final leg,
+        # work/bernstein/proofs/d2/openrouter/attempt-final-f15a2a9e): this
+        # block only runs if the tick loop actually exits via `self._running`
+        # going False, i.e. someone called `.stop()` (normally the SIGINT/
+        # SIGTERM handler installed around `orchestrator.run()` in this
+        # module's __main__ block). But `bernstein run --quiet` /
+        # `_wait_for_run_completion()` (cli/run_bootstrap.py) never signals
+        # this process - it just polls the task server's HTTP /status
+        # endpoint from an entirely separate CLI process and returns once
+        # quiescent. This orchestrator subprocess is launched detached
+        # (`start_new_session=True` in server_launch._start_spawner), so
+        # when the CLI process then exits and the container's PID namespace
+        # tears down, the kernel SIGKILLs every process in the namespace
+        # unconditionally - no Python code here ever runs. See
+        # `_regenerate_final_retrospective` / the tick()-level
+        # "tick-quiescence-self-stop" path below for the self-triggered
+        # fix that covers that terminal path too; this call is now a no-op
+        # (guarded by `_final_retrospective_regenerated`) whenever that path
+        # already handled it, and remains the sole trigger for interrupt/
+        # kill-signal shutdowns where `.stop()` IS called.
+        self._regenerate_final_retrospective(trigger_path="tick-loop-drain")
+
         self._post_bulletin("status", "run stopped")
         self._recorder.record(
             "run_completed",
             run_id=self._run_id,
             ticks=self._tick_count,
             fingerprint=self._recorder.fingerprint(),
+            outcome=self._closure_outcome.value,
         )
+        self._mark_finalization_started()
+        try:
+            self._seal_journal_into_lineage_spine()
+            if self._otel_stream is not None:
+                self._otel_stream.finalize()
+            self._write_run_closure()
+        finally:
+            self._mark_finalization_done()
         logger.info(
             "Orchestrator stopped (replay: %s, fingerprint: %s)",
             self._recorder.path,
             self._recorder.fingerprint()[:16] + "...",
         )
+
+    def _seal_journal_into_lineage_spine(self) -> None:
+        """Wire the journal head into the f01 lineage spine (issue #2293).
+
+        Records the finalized journal head into the run's lineage spine so
+        the run's replay identity and its artifact provenance share one
+        root. Failures are logged, never raised: sealing is a provenance
+        aid and must not fail a run that already completed.
+        """
+        try:
+            from bernstein.core.security.audit import load_or_create_audit_key
+
+            hmac_key = load_or_create_audit_key()
+            seal_journal_into_spine(
+                self._recorder,
+                lineage_root=self._workdir / ".sdd" / "lineage",
+                hmac_key=hmac_key,
+                actor="orchestrator",
+            )
+        except Exception as exc:
+            logger.warning("Failed to seal journal head into lineage spine: %s", sanitize_log(str(exc)))
+            logger.warning("Run receipt not written for run %s: journal-head seal failed", self._run_id)
+        else:
+            # Here rather than beside the seal call above: the receipt binds
+            # the spine head as it stands when the receipt is built, so rows
+            # appended after the seal are still covered -- the intent-capsule
+            # seal already relies on that. Inside the try, a provenance
+            # failure would be reported as a seal failure and would withhold
+            # the receipt, which inverts what each one is worth.
+            self._record_run_branch_provenance(hmac_key)
+            self._seal_intent_capsules(hmac_key)
+            self._write_run_receipt()
+
+    def _record_run_branch_provenance(self, hmac_key: bytes) -> None:
+        """Record a lineage row per path this run's branch added (issue #2789).
+
+        The merge boundary in ``spawner_merge`` covers work that arrives
+        through the orchestrator's own merge. Work also reaches a run branch
+        by direct commit and by a supervisor folding a worktree in outside
+        the orchestrator, and a hook on the merge alone leaves those runs
+        with a spine holding nothing the run produced -- the same shape of
+        gap, one path over.
+
+        Failures are logged, never raised: the branch is durable in git and
+        every row is re-derivable from it, so a provenance write that fails
+        must not fail a run that already completed.
+        """
+        try:
+            from bernstein.core.git.git_basic import is_git_repo, resolve_default_branch
+            from bernstein.core.lineage.merge_provenance import record_run_branch_artifacts
+
+            # A workdir that is not a work tree has no branch to read, so
+            # there is nothing to record. Stating that here keeps every such
+            # run from spawning git only to have it fail, and from logging a
+            # warning about a condition that is ordinary rather than wrong.
+            if not is_git_repo(self._workdir):
+                return
+
+            record_run_branch_artifacts(
+                worktree_root=self._workdir,
+                actor="orchestrator",
+                lineage_root=self._workdir / ".sdd" / "lineage",
+                run_id=self._run_id,
+                hmac_key=hmac_key,
+                default_branch=resolve_default_branch(self._workdir),
+            )
+        except Exception as exc:
+            logger.warning("Run-branch provenance not recorded for run %s: %s", self._run_id, sanitize_log(str(exc)))
+
+    def _write_run_receipt(self) -> None:
+        """Write the signed run receipt at finalization (issue #2924).
+
+        Binds the sealed journal head and the run's lineage-spine head into
+        one offline-verifiable ``run-receipt.json`` next to the journal.
+        Called only from the seal hook's success branch: when sealing the
+        journal head into the spine fails, no receipt is written at all
+        (fail-closed) rather than signing a spine whose journal binding is
+        incomplete. Degrades to a documented no-op when no receipt signing
+        key is configured (``BERNSTEIN_RUN_RECEIPT_SIGNING_KEY_PATH`` /
+        ``BERNSTEIN_RUN_RECEIPT_SIGNING_ENV_VAR``) -- the audit-receipt
+        posture: never emit an unsigned "receipt". Failures are logged,
+        never raised: the receipt is a verification aid and must not fail a
+        run that already completed.
+        """
+        try:
+            from bernstein.core.replay.run_receipt import write_run_receipt_if_configured
+
+            receipt_path = write_run_receipt_if_configured(self._run_id, self._workdir / ".sdd")
+        except Exception as exc:
+            logger.warning("Failed to write run receipt: %s", sanitize_log(str(exc)))
+        else:
+            if receipt_path is not None:
+                logger.info("Run receipt written: %s", receipt_path)
+
+    def _write_run_closure(self) -> None:
+        """Commit the final journal head to the universal closure event.
+
+        This runs after the lineage/capsule seal because those operations can
+        append run-attributed audit events.  Closure must be the final event
+        for this run or a verifier will (correctly) invalidate it.
+        """
+        try:
+            from bernstein.core.security.audit_chain import AuditChainStore
+            from bernstein.core.security.run_closure import close_run
+
+            close_run(
+                chain=AuditChainStore(self._workdir / ".sdd" / "audit"),
+                run_id=self._run_id,
+                outcome=self._closure_outcome,
+                actor="orchestrator",
+                run_journal_head=self._recorder.fingerprint(),
+                run_journal_event_count=self._recorder.event_count(),
+            )
+        except Exception as exc:
+            # Honest degradation: absence projects as open.  A closure aid
+            # must not rewrite a run's already-durable execution outcome.
+            logger.warning("Run closure marker not written for run %s: %s", self._run_id, sanitize_log(str(exc)))
+
+    def _seal_intent_capsules(self, hmac_key: bytes) -> None:
+        """Commit the finished journal's end for every capsule bound to this run (#2649).
+
+        Offline verification cannot otherwise tell a truncated journal from a
+        short one: the journal chain recomputes from genesis, so any prefix
+        verifies on its own. Sealing here -- once the run is over and the
+        journal is final -- is what makes a later ``bernstein intent verify``
+        able to attest completeness rather than only "no drift in what remains".
+
+        Idempotent, and failures are logged rather than raised: sealing is an
+        attestation aid and must not fail a run that already completed.
+        """
+        try:
+            from bernstein.core.security.audit_chain import AuditChainStore
+            from bernstein.core.security.intent_capsule import seal_capsules_bound_to_run
+
+            sdd_dir = self._workdir / ".sdd"
+            sealed = seal_capsules_bound_to_run(
+                chain=AuditChainStore(sdd_dir / "audit", key=hmac_key),
+                sdd_dir=sdd_dir,
+                run_id=self._run_id,
+            )
+            if sealed:
+                logger.info("Sealed %d intent capsule(s) for run %s", len(sealed), self._run_id)
+        except Exception as exc:
+            logger.warning("Failed to seal intent capsules: %s", sanitize_log(str(exc)))
 
     def _has_active_agents(self) -> bool:
         """Return True if any agents are still alive (not dead)."""
@@ -1979,7 +3490,7 @@ class Orchestrator:
         """Check WAL files from previous runs for uncommitted entries.
 
         Scans all WAL files in ``.sdd/runtime/wal/`` (excluding the current
-        run) for entries written with ``committed=False`` — these represent
+        run) for entries written with ``committed=False`` - these represent
         task claims where the agent was never successfully spawned (crash
         between claim and spawn).
 
@@ -2014,7 +3525,7 @@ class Orchestrator:
         try:
             self._replay_wal_with_engine(sdd_dir)
         except Exception:
-            logger.exception("WAL replay engine failed (non-fatal) — continuing with legacy recovery")
+            logger.exception("WAL replay engine failed (non-fatal) - continuing with legacy recovery")
         uncommitted = WALRecovery.scan_all_uncommitted(
             sdd_dir,
             exclude_run_id=self._run_id,
@@ -2232,7 +3743,7 @@ class Orchestrator:
                 resp.raise_for_status()
             except Exception as exc:
                 logger.warning(
-                    "WAL replay: /tasks/%s/fail failed (%s) — orphan will be handled by legacy force-claim recovery",
+                    "WAL replay: /tasks/%s/fail failed (%s) - orphan will be handled by legacy force-claim recovery",
                     task_id,
                     exc,
                 )
@@ -2580,8 +4091,13 @@ class Orchestrator:
 
         return preserved
 
-    def stop(self) -> None:
+    def stop(
+        self,
+        *,
+        outcome: RunClosureOutcome | str = RunClosureOutcome.CANCELLED,
+    ) -> None:
         """Delegate to orchestrator_cleanup.stop."""
+        self._closure_outcome = RunClosureOutcome(outcome)
         from bernstein.core.orchestration import orchestrator_cleanup
 
         orchestrator_cleanup.stop(self)
@@ -2631,24 +4147,33 @@ class Orchestrator:
             quarantine=self._quarantine,
             workdir=self._workdir,
             session_id=session.id if session is not None else None,
+            role_model_policy=getattr(self._spawner, "role_model_policy", None),
+            run_pinned_model=getattr(self._spawner, "default_model", None),
         )
 
     def _handle_anomaly_signal(self, signal: object) -> None:
         """Dispatch an anomaly signal: log, stop spawning, or kill agent."""
         import contextlib
 
+        from bernstein.core.agents import heartbeat as heartbeat_protocol
         from bernstein.core.cost_anomaly import AnomalySignal
 
         assert isinstance(signal, AnomalySignal)
         self._anomaly_detector.record_signal(signal)
         if signal.action == "kill_agent" and signal.agent_id:
-            logger.warning("Anomaly [%s]: %s — killing agent", signal.rule, signal.message)
+            logger.warning("Anomaly [%s]: %s - killing agent", signal.rule, signal.message)
             session = self._agents.get(signal.agent_id)
             if session:
                 with contextlib.suppress(Exception):
                     self._spawner.kill(session)
+                # Every forced-kill path must reap the session's backgrounded
+                # heartbeat shell loop (see heartbeat.py's
+                # _reap_session_heartbeat_loop / Defect-10) so the loop does
+                # not outlive the agent it was monitoring.
+                with contextlib.suppress(Exception):
+                    heartbeat_protocol._reap_session_heartbeat_loop(self, session, reason="anomaly_kill")
         elif signal.action == "stop_spawning":
-            logger.warning("Anomaly [%s]: %s — stopping new spawns", signal.rule, signal.message)
+            logger.warning("Anomaly [%s]: %s - stopping new spawns", signal.rule, signal.message)
             self._stop_spawning = True
         else:
             logger.info("Anomaly [%s]: %s", signal.rule, signal.message)
@@ -2732,11 +4257,47 @@ class Orchestrator:
                     )
 
     def _record_live_costs(self) -> None:
-        """Update live cost tracker from active agent token usage."""
+        """Update live cost tracker from active agent token usage.
+
+        Bug item-7 (2026-07-02, D2 claude FAIL-NOTE): ``session.tokens_used``
+        is never populated on the openai_agents provider path, so this tick
+        skipped every live agent and the run ledger's ``spent_usd`` stayed
+        0.0 for the entire run - budget guards were unenforceable while real
+        cost accumulated only in the ``.tokens`` sidecars. Fix: read each
+        live session's cumulative sidecar totals (the same source of truth
+        the orphan-recovery path prices dead agents from) and feed them to
+        the delta-safe ``record_cumulative``. ``session.tokens_used`` remains
+        the fallback for providers that don't write a sidecar.
+        """
+        from bernstein.core.cost.cost import read_tokens_sidecar_totals  # local: avoid import cycle
+
         any_change = False
         for session in self._agents.values():
-            if session.status == "dead" or session.tokens_used <= 0:
+            if session.status == "dead":
                 continue
+
+            # Same sidecar location contract as the openai_agents runner and
+            # the orphan-recovery path: .sdd/runtime/<session_id>.tokens at
+            # the orchestrator root (never inside a per-task worktree).
+            sidecar_path = self._workdir / ".sdd" / "runtime" / f"{session.id}.tokens"
+            sidecar_in, sidecar_out = read_tokens_sidecar_totals(sidecar_path)
+            if sidecar_in > 0 or sidecar_out > 0:
+                total_in, total_out = sidecar_in, sidecar_out
+                token_source = str(sidecar_path)
+            elif session.tokens_used > 0:
+                total_in, total_out = session.tokens_used, 0
+                token_source = "session.tokens_used"
+            else:
+                continue
+            # "tokens" here are LLM usage counts, not credentials.
+            # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
+            logger.debug(
+                "live_cost_tick: session=%s tokens_in=%d tokens_out=%d source=%s",
+                session.id,
+                total_in,
+                total_out,
+                token_source,
+            )
 
             model_name = session.model_config.model if session.model_config else "sonnet"
             task_id = session.task_ids[0] if session.task_ids else f"live-{session.id}"
@@ -2747,8 +4308,8 @@ class Orchestrator:
                 agent_id=session.id,
                 task_id=task_id,
                 model=model_name,
-                total_input_tokens=session.tokens_used,
-                total_output_tokens=0,
+                total_input_tokens=total_in,
+                total_output_tokens=total_out,
                 role=role_label,
             )
             if delta_cost > 0:
@@ -2880,8 +4441,16 @@ class Orchestrator:
 
         with contextlib.suppress(Exception):
             self._spawner.kill(session)
+        # Every forced-kill path must reap the session's backgrounded
+        # heartbeat shell loop (see heartbeat.py's
+        # _reap_session_heartbeat_loop / Defect-10) so the loop does not
+        # outlive the agent it was monitoring.
+        with contextlib.suppress(Exception):
+            from bernstein.core.agents import heartbeat as heartbeat_protocol
 
-        from bernstein.core.lifecycle import transition_agent
+            heartbeat_protocol._reap_session_heartbeat_loop(self, session, reason="cost_cap_kill")
+
+        from bernstein.core.tasks.lifecycle import transition_agent
 
         transition_agent(session, "dead", actor="orchestrator", reason="max_cost_per_agent exceeded")
         self._release_file_ownership(session.id)
@@ -2898,6 +4467,9 @@ class Orchestrator:
                     max_task_retries=self._config.max_task_retries,
                     retried_task_ids=self._retried_task_ids,
                     workdir=self._workdir,
+                    role_model_policy=getattr(self._spawner, "role_model_policy", None),
+                    default_adapter_name=getattr(self._spawner, "default_adapter_name", None),
+                    run_pinned_model=getattr(self._spawner, "default_model", None),
                 )
 
     def _enforce_budget_killswitch(self) -> None:
@@ -2921,7 +4493,7 @@ class Orchestrator:
         """
         status = self._cost_tracker.status()
         if not status.should_stop:
-            # Budget was increased or the tracker reset — re-arm so a
+            # Budget was increased or the tracker reset - re-arm so a
             # future exhaustion triggers a fresh SHUTDOWN wave.
             if self._budget_stop_fired_at is not None:
                 logger.info("Budget kill-switch re-armed (spend back under threshold)")
@@ -2939,7 +4511,7 @@ class Orchestrator:
                 f"({status.percentage_used * 100:.1f}%)"
             )
             logger.warning(
-                "Budget kill-switch fired — sending SHUTDOWN to %d live agent(s); SIGKILL after %ds grace period",
+                "Budget kill-switch fired - sending SHUTDOWN to %d live agent(s); SIGKILL after %ds grace period",
                 len(live_sessions),
                 self._cost_tracker.kill_grace_period_s,
             )
@@ -2954,7 +4526,7 @@ class Orchestrator:
             )
             self._notify(
                 "budget.exhaust",
-                "Budget exhausted — terminating agents",
+                "Budget exhausted - terminating agents",
                 (
                     f"Spent ${status.spent_usd:.4f} of ${status.budget_usd:.2f} "
                     f"({status.percentage_used * 100:.1f}%). SHUTDOWN sent to "
@@ -2984,10 +4556,18 @@ class Orchestrator:
             elapsed,
             len(pending_kill),
         )
+        from bernstein.core.agents import heartbeat as heartbeat_protocol
+
         for session in pending_kill:
             self._budget_stop_killed_agents.add(session.id)
             with contextlib.suppress(Exception):
                 self._spawner.kill(session)
+            # Every forced-kill path must reap the session's backgrounded
+            # heartbeat shell loop (see heartbeat.py's
+            # _reap_session_heartbeat_loop / Defect-10) so the loop does
+            # not outlive the agent it was monitoring.
+            with contextlib.suppress(Exception):
+                heartbeat_protocol._reap_session_heartbeat_loop(self, session, reason="budget_killswitch")
         self._post_bulletin(
             "alert",
             f"budget.exhaust: SIGKILLed {len(pending_kill)} agent(s) after "
@@ -3132,7 +4712,7 @@ class Orchestrator:
             self._consecutive_server_failures += 1
             if self._consecutive_server_failures >= ORCHESTRATOR.server_failure_warn:
                 logger.critical(
-                    "Task server health check failed %d consecutive times — "
+                    "Task server health check failed %d consecutive times - "
                     "server may have crashed (watchdog should restart it)",
                     self._consecutive_server_failures,
                 )
@@ -3179,12 +4759,13 @@ class Orchestrator:
         return unclaimed
 
     def _release_stale_claims(self, claimed_tasks: list[Task]) -> int:
-        """Fail claimed tasks that have been stuck longer than the timeout.
+        """Release claimed tasks whose agent is dead or whose claim is stale.
 
-        When an agent dies silently (no crash signal, no heartbeat timeout),
-        its claimed tasks stay in "claimed" forever.  This method detects
-        tasks with no matching live agent that have exceeded the stale claim
-        timeout and marks them failed so they can be retried.
+        Two paths:
+        - Dead/gone agent: retry immediately via ``_retry_or_fail_task``.
+          The agent is confirmed gone (not tracked, or marked dead), so
+          waiting for a timeout is pointless.
+        - Live but slow agent: fail after ``stale_claim_timeout_s``.
 
         Args:
             claimed_tasks: Tasks with status "claimed" from the current tick.
@@ -3196,37 +4777,54 @@ class Orchestrator:
         timeout = self._config.stale_claim_timeout_s
         released = 0
         for task in claimed_tasks:
-            # Skip tasks that have a known live agent in this session
-            if task.id in self._task_to_session:
-                agent_id = self._task_to_session[task.id]
-                agent = self._agents.get(agent_id)
-                if agent is not None and agent.status != "dead":
-                    continue
+            agent_id = self._task_to_session.get(task.id)
+            agent = self._agents.get(agent_id) if agent_id is not None else None
+            agent_dead = agent is None or agent.status == "dead"
 
-            # Use claimed_at (when available) to measure actual time in claimed
-            # state.  Fall back to created_at for legacy tasks that pre-date the
-            # claimed_at field — this is conservative (over-counts) but safe.
-            claim_epoch = task.claimed_at if task.claimed_at is not None else task.created_at
-            age_s = now - claim_epoch
-            if age_s < timeout:
+            if agent_dead:
+                # Agent confirmed gone — reclaim immediately, no timeout wait.
+                try:
+                    self._retry_or_fail_task(
+                        task.id,
+                        reason=("Dead agent: claimed task held by agent no longer tracked (or confirmed dead)"),
+                    )
+                    released += 1
+                    logger.warning(
+                        "Immediately reclaimed task %s (%s) from dead/gone agent",
+                        task.id,
+                        task.title,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to reclaim task %s from dead agent",
+                        task.id,
+                        exc_info=True,
+                    )
                 continue
 
-            try:
-                fail_task(
-                    self._client,
-                    self._config.server_url,
-                    task.id,
-                    reason=f"Stale claim: task stuck in claimed state for {age_s / 60:.0f}m with no live agent",
-                )
-                released += 1
-                logger.warning(
-                    "Released stale claimed task %s (%s) — stuck for %.0fm",
-                    task.id,
-                    task.title,
-                    age_s / 60,
-                )
-            except Exception:
-                logger.debug("Failed to release stale task %s", task.id, exc_info=True)
+            # Agent is alive but the claim may be stale (slow agent).
+            if task.id in self._task_to_session:
+                claim_epoch = task.claimed_at if task.claimed_at is not None else task.created_at
+                age_s = now - claim_epoch
+                if age_s < timeout:
+                    continue
+
+                try:
+                    fail_task(
+                        self._client,
+                        self._config.server_url,
+                        task.id,
+                        reason=f"Stale claim: task stuck in claimed state for {age_s / 60:.0f}m with no live agent",
+                    )
+                    released += 1
+                    logger.warning(
+                        "Released stale claimed task %s (%s) - stuck for %.0fm",
+                        task.id,
+                        task.title,
+                        age_s / 60,
+                    )
+                except Exception:
+                    logger.debug("Failed to release stale task %s", task.id, exc_info=True)
 
         if released:
             logger.warning("Released %d stale claimed task(s)", released)
@@ -3235,6 +4833,46 @@ class Orchestrator:
     def _collect_completion_data(self, session: AgentSession) -> CompletionData:
         """Delegate to task_lifecycle.collect_completion_data."""
         return collect_completion_data(self._workdir, session)
+
+    def _check_for_incidents(self, tasks_by_status: dict[str, list[Task]]) -> None:
+        """Detect and record incidents from terminal task-board state.
+
+        The failed/total counts fed to the incident manager come from the
+        task server's own ``done``/``failed`` buckets via
+        :func:`error_budget_from_task_board`, never from the observability
+        collector's in-memory success bit or from agent process exit
+        codes. An agent whose process dies (SIGTERM from heartbeat
+        escalation, OOM, a plain crash) after its claimed task already
+        reached ``done`` must not move this ratio (#4310).
+
+        Args:
+            tasks_by_status: Task board buckets fetched this tick.
+        """
+        board_budget = error_budget_from_task_board(
+            tasks_by_status, slo_target=self._slo_tracker.error_budget.slo_target
+        )
+        failed_ids = [t.id for t in tasks_by_status.get("failed", [])]
+        incident = self._incident_manager.check_for_incidents(
+            failed_task_count=board_budget.failed_tasks,
+            total_task_count=board_budget.total_tasks,
+            consecutive_failures=self._consecutive_failures,
+            error_budget_depleted=board_budget.is_depleted,
+            contributing_task_ids=failed_ids,
+        )
+        self._incident_manager.save(self._workdir / ".sdd" / "runtime")
+
+        # Notify PagerDuty on SEV1/SEV2 incidents
+        if incident is not None and incident.severity in ("sev1", "sev2"):
+            self._notify(
+                "incident.critical",
+                f"Incident [{incident.severity.value.upper()}]: {incident.title}",
+                incident.description,
+                incident_id=incident.id,
+                severity=incident.severity.value,
+                failed_tasks=str(board_budget.failed_tasks),
+                total_tasks=str(board_budget.total_tasks),
+                consecutive_failures=str(self._consecutive_failures),
+            )
 
     def _should_trigger_manager_review(self, failed_count: int) -> bool:
         """Return True when a manager queue review is warranted.
@@ -3320,6 +4958,7 @@ class Orchestrator:
         task_id: str,
         reason: str,
         tasks_snapshot: dict[str, list[Task]] | None = None,
+        transport_failure: bool = False,
     ) -> None:
         """Delegate to task_lifecycle.retry_or_fail_task."""
         retry_or_fail_task(
@@ -3331,6 +4970,10 @@ class Orchestrator:
             retried_task_ids=self._retried_task_ids,
             tasks_snapshot=tasks_snapshot,
             workdir=self._workdir,
+            role_model_policy=getattr(self._spawner, "role_model_policy", None),
+            default_adapter_name=getattr(self._spawner, "default_adapter_name", None),
+            run_pinned_model=getattr(self._spawner, "default_model", None),
+            transport_failure=transport_failure,
         )
 
     def _check_file_overlap(self, batch: list[Task]) -> bool:
@@ -3345,7 +4988,11 @@ class Orchestrator:
         if not all_files:
             return False
 
-        # In-memory ownership check — filters out dead agents explicitly.
+        held_by: dict[str, str] = {}
+        lock_timestamps: dict[str, float] = {}
+        conflict = False
+
+        # In-memory ownership check - filters out dead agents explicitly.
         for fpath in all_files:
             owner_id = self._file_ownership.get(fpath)
             if owner_id:
@@ -3356,7 +5003,8 @@ class Orchestrator:
                         fpath,
                         owner_id,
                     )
-                    return True
+                    held_by[fpath] = owner_id
+                    conflict = True
 
         # Persistent lock check (survives crashes via FileLockManager TTL).
         conflicts = self._lock_manager.check_conflicts(all_files)
@@ -3368,8 +5016,48 @@ class Orchestrator:
                     lock.agent_id,
                     lock.task_id,
                 )
+                held_by[fpath] = lock.agent_id
+                lock_timestamps[lock.agent_id] = min(lock.locked_at, lock_timestamps.get(lock.agent_id, lock.locked_at))
+                conflict = True
+
+        if conflict:
+            detector = self._loop_detector
+            if detector:
+                waiting_agent = self.resolve_waiting_agent(batch[0].parent_task_id if batch else None)
+                if waiting_agent:
+                    detector.record_lock_wait(
+                        waiting_agent_id=waiting_agent,
+                        wanted_files=all_files,
+                        held_by=held_by,
+                        lock_timestamps=lock_timestamps if lock_timestamps else None,
+                    )
             return True
+
         return False
+
+    def resolve_waiting_agent(self, parent_task_id: str | None) -> str | None:
+        """Return the agent id waiting on ``parent_task_id``, or ``None``.
+
+        Recording a wait and clearing it must key on the same id, or the
+        wait-for graph keeps an entry nothing can ever remove -- the leak
+        this wiring exists to avoid. One resolver, called from both sides,
+        is what keeps them from drifting apart.
+
+        Returns ``None`` rather than substituting a task id when no agent
+        owns the task: a task id can never close a cycle in a graph whose
+        every target is an agent id, so an invented node is a permanent
+        non-participant, not a conservative default.
+        """
+        if not parent_task_id:
+            return None
+        owner = self._task_to_session.get(parent_task_id)
+        if owner:
+            return owner
+        for sessions in (self._agents, self._batch_sessions):
+            for session in sessions.values():
+                if parent_task_id in session.task_ids:
+                    return session.id
+        return None
 
     def _should_auto_decompose(self, task: Task) -> bool:
         """Delegate to task_lifecycle.should_auto_decompose."""
@@ -3398,6 +5086,30 @@ class Orchestrator:
         from bernstein.core.orchestration import orchestrator_cleanup
 
         orchestrator_cleanup.save_session_state(self)
+
+    def _persist_controller_sidecar(self) -> None:
+        """Persist the current adaptive-parallelism and claim-conflict state to the sidecar.
+
+        Best-effort: failures are logged and never raised so a broken
+        sidecar path cannot prevent a clean shutdown.
+        """
+        try:
+            _ap_state = AdaptiveParallelismState(
+                configured_max=self._adaptive_parallelism.configured_max,
+                current_max=self._adaptive_parallelism._current_max,
+                slo_constrained_max=self._adaptive_parallelism._slo_constrained_max,
+                last_adjustment_reason=self._adaptive_parallelism._last_adjustment_reason,
+                low_error_since_epoch=self._adaptive_parallelism._low_error_since,
+            )
+            _conflict_entries: dict[str, ClaimConflictEntry] = {}
+            for _tid, (_ep, _until) in self._claim_conflict_state.items():
+                _conflict_entries[_tid] = ClaimConflictEntry(
+                    episode_count=int(_ep),
+                    backoff_until_epoch=float(_until),
+                )
+            _save_controller_state(self._workdir, _ap_state, _conflict_entries)
+        except Exception:
+            logger.warning("Controller sidecar persist failed during shutdown", exc_info=True)
 
     def _cleanup(self) -> None:
         """Delegate to orchestrator_cleanup.cleanup."""
@@ -3589,7 +5301,7 @@ class Orchestrator:
 
         claimed_dir.mkdir(parents=True, exist_ok=True)
 
-        from bernstein.core.backlog_parser import parse_backlog_text
+        from bernstein.core.backlog_parser import BacklogParseError, parse_backlog_text
 
         # Phase 1: Parse all candidates, filter dupes, sort by priority
         candidates: list[tuple[Path, ParsedBacklogTask]] = []
@@ -3598,9 +5310,17 @@ class Orchestrator:
                 continue
 
             content = backlog_file.read_text(encoding="utf-8")
-            parsed_task = parse_backlog_text(backlog_file.name, content)
+            try:
+                parsed_task = parse_backlog_text(backlog_file.name, content)
+            except BacklogParseError as exc:
+                # Fail-closed per file (#3110): a malformed declaration is
+                # refused with the offending field named and never becomes a
+                # code_diff task; the scan continues with the other files.
+                logger.error("ingest_backlog: refused %s - %s", backlog_file.name, exc)
+                self._claim_backlog_file(backlog_file, open_dir, claimed_dir)
+                continue
             if parsed_task is None:
-                logger.warning("ingest_backlog: could not parse %s — skipping", backlog_file.name)
+                logger.warning("ingest_backlog: could not parse %s - skipping", backlog_file.name)
                 self._claim_backlog_file(backlog_file, open_dir, claimed_dir)
                 continue
 
@@ -3618,7 +5338,7 @@ class Orchestrator:
         if not batch_files:
             return 0
 
-        # Phase 2: POST batch — single HTTP call for all collected tasks
+        # Phase 2: POST batch - single HTTP call for all collected tasks
         payloads = [parsed.to_task_payload() for _, parsed in batch_files]
         try:
             resp = self._client.post(
@@ -3629,7 +5349,7 @@ class Orchestrator:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in (404, 422):
                 # 404: server doesn't support batch yet (older build).
-                # 422: one task in the batch fails pydantic validation — a
+                # 422: one task in the batch fails pydantic validation - a
                 # single oversized title would otherwise poison every batch
                 # for the whole run.  Fall back to one-by-one so valid tasks
                 # still land and only the bad task keeps retrying.
@@ -3640,7 +5360,7 @@ class Orchestrator:
             logger.warning("ingest_backlog: batch POST failed: %s", exc)
             return 0
 
-        # Phase 3: Mark files as claimed — only on success
+        # Phase 3: Mark files as claimed - only on success
         count = 0
         for backlog_file, parsed in batch_files:
             title_key = parsed.title.lower().strip()
@@ -3655,7 +5375,7 @@ class Orchestrator:
         """Mark a backlog file as claimed.
 
         Files from ``open/`` are moved into ``claimed/``.
-        Files from ``issues/`` stay in place — only a marker is created in
+        Files from ``issues/`` stay in place - only a marker is created in
         ``claimed/`` so they are not re-ingested.
         """
         with contextlib.suppress(OSError):
@@ -3696,12 +5416,78 @@ class Orchestrator:
 
     # -- Run summary --------------------------------------------------------
 
+    def _refresh_drain_tracker(self, refreshed_tasks_by_status: dict[str, list[Task]]) -> int:
+        """Update the post-/complete drain counter against freshly-fetched tasks.
+
+        Defect 29 (2026-07-02, work/bernstein/proofs/d2/minimax/attempt-83808a8a):
+        the run-summary used to fire the moment ``open_tasks == active_agents == 0``
+        held, with no check that the post-/complete chain (task_done ->
+        ``_reap_and_cleanup_session`` -> ``_apply_janitor_verdict_action``)
+        had actually run for the just-completed tasks. On MiniMax-M2.7-highspeed
+        ~40 s child runtimes that race always lost - janitor never fired,
+        ``generate_retrospective`` was skipped because the chain never registered
+        the completion in ``_processed_done_tasks``, and no merge-to-main
+        happened before the orchestrator self-stopped.
+
+        Definition of "drained" for a single task:
+
+        * Its id is in ``self._processed_done_tasks`` (the orchestrator's
+          ``process_completed_tasks`` step has at least started the chain), AND
+        * Its session is either absent (``_find_session_for_task`` returns
+          ``None`` -- the agent never had a worktree, or it was cleaned up)
+          or its session.status == ``"dead"`` (the reap step inside
+          ``_reap_and_cleanup_session`` transitioned it).
+
+        The function returns the current pending count after the refresh.
+
+        Args:
+            refreshed_tasks_by_status: Latest task buckets from the refetch
+                inside the step 8b block.
+
+        Returns:
+            The number of tasks whose post-/complete chain has NOT yet drained.
+        """
+        terminal_ids: set[str] = set()
+        for bucket in ("done", "failed"):
+            terminal_ids.update(t.id for t in refreshed_tasks_by_status.get(bucket, []))
+
+        # Increment for any newly-observed terminal task.
+        for tid in terminal_ids:
+            if tid not in self._post_complete_seen_task_ids:
+                self._pending_post_complete_count += 1
+                self._post_complete_seen_task_ids.add(tid)
+
+        # Decrement for tasks whose chain has fully drained. We iterate over
+        # a snapshot because we mutate the set below.
+        for tid in list(self._post_complete_seen_task_ids):
+            if tid not in self._processed_done_tasks:
+                # process_completed_tasks hasn't started the chain for this
+                # task yet (e.g. auto-complete-by-reap happened in this tick
+                # AFTER process_completed_tasks ran). Leave the counter alone.
+                continue
+            session = self._find_session_for_task(tid)
+            if session is None or session.status == "dead":
+                self._pending_post_complete_count -= 1
+                self._post_complete_seen_task_ids.discard(tid)
+
+        return self._pending_post_complete_count
+
     def _generate_run_summary(
         self,
         done_tasks: list[Task],
         failed_tasks: list[Task],
+        *,
+        full_status_counts: dict[str, int] | None = None,
     ) -> None:
-        """Write a run completion summary to .sdd/runtime/summary.md."""
+        """Write a run completion summary to .sdd/runtime/summary.md.
+
+        ``full_status_counts`` is the per-status task histogram at this moment.
+        Without it the interim retrospective sees only done and failed, so a run
+        whose tasks are all still open/claimed/in-progress/orphaned reports
+        ``0/0`` and HEALTHY (issue #3010): ``count_incomplete_declared(None)``
+        is 0, and nothing else in the report can tell "no tasks finished
+        because there were none" from "no tasks finished at all".
+        """
         runtime_dir = self._workdir / ".sdd" / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         summary_path = runtime_dir / "summary.md"
@@ -3713,6 +5499,22 @@ class Orchestrator:
         collector = get_collector(self._workdir / ".sdd" / "metrics")
         total_cost = collector.get_total_cost()
         files_modified: int = sum(getattr(m, "files_modified", 0) for m in collector.task_metrics.values())
+
+        # Defect 29 firing log: every input that the run-end decision was
+        # made against, so a 2-minute diagnosis from logs alone is possible.
+        logger.info(
+            "run_summary_firing: tick=#%d tasks_completed=%d tasks_failed=%d "
+            "files_modified=%d cost_usd=%.4f wall_clock_s=%.1f "
+            "pending_post_complete=%d processed_done_tasks=%d -> action=fire_summary",
+            self._tick_count,
+            total_completed,
+            total_failed,
+            files_modified,
+            total_cost,
+            wall_clock_s,
+            self._pending_post_complete_count,
+            len(self._processed_done_tasks),
+        )
 
         task_lines: list[str] = [f"- [x] {task.title}" for task in sorted(done_tasks, key=lambda t: t.title)]
         for task in sorted(failed_tasks, key=lambda t: t.title):
@@ -3775,12 +5577,28 @@ class Orchestrator:
             duration=duration_str,
         )
 
+        # NOTE: _generate_run_summary() is invoked from the tick-level "queue
+        # looks empty" heuristic (see 8b in tick()), not true orchestrator
+        # shutdown - child tasks can still fail afterwards (janitor rejection,
+        # etc.). Mark this retrospective INTERIM; run() re-generates the
+        # FINAL retrospective, unconditionally overwriting this one, once the
+        # tick loop actually exits (see A5 stale-retrospective bug).
+        #
+        # The histogram has to be threaded through even though this report is
+        # interim: when quiescence holds with zero terminal tasks the tick loop
+        # never exits (the self-stop block at 8b is nested under
+        # `_had_any_terminal_task`), so the FINAL regeneration never runs and
+        # this interim report is the only retrospective the run ever writes.
+        # Giving the orchestrator a terminal state for that case is a separate
+        # change to the main loop, tracked apart from this PR.
         generate_retrospective(
             done_tasks=done_tasks,
             failed_tasks=failed_tasks,
             collector=collector,
             runtime_dir=runtime_dir,
             run_start_ts=self._run_start_ts,
+            trigger_reason="mid-run",
+            full_status_counts=full_status_counts,
         )
 
         # Auto-PR: create a GitHub PR if BERNSTEIN_AUTO_PR is set
@@ -3980,8 +5798,55 @@ class Orchestrator:
                 ]
             )
 
+        evidence = self._evidence_projection_for_tasks(done_tasks)
+        if evidence:
+            body_lines.extend(["## Evidence", "", evidence, ""])
+
         body_lines.extend(["---", "*Generated by Bernstein*"])
         return "\n".join(body_lines)
+
+    def _evidence_projection_for_tasks(self, done_tasks: list[Task]) -> str:
+        """Project the first completed task's sealed evidence bundle (AC3).
+
+        Reads the sealed verification-evidence bundle off disk for each done task
+        in turn and returns the tracker-comment projection (gate verdict, anchor
+        prefix, offline verify command) for the first one present -- the same
+        pointer the canonical ``bernstein pr`` path emits.
+
+        Fail-open (issue #2362): resolving or projecting a bundle must never
+        block or fail auto-PR creation, so any error is caught, sanitised-logged,
+        and swallowed, and a task with no sealed bundle yields an empty string --
+        the body is then exactly as before.
+        """
+        try:
+            from bernstein.core.evidence.bundle import read_evidence_bundle
+            from bernstein.github_app.evidence_projection import build_evidence_projection
+
+            for task in done_tasks:
+                bundle = read_evidence_bundle(self._workdir, task.id)
+                if bundle is not None:
+                    return build_evidence_projection(bundle)
+        except Exception as exc:  # fail-open: evidence must never block auto-PR
+            logger.warning(
+                "Auto-PR: evidence projection failed; PR body unchanged: %s",
+                sanitize_log(str(exc)),
+            )
+        return ""
+
+    def _collect_isolation_downgrades(self) -> list[dict[str, str]]:
+        """Return requested-vs-actual isolation downgrades from the spawner.
+
+        Issue #3014: when a container isolation request cannot be honoured, the
+        spawn falls back to a weaker boundary and records the downgrade.
+        Draining it into the run summary makes the downgrade visible in the run
+        outcome.
+        Guarded so an older or stubbed spawner without the attribute never
+        breaks summary emission.
+        """
+        downgrades = getattr(self._spawner, "isolation_downgrades", None)
+        if not isinstance(downgrades, list):
+            return []
+        return [d.as_dict() for d in downgrades]
 
     def _emit_summary_card(
         self,
@@ -4021,6 +5886,7 @@ class Orchestrator:
             wall_clock_seconds=wall_clock_s,
             total_cost_usd=total_cost,
             quality_score=quality_score,
+            isolation_downgrades=self._collect_isolation_downgrades(),
         )
 
         sdd_dir = self._workdir / ".sdd"
@@ -4042,6 +5908,7 @@ class Orchestrator:
             session = self._agents.get(session_id)
             if session is None:
                 continue
+            self._record_mutation_capability_once(session)
             self._recorder.record(
                 "agent_spawned",
                 agent_id=session.id,
@@ -4050,7 +5917,70 @@ class Orchestrator:
                 provider=session.provider,
                 task_ids=session.task_ids,
                 agent_source=session.agent_source,
+                # Issue #4908: record the resolved endpoint identity
+                # (adapter, model, base_url, endpoint_profile_name) so
+                # operators can answer "which model server produced this
+                # work" from the run record alone. Only the api_key_env
+                # variable *name* is recorded; its value is never exposed.
+                endpoint_adapter_name=session.endpoint_adapter_name,
+                endpoint_model=session.endpoint_model,
+                endpoint_base_url=session.endpoint_base_url,
+                endpoint_profile_name=session.endpoint_profile_name,
             )
+            # Issue #3375: pin the declared context files the spawner resolved
+            # for this session at their content addresses. Recorded only when
+            # the tasks declared something, so undeclared runs journal exactly
+            # what they did before. Entries keep declared order; unresolvable
+            # paths hold their position with a reason code.
+            if session.context_attachments:
+                self._recorder.record(
+                    CONTEXT_FILES_ATTACHED_EVENT,
+                    agent_id=session.id,
+                    task_ids=session.task_ids,
+                    entries=list(session.context_attachments),
+                )
+            # Issue #3382: pin the skill templates injected into this
+            # session's worktree at spawn/resume time, with both the
+            # pre-render and rendered-bytes digests. Unlike
+            # context.files_attached, this is emitted unconditionally -
+            # skills have an always-inject default (_ALWAYS_INJECT), so
+            # an empty set on a fresh spawn is itself meaningful and must
+            # not be silently indistinguishable from "never recorded".
+            self._recorder.record(
+                SKILLS_INJECTED_EVENT,
+                agent_id=session.id,
+                task_ids=session.task_ids,
+                entries=list(session.injected_skills),
+            )
+            # Issue #3382: anchor each injected skill's content hash to this
+            # run's lineage spine, so provenance queries can answer "which
+            # runs used skill X" independently of the human-readable
+            # activation log or the journal event above.
+            workdir = getattr(self, "_workdir", None)
+            if session.injected_skills and workdir is not None:
+                from bernstein import get_templates_dir
+
+                run_id = getattr(self, "_run_id", "")
+                hmac_key = load_or_create_audit_key()
+                lineage_root = workdir / ".sdd" / "lineage"
+                spine = LineageSpine(lineage_root, run_id=run_id, hmac_key=hmac_key)
+                journal_head = spine.head_hash()
+                skills_dir = get_templates_dir(workdir) / "skills"
+                for record in session.injected_skills:
+                    if record.get("status") != "injected":
+                        continue
+                    template_name = record.get("template_name", "")
+                    skill_source = skills_dir / template_name
+                    if not skill_source.is_file():
+                        continue
+                    skill_hash = "sha256:" + hashlib.sha256(skill_source.read_bytes()).hexdigest()
+                    record_usage(
+                        workdir=workdir,
+                        skill_hash=skill_hash,
+                        run_id=run_id,
+                        journal_head=journal_head,
+                        timestamp=int(time.time()),
+                    )
             for tid in session.task_ids:
                 self._recorder.record(
                     "task_claimed",
@@ -4077,10 +6007,134 @@ class Orchestrator:
             self._recorder.record("task_verification_failed", task_id=task_id, failed_signals=failed_signals)
 
         for agent_id in result.reaped:
+            self._record_provider_mutations_for(agent_id)
             self._recorder.record("agent_reaped", agent_id=agent_id)
 
         for task_id in result.retried:
             self._recorder.record("task_retried", task_id=task_id)
+
+    def _record_mutation_capability_once(self, session: AgentSession) -> None:
+        """Record a provider's mutation-observability capability once per run.
+
+        Issue #2507: the adapter contract declares whether provider-side
+        context mutations are observable at all. Recording the declaration
+        into the journal keeps an absence of mutation entries
+        distinguishable from an inability to see them.
+
+        Issue #2646: the capability is resolved and recorded *before* the
+        dedup key is set, and the key is the resolved adapter name (not the
+        raw provider label). A failed record is retried on the next spawn
+        instead of being marked done, and provider-less sessions that resolve
+        to different adapters no longer collapse to a single key. Failures are
+        logged and swallowed: capability recording must never break a spawn
+        tick.
+        """
+        try:
+            from bernstein.core.replay.provider_state import (
+                capability_for_provider,
+                record_mutation_capability,
+            )
+
+            model = session.model_config.model if session.model_config else ""
+            adapter_name, capability = capability_for_provider(session.provider, model)
+            if adapter_name in self._mutation_capability_recorded:
+                return
+            record_mutation_capability(self._recorder, adapter=adapter_name, capability=capability)
+            self._mutation_capability_recorded.add(adapter_name)
+        except Exception as exc:
+            logger.warning("provider-state: capability recording failed: %s", type(exc).__name__)
+
+    def _record_provider_mutations_for(self, agent_id: str) -> None:
+        """Chain a reaped agent's observed provider-side mutations (issue #2507).
+
+        Reads the mutation signals the adapter observed for the session and
+        chains each one into the run journal as a content-addressed
+        ``provider_state_mutation`` entry, before the ``agent_reaped`` event,
+        so nothing downstream builds on unrecorded state. In deterministic
+        modes the entries are flagged and replay verification fails closed.
+        Failures are logged and swallowed: recording must never break a tick.
+        """
+        session = self._agents.get(agent_id)
+        if session is None:
+            return
+        try:
+            from bernstein.adapters.registry import adapter_name_for_provider, get_adapter
+            from bernstein.core.replay.provider_state import record_agent_mutations
+
+            model = session.model_config.model if session.model_config else ""
+            adapter_name = adapter_name_for_provider(session.provider, model)
+            if not adapter_name:
+                return
+            adapter = get_adapter(adapter_name)
+            signals = adapter.observed_provider_mutations(self._workdir, session.id)
+            if not signals:
+                return
+            record_agent_mutations(
+                self._recorder,
+                signals,
+                agent_id=agent_id,
+                audit_chain=self._get_provider_audit_chain(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "provider-state: mutation recording failed for agent %s: %s",
+                agent_id,
+                type(exc).__name__,
+            )
+            # Fail closed under deterministic/replay mode: a dropped capture
+            # (I/O or parse error) must not read as an absence of mutations
+            # (#2646). The remediation is fully guarded in the helper.
+            self._record_capture_failure(agent_id, reason=type(exc).__name__)
+
+    def _record_capture_failure(self, agent_id: str, *, reason: str) -> None:
+        """Chain a fail-closed marker when provider-mutation capture failed.
+
+        Issue #2646: in deterministic/replay mode a dropped capture must make
+        replay verification fail closed rather than pass as an absence of
+        mutations. Outside deterministic mode there is no replay to verify, so
+        the marker is skipped. The marker is a load-bearing journal entry; if
+        even the marker cannot be recorded the failure is logged (never
+        raised) so a reap tick is never broken.
+        """
+        try:
+            from bernstein.core.replay.provider_state import (
+                deterministic_mode_active,
+                record_capture_failure,
+            )
+
+            if not deterministic_mode_active():
+                return
+            record_capture_failure(self._recorder, agent_id=agent_id, reason=reason)
+        except Exception as exc:
+            logger.warning(
+                "provider-state: capture-failure marker not recorded for agent %s: %s",
+                agent_id,
+                type(exc).__name__,
+            )
+
+    def _get_provider_audit_chain(self) -> Any | None:
+        """Return the run's audit chain for mirroring provider-state mutations.
+
+        Issue #2646: provider mutations chained into the replay journal are
+        additionally mirrored into the HMAC audit chain so a verifier can
+        confirm each entry is chain-attested. Built once and cached; returns
+        ``None`` when the chain cannot be constructed (missing key, IO error).
+        Mirroring is best-effort -- the journal entry is the load-bearing
+        record and a chain failure must never block it. Only the exception
+        type is logged: this path touches the audit HMAC key.
+        """
+        if self._provider_audit_chain is not None:
+            return self._provider_audit_chain
+        try:
+            from bernstein.core.security.audit import load_or_create_audit_key
+            from bernstein.core.security.audit_chain import AuditChainStore
+
+            hmac_key = load_or_create_audit_key()
+            self._provider_audit_chain = AuditChainStore(self._workdir / ".sdd" / "audit", key=hmac_key)
+            return self._provider_audit_chain
+        except Exception as exc:
+            logger.warning("provider-state: audit chain unavailable: %s", type(exc).__name__)
+            return None
 
     def _log_summary(self, result: TickResult) -> None:
         """Write a one-line summary and agent state snapshot each tick."""
@@ -4156,6 +6210,10 @@ class TickResult:
         self.errors: list[str] = []
         # Populated when dry_run=True: (role, title, model, effort) tuples
         self.dry_run_planned: list[tuple[str, str, str | None, str | None]] = []
+        # Set to the halting decision hash when the cost-aware dispatch policy
+        # (issue #2354) refused this tick's spawns before a USD cap was
+        # breached; None when no cost policy fired.
+        self.cost_dispatch_halt: str | None = None
 
 
 def _resolve_manager_llm(workdir: Path) -> tuple[str, str]:
@@ -4168,7 +6226,7 @@ def _resolve_manager_llm(workdir: Path) -> tuple[str, str]:
 
     provider = "openrouter_free"
     model = "nvidia/nemotron-3-super-120b-a12b"
-    seed_path = workdir / _BERNSTEIN_YAML
+    seed_path = resolve_seed_path(workdir)
     if seed_path.exists():
         with contextlib.suppress(Exception):
             seed = parse_seed(seed_path)
@@ -4396,9 +6454,39 @@ def _collect_smtp_targets(seed: Any, targets: list[NotificationTarget]) -> None:
     )
 
 
+def _resolve_spawner_adapter_name(
+    explicit_adapter: str | None,
+    seed_cli: str | None,
+) -> str | None:
+    """Resolve the orchestrator's adapter with explicit-override precedence.
+
+    An adapter supplied out-of-band -- the ``--adapter`` flag or the
+    ``BERNSTEIN_ADAPTER`` env var, both surfaced here as ``explicit_adapter``
+    -- always wins over the seed's ``cli`` field. The seed value is only a
+    fallback for when no adapter was passed explicitly.
+
+    This mirrors the run-model precedence (``args.model or seed.model``) and
+    is load-bearing for ``bernstein run --idle``: that mode exports
+    ``BERNSTEIN_ADAPTER=mock`` precisely so the orchestrator never spawns real
+    Claude agents (and burns tokens / 401s) when the resolved
+    ``bernstein.yaml`` leaves ``cli`` at its ``auto`` default. Letting the
+    seed's ``cli`` clobber an explicit adapter silently defeats that contract.
+
+    Returns ``None`` only when neither source configured an adapter, which the
+    caller treats as a fatal misconfiguration (Bernstein never defaults to
+    Claude).
+    """
+    explicit = (explicit_adapter or "").strip()
+    if explicit:
+        return explicit
+    seed_value = (seed_cli or "").strip()
+    return seed_value or None
+
+
 if __name__ == "__main__":
     import argparse
     import sys
+    import traceback
     from pathlib import Path
 
     from bernstein.adapters.registry import get_adapter
@@ -4408,15 +6496,49 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8052)
     # The adapter default deliberately falls through to the BERNSTEIN_ADAPTER
-    # env var first.  The bootstrap subprocess launcher sets that var when the
-    # operator passes ``--idle`` / a ``cli`` override / a seed-resolved cli,
-    # which closes the long-standing bug where ``bernstein run --idle`` would
-    # silently spawn Claude (and burn real tokens) because this default was
-    # hardcoded to ``"claude"``.
-    _adapter_env_default = os.environ.get("BERNSTEIN_ADAPTER", "").strip() or "claude"
+    # env var first, with NO further fallback.  Bernstein must never silently
+    # spawn Claude (and burn real tokens) because an adapter was never
+    # configured - the operator must pass ``--adapter``, set
+    # ``BERNSTEIN_ADAPTER``, or configure ``cli`` in the seed. Absence of all
+    # three is a fatal misconfiguration, checked below once the seed-resolved
+    # value (if any) has also been consulted.
+    _adapter_env_default = os.environ.get("BERNSTEIN_ADAPTER", "").strip() or None
     parser.add_argument("--adapter", type=str, default=_adapter_env_default)
     parser.add_argument("--cells", type=int, default=1, help="Number of parallel cells (1=single-cell)")
+    # Run-level model override (from ``bernstein run --model``), threaded through
+    # by the CLI's spawner launcher. Falls back to BERNSTEIN_MODEL env var so
+    # any nested resolve_adapter()-style callers can also honour it. This is
+    # the value AgentSpawner uses to coerce Claude tier names (opus/sonnet/
+    # haiku) emitted by the heuristic model selector into a model the active
+    # non-Claude adapter understands - see _coerce_model_for_non_claude_adapter.
+    _model_env_default = os.environ.get("BERNSTEIN_MODEL", "").strip() or None
+    parser.add_argument("--model", type=str, default=_model_env_default)
+    # Resolved bernstein.yaml path, threaded through from bootstrap_from_seed()
+    # via _start_spawner()'s --seed-path / BERNSTEIN_SEED_PATH env var. Fixes
+    # the bug where this subprocess independently re-derived
+    # ``workdir / "bernstein.yaml"`` and silently lost role_model_policy (and
+    # every other seed setting) whenever the real seed lived elsewhere.
+    parser.add_argument(
+        "--seed-path",
+        type=str,
+        default=os.environ.get("BERNSTEIN_SEED_PATH", "").strip() or None,
+    )
     args = parser.parse_args()
+
+    print(f"[SPAWNER-DEBUG] orchestrator __main__: parsed CLI args={vars(args)!r}", file=sys.stderr, flush=True)
+    print(
+        f"[SPAWNER-DEBUG] orchestrator __main__: BERNSTEIN_SEED_PATH env var="
+        f"{os.environ.get('BERNSTEIN_SEED_PATH', '<unset>')!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        f"[SPAWNER-DEBUG] orchestrator __main__: BERNSTEIN_ADAPTER env var="
+        f"{os.environ.get('BERNSTEIN_ADAPTER', '<unset>')!r}, BERNSTEIN_MODEL env var="
+        f"{os.environ.get('BERNSTEIN_MODEL', '<unset>')!r}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     workdir = Path.cwd()
 
@@ -4460,15 +6582,35 @@ if __name__ == "__main__":
     _replay_run_id = os.environ.get("BERNSTEIN_REPLAY_RUN_ID", "").strip()
     _sdd_dir = workdir / ".sdd"
     if _replay_run_id:
-        from bernstein.core.orchestration.deterministic import DeterministicStore, set_active_store
-
-        _det_store = DeterministicStore(
-            _sdd_dir / "runs" / _replay_run_id,
-            replay=True,
+        from bernstein.core.orchestration.deterministic import (
+            ReplayRecordingMissingError,
+            allow_live_miss,
+            open_replay_store,
+            set_active_store,
         )
+
+        # Hermetic by default (issue #1832): a cache miss aborts the run via
+        # ReplayMissError rather than silently calling the live model. The
+        # opt-in BERNSTEIN_REPLAY_ALLOW_LIVE_MISS flag restores live
+        # fall-through (logged per miss) for record-extend workflows.
+        _strict_replay = not allow_live_miss()
+        # Refuse a strict replay against a run with no recording before any
+        # agent is spawned or any network call is made (issue #2790). The
+        # CLI-adapter path never records, so cached_count == 0 there; without
+        # this guard replay silently degrades to a full live run.
+        try:
+            _det_store = open_replay_store(
+                _sdd_dir / "runs" / _replay_run_id,
+                strict=_strict_replay,
+            )
+        except ReplayRecordingMissingError as exc:
+            logger.error("FATAL: %s", exc)
+            print(f"[FATAL] {exc}", file=sys.stderr, flush=True)
+            sys.exit(1)
         set_active_store(_det_store)
         logger.info(
-            "Deterministic replay mode: loaded %d cached LLM responses from run %s",
+            "Deterministic replay mode (%s): loaded %d cached LLM responses from run %s",
+            "strict/hermetic" if _strict_replay else "non-strict/live-miss-allowed",
             _det_store.cached_count,
             _replay_run_id,
         )
@@ -4479,17 +6621,100 @@ if __name__ == "__main__":
         # the real store is set after the orchestrator assigns its run_id below.
         pass  # store will be set after orchestrator is instantiated
 
+    print("[SPAWNER-DEBUG] orchestrator __main__: entering top-level try block", file=sys.stderr, flush=True)
     try:
         # Try to load adapter from seed if available
         adapter_name = args.adapter
-        seed_path = workdir / _BERNSTEIN_YAML
+        seed_path = Path(args.seed_path) if args.seed_path else resolve_seed_path(workdir)
+        logger.info(
+            "orchestrator __main__: resolved seed_path=%s (from --seed-path=%s, exists=%s)",
+            seed_path,
+            args.seed_path,
+            seed_path.exists(),
+        )
         seed: SeedConfig | None = None
         if seed_path.exists():
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: seed file exists at {seed_path}, attempting parse_seed()",
+                file=sys.stderr,
+                flush=True,
+            )
             try:
                 seed = parse_seed(seed_path)
-                adapter_name = getattr(seed, "cli", adapter_name)
+                # An explicit --adapter / BERNSTEIN_ADAPTER wins over the
+                # seed's ``cli`` (which defaults to ``auto``); the seed value
+                # is only a fallback. Without this, ``bernstein run --idle``
+                # (which exports BERNSTEIN_ADAPTER=mock) is silently overridden
+                # by the seed default and spawns real Claude agents.
+                adapter_name = _resolve_spawner_adapter_name(args.adapter, getattr(seed, "cli", None))
+                _seed_role_model_policy = getattr(seed, "role_model_policy", None)
+                if not _seed_role_model_policy:
+                    print(
+                        "[SPAWNER-DEBUG] orchestrator __main__: role_model_policy is None/empty "
+                        f"after seed parse (seed_path={seed_path})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[SPAWNER-DEBUG] orchestrator __main__: parsed role_model_policy="
+                        f"{json.dumps(_seed_role_model_policy, default=str)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                print(
+                    "[SPAWNER-DEBUG] orchestrator __main__: seed parse SUCCESS - cli="
+                    f"{getattr(seed, 'cli', None)!r}, top-level model="
+                    f"{getattr(seed, 'model', None)!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                logger.info(
+                    "orchestrator __main__: parsed seed from %s (cli=%s, model=%s, role_model_policy=%s)",
+                    seed_path,
+                    getattr(seed, "cli", None),
+                    getattr(seed, "model", None),
+                    getattr(seed, "role_model_policy", None),
+                )
             except Exception as exc:
+                print(
+                    f"[SPAWNER-DEBUG] orchestrator __main__: seed parse FAILED for {seed_path}: "
+                    f"{exc!r}\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 logger.warning("Failed to parse seed for adapter config: %s", exc)
+        else:
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: seed file does NOT exist at {seed_path} "
+                "- role_model_policy and model will be unset from seed",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if not adapter_name:
+            # Name --cli, not --adapter. --adapter is this module's own argparse
+            # flag; the operator reaching this message typed `bernstein`, whose
+            # equivalent option is --cli. Naming a flag `bernstein --help` does
+            # not list sends the reader looking for something that is not there
+            # (#3526).
+            logger.error("%s", NO_ADAPTER_CONFIGURED)
+            sys.exit(1)
+
+        # Run-level model: ``--model`` flag (threaded from ``bernstein run
+        # --model``) wins, falling back to the seed's resolved model (also
+        # set from the same CLI flag when the seed is parsed in-process).
+        # This is the value that reaches AgentSpawner as ``default_model``
+        # so child-task spawns can coerce Claude tier names for non-Claude
+        # adapters instead of passing them through literally.
+        run_model: str | None = args.model or (getattr(seed, "model", None) if seed else None)
+        print(
+            f"[SPAWNER-DEBUG] orchestrator __main__: resolved run_model={run_model!r} "
+            f"(args.model={args.model!r}, seed.model="
+            f"{getattr(seed, 'model', None) if seed else '<no seed>'!r})",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if adapter_name == "auto":
             # Auto mode: default to Claude Code (primary), others used via routing
@@ -4545,7 +6770,7 @@ if __name__ == "__main__":
 
             resolve_default_policy(workdir=workdir)
         except Exception as exc:
-            # Never let policy load kill the orchestrator — log and fall
+            # Never let policy load kill the orchestrator - log and fall
             # through to the legacy unscoped path. Only the exception
             # message is logged here, not credential values.
             # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
@@ -4577,7 +6802,7 @@ if __name__ == "__main__":
                 # Pass through the signing mode from bernstein.yaml
                 # (default 'warn' so the new gate is non-blocking).
                 # BERNSTEIN_MCP_SIGNING_MODE env-var still wins inside
-                # MCPManager — see _resolve_signing_mode.
+                # MCPManager - see _resolve_signing_mode.
                 signing_mode = getattr(seed, "mcp_signing_mode", "warn")
                 mcp_manager = MCPManager(
                     mcp_server_configs,
@@ -4613,6 +6838,18 @@ if __name__ == "__main__":
         if catalog_registry is None:
             catalog_registry = _CatalogRegistry.default()
 
+        # Configured `catalogs:` entries (generic + plugin-layout) load into
+        # loaded_agents here so match() can see them. Previously only
+        # discover() consumed them, into the separate _cached_roles metadata
+        # cache that match() never reads (issue #3972). A registry built
+        # from an empty config (the .default() branch above) carries no
+        # generic/plugin entries, so this is a no-op there - the
+        # Agency-cache-path loading below is unaffected either way.
+        try:
+            catalog_registry.load_configured_entries()
+        except Exception:
+            logger.warning("Failed to load configured catalog entries into the match path", exc_info=True)
+
         agency_cache_path = _AgencyProvider.default_cache_path()
         if agency_cache_path.exists():
             try:
@@ -4644,16 +6881,33 @@ if __name__ == "__main__":
         _container_image = os.environ.get("BERNSTEIN_CONTAINER_IMAGE", "bernstein-agent:latest")
         _two_phase = os.environ.get("BERNSTEIN_TWO_PHASE_SANDBOX", "0").strip() in ("1", "true", "yes")
         _sandbox_runtime = os.environ.get("BERNSTEIN_SANDBOX_RUNTIME", "").strip().lower()
+        # Issue #3039: the explicit-attach gate below keys on "a container
+        # runtime was named", so podman gets the same wiring-time probe -
+        # and the same refusal - as docker.
+        from bernstein.core.sandbox.explicit_attach import (
+            is_container_runtime as _is_container_runtime,
+        )
+
         sandbox_config = (
             seed.sandbox if seed is not None and seed.sandbox is not None and seed.sandbox.enabled else None
         )
         if _sandbox_runtime:
+            from typing import cast
+
             from bernstein.core.sandbox import DockerSandbox
 
             base_sandbox = sandbox_config or DockerSandbox(enabled=True)
+            # Issue #3039: carry through whichever container runtime the
+            # operator named rather than mapping everything but one literal
+            # onto docker. Non-container names (worktree, the cloud
+            # backends) keep the historical docker default - they are
+            # executed by their own path, not by this config.
+            _cfg_runtime: SandboxRuntime = (
+                cast("SandboxRuntime", _sandbox_runtime) if _is_container_runtime(_sandbox_runtime) else "docker"
+            )
             sandbox_config = DockerSandbox(
                 enabled=True,
-                runtime="podman" if _sandbox_runtime == "podman" else "docker",
+                runtime=_cfg_runtime,
                 default_image=_container_image or base_sandbox.default_image,
                 adapter_images=base_sandbox.adapter_images,
                 cpu_cores=base_sandbox.cpu_cores,
@@ -4676,6 +6930,91 @@ if __name__ == "__main__":
             from bernstein.core.container import ensure_agent_image
 
             ensure_agent_image(_container_iso.runtime, _container_iso.image)
+
+        # ``--sandbox docker`` (BERNSTEIN_SANDBOX_RUNTIME=docker) previously
+        # provisioned one run-level SandboxSession shared by every agent,
+        # so a single exec timeout killed the container for all of them
+        # and concurrent agents shared one /workspace clone. Attach the
+        # DockerSandboxBackend plus a manifest factory instead: the
+        # spawner provisions ONE session per spawn and destroys it when
+        # the exec future resolves (issue #2162).
+        #
+        # BERNSTEIN_SANDBOX_RUNTIME is only ever set by an explicit
+        # ``--sandbox`` flag, so reaching this block always means the
+        # operator explicitly requested container isolation. An unusable
+        # runtime is therefore a loud failure (SandboxSelectionError)
+        # rather than a silent degrade to legacy container / host worktree
+        # execution, which would drop the isolation boundary without a
+        # console signal (issue #2809).
+        #
+        # The gate keys on "the operator named a container runtime", not on
+        # the literal string "docker" (issue #3039): a docker-only gate let
+        # ``--sandbox podman`` skip the wiring-time probe entirely and fall
+        # through to worktree execution with no refusal, so the one runtime
+        # that failed closed was the one the gate happened to name. Runtimes
+        # without a first-party SandboxBackend (podman) are verified here and
+        # then keep the CLI-driven sandbox path; the probe exists so an
+        # explicit request fails closed, not to change how they execute.
+        _docker_sandbox_backend = None
+        _docker_manifest_factory = None
+        if _is_container_runtime(_sandbox_runtime):
+            import subprocess as _subprocess
+
+            from bernstein.core.sandbox.explicit_attach import attach_container_backend
+            from bernstein.core.sandbox.manifest import GitRepoEntry, WorkspaceManifest
+
+            _branch_result = _subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            _current_branch = _branch_result.stdout.strip() or "HEAD"
+
+            def _make_docker_manifest(_src: str = str(workdir), _branch: str = _current_branch) -> WorkspaceManifest:
+                return WorkspaceManifest(
+                    root="/workspace",
+                    repo=GitRepoEntry(src_path=_src, branch=_branch),
+                )
+
+            # Fail fast at wiring time so an unusable runtime surfaces
+            # before any spawn. ``explicit=True`` turns an unavailable
+            # runtime into a raised SandboxSelectionError instead of a
+            # silent host fallback, for whichever runtime was named.
+            _docker_sandbox_backend = attach_container_backend(_sandbox_runtime, explicit=True)
+            if _docker_sandbox_backend is not None:
+                _docker_manifest_factory = _make_docker_manifest
+                logger.info(
+                    "Docker sandbox backend attached; one session per agent spawn (branch=%s)",
+                    _current_branch,
+                )
+            else:
+                # Verified but backend-less (podman): the CLI-driven sandbox
+                # path below runs the agents. Reaching here means the probe
+                # passed - an unavailable runtime raised above.
+                logger.info(
+                    "Container runtime %s verified; agents run through the %s CLI sandbox",
+                    _sandbox_runtime,
+                    _sandbox_runtime,
+                )
+
+        def _teardown_docker_sandbox() -> None:
+            """Destroy any Docker sandbox sessions the backend still tracks.
+
+            Per-agent sessions are normally destroyed when their exec
+            future resolves; this backend-level sweep catches anything
+            left behind so no ``sleep infinity`` container outlives the
+            orchestrator.
+            """
+            if _docker_sandbox_backend is None:
+                return
+            try:
+                _asyncio.run(_docker_sandbox_backend.destroy_all())
+                logger.info("Docker sandbox backend cleanup complete")
+            except Exception:
+                logger.warning("Failed to clean up Docker sandbox sessions", exc_info=True)
 
         runtime_bridge = None
         openclaw_cfg = seed.bridges.openclaw if seed is not None and seed.bridges is not None else None
@@ -4724,9 +7063,20 @@ if __name__ == "__main__":
             ),
         )
 
+        _spawner_role_model_policy = seed.role_model_policy if seed else None
+        _spawner_policy_repr = (
+            json.dumps(_spawner_role_model_policy, default=str) if _spawner_role_model_policy else "<None/empty>"
+        )
+        print(
+            "[SPAWNER-DEBUG] orchestrator __main__: constructing AgentSpawner with "
+            f"role_model_policy={_spawner_policy_repr}, "
+            f"default_model={run_model!r}, adapter={adapter_inst!r}",
+            file=sys.stderr,
+            flush=True,
+        )
         spawner = AgentSpawner(
             adapter=adapter_inst,
-            templates_dir=get_templates_dir(workdir),
+            templates_dir=get_templates_dir(workdir) / "roles",
             workdir=workdir,
             router=router,
             mcp_config=mcp_config,
@@ -4740,9 +7090,23 @@ if __name__ == "__main__":
             container_config=container_config,
             sandbox=sandbox_config,
             role_model_policy=seed.role_model_policy if seed else None,
+            provider_availability=seed.provider_availability if seed else None,
             runtime_bridge=runtime_bridge,
             resource_limits=agent_rlimits,
             warm_pool=warm_pool,
+            sandbox_backend=_docker_sandbox_backend,
+            sandbox_manifest_factory=_docker_manifest_factory,
+            sandbox_options={"image": _container_image} if _docker_sandbox_backend is not None else None,
+            sandbox_server_port=args.port,
+            default_model=run_model,
+            # Explicit adapter selection (--adapter / BERNSTEIN_ADAPTER / a
+            # non-"auto" seed cli) must never be overridden by model-name
+            # inference at spawn time (#2751). "auto" is the only unpinned
+            # state - adapter_name is guaranteed non-empty by the fatal
+            # check above.
+            adapter_pinned=adapter_name != "auto",
+            # Context policy configuration (loads from bernstein.yaml context: section)
+            context_policy_config=getattr(seed, "context", None) if seed else None,
         )
         run_config_budget_usd: float | None = None
         dry_run = False
@@ -4809,7 +7173,17 @@ if __name__ == "__main__":
                 node_timeout_s=(cluster_cfg.node_timeout_s if cluster_cfg else 60),
                 server_url=os.environ.get("BERNSTEIN_SERVER_URL") or (cluster_cfg.server_url if cluster_cfg else None),
                 bind_host=os.environ.get("BERNSTEIN_BIND_HOST", "127.0.0.1"),
+                gossip_peers=(cluster_cfg.gossip_peers if cluster_cfg else ()),
+                claim_lease_ttl_s=(cluster_cfg.claim_lease_ttl_s if cluster_cfg else 300),
+                claim_journal_path=(cluster_cfg.claim_journal_path if cluster_cfg else None),
+                # Carried through the env override too: dropping the pins here
+                # would leave a MESH node folding nothing from its peers (#2997).
+                gossip_peer_keys=(cluster_cfg.gossip_peer_keys if cluster_cfg else ()),
             )
+
+        # Topology branch (#2558): MESH starts a leaderless coordinator instead
+        # of taking its assignments from the central node registry.
+        start_cluster_coordinator(cluster_cfg, sdd_dir=workdir / ".sdd")
 
         # Resolve compliance can force approval gates
         if compliance_config and compliance_config.approval_gates and approval_mode == "auto":
@@ -4834,6 +7208,22 @@ if __name__ == "__main__":
             max_cost_per_agent=seed.max_cost_per_agent if seed else 0.0,
             test_agent=seed.test_agent if seed else TestAgentConfig(),
             cost_autopilot=seed.cost_autopilot if seed else False,
+            judge_model=seed.judge_model if seed else None,
+            judge_provider=seed.judge_provider if seed else None,
+            cost_policy=getattr(seed, "cost_policy", None) if seed else None,
+            # Without this the top-level ``evolution_enabled`` key in
+            # bernstein.yaml never reached the runtime object and the
+            # self-evolution loop ran regardless of the seed (#config-drift).
+            evolution_enabled=getattr(seed, "evolution_enabled", True) if seed else True,
+            # Threads ``orchestration.test_followup`` from bernstein.yaml
+            # (issue #4462); see core.orchestration.test_followup for the
+            # env-override resolution applied when this is actually used.
+            test_followup_enabled=(
+                getattr(getattr(seed, "orchestration", None), "test_followup", True) if seed else True
+            ),
+            # Issue #4463: top-level ``gate_repair_enabled`` key in
+            # bernstein.yaml; BERNSTEIN_GATE_REPAIR overrides at runtime.
+            gate_repair_enabled=getattr(seed, "gate_repair_enabled", True) if seed else True,
         )
 
         if args.cells > 1:
@@ -4868,6 +7258,7 @@ if __name__ == "__main__":
             try:
                 multi_orchestrator.run()
             finally:
+                _teardown_docker_sandbox()
                 if mcp_manager is not None:
                     mcp_manager.stop_all()
         else:
@@ -4884,7 +7275,7 @@ if __name__ == "__main__":
 
             def _signal_handler(signum: int, _frame: object) -> None:
                 logger.info("Signal %d received, stopping orchestrator", signum)
-                orchestrator.stop()
+                orchestrator.stop(outcome="cancelled")
 
             signal.signal(signal.SIGINT, _signal_handler)
             signal.signal(signal.SIGTERM, _signal_handler)
@@ -4914,10 +7305,40 @@ if __name__ == "__main__":
                 else:
                     orchestrator.run()
             finally:
+                _teardown_docker_sandbox()
                 if mcp_manager is not None:
                     mcp_manager.stop_all()
     except Exception:
+        _crash_tb = traceback.format_exc()
+        print(
+            f"[SPAWNER-DEBUG] orchestrator __main__: FATAL uncaught exception:\n{_crash_tb}",
+            file=sys.stderr,
+            flush=True,
+        )
         logger.exception("Orchestrator crashed")
+        _failed_orchestrator = locals().get("orchestrator")
+        if isinstance(_failed_orchestrator, Orchestrator):
+            _failed_orchestrator._closure_outcome = RunClosureOutcome.FAILED
+            _failed_orchestrator._write_run_closure()
+        try:
+            _crash_log_dir = workdir / ".sdd" / "runtime"
+            _crash_log_dir.mkdir(parents=True, exist_ok=True)
+            _crash_log_path = _crash_log_dir / "spawner_crash.log"
+            with _crash_log_path.open("a", encoding="utf-8") as _crash_fh:
+                _crash_fh.write(f"\n=== spawner crash at {datetime.now(UTC).isoformat()} ===\n")
+                _crash_fh.write(_crash_tb)
+                _crash_fh.write("\n")
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: crash traceback appended to {_crash_log_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as _log_exc:  # pragma: no cover - crash logging must never itself crash the reporting path
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: FAILED to write spawner_crash.log: {_log_exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
         sys.exit(1)
 # ---------------------------------------------------------------------------
 # Meta-messages for orchestrator nudges (T567)

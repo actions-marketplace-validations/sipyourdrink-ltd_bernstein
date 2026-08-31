@@ -170,7 +170,7 @@ def check_audit_chain_hmac(workdir: Path) -> Check:
         return Check(
             name="audit chain HMAC valid",
             status=CheckStatus.WARN,
-            detail=f"no audit dir at {audit_dir} — nothing to verify yet",
+            detail=f"no audit dir at {audit_dir} - nothing to verify yet",
         )
     try:
         result = verify_audit_integrity(audit_dir)
@@ -191,7 +191,7 @@ def check_audit_chain_hmac(workdir: Path) -> Check:
     return Check(
         name="audit chain HMAC valid",
         status=CheckStatus.FAIL,
-        detail=f"chain broken — {first}",
+        detail=f"chain broken - {first}",
         fix="investigate audit log; tampering or corruption suspected",
     )
 
@@ -208,7 +208,7 @@ def check_no_external_hostnames(workdir: Path) -> Check:
         return Check(
             name="no external hostnames in runtime",
             status=CheckStatus.WARN,
-            detail=f"no .sdd/runtime at {runtime} — nothing to scan",
+            detail=f"no .sdd/runtime at {runtime} - nothing to scan",
         )
     needles = (
         b"api.openai.com",
@@ -333,12 +333,6 @@ def check_policy_blocks_known_endpoints() -> Check:
 
         for host, port in CodexAdapter.external_endpoints:
             declared.append((host, port, "codex"))
-    with suppress(Exception):
-        from bernstein.adapters.cloudflare_agents import CloudflareAgentsAdapter
-
-        for host, port in CloudflareAgentsAdapter.external_endpoints:
-            declared.append((host, port, "cloudflare"))
-
     if not declared:
         return Check(
             name="policy blocks declared endpoints",

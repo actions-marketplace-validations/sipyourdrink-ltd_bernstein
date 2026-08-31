@@ -31,7 +31,7 @@ _BINARY_OVERRIDES: dict[str, str] = {
     "q_dev": "q",
     "open_interpreter": "interpreter",
     "openai_agents": "python",  # SDK adapter, not a standalone binary
-    "cloudflare": "wrangler",
+    "python_runtime": "python",  # in-process runtime driven by a Python worker
     "letta_code": "letta",
     "continue": "continue",
     "openhands": "openhands",
@@ -50,6 +50,7 @@ _DEFAULT_SMOKE_MODELS: dict[str, str] = {
     "gemini": "gemini-3-flash",
     "kiro": "sonnet",
     "kilo": "sonnet",
+    "muse": "spark",
     "opencode": "gpt-5.4-mini",
     "qwen": "qwen-coder",
 }
@@ -173,16 +174,24 @@ def _resolve_source_file(adapter_obj: Any) -> str:
 
 
 def _binary_for_adapter(name: str) -> str:
-    """Map a registry key to its expected CLI binary name."""
+    """Map a registry key to its expected CLI binary name.
+
+    Explicit overrides win, then the adapter's capability profile (which
+    already declares its binary), then the registry key itself. Mirrors
+    :func:`bernstein.adapters.report._binary_for_adapter` so this surface
+    and ``bernstein adapters check`` agree.
+    """
     if name in _BINARY_OVERRIDES:
         return _BINARY_OVERRIDES[name]
-    return name
+    from bernstein.adapters.capability_profile import profile_binary_for
+
+    return profile_binary_for(name) or name
 
 
 def _enumerate_adapters() -> list[dict[str, str]]:
     """Snapshot the live adapter registry as plain dicts.
 
-    The registry is the source of truth — we never enumerate by scanning
+    The registry is the source of truth - we never enumerate by scanning
     files. Includes the synthetic ``generic`` adapter, which is built
     on demand inside ``get_adapter`` and not present in the ``_ADAPTERS``
     dict.
@@ -247,6 +256,30 @@ def _register_check_subcommand() -> None:
 
 
 _register_check_subcommand()
+
+
+def _register_verify_subcommand() -> None:
+    """Attach the receipt-gated admission verify subcommand (#2610)."""
+    try:
+        from bernstein.cli.commands.adapters_verify_cmd import register_adapters_verify
+    except Exception:  # pragma: no cover -- defensive
+        return
+    register_adapters_verify(adapters_group)
+
+
+_register_verify_subcommand()
+
+
+def _register_draft_subcommand() -> None:
+    """Attach the probe-to-draft onboarding subcommand (#3763)."""
+    try:
+        from bernstein.cli.commands.adapters_draft_cmd import register_adapters_draft
+    except Exception:  # pragma: no cover -- defensive
+        return
+    register_adapters_draft(adapters_group)
+
+
+_register_draft_subcommand()
 
 
 @adapters_group.command("list")

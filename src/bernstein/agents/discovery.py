@@ -4,8 +4,8 @@ Scans known sources for agent catalogs and maintains a registry at
 ``.sdd/agents/registry.json``.
 
 Supported sources:
-- **local**: ``~/.bernstein/agents/`` — user-level agent definitions.
-- **project**: ``.sdd/agents/local/`` — project-level custom agents.
+- **local**: ``~/.bernstein/agents/`` - user-level agent definitions.
+- **project**: ``.sdd/agents/local/`` - project-level custom agents.
 - **github**: Repos tagged ``bernstein-agents`` or containing
   ``.bernstein-catalog.yaml`` (requires network access).
 - **npm**: Packages with ``bernstein-agent`` keyword (requires network access).
@@ -138,6 +138,7 @@ class AgentDiscovery:
     metrics: dict[str, AgentMetrics] = field(default_factory=dict[str, AgentMetrics])
     total_agents: int = 0
     last_full_sync: str | None = None
+    project_dir: Path | None = None
 
     # ------------------------------------------------------------------ #
     # Factory / persistence                                                #
@@ -301,16 +302,107 @@ class AgentDiscovery:
             existing_names.add(pkg_name)
             logger.info("npm discovery: found %s", pkg_name)
 
+    def discover_harness_local(self, *, enabled: bool = False) -> list[DirectoryEntry]:
+        """Opt-in discovery of harness-local agent and skill resources.
+
+        OFF by default: when *enabled* is False, makes zero filesystem reads outside
+        the project directory and returns an empty list.
+
+        Args:
+            enabled: Explicit opt-in flag. Must be True to perform discovery.
+
+        Returns:
+            List of discovered ``DirectoryEntry`` objects.
+        """
+        if not enabled:
+            return []
+
+        proj_dir = self.project_dir or Path.cwd()
+        harness_dirs = [
+            Path.home() / ".claude" / "agents",
+            Path.home() / ".claude" / "plugins",
+            proj_dir / ".claude" / "agents",
+        ]
+
+        from bernstein.agents.agency_provider import compute_catalog_digest
+        from bernstein.agents.catalog import CatalogAgent
+        from bernstein.agents.plugin_catalog import parse_agent_file
+
+        added: list[DirectoryEntry] = []
+        for hdir in harness_dirs:
+            if not hdir.exists() or not hdir.is_dir():
+                continue
+
+            agent_count = 0
+            is_refused = False
+
+            # Lockfile digest verification (#3973)
+            lock_file = hdir / "agents.lock"
+            if lock_file.is_file():
+                try:
+                    data = json.loads(lock_file.read_text(encoding="utf-8"))
+                    expected_digest = data.get("content_digest", "") if isinstance(data, dict) else ""
+                    if not expected_digest:
+                        is_refused = True
+                    else:
+                        actual_digest = compute_catalog_digest(hdir)
+                        if actual_digest != expected_digest:
+                            is_refused = True
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    # A lockfile that is present but unusable - malformed JSON, undecodable
+                    # bytes, or an unreadable file under it - refuses the directory rather
+                    # than escaping to the caller and aborting the whole discovery sweep.
+                    is_refused = True
+
+            if is_refused:
+                logger.warning("Refusing harness-local directory %s: digest mismatch or corrupt lockfile", hdir)
+                entry = DirectoryEntry(
+                    name=f"harness:{hdir.name}",
+                    source_type="local",
+                    path=str(hdir),
+                    agents=0,
+                    last_sync=_now_iso(),
+                    enabled=False,
+                )
+                self.directories.append(entry)
+                added.append(entry)
+                continue
+
+            for md_file in hdir.glob("**/*.md"):
+                if md_file.name == "SKILL.md":
+                    continue
+                parsed = parse_agent_file(md_file)
+                if isinstance(parsed, CatalogAgent):
+                    agent_count += 1
+
+            entry = DirectoryEntry(
+                name=f"harness:{hdir.name}",
+                source_type="local",
+                path=str(hdir),
+                agents=agent_count,
+                last_sync=_now_iso(),
+                enabled=True,
+            )
+            self.directories.append(entry)
+            added.append(entry)
+
         return added
 
-    def full_sync(self, *, include_network: bool = False) -> dict[str, int]:
+    def full_sync(
+        self,
+        *,
+        include_network: bool = False,
+        include_harness_local: bool = False,
+    ) -> dict[str, int]:
         """Run all local discovery steps (and optionally network steps).
 
         Always scans the local user directory and the project local directory.
         When *include_network* is True also queries GitHub and npm.
+        When *include_harness_local* is True also performs harness-local discovery.
 
         Args:
             include_network: If ``True``, also perform GitHub and npm searches.
+            include_harness_local: If ``True``, perform opt-in harness-local discovery.
 
         Returns:
             Dict mapping source name → number of agents found.
@@ -318,6 +410,10 @@ class AgentDiscovery:
         results: dict[str, int] = {}
         results["local"] = self.discover_local()
         results["project"] = self.discover_project()
+
+        if include_harness_local:
+            harness_entries = self.discover_harness_local(enabled=True)
+            results["harness_local"] = sum(e.agents for e in harness_entries)
 
         if include_network:
             gh_entries = self.discover_github()
@@ -438,3 +534,125 @@ class AgentDiscovery:
 def _now_iso() -> str:
     """Return current UTC time as an ISO-8601 string."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# --------------------------------------------------------------------------- #
+# Publication-record round-trip                                               #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ResolvedCapability:
+    """The outcome of resolving a peer from a published registry record.
+
+    A peer that discovered this node from a registry surface (an A2A card, an
+    MCP-registry entry, or an AGNTCY ADS / OASF descriptor) needs one thing
+    before it delegates work: proof that what it resolved is authentic and
+    actually advertises the capability it wants. This is the normalized result
+    of that check - the same shape across every surface, so a consumer routes
+    on ``ok`` / ``advertised_tools`` without special-casing the trust root.
+
+    Attributes:
+        ok: True when the record verified and (if requested) the capability is
+            advertised.
+        surface: The record's surface (``a2a-card``, ``mcp-registry``,
+            ``agntcy-ads``).
+        trust_root: How the record was authenticated -
+            ``ed25519-card`` for the card-anchored surfaces, or the ADS
+            provenance trust root (``sigstore`` / ``ed25519-fallback``).
+        endpoint: The endpoint peers send A2A traffic to (when present).
+        publisher_fingerprint: The card key fingerprint the record verified
+            against, or ``None`` when the card could not be parsed.
+        advertised_tools: The capabilities the record advertises.
+        errors: Human-readable failures; empty when ``ok``.
+    """
+
+    ok: bool
+    surface: str
+    trust_root: str
+    endpoint: str | None
+    publisher_fingerprint: str | None
+    advertised_tools: tuple[str, ...]
+    errors: tuple[str, ...] = ()
+
+
+def resolve_publication_record(
+    record: dict[str, Any],
+    *,
+    require_capability: str | None = None,
+) -> ResolvedCapability:
+    """Resolve a published registry record: verify, then confirm capability.
+
+    This is the first half of the discovery round-trip a peer walks after it
+    resolves this node from a directory: ``resolve -> verify descriptor ->
+    confirm capability`` (the remaining ``send task -> verify receipt`` half is
+    the A2A message + receipt path). It verifies the record offline via
+    :func:`~bernstein.core.protocols.a2a.publish.verify_publication_record`
+    (which, for an ADS record, checks the OASF descriptor against the pinned
+    schema version and validates its Sigstore provenance), then confirms the
+    requested capability is advertised.
+
+    Args:
+        record: A record produced by one of the ``build_*`` publication
+            functions.
+        require_capability: If set, the resolution fails unless this tool is in
+            the record's advertised capabilities.
+
+    Returns:
+        A :class:`ResolvedCapability`. Never raises on malformed input.
+    """
+    from bernstein.core.interop.a2a_card import SignedCapabilityCard, card_public_key_fingerprint
+    from bernstein.core.protocols.a2a.publish import verify_publication_record
+
+    if not isinstance(record, dict):
+        return ResolvedCapability(
+            ok=False,
+            surface="",
+            trust_root="",
+            endpoint=None,
+            publisher_fingerprint=None,
+            advertised_tools=(),
+            errors=("record is not an object",),
+        )
+
+    surface = str(record.get("surface", ""))
+    endpoint = record.get("endpoint") if isinstance(record.get("endpoint"), str) else None
+
+    verification = verify_publication_record(record)
+    errors: list[str] = list(verification.errors)
+
+    fingerprint: str | None = None
+    advertised: tuple[str, ...] = ()
+    try:
+        card = SignedCapabilityCard.from_dict(record.get("capabilityCard", {}))
+        fingerprint = "ed25519/" + card_public_key_fingerprint(card.card.public_key_pem)
+        advertised = tuple(card.card.advertised_tools)
+    except (ValueError, TypeError) as exc:
+        errors.append(f"capabilityCard is not parseable: {exc}")
+
+    # An ADS consumer reads the capability from the OASF descriptor it
+    # resolved; verification has already proven that descriptor equals the
+    # deterministic projection of the card, so the two agree.
+    trust_root = "ed25519-card"
+    if surface == "agntcy-ads":
+        provenance = record.get("provenance")
+        if isinstance(provenance, dict):
+            trust_root = str(provenance.get("trust_root", ""))
+        descriptor = record.get("descriptor")
+        if isinstance(descriptor, dict) and isinstance(descriptor.get("skills"), list):
+            advertised = tuple(
+                str(skill["name"]) for skill in descriptor["skills"] if isinstance(skill, dict) and "name" in skill
+            )
+
+    if require_capability is not None and require_capability not in advertised:
+        errors.append(f"record does not advertise the required capability {require_capability!r}")
+
+    return ResolvedCapability(
+        ok=not errors,
+        surface=surface,
+        trust_root=trust_root,
+        endpoint=endpoint,
+        publisher_fingerprint=fingerprint,
+        advertised_tools=advertised,
+        errors=tuple(errors),
+    )

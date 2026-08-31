@@ -203,8 +203,8 @@ through the most expensive routed model.
 The same number is persisted to `.sdd/runs/<run-id>/summary.json`
 (`routing_savings_usd`) for `bernstein recap` and downstream dashboards.
 
-**Baseline anchor.** The comparison model is **Opus** — the most
-expensive tier in the default cascade (`haiku → sonnet → opus`). Picking
+**Baseline anchor.** The comparison model is **Opus** - the most
+expensive tier in the default cascade (`sonnet → opus`). Picking
 the top of the cascade gives an intentionally generous "what if I had
 just used the smartest model for everything" number; the buyer-facing
 question the card is built to answer.
@@ -224,24 +224,14 @@ wrapped by `calculate_savings()` in
   used a different prompt strategy and likely a different token count;
   the number assumes identical token usage across tiers.
 - Savings can read as zero on a run that was already 100% Opus or 100%
-  fast-path — there is nothing to compare.
+  fast-path - there is nothing to compare.
 - Token rates come from the static catalogue in
   `_MODEL_COST_USD_PER_1K`. When provider pricing changes, the catalogue
   needs to move with it, otherwise the savings number drifts.
 
-For a multi-run aggregate of the same comparison see `bernstein cost` —
+For a multi-run aggregate of the same comparison see `bernstein cost` -
 the `--json` payload includes `savings_vs_opus_usd` over the configured
 window.
-
-## Peak-hour routing
-
-Route non-urgent tasks to off-peak windows to reduce costs:
-
-```yaml
-# Configured in bernstein.yaml or via src/bernstein/core/cost/peak_hour_router.py
-peak_hour_routing:
-  enabled: true
-```
 
 ## Cost monitoring and alerts
 

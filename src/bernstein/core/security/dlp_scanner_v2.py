@@ -2,12 +2,12 @@
 
 Builds on ``dlp_scanner.py`` with additional capabilities:
 
-1. **StrEnum-based categories** — ``DLPCategory`` for type-safe category
+1. **StrEnum-based categories** - ``DLPCategory`` for type-safe category
    handling (SOURCE_CODE, PROPRIETARY_DATA, REGULATED_DATA, CREDENTIALS, PII).
-2. **Luhn-validated credit cards** — reduces false-positive rate for card
+2. **Luhn-validated credit cards** - reduces false-positive rate for card
    number patterns.
-3. **Configurable customer-ID prefixes** — detect ``CUST-*``, ``ORG-*``, etc.
-4. **License header detection** — identifies foreign project licence text
+3. **Configurable customer-ID prefixes** - detect ``CUST-*``, ``ORG-*``, etc.
+4. **License header detection** - identifies foreign project licence text
    embedded in agent output.
 5. **Severity-grouped Markdown report** via ``render_dlp_report``.
 
@@ -33,6 +33,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+from bernstein.core.security.luhn import luhn_check
 
 __all__ = [
     "DLPCategory",
@@ -125,34 +127,6 @@ class DLPPolicy:
 
 
 # ---------------------------------------------------------------------------
-# Luhn validator
-# ---------------------------------------------------------------------------
-
-
-def _luhn_check(digits: str) -> bool:
-    """Validate a digit string using the Luhn algorithm.
-
-    Args:
-        digits: String of digits (spaces/dashes already stripped).
-
-    Returns:
-        True when the digit string passes Luhn validation.
-    """
-    if not digits or not digits.isdigit():
-        return False
-    total = 0
-    reverse_digits = digits[::-1]
-    for i, ch in enumerate(reverse_digits):
-        n = int(ch)
-        if i % 2 == 1:
-            n *= 2
-            if n > 9:
-                n -= 9
-        total += n
-    return total % 10 == 0
-
-
-# ---------------------------------------------------------------------------
 # Pattern definitions
 # ---------------------------------------------------------------------------
 
@@ -163,7 +137,7 @@ _RuleDef = tuple[DLPCategory, str, re.Pattern[str], DLPSeverity, float, str]
 def _build_regulated_data_rules() -> list[_RuleDef]:
     """Patterns for REGULATED_DATA: credit cards (Luhn), SSN, health records."""
     return [
-        # Credit card — 13-19 digits (groups of 4 separated by spaces or dashes).
+        # Credit card - 13-19 digits (groups of 4 separated by spaces or dashes).
         # Luhn validation is applied post-match.
         (
             DLPCategory.REGULATED_DATA,
@@ -182,7 +156,7 @@ def _build_regulated_data_rules() -> list[_RuleDef]:
             0.90,
             "US Social Security Number pattern",
         ),
-        # Medical Record Number (MRN) — labeled
+        # Medical Record Number (MRN) - labeled
         (
             DLPCategory.REGULATED_DATA,
             "mrn",
@@ -191,7 +165,7 @@ def _build_regulated_data_rules() -> list[_RuleDef]:
             0.85,
             "Medical Record Number (MRN)",
         ),
-        # Patient ID — labeled
+        # Patient ID - labeled
         (
             DLPCategory.REGULATED_DATA,
             "patient_id",
@@ -437,9 +411,15 @@ def _collect_rules(policy: DLPPolicy) -> list[_RuleDef]:
 
 
 def _validate_credit_card(matched_raw: str) -> bool:
-    """Validate a potential credit card match using Luhn algorithm."""
+    """Validate a potential credit card match using Luhn algorithm.
+
+    The lower bound is this call site's own policy; there is deliberately no
+    upper one, so a Luhn-valid run longer than 19 digits is treated as a card
+    here and is not by ``pii_output_gate``. See
+    ``tests/unit/security/test_luhn_shared.py``, which pins that difference.
+    """
     digits_only = re.sub(r"\D", "", matched_raw)
-    return len(digits_only) >= 13 and _luhn_check(digits_only)
+    return len(digits_only) >= 13 and luhn_check(digits_only)
 
 
 def _scan_lines(

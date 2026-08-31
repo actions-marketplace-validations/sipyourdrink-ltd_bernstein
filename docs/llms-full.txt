@@ -1,11 +1,19 @@
 # Bernstein
 
-> Forward-deployed engineering, with a coding swarm that fits in your `.sdd/`.
+> Bernstein is the open-source governance layer for AI agents, with a deterministic
+> scheduler driving CLI coding agents (Claude Code,
+> Codex, Gemini CLI, and 40+ more). Scheduling is plain Python - no LLM in the
+> coordination loop - so runs are reproducible end to end.
 >
-> Bernstein is an open-source multi-agent orchestration platform for AI coding
-> agents. Deterministic scheduling, 41 CLI adapters, pluggable sandbox backends,
-> cloud artifact storage sinks, progressive-disclosure skill packs, zero vendor
-> lock-in. Apache 2.0 licensed.
+> Every coding task runs in its own git worktree behind lint/type/test gates;
+> artifact-mode tasks complete on a signed lineage receipt in an isolated
+> plain directory instead. An
+> always-on lineage spine and replay journal record what happened; an opt-in
+> HMAC-chained audit log and signed receipts make results independently
+> checkable after the fact. `bernstein artifact verify` and `bernstein audit
+> verify --merkle-only` check from the on-disk artefacts alone; replaying the
+> HMAC chain needs the install's audit key. Air-gap install profile included.
+> Apache-2.0.
 
 This document is the long-form `llms-full.txt` variant per the llms.txt spec
 (<https://llmstxt.org/>). It expands on the short `llms.txt` with more context
@@ -15,36 +23,35 @@ for ingestion by language models. Machine-readable Markdown, link-rich.
 
 Bernstein takes a goal, breaks it into tasks, assigns them to AI coding agents
 running in parallel, verifies the output, and merges the results. The orchestrator
-itself is deterministic Python — zero LLM tokens on scheduling. Every run is
+itself is deterministic Python - zero LLM tokens on scheduling. Every run is
 reproducible. Every step is logged and replayable.
 
 - Pure Python orchestration. No LLM in the coordination loop.
-- 41 CLI agent adapters. Mix Claude Code, Codex, Gemini CLI, Aider, Cursor,
+- 40+ CLI agent adapters. Mix Claude Code, Codex, Gemini CLI, Aider, Cursor,
   and more in the same run.
 - Git worktree isolation per agent. Main branch stays clean.
 - Janitor verification: tests, lint, types, PII gating.
 - File-based state in `.sdd/`. No database. Inspect with `cat`, back up with
   `cp -r`.
 
-## Forward-deployed engineering use case
+## Dropping into an unfamiliar repo
 
-Bernstein is built for the forward-deployed engineering pattern:
-parachute onto a client repo and stand up an AI engineering crew in
-minutes. State lives in `.sdd/` — no server to provision. Per-agent
-credential scoping keeps your keys out of the client's environment.
-The 41-adapter spread means the swarm runs on whichever CLI agent
-the client already trusts (Claude Code, Codex, Gemini CLI, Aider,
-and more). Every step is an HMAC-signed audit record, replayable
-for client compliance review.
+Bernstein stands up an AI engineering crew in minutes. State lives in
+`.sdd/` - no server to provision. Per-agent credential scoping keeps your
+keys out of the target environment. The multi-adapter spread means the crew
+runs on whichever CLI agent the repo's owners already trust (Claude Code,
+Codex, Gemini CLI, Aider, and more). Every step lands in the always-on
+replay journal and lineage spine; run with `--audit` and every step is also
+an HMAC-signed audit record, replayable for compliance review.
 
 ## Primary use cases
 
-- **Forward-deployed engineering** — drop the swarm onto a client repo when
-  you arrive, take it with you when you leave.
-- **Self-evolving projects** — point Bernstein at its own repo and let it
+- **Client and contract work** - drop the crew onto a repo when you arrive,
+  take it with you when you leave.
+- **Self-evolving projects** - point Bernstein at its own repo and let it
   execute the backlog.
-- **CI fleets** — run a swarm of agents in parallel on PRs, with per-agent
-  credential scoping and signed audit trail.
+- **CI fleets** - run a crew of agents in parallel on PRs, with per-agent
+  credential scoping and an opt-in signed audit trail.
 
 ## Install
 
@@ -87,16 +94,16 @@ bernstein stop                          # graceful shutdown
 
 ## Core Documentation
 
-- [Getting Started](https://bernstein.readthedocs.io/en/latest/getting-started/GETTING_STARTED/) — Install, configure, run first orchestration in 60 seconds
-- [Architecture](https://bernstein.readthedocs.io/en/latest/architecture/ARCHITECTURE/) — Task server, agent spawner, janitor verification, worktree isolation
-- [Why deterministic](https://bernstein.readthedocs.io/en/latest/architecture/WHY_DETERMINISTIC/) — Design rationale for zero-LLM scheduling
-- [Lifecycle FSM](https://bernstein.readthedocs.io/en/latest/architecture/LIFECYCLE/) — Task and agent state machines with transition tables
-- [Adapter Guide](https://bernstein.readthedocs.io/en/latest/adapters/ADAPTER_GUIDE/) — Supported agents and how to add your own
-- [Sandbox backends](https://bernstein.readthedocs.io/en/latest/architecture/sandbox/) — Worktree, Docker, E2B, Modal
-- [Artifact sinks](https://bernstein.readthedocs.io/en/latest/architecture/storage/) — Local, S3, GCS, Azure Blob, Cloudflare R2
-- [Skills](https://bernstein.readthedocs.io/en/latest/architecture/skills/) — Progressive-disclosure skill packs (OpenAI Agents SDK pattern)
-- [Configuration](https://bernstein.readthedocs.io/en/latest/operations/CONFIG/) — `bernstein.yaml` reference
-- [API Reference](https://bernstein.readthedocs.io/en/latest/reference/openapi-reference/) — Task server REST API on `:8052`
+- [Getting Started](https://bernstein.readthedocs.io/en/latest/getting-started/GETTING_STARTED/) - Install, configure, run first orchestration in 60 seconds
+- [Architecture](https://bernstein.readthedocs.io/en/latest/architecture/ARCHITECTURE/) - Task server, agent spawner, janitor verification, worktree isolation
+- [Why deterministic](https://bernstein.readthedocs.io/en/latest/architecture/WHY_DETERMINISTIC/) - Design rationale for zero-LLM scheduling
+- [Lifecycle FSM](https://bernstein.readthedocs.io/en/latest/architecture/LIFECYCLE/) - Task and agent state machines with transition tables
+- [Adapter Guide](https://bernstein.readthedocs.io/en/latest/adapters/ADAPTER_GUIDE/) - Supported agents and how to add your own
+- [Sandbox backends](https://bernstein.readthedocs.io/en/latest/architecture/sandbox/) - Worktree, Docker, E2B, Modal
+- [Artifact sinks](https://bernstein.readthedocs.io/en/latest/architecture/storage/) - Local, S3, GCS, Azure Blob, Cloudflare R2
+- [Skills](https://bernstein.readthedocs.io/en/latest/architecture/skills/) - Progressive-disclosure skill packs (OpenAI Agents SDK pattern)
+- [Configuration](https://bernstein.readthedocs.io/en/latest/operations/CONFIG/) - `bernstein.yaml` reference
+- [API Reference](https://bernstein.readthedocs.io/en/latest/reference/openapi-reference/) - Task server REST API on `:8052`
 
 ## Capabilities
 
@@ -108,7 +115,7 @@ bernstein stop                          # graceful shutdown
   Knowledge graph for codebase impact analysis. Semantic caching saves tokens
   on repeated patterns. Cost anomaly detection (burn-rate alerts). Behavior
   anomaly detection with Z-score flagging.
-- **Sandboxing**. Pluggable `SandboxBackend` protocol — local git worktrees
+- **Sandboxing**. Pluggable `SandboxBackend` protocol - local git worktrees
   (default), Docker containers, E2B Firecracker microVMs, Modal serverless
   containers (with optional GPU).
 - **Artifact storage**. `.sdd/` state can stream to pluggable `ArtifactSink`
@@ -123,17 +130,12 @@ bernstein stop                          # graceful shutdown
   pluggy-based plugin system, multi-repo workspaces, cluster mode for
   distributed execution.
 
-## Comparisons
-
-- [vs CrewAI / AutoGen / LangGraph](https://bernstein.readthedocs.io/en/latest/compare/) — Feature matrices vs LLM-orchestration frameworks
-- [vs other CLI-agent orchestrators](https://bernstein.readthedocs.io/en/latest/compare/) — `awslabs/cli-agent-orchestrator`, Composio's `@aoagents/ao`, emdash, ralphex
-
 ## Resources
 
-- [GitHub Repository](https://github.com/sipyourdrink-ltd/bernstein) — Source code, issues, discussions
-- [PyPI Package](https://pypi.org/project/bernstein/) — `pip install bernstein`
-- [npm wrapper](https://www.npmjs.com/package/bernstein-orchestrator) — `npx bernstein-orchestrator`
+- [GitHub Repository](https://github.com/sipyourdrink-ltd/bernstein) - Source code, issues, discussions
+- [PyPI Package](https://pypi.org/project/bernstein/) - `pip install bernstein`
+- [npm wrapper](https://www.npmjs.com/package/bernstein-orchestrator) - `npx bernstein-orchestrator`
 - [Website](https://bernstein.run)
 - [Documentation](https://bernstein.readthedocs.io/)
-- [Author](https://alexchernysh.com) — Built by Alex Chernysh
-- [X / Twitter](https://x.com/alex_chernysh) — `@alex_chernysh`
+- [Author](https://alexchernysh.com) - Built by Alex Chernysh
+- [X / Twitter](https://x.com/alex_chernysh) - `@alex_chernysh`

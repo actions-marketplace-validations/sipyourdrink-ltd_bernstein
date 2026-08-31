@@ -15,7 +15,12 @@ import uuid
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+from bernstein.core.observability.log_redact import redact_sensitive_text
 
 _JSONL_GLOB = "*.jsonl"
 
@@ -50,11 +55,13 @@ class TraceStep:
     allocated_budget: int = 0
     consumed_this_turn: int = 0
     remaining_budget: int = 0
-    # Compaction boundary metadata (v1 — namespaced, forward-compatible)
+    # Compaction boundary metadata (v1 - namespaced, forward-compatible)
     compaction_correlation_id: str = ""
     compaction_tokens_before: int = 0
     compaction_tokens_after: int = 0
     compaction_reason: str = ""
+    compaction_source_content_hash: str = ""
+    compaction_referenced_content_hashes: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -76,6 +83,10 @@ class TraceStep:
             compaction_tokens_before=cast("int", d.get("compaction_tokens_before", 0)),
             compaction_tokens_after=cast("int", d.get("compaction_tokens_after", 0)),
             compaction_reason=d.get("compaction_reason", ""),
+            compaction_source_content_hash=d.get("compaction_source_content_hash", ""),
+            compaction_referenced_content_hashes=cast(
+                "dict[str, str]", d.get("compaction_referenced_content_hashes", {})
+            ),
         )
 
 
@@ -116,6 +127,10 @@ class AgentTrace:
     turn_count: int = 0
     # Settings snapshot captured at spawn time (T557)
     settings_snapshot: dict[str, Any] = field(default_factory=dict[str, Any])
+    # Per-section context receipt captured at spawn time (issue #4405). Each
+    # entry is ``{"label", "content_sha256", "token_estimate", "char_count"}``
+    # in prompt order. Empty when no receipt was captured.
+    context_receipt: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def duration_s(self) -> float | None:
@@ -144,6 +159,7 @@ class AgentTrace:
             log_path=d.get("log_path", ""),
             task_snapshots=cast("list[dict[str, Any]]", d.get("task_snapshots", [])),
             settings_snapshot=cast("dict[str, Any]", d.get("settings_snapshot", {})),
+            context_receipt=cast("list[dict[str, Any]]", d.get("context_receipt", [])),
         )
 
 
@@ -315,7 +331,7 @@ def _extract_file_hint(args: str) -> str:
     if stripped.startswith(("/", "./", "src/", "tests/", "templates/")):
         return stripped.split()[0]
 
-    # Short non-space string — could be a filename
+    # Short non-space string - could be a filename
     if " " not in stripped and len(stripped) < 120:
         return stripped
 
@@ -360,14 +376,14 @@ class TraceStore:
         on every persisted trace dict when emission is enabled.  The field is intentionally generic (``_rev``) so it
         reads as a schema-version marker; survives copy-paste of the
         jsonl file into GitHub issues; and is skipped entirely when the
-        token resolves to the disabled sentinel — we never persist a
+        token resolves to the disabled sentinel - we never persist a
         useless ``"_rev": "0…0"`` placeholder.
 
         Args:
             trace: The trace to persist.
         """
         self._ensure_dir()
-        # Lazy import — keeps the observability package free of identity
+        # Lazy import - keeps the observability package free of identity
         # at module-load (and avoids a cycle if either side grows).
         # Reading through the module object (not the re-export) so the
         # gate can be flipped at runtime by monkeypatch in tests.
@@ -384,7 +400,10 @@ class TraceStore:
                 # Single field, top-level, JSON-serialisable.  Doesn't
                 # collide with any existing ``AgentTrace`` field name.
                 payload["_rev"] = header["_rev"]
-        data = json.dumps(payload)
+        # Redact before any bytes reach either live trace location.  Both the
+        # direct lookup file and per-task JSONL therefore persist identical,
+        # credential-safe bytes.
+        data = redact_sensitive_text(json.dumps(payload))
 
         # Write per-trace file (overwrites on update)
         self._path_for_trace(trace.trace_id).write_text(data + "\n")
@@ -667,11 +686,15 @@ def record_compaction_boundary(
     tokens_before: int,
     tokens_after: int,
     reason: str,
+    *,
+    source_content_hash: str = "",
+    referenced_content_hashes: Mapping[str, str] | None = None,
+    files: list[str] | None = None,
 ) -> TraceStep:
     """Create a TraceStep marking a context compaction boundary.
 
     The marker is versioned via namespaced fields (``compaction_*``) so
-    existing trace consumers are unaffected — the fields are optional and
+    existing trace consumers are unaffected - the fields are optional and
     default to empty / zero.
 
     Args:
@@ -680,20 +703,29 @@ def record_compaction_boundary(
         tokens_before: Token count before compaction.
         tokens_after: Token count after compaction.
         reason: Why compaction was triggered (e.g., ``"token_budget"``).
+        source_content_hash: Content hash of the exact pre-compaction region.
+        referenced_content_hashes: Mapping of referenced artifact paths to hashes.
+        files: Optional list of files involved. If not specified, inferred from
+            the keys of ``referenced_content_hashes``.
 
     Returns:
         The created TraceStep (caller should append to ``trace.steps``).
     """
     saved = tokens_before - tokens_after if tokens_before > tokens_after else 0
+    ref_hashes = dict(referenced_content_hashes or {})
+    step_files = list(files) if files is not None else list(ref_hashes.keys())
     step = TraceStep(
         type="compact",
         timestamp=time.time(),
         detail=(f"compaction v1: {tokens_before} -> {tokens_after} (-{saved} tokens), reason={reason}"),
+        files=step_files,
         tokens=saved,
         compaction_correlation_id=correlation_id,
         compaction_tokens_before=tokens_before,
         compaction_tokens_after=tokens_after,
         compaction_reason=reason,
+        compaction_source_content_hash=source_content_hash,
+        compaction_referenced_content_hashes=ref_hashes,
     )
     return step
 
@@ -781,9 +813,9 @@ def score_patch_match(
 
     mismatch_reason = ""
     if ratio < 0.5:
-        mismatch_reason = f"Low similarity ({ratio:.2f}) — patch may have applied to wrong location"
+        mismatch_reason = f"Low similarity ({ratio:.2f}) - patch may have applied to wrong location"
     elif ratio < 0.8:
-        mismatch_reason = f"Moderate similarity ({ratio:.2f}) — verify patch applied correctly"
+        mismatch_reason = f"Moderate similarity ({ratio:.2f}) - verify patch applied correctly"
 
     return PatchMatchResult(
         file_path=file_path,
@@ -876,9 +908,9 @@ def preview_edit_conflict(
 
     hint = "manual merge required"
     if not diff:
-        hint = "no conflict — contents are identical"
+        hint = "no conflict - contents are identical"
     elif len(conflict_lines) == 1:
-        hint = f"single-region conflict at line {conflict_lines[0]} — prefer agent with later timestamp"
+        hint = f"single-region conflict at line {conflict_lines[0]} - prefer agent with later timestamp"
 
     return FileEditConflict(
         file_path=file_path,
@@ -1081,7 +1113,7 @@ def _collect_crash_metrics(workdir: Path) -> dict[str, Any]:
 # Diagnostic delta capture around edits
 # ---------------------------------------------------------------------------
 
-_MAX_DELTA_BYTES: int = 65_536  # 64 KB per side — avoids bloating trace storage
+_MAX_DELTA_BYTES: int = 65_536  # 64 KB per side - avoids bloating trace storage
 
 
 @dataclass
@@ -1210,8 +1242,8 @@ def capture_edit_delta(
 class EditReplayArtifact:
     """Pre-edit state preserved for fallback replay of a failed file edit.
 
-    When an edit cannot be applied cleanly — patch mismatch, write error, or
-    a low-confidence AI transform — this artifact saves the last-known-good
+    When an edit cannot be applied cleanly - patch mismatch, write error, or
+    a low-confidence AI transform - this artifact saves the last-known-good
     content and enough context to retry the edit deterministically.
 
     Attributes:

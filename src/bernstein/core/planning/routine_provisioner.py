@@ -88,7 +88,7 @@ def recommend_triggers(scenario: ScenarioRecipe) -> tuple[TriggerRecommendation,
 
     Returns:
         A tuple of trigger recommendations, possibly empty. Each recommendation
-        is independent — operators can pick one or several.
+        is independent - operators can pick one or several.
     """
     tags = {t.lower() for t in scenario.tags}
     out: list[TriggerRecommendation] = []
@@ -131,7 +131,7 @@ def _format_task_list(tasks: tuple[ScenarioTaskTemplate, ...]) -> str:
     """Render a markdown bullet list of scenario tasks."""
     lines: list[str] = []
     for idx, t in enumerate(tasks, start=1):
-        suffix = f" — {t.description}" if t.description else ""
+        suffix = f" - {t.description}" if t.description else ""
         lines.append(f"{idx}. **{t.title}** (role: `{t.role}`, priority: {t.priority}){suffix}")
     return "\n".join(lines)
 
@@ -144,7 +144,7 @@ def build_routine_prompt(scenario: ScenarioRecipe, bernstein_url: str) -> str:
     1. Connect to the Bernstein MCP server at ``bernstein_url``.
     2. Call ``bernstein_scenario`` with this scenario's id (and PR/branch
        context if it was triggered by a GitHub event).
-    3. Poll ``bernstein_scenario_status`` until completion.
+    3. Poll ``bernstein_scenario`` with ``action="status"`` until completion.
     4. Summarise the outcome (and post a PR comment when applicable).
 
     Args:
@@ -161,10 +161,12 @@ def build_routine_prompt(scenario: ScenarioRecipe, bernstein_url: str) -> str:
         "\n"
         "## Steps\n"
         "1. Call the Bernstein MCP tool `bernstein_scenario` with:\n"
+        "   - action: `run`\n"
         f"   - scenario_id: `{scenario.scenario_id}`\n"
         "   - context: short summary of the trigger event\n"
         "   - pr_number / branch: from the trigger payload when present\n"
-        "2. Poll `bernstein_scenario_status(orchestration_id)` every 30s.\n"
+        '2. Poll `bernstein_scenario` with action="status" and the returned\n'
+        "   orchestration_id every 30s.\n"
         "3. When all tasks finish, summarise outcomes:\n"
         "   - per-task status (passed / failed)\n"
         "   - quality gate failures, if any\n"
@@ -360,8 +362,8 @@ def _format_triggers_markdown(triggers: tuple[TriggerRecommendation, ...]) -> st
     for r in triggers:
         header = f"## {r.type}"
         if r.event:
-            header += f" — `{r.event}`"
+            header += f" - `{r.event}`"
         if r.cadence:
-            header += f" — cadence `{r.cadence}`"
+            header += f" - cadence `{r.cadence}`"
         lines.extend((header, "", r.reason, ""))
     return "\n".join(lines).rstrip() + "\n"

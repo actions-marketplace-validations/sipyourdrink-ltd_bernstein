@@ -9,8 +9,8 @@
 ## Problem
 
 Bernstein needs an extension point that lets users add custom behavior at key
-orchestration events — task created, agent spawned, task completed, cost
-threshold exceeded — without modifying core code.
+orchestration events - task created, agent spawned, task completed, cost
+threshold exceeded - without modifying core code.
 
 The questions are:
 1. Should we build our own plugin system or use an existing one?
@@ -24,7 +24,7 @@ The questions are:
 **Use [pluggy](https://pluggy.readthedocs.io/) as the plugin infrastructure.**
 
 Pluggy is the hook system used by pytest and tox. It provides named hooks,
-ordered hook calling, error isolation, and pip-installable plugin discovery — all
+ordered hook calling, error isolation, and pip-installable plugin discovery - all
 the machinery we need, battle-tested by one of Python's most-used testing tools.
 
 ---
@@ -52,12 +52,12 @@ class EventEmitter:
 **Pros**: Simple, no dependencies, immediately understandable.
 
 **Cons**:
-- No discovery mechanism — plugins must be registered manually in user code.
-- No hook specification — no way to define the canonical signature for an event.
+- No discovery mechanism - plugins must be registered manually in user code.
+- No hook specification - no way to define the canonical signature for an event.
   Users guess at keyword arguments.
-- No ordering control — all handlers are equal, no way to say "run before
+- No ordering control - all handlers are equal, no way to say "run before
   the default handler" or "run last."
-- No pytest integration — custom event names can't be type-checked or
+- No pytest integration - custom event names can't be type-checked or
   auto-completed.
 
 **Verdict**: Good for internal use; insufficient for a public plugin API.
@@ -67,9 +67,10 @@ class EventEmitter:
 ```python
 import importlib.metadata
 
+
 def load_plugins() -> list[Any]:
     plugins = []
-    for ep in importlib.metadata.entry_points(group='bernstein.plugins'):
+    for ep in importlib.metadata.entry_points(group="bernstein.plugins"):
         plugin_class = ep.load()
         plugins.append(plugin_class())
     return plugins
@@ -79,9 +80,9 @@ def load_plugins() -> list[Any]:
 packaging authors.
 
 **Cons**:
-- Entry points alone don't define hook signatures — still need a way to
+- Entry points alone don't define hook signatures - still need a way to
   specify what methods plugins can implement.
-- Manual discovery only — no way for users to register plugins without packaging
+- Manual discovery only - no way for users to register plugins without packaging
   them.
 - No error isolation built in.
 
@@ -91,11 +92,11 @@ entry points internally for pip-based discovery; we'd be reinventing the rest.
 ### Option C: Pluggy (chosen)
 
 Pluggy provides three things:
-1. **Hook specifications** (`@hookspec`) — define the canonical signature and
+1. **Hook specifications** (`@hookspec`) - define the canonical signature and
    documentation for each hook.
-2. **Hook implementations** (`@hookimpl`) — plugins annotate their methods,
+2. **Hook implementations** (`@hookimpl`) - plugins annotate their methods,
    pluggy calls them with the right arguments.
-3. **Discovery** — register plugins manually (`register(MyPlugin())`) or via
+3. **Discovery** - register plugins manually (`register(MyPlugin())`) or via
    pip entry points (plugins installed via `pip install` are auto-discovered).
 
 Error isolation is trivially added with a `_safe_call` wrapper:
@@ -120,7 +121,7 @@ def _safe_call(self, hook_name: str, **kwargs) -> None:
   that need to run before the default behavior.
 - **Entry point discovery.** A plugin distributed via pip just needs:
   ```toml
-  [project.entry-points."bernstein"]
+  [project.entry-points."bernstein.plugins"]
   my_plugin = "my_package:MyPlugin"
   ```
   Bernstein discovers and loads it automatically on startup.
@@ -135,6 +136,7 @@ def _safe_call(self, hook_name: str, **kwargs) -> None:
 
 ```python
 # src/bernstein/plugins/hookspecs.py
+
 
 class BernsteinSpec:
     @hookspec
@@ -170,6 +172,12 @@ class BernsteinSpec:
         """Called when a quality gate (lint, tests, type-check) fails."""
 ```
 
+> **Note.** The hook names and signatures above illustrate the original ADR
+> and have since evolved (for example `on_task_claimed` and `on_agent_died`
+> no longer exist, and task-scoped hooks now take `str`-based `task_id` /
+> `role` arguments rather than `Task` objects). Treat
+> `src/bernstein/plugins/hookspecs.py` as the live contract.
+
 ---
 
 ## Consequences
@@ -190,7 +198,7 @@ entry points.
 
 **Hook specifications are the API contract.** The `hookspecs.py` file is the
 definitive documentation of what events Bernstein exposes. When we add a new hook,
-we add it here first — the spec is the contract.
+we add it here first - the spec is the contract.
 
 ### Costs
 

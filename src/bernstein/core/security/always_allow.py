@@ -5,7 +5,7 @@ invocation matches a known-safe signature.  For example, ``grep`` on
 ``src/*`` paths is always allowed, while ``grep`` on ``/etc`` still
 triggers an ask or deny.
 
-Rules take **highest precedence** — an ALLOW from this engine overrides
+Rules take **highest precedence** - an ALLOW from this engine overrides
 any ASK or DENY from other guardrails (except IMMUNE and SAFETY which
 remain bypass-immune).
 
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 ENV_ALWAYS_ALLOW_PATH = "BERNSTEIN_ALWAYS_ALLOW_PATH"
 
 #: Relative orchestrator-only location for the rules file. ``.sdd/*`` is an
-#: IMMUNE path — agents cannot modify anything there without being hard-blocked.
+#: IMMUNE path - agents cannot modify anything there without being hard-blocked.
 TRUSTED_RULES_REL = Path(".sdd") / "config" / "always_allow.yaml"
 
 #: Relative orchestrator-only location for the manifest that pins the sha256
@@ -141,7 +141,7 @@ def _pattern_matches(pattern: str, value: str) -> bool:
         try:
             return re.search(pattern, value) is not None
         except re.error:
-            logger.debug("Invalid regex %r — falling back to glob", pattern)
+            logger.debug("Invalid regex %r - falling back to glob", pattern)
     return fnmatch.fnmatch(value, pattern)
 
 
@@ -197,6 +197,22 @@ def _is_agent_writable(rules_path: Path, workdir: Path) -> bool:
     a compromised agent.  Paths that resolve outside *workdir* (e.g. the
     orchestrator's ``.sdd/config/`` when rules live there, or an absolute
     path passed via env var) are treated as trusted.
+
+    Left off the #3802/#4035 path-containment sweep on purpose:
+    ``contained_path``/``contained_subpath`` join a caller-supplied relative
+    *segment* onto a base and refuse a result outside it; this function
+    instead classifies an already-resolved, possibly-absolute path's
+    relationship to *workdir*, where "outside" is the routine, expected
+    branch (ENV_ALWAYS_ALLOW_PATH is documented above to point anywhere) and
+    not a refusal. ``validate_relative_path`` rejects a leading ``/`` or
+    drive letter outright, so passing ``str(rules_path)`` as the shared
+    helper's candidate would raise for every legitimate outside-workdir rules
+    path before containment is even checked - the exact "no behaviour change
+    is silently introduced" case #3802's acceptance criteria call out. The
+    ``resolve()``-then-``relative_to()`` shape here already matches what the
+    helper does internally; it stays local because reusing the helper's API
+    would require the same falsify-then-recover step the helper exists to
+    avoid.
     """
     try:
         resolved_rules = rules_path.resolve()
@@ -208,7 +224,7 @@ def _is_agent_writable(rules_path: Path, workdir: Path) -> bool:
     try:
         rel = resolved_rules.relative_to(resolved_workdir)
     except ValueError:
-        # File lives outside the agent workdir — trusted.
+        # File lives outside the agent workdir - trusted.
         return False
 
     parts = rel.parts
@@ -249,7 +265,7 @@ def write_always_allow_manifest(workdir: Path, rules_path: Path) -> Path:
 
     Call this from the orchestrator (never from an agent process) immediately
     after authoring or updating the rules file. The resulting manifest lives
-    under ``.sdd/config/`` which is an IMMUNE path — agents cannot forge a
+    under ``.sdd/config/`` which is an IMMUNE path - agents cannot forge a
     matching manifest without already breaking a higher guardrail.
 
     Args:
@@ -261,6 +277,12 @@ def write_always_allow_manifest(workdir: Path, rules_path: Path) -> Path:
     """
     manifest_path = workdir / TRUSTED_MANIFEST_REL
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    # Not a #3802/#4035 conversion target: this chooses between a relative
+    # and an absolute *display string* for a manifest this function's own
+    # docstring says only the orchestrator ever calls, on a path it already
+    # trusts - there is no untrusted candidate here for contained_subpath to
+    # prove contained, and the same absolute-candidate mismatch as
+    # _is_agent_writable above applies if it were forced in anyway.
     payload = {
         "version": 1,
         "path": str(rules_path.resolve().relative_to(workdir.resolve()))
@@ -291,7 +313,12 @@ def _verify_manifest(workdir: Path, rules_path: Path) -> None:
             "load agent-supplied always-allow rules."
         )
         _record_tamper_event(workdir, rules_path, reason)
-        logger.error(reason)  # lgtm[py/clear-text-logging-sensitive-data] — file paths only, no credential material
+        # Log a generic safety message; the full path-bearing reason is in
+        # .sdd/metrics/guardrails.jsonl for operator forensic review.
+        logger.error(
+            "Always-allow rules rejected: agent-writable rules file has no "
+            "orchestrator manifest. See .sdd/metrics/guardrails.jsonl for details."
+        )
         raise AlwaysAllowTamperError(reason)
 
     try:
@@ -299,7 +326,12 @@ def _verify_manifest(workdir: Path, rules_path: Path) -> None:
     except (OSError, json.JSONDecodeError) as exc:
         reason = f"Always-allow manifest at {manifest_path} is unreadable: {type(exc).__name__}"
         _record_tamper_event(workdir, rules_path, reason)
-        logger.error(reason)  # lgtm[py/clear-text-logging-sensitive-data] — file path + exception type only
+        # Log a generic safety message; the full path-bearing reason is in
+        # .sdd/metrics/guardrails.jsonl for operator forensic review.
+        logger.error(
+            "Always-allow manifest unreadable (%s). See .sdd/metrics/guardrails.jsonl for details.",
+            type(exc).__name__,
+        )
         raise AlwaysAllowTamperError(f"Always-allow manifest at {manifest_path} is unreadable: {exc}") from exc
 
     expected_digest = str(manifest.get("sha256", "")).lower()
@@ -308,12 +340,12 @@ def _verify_manifest(workdir: Path, rules_path: Path) -> None:
         reason = (
             f"Always-allow rules file {rules_path} sha256={actual_digest} "
             f"does not match manifest sha256={expected_digest or '<missing>'}. "
-            "Refusing to load — possible agent self-escalation."
+            "Refusing to load - possible agent self-escalation."
         )
         _record_tamper_event(workdir, rules_path, reason)
-        logger.error(  # lgtm[py/clear-text-logging-sensitive-data] — digests are integrity fingerprints, not secrets
+        logger.error(  # lgtm[py/clear-text-logging-sensitive-data] - digests are integrity fingerprints, not secrets
             "Always-allow rules file %s digest mismatch (digests redacted). "
-            "Refusing to load — possible agent self-escalation.",
+            "Refusing to load - possible agent self-escalation.",
             rules_path,
         )
         raise AlwaysAllowTamperError(reason)
@@ -325,9 +357,9 @@ def _resolve_rules_path(workdir: Path) -> tuple[Path | None, bool]:
     Priority order:
         1. ``$BERNSTEIN_ALWAYS_ALLOW_PATH`` (always treated as explicit, but
            still verified against agent-writable heuristics).
-        2. ``.sdd/config/always_allow.yaml`` — orchestrator-only trusted path.
-        3. ``.bernstein/always_allow.yaml`` — legacy, requires manifest.
-        4. ``.bernstein/rules.yaml`` — legacy combined file, requires manifest.
+        2. ``.sdd/config/always_allow.yaml`` - orchestrator-only trusted path.
+        3. ``.bernstein/always_allow.yaml`` - legacy, requires manifest.
+        4. ``.bernstein/rules.yaml`` - legacy combined file, requires manifest.
 
     Returns:
         Tuple of (path, is_trusted). ``path`` is ``None`` when no rules file
@@ -359,15 +391,15 @@ def load_always_allow_rules(workdir: Path, *, strict: bool = True) -> AlwaysAllo
     """Load always-allow rules with tamper-aware source selection.
 
     The loader walks a priority list (env var, ``.sdd/config/``, legacy
-    ``.bernstein/``) and — for any source that lives in the agent's writable
-    surface — verifies the sha256 against an orchestrator-signed manifest in
+    ``.bernstein/``) and - for any source that lives in the agent's writable
+    surface - verifies the sha256 against an orchestrator-signed manifest in
     ``.sdd/config/always_allow.manifest.json`` before parsing.
 
     Args:
         workdir: Project root.
         strict: When ``True`` (default), tamper detection raises
             :class:`AlwaysAllowTamperError`. When ``False``, the error is
-            swallowed and an empty engine is returned — useful for callers
+            swallowed and an empty engine is returned - useful for callers
             that prefer a safe-default (no ALLOW overrides) over a crash.
 
     Returns:

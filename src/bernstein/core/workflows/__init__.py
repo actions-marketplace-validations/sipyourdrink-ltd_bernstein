@@ -1,4 +1,4 @@
-"""Archon-inspired YAML workflow manifests.
+"""Declarative YAML workflow manifests.
 
 Companion to ``bernstein run -g <goal>``: a declarative way to run a
 DAG of agent / command / loop nodes through the existing
@@ -7,10 +7,10 @@ parallel spawn path.
 
 Public surface:
 
-* :class:`WorkflowSpec` / :class:`WorkflowNode` / :class:`LoopSpec` —
+* :class:`WorkflowSpec` / :class:`WorkflowNode` / :class:`LoopSpec` -
   Pydantic v2 schema for the YAML manifest (see
   :mod:`bernstein.core.workflows.workflow_spec`).
-* :class:`WorkflowRunner` — DAG executor (see
+* :class:`WorkflowRunner` - DAG executor (see
   :mod:`bernstein.core.workflows.workflow_runner`).
 """
 

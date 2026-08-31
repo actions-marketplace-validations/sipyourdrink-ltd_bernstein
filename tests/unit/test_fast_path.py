@@ -16,7 +16,10 @@ from bernstein.core.fast_path import (
     get_l1_model_config,
     try_fast_path_batch,
 )
-from bernstein.core.models import Complexity, Scope, Task
+from bernstein.core.models import Complexity, ModelConfig, Scope, Task
+
+from bernstein.core import fast_path as fast_path_module
+from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 
 # --- Helpers ---
 
@@ -279,6 +282,86 @@ class TestExecuteFastPath:
         assert "get_cwd" in src.read_text()
         assert "getCwd" not in src.read_text()
 
+    def test_rename_ignores_absolute_owned_file(self, tmp_path: Path) -> None:
+        """An absolute entry in owned_files never reaches a file outside workdir.
+
+        ``Path.__truediv__`` drops the left operand entirely when the right
+        operand is absolute, so ``workdir / "/x/y"`` is ``/x/y``.  The entry
+        is skipped and the outside file is left byte-for-byte unchanged.
+        """
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        outside = tmp_path / "outside.py"
+        outside.write_text("def getCwd():\n    return 1\n", encoding="utf-8")
+        original = outside.read_bytes()
+
+        task = _make_task(
+            title="Rename getCwd to get_cwd",
+            complexity=Complexity.LOW,
+            owned_files=[str(outside)],
+        )
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            workdir,
+            [str(outside)],
+            task=task,
+        )
+
+        assert outside.read_bytes() == original
+        assert result.files_modified == 0
+
+    def test_rename_ignores_parent_traversal_owned_file(self, tmp_path: Path) -> None:
+        """A ``..`` entry in owned_files never reaches a file outside workdir."""
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        outside = tmp_path / "outside.py"
+        outside.write_text("def getCwd():\n    return 1\n", encoding="utf-8")
+        original = outside.read_bytes()
+
+        rel = "../outside.py"
+        task = _make_task(
+            title="Rename getCwd to get_cwd",
+            complexity=Complexity.LOW,
+            owned_files=[rel],
+        )
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            workdir,
+            [rel],
+            task=task,
+        )
+
+        assert outside.read_bytes() == original
+        assert result.files_modified == 0
+
+    def test_rename_skips_bad_entry_but_still_renames_good_one(self, tmp_path: Path) -> None:
+        """A refused entry is skipped and logged; the run does not crash."""
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        good = workdir / "main.py"
+        good.write_text("def getCwd():\n    return getCwd()\n", encoding="utf-8")
+        outside = tmp_path / "outside.py"
+        outside.write_text("def getCwd():\n    return 1\n", encoding="utf-8")
+        original = outside.read_bytes()
+
+        targets = ["../outside.py", "main.py"]
+        task = _make_task(
+            title="Rename getCwd to get_cwd",
+            complexity=Complexity.LOW,
+            owned_files=targets,
+        )
+        result = execute_fast_path(
+            FastPathAction.RENAME_SYMBOL,
+            workdir,
+            targets,
+            task=task,
+        )
+
+        assert result.success is True
+        assert result.files_modified == 1
+        assert "get_cwd" in good.read_text(encoding="utf-8")
+        assert outside.read_bytes() == original
+
     def test_rename_no_task_fails(self) -> None:
         result = execute_fast_path(
             FastPathAction.RENAME_SYMBOL,
@@ -365,18 +448,79 @@ class TestFastPathStats:
         assert stats.actions["ruff_fix"] == 5
 
 
+class TestLoadFastPathConfig:
+    """Tests for load_fast_path_config()."""
+
+    def setup_method(self) -> None:
+        self._orig_l0 = list(fast_path_module._l0_patterns)
+        self._orig_l1 = list(fast_path_module._l1_patterns)
+        self._orig_l1_model = fast_path_module._l1_model_config
+
+    def teardown_method(self) -> None:
+        fast_path_module._l0_patterns = self._orig_l0
+        fast_path_module._l1_patterns = self._orig_l1
+        fast_path_module._l1_model_config = self._orig_l1_model
+
+    def test_load_config_ignores_pending_upgrades(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        from bernstein.core.fast_path import load_fast_path_config
+
+        routing_yaml = tmp_path / "routing.yaml"
+        routing_yaml.write_text(
+            """
+fast_path:
+  enabled: true
+  l1_model: "claude-3-haiku"
+  l1_effort: "low"
+pending_upgrades:
+  - id: "legacy-pending"
+    title: "Old upgrade"
+    change: "Ignore me"
+""",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = load_fast_path_config(routing_yaml)
+            assert result is True
+            assert any("pending_upgrades" in record.message for record in caplog.records)
+
+        assert fast_path_module._l1_model_config is not None
+        assert fast_path_module._l1_model_config.model == "claude-3-haiku"
+
+
 # --- L1 model config ---
 
 
 class TestL1ModelConfig:
-    """Tests for L1 cheapest model config."""
+    """Tests for L1 cheapest model config.
 
-    def test_l1_model_is_sonnet(self) -> None:
+    L1 model config comes only from routing.yaml's fast_path.l1_model
+    (see load_fast_path_config) - Bernstein never hardcodes a fallback
+    model, so get_l1_model_config() must raise when unconfigured and
+    return exactly what was configured when it is.
+    """
+
+    def setup_method(self) -> None:
+        self._orig = fast_path_module._l1_model_config
+
+    def teardown_method(self) -> None:
+        fast_path_module._l1_model_config = self._orig
+
+    def test_raises_when_unconfigured(self) -> None:
+        fast_path_module._l1_model_config = None
+        with pytest.raises(ModelNotConfiguredError, match="No L1 model configured"):
+            get_l1_model_config()
+
+    def test_l1_model_returns_config_supplied_model(self) -> None:
+        fast_path_module._l1_model_config = ModelConfig(model="sonnet", effort="normal", max_tokens=50_000)
         cfg = get_l1_model_config()
         assert cfg.model == "sonnet"
         assert cfg.effort == "normal"
 
     def test_l1_model_has_reasonable_token_limit(self) -> None:
+        fast_path_module._l1_model_config = ModelConfig(model="sonnet", effort="normal", max_tokens=50_000)
         cfg = get_l1_model_config()
         assert cfg.max_tokens <= 100_000
 

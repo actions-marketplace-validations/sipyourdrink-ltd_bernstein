@@ -66,7 +66,7 @@ keyring; on a headless / SSH host the CLI falls back to a URL flow.
 > installer of their choice and Bernstein discovers whatever is on
 > `PATH`.
 
-### `gemini` (legacy; Enterprise-only after 2026-06-18)
+### `gemini` (legacy; Enterprise-only since 2026-06-18)
 
 ```bash
 npm install -g @google/gemini-cli
@@ -75,7 +75,7 @@ gemini auth
 
 The legacy binary keeps working for operators on Enterprise licenses
 with paid Gemini Enterprise Agent Platform API keys. Free / AI Pro /
-Ultra subscribers should migrate to `antigravity` before 2026-06-18.
+Ultra subscribers needed to migrate to `antigravity` by 2026-06-18; that deadline has now passed.
 
 ---
 
@@ -152,3 +152,13 @@ want Claude continue using the existing `claude` adapter.
    reports the binary path and `conformance: ok`.
 4. Optionally uninstall the legacy `gemini` binary. The adapter
    handles either ordering.
+
+---
+
+## Successor CLI (`agy`)
+
+The hosted backend behind the non-enterprise path was discontinued in
+June 2026. Consumer-path operators (free / AI Pro / Ultra) should use
+the separate [`agy` adapter](agy.md) for the successor Antigravity CLI
+(`agy` binary). This dual-binary adapter remains the enterprise /
+API-key lane.

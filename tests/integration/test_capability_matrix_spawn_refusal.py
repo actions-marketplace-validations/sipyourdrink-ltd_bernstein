@@ -1,7 +1,7 @@
 """End-to-end spawn-refusal integration tests for the lethal-trifecta matrix.
 
-These tests exercise the *real* :class:`AgentSpawner.spawn_for_tasks` path —
-not the unit-level ``CapabilityRegistry.evaluate_chain`` — to prove that
+These tests exercise the *real* :class:`AgentSpawner.spawn_for_tasks` path -
+not the unit-level ``CapabilityRegistry.evaluate_chain`` - to prove that
 the capability matrix is wired into spawn-time enforcement and cannot be
 bypassed by alias renames, runtime tag mutation, or relaxed-mode flips.
 
@@ -9,20 +9,20 @@ Each scenario constructs a real :class:`CatalogRegistry` with a typed
 :class:`CatalogAgent`, hands it to a ``MagicMock``-backed adapter, and
 calls ``spawner.spawn_for_tasks([task])``.  Refusal is detected by the
 ``SpawnError`` raised at validation time *before* the adapter's
-``spawn()`` method is ever invoked — which is also asserted via
+``spawn()`` method is ever invoked - which is also asserted via
 ``adapter.spawn.assert_not_called()`` and via a monkeypatched
 ``subprocess.Popen`` watch.
 
 Coverage maps the deliverable list:
-    * Happy path (baseline) — no trifecta, spawn succeeds.
-    * Direct trifecta refusal — declared trifecta tools.
-    * Aliased tool refusal — same trifecta but renamed to undeclared aliases.
-    * Runtime substitution — operator config swaps a tool mid-spawn.
-    * Mutation refusal — registry mutates between validation and execution.
-    * Bypass-immune override — bypass=True does not relax IMMUNE/lethal.
-    * Audit event — refusal emits ``capability_matrix_refusal`` HMAC entry.
-    * No subprocess on refusal — ``subprocess.Popen`` is never called.
-    * Adapter-only chain (regression) — adapter envelope alone passes.
+    * Happy path (baseline) - no trifecta, spawn succeeds.
+    * Direct trifecta refusal - declared trifecta tools.
+    * Aliased tool refusal - same trifecta but renamed to undeclared aliases.
+    * Runtime substitution - operator config swaps a tool mid-spawn.
+    * Mutation refusal - registry mutates between validation and execution.
+    * Bypass-immune override - bypass=True does not relax IMMUNE/lethal.
+    * Audit event - refusal emits ``capability_matrix_refusal`` HMAC entry.
+    * No subprocess on refusal - ``subprocess.Popen`` is never called.
+    * Adapter-only chain (regression) - adapter envelope alone passes.
 
 Multi-OS: tests do not rely on POSIX-only signals or ``chmod 0o600``;
 ``tmp_path`` and ``unittest.mock`` work identically on Windows runners.
@@ -63,7 +63,7 @@ def workdir(tmp_path: Path) -> Path:
 
     The capability templates are staged at ``<workdir>/templates/capabilities/``
     so :meth:`CapabilityRegistry.load_default` resolves the local copy
-    instead of the bundled defaults — guaranteeing the integration test
+    instead of the bundled defaults - guaranteeing the integration test
     runs against an isolated, predictable registry.
     """
     subprocess.run(
@@ -220,13 +220,21 @@ def _build_spawner(
     adapter: MagicMock,
     catalog: CatalogRegistry | None = None,
 ) -> AgentSpawner:
-    """Construct an :class:`AgentSpawner` plumbed exactly like prod (sans worktree)."""
+    """Construct an :class:`AgentSpawner` plumbed exactly like prod (sans worktree).
+
+    ``default_model`` is set explicitly: these tests exercise capability-matrix
+    enforcement, not model routing, but the ``mockcli`` adapter is not
+    Claude-compatible, so an unconfigured model would now correctly raise
+    ``ModelNotConfiguredError`` at the spawn boundary (Bernstein never
+    silently falls back to a Claude tier name for a non-Claude adapter).
+    """
     return AgentSpawner(
         adapter=adapter,
         templates_dir=workdir / "templates" / "roles",
         workdir=workdir,
         catalog=catalog,
         use_worktrees=False,
+        default_model="mock-model",
     )
 
 
@@ -241,12 +249,12 @@ def _set_enforcement(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. Happy path — non-trifecta tools spawn successfully (baseline)
+# 1. Happy path - non-trifecta tools spawn successfully (baseline)
 # ---------------------------------------------------------------------------
 
 
 class TestHappyPath:
-    """A non-trifecta agent must spawn — the matrix is permissive by design
+    """A non-trifecta agent must spawn - the matrix is permissive by design
     when capability axes do not union the lethal trifecta.
     """
 
@@ -271,7 +279,7 @@ class TestHappyPath:
 
 
 # ---------------------------------------------------------------------------
-# 2. Direct trifecta refusal — declared tags union the trifecta
+# 2. Direct trifecta refusal - declared tags union the trifecta
 # ---------------------------------------------------------------------------
 
 
@@ -300,14 +308,14 @@ class TestDirectTrifectaRefusal:
 
 
 # ---------------------------------------------------------------------------
-# 3. Aliased tool refusal — same trifecta but tool names are unknown aliases
+# 3. Aliased tool refusal - same trifecta but tool names are unknown aliases
 # ---------------------------------------------------------------------------
 
 
 class TestAliasedToolRefusal:
     """Renaming a trifecta-bearing tool to a different *registered* alias
-    must NOT bypass the spawn refusal.  The matrix is name-agnostic — it
-    keys on declared capabilities, not on canonical tool names — so an
+    must NOT bypass the spawn refusal.  The matrix is name-agnostic - it
+    keys on declared capabilities, not on canonical tool names - so an
     operator who registers ``read_file`` with ``[private_data]`` caps
     must see the same refusal as if they had used ``fs.read``.
 
@@ -345,7 +353,7 @@ class TestAliasedToolRefusal:
         """Aliases that are registered with the canonical caps still trip.
 
         The matrix is keyed on the declared cap set, not the canonical
-        tool name — so renaming ``fs.read_secret`` → ``read_file`` (with
+        tool name - so renaming ``fs.read_secret`` → ``read_file`` (with
         the same ``[private_data]`` cap) must produce the same refusal.
         """
         self._register_alias_yaml(workdir)
@@ -384,14 +392,14 @@ class TestAliasedToolRefusal:
 
 
 # ---------------------------------------------------------------------------
-# 4. Runtime substitution — operator-supplied chain swap mid-spawn
+# 4. Runtime substitution - operator-supplied chain swap mid-spawn
 # ---------------------------------------------------------------------------
 
 
 class TestRuntimeSubstitution:
     """If an operator hot-swaps a clean catalog agent for a trifecta one
     between two ``spawn_for_tasks`` invocations, the SECOND spawn must be
-    refused.  This is the realistic "config refresh" attack surface — and
+    refused.  This is the realistic "config refresh" attack surface - and
     it pins the property that no spawner-internal cache can make a stale
     "allow" decision sticky.
     """
@@ -402,7 +410,7 @@ class TestRuntimeSubstitution:
         mock_adapter: MagicMock,
         make_task: Any,
     ) -> None:
-        # First spawn uses a safe catalog — must succeed.
+        # First spawn uses a safe catalog - must succeed.
         safe_catalog = _catalog_with(tools=["fs.read", "git.commit"])
         spawner = _build_spawner(workdir=workdir, adapter=mock_adapter, catalog=safe_catalog)
         spawner.spawn_for_tasks([make_task(task_id="T-001")])
@@ -420,19 +428,19 @@ class TestRuntimeSubstitution:
         with pytest.raises(SpawnError, match="lethal trifecta"):
             spawner.spawn_for_tasks([make_task(task_id="T-002")])
 
-        # Adapter spawn count is exactly 1 — only the first (safe) call ran.
+        # Adapter spawn count is exactly 1 - only the first (safe) call ran.
         assert mock_adapter.spawn.call_count == 1
 
 
 # ---------------------------------------------------------------------------
-# 5. Mutation refusal — registry tags mutated between validation and exec
+# 5. Mutation refusal - registry tags mutated between validation and exec
 # ---------------------------------------------------------------------------
 
 
 class TestMutationRefusal:
     """The :func:`_enforce_lethal_trifecta` guard re-loads the registry on
     every spawn, so post-spawn YAML edits (or in-flight registry rewrites)
-    are observed at the *next* spawn — but a decision that fired during
+    are observed at the *next* spawn - but a decision that fired during
     the current spawn is captured atomically before the manifest is
     written.
     """
@@ -485,7 +493,7 @@ class TestMutationRefusal:
         """The persisted manifest is frozen against post-deny YAML edits.
 
         The unit-level "frozen :class:`ChainDecision`" contract is
-        translated into the live spawn path — once the spawn manifest is
+        translated into the live spawn path - once the spawn manifest is
         written with ``allowed=False``, mutating the YAML cannot rewrite
         the historical record.
         """
@@ -501,7 +509,7 @@ class TestMutationRefusal:
         assert manifest_files, "Expected a manifest to be written on refusal"
         manifest = json.loads(manifest_files[-1].read_text(encoding="utf-8"))
         assert manifest["allowed"] is False
-        # Frozen even after we mutate the YAML — manifest value stays as-was.
+        # Frozen even after we mutate the YAML - manifest value stays as-was.
         (workdir / _CAPABILITY_TEMPLATES_REL / "surfaces.yaml").write_text(
             "tools:\n  - name: fs.read\n    capabilities: []\n",
             encoding="utf-8",
@@ -511,7 +519,7 @@ class TestMutationRefusal:
 
 
 # ---------------------------------------------------------------------------
-# 6. Bypass-immune override — bypass=True does NOT relax IMMUNE
+# 6. Bypass-immune override - bypass=True does NOT relax IMMUNE
 # ---------------------------------------------------------------------------
 
 
@@ -543,7 +551,7 @@ class TestBypassImmuneAtSpawnTime:
 
 
 # ---------------------------------------------------------------------------
-# 7. Audit event — every refusal lands in the HMAC-chained audit log
+# 7. Audit event - every refusal lands in the HMAC-chained audit log
 # ---------------------------------------------------------------------------
 
 
@@ -634,7 +642,7 @@ class TestNoSubprocessOnRefusal:
 
 class TestAdapterEnvelopeAlone:
     """The bundled YAML tags every ``adapter.*`` entry with all three caps,
-    intentionally — but the spawner only evaluates the catalog tool list,
+    intentionally - but the spawner only evaluates the catalog tool list,
     so a no-tools agent must still spawn.  This pins the contract that
     operators have to *opt into* a trifecta-prone tool list.
     """
@@ -654,7 +662,7 @@ class TestAdapterEnvelopeAlone:
 
 
 # ---------------------------------------------------------------------------
-# 10. Warn / off mode regression — refusal does NOT fire under WARN
+# 10. Warn / off mode regression - refusal does NOT fire under WARN
 # ---------------------------------------------------------------------------
 
 
@@ -690,7 +698,7 @@ class TestRelaxedModeRegression:
 
 
 # ---------------------------------------------------------------------------
-# 11. Logging surface — refusal logs at ERROR level with the trifecta tag
+# 11. Logging surface - refusal logs at ERROR level with the trifecta tag
 # ---------------------------------------------------------------------------
 
 
@@ -755,7 +763,7 @@ class TestEnforcementCoercion:
 
 
 # ---------------------------------------------------------------------------
-# 13. Single-tool trifecta — adapter-equivalent omnipotent tool refused
+# 13. Single-tool trifecta - adapter-equivalent omnipotent tool refused
 # ---------------------------------------------------------------------------
 
 
@@ -828,13 +836,13 @@ class TestManifestOffendingToolsOnDeny:
 
 
 # ---------------------------------------------------------------------------
-# 15. No catalog at all — spawner falls back to built-in role template
+# 15. No catalog at all - spawner falls back to built-in role template
 # ---------------------------------------------------------------------------
 
 
 class TestNoCatalog:
     """If the spawner is built without a catalog the trifecta evaluation
-    has zero declared tools to chain — the spawn must succeed.  This
+    has zero declared tools to chain - the spawn must succeed.  This
     regression-pins the default open-source posture: stock Bernstein with
     no operator-declared tools never blocks.
     """
@@ -849,3 +857,139 @@ class TestNoCatalog:
 
         spawner.spawn_for_tasks([make_task()])
         mock_adapter.spawn.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# 16. Scalar frontmatter tools/capabilities through trifecta enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestScalarFrontmatterTrifectaEnforcement:
+    """Regression: before the fix (task ffe2d7a6ad9d, commit c1f8f92),
+    ``list(fm.get("tools") or [])`` on a scalar string iterated
+    *characters* instead of splitting on comma.  The single-character
+    tool names never matched any registered tool, so
+    ``_enforce_lethal_trifecta`` saw an empty declared set and the
+    check was silently bypassed.
+
+    This test proves the fix closes that bypass end-to-end: parse an
+    agency MD file with scalar ``tools:`` form, feed the resulting
+    CatalogAgent through the real spawner path, and verify the
+    trifecta fires.
+    """
+
+    def test_scalar_tools_parsed_as_names_not_chars(self, tmp_path: Path) -> None:
+        """Scalar ``tools: A, B, C`` must produce ``["A", "B", "C"]``,
+        not ``["A", ",", " ", "B", ...]``.
+        """
+        from bernstein.agents.agency_provider import AgencyProvider
+
+        md_file = tmp_path / "trifecta-agent.md"
+        md_file.write_text(
+            "---\n"
+            "name: Trifecta Agent\n"
+            "description: Agent with scalar tools form\n"
+            "tools: fs.read_secret, net.egress, exec.shell\n"
+            "---\n"
+            "You are a test agent.\n",
+            encoding="utf-8",
+        )
+
+        agents = AgencyProvider._parse_file(md_file, division="engineering")
+
+        assert len(agents) == 1
+        assert agents[0].tools == ["fs.read_secret", "net.egress", "exec.shell"]
+
+    def test_scalar_trifecta_refuses_spawn(
+        self,
+        workdir: Path,
+        mock_adapter: MagicMock,
+        make_task: Any,
+        tmp_path: Path,
+    ) -> None:
+        """Full end-to-end: scalar frontmatter → parse → catalog → spawner
+        → spawn refused in enforce mode."""
+        from bernstein.agents.agency_provider import AgencyProvider
+        from bernstein.core.security.capability_matrix import (
+            CapabilityRegistry,
+            ToolCapabilities,
+        )
+
+        md_file = tmp_path / "trifecta-agent.md"
+        md_file.write_text(
+            "---\n"
+            "name: Trifecta Agent\n"
+            "description: Agent with scalar tools form\n"
+            "tools: fs.read_secret, net.egress, exec.shell\n"
+            "---\n"
+            "You are a test agent.\n",
+            encoding="utf-8",
+        )
+
+        # 1. Parse the scalar-frontmatter MD file.
+        agents = AgencyProvider._parse_file(md_file, division="engineering")
+        assert len(agents) == 1
+        parsed_agent = agents[0]
+
+        # 2. Tools are full names, not individual characters.
+        assert parsed_agent.tools == ["fs.read_secret", "net.egress", "exec.shell"]
+
+        # 3. Register those tools with capabilities that union the trifecta.
+        registry = CapabilityRegistry()
+        registry.register(
+            ToolCapabilities(
+                tool_name="fs.read_secret",
+                capabilities=frozenset({Capability.PRIVATE_DATA}),
+            )
+        )
+        registry.register(
+            ToolCapabilities(
+                tool_name="net.egress",
+                capabilities=frozenset({Capability.UNTRUSTED_INPUT, Capability.EXTERNAL_COMM}),
+            )
+        )
+        registry.register(
+            ToolCapabilities(
+                tool_name="exec.shell",
+                capabilities=frozenset({Capability.PRIVATE_DATA, Capability.EXTERNAL_COMM}),
+            )
+        )
+
+        # 4. Build catalog + spawner and call spawn_for_tasks.
+        catalog = CatalogRegistry()
+        catalog.register_agent(parsed_agent)
+        spawner = _build_spawner(workdir=workdir, adapter=mock_adapter, catalog=catalog)
+
+        # Patch the registry loaded by the spawner so it uses ours.
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            CapabilityRegistry,
+            "load_default",
+            classmethod(lambda cls, **kwargs: registry),  # type: ignore[arg-type]
+        )
+
+        # 5. Spawn must be refused.
+        with pytest.raises(SpawnError, match="lethal trifecta"):
+            spawner.spawn_for_tasks([make_task(task_id="T-scalar-trifecta")])
+
+        mock_adapter.spawn.assert_not_called()
+
+        # 6. Persisted manifest must list full tool names, not characters.
+        manifest_dir = workdir / ".sdd" / "runtime" / "spawn_capabilities"
+        manifests = sorted(manifest_dir.glob("*.json"))
+        assert manifests, "Expected a manifest on refusal"
+        manifest = json.loads(manifests[-1].read_text(encoding="utf-8"))
+        assert manifest["allowed"] is False
+        # Each listed tool is a full name, never a single character.
+        for tool in manifest["tools"]:
+            assert len(tool) > 1, (
+                f"Manifest tool {tool!r} is a single character — scalar frontmatter was not split on comma"
+            )
+        # The scalar-parsed tools must appear in full form in the manifest.
+        # The spawner prepends the adapter tool, so the manifest has 4 entries.
+        expected_tools = {"fs.read_secret", "net.egress", "exec.shell"}
+        assert expected_tools.issubset(set(manifest["tools"])), (
+            f"Scalar-parsed tools missing from manifest: {expected_tools - set(manifest['tools'])}"
+        )
+
+        monkeypatch.undo()

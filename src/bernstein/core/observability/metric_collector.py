@@ -2,6 +2,9 @@
 
 Collects time-series metrics for agent success rates, task completion times,
 API usage patterns, error rates, and cost efficiency.
+
+Dropped lines: permanently failing write targets are dropped after
+``_MAX_FLUSH_ATTEMPTS=3`` retries to prevent unbounded buffer growth.
 """
 
 from __future__ import annotations
@@ -15,10 +18,18 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from bernstein.core.persistence.runtime_state import rotate_log_file
-from bernstein.core.tenanting import normalize_tenant_id, tenant_metrics_dir
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+from bernstein.core.persistence.anchored_write import (
+    AnchoredDir,
+    anchored_append,
+    mkdir_anchored,
+    rotate_anchored,
+)
+from bernstein.core.tenanting import normalize_tenant_id, tenant_metrics_target
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +38,18 @@ logger = logging.getLogger(__name__)
 # orchestrators never accumulate multi-GB metric files.
 _METRIC_FILE_ROTATE_BYTES = 10 * 1024 * 1024
 _METRIC_FILE_MAX_BACKUPS = 5
+#: How many times a line may be re-queued after its target's write failed.
+#: A target that is permanently unwritable would otherwise carry its lines
+#: forward through every flush for the life of the process, so the buffer
+#: grows without bound and each flush retries a write that cannot succeed.
+_MAX_FLUSH_ATTEMPTS = 3
 
 
 def iter_metric_files(metrics_dir: Path, prefix: str) -> list[Path]:
     """Return live and rotated metric JSONL files matching *prefix*.
 
     The on-disk layout is ``{prefix}_YYYYMMDD.jsonl`` plus rotation suffixes
-    ``.1``, ``.2`` … applied by :func:`rotate_log_file`. Callers that
+    ``.1``, ``.2`` … applied by :func:`rotate_anchored`. Callers that
     aggregate across days must include rotated backups, otherwise any
     rollover silently truncates their view.
 
@@ -84,10 +100,10 @@ class PrivacyLevel(Enum):
     """Analytics privacy presets controlling what metric data is collected and exported.
 
     Attributes:
-        FULL: All data collected — task IDs, agent IDs, costs, tokens, error detail.
-        STANDARD: Aggregate-safe — strip individual task/agent/session identifiers
+        FULL: All data collected - task IDs, agent IDs, costs, tokens, error detail.
+        STANDARD: Aggregate-safe - strip individual task/agent/session identifiers
             from labels, but retain cost and performance signals.
-        MINIMAL: Counts only — suppress identifiers, cost, and token data; only
+        MINIMAL: Counts only - suppress identifiers, cost, and token data; only
             aggregate success/failure counts are retained.
     """
 
@@ -295,7 +311,17 @@ class MetricsCollector:
         self._usage_quotas: dict[str, UsageQuota] = {}
 
         # Write buffer for batched file I/O
-        self._buffer: list[tuple[Path, str]] = []
+        # Buffered points carry the directory as an anchor plus a filename
+        # rather than as a joined path.  A point is written at flush time, not
+        # at record time, so a path stored here would be resolved long after
+        # the directory it names was decided on -- the anchor defers the walk
+        # to the moment of the write instead.
+        # The fourth element is how many flushes have already failed for
+        # this line. Counting per line rather than per target keeps the
+        # bound where the data is: nothing extra to lock, nothing to reset
+        # on success, and a line re-queued once does not restart the count
+        # because a later line to the same target happened to succeed.
+        self._buffer: list[tuple[AnchoredDir, str, str, int]] = []
         self._buffer_limit: int = 50
         self._flush_interval: float = 5.0  # seconds between time-based flushes
         self._last_flush: float = time.time()
@@ -458,7 +484,7 @@ class MetricsCollector:
                 },
             )
 
-        # Write token usage — enables avg-tokens-per-task queries in /quality
+        # Write token usage - enables avg-tokens-per-task queries in /quality
         if tokens_used > 0 and self._privacy_level is not PrivacyLevel.MINIMAL:
             self._write_metric_point(
                 MetricType.API_USAGE,
@@ -472,7 +498,7 @@ class MetricsCollector:
         # Update usage quota
         self._update_usage_quota(metrics.provider, metrics.model, tokens_used)
 
-        # Flush buffered points — task completion is a natural checkpoint
+        # Flush buffered points - task completion is a natural checkpoint
         self._flush_buffer()
 
         return metrics
@@ -506,7 +532,7 @@ class MetricsCollector:
             role: Agent role.
             model: Model being used.
             provider: API provider.
-            agent_source: Where the agent prompt came from — ``"catalog"``,
+            agent_source: Where the agent prompt came from - ``"catalog"``,
                 ``"agency"``, or ``"built-in"`` (default).
 
         Returns:
@@ -904,7 +930,7 @@ class MetricsCollector:
 
         today = datetime.now().strftime("%Y-%m-%d")
         filename = f"{metric_type.value}_{today}.jsonl"
-        filepath = self._metrics_dir / filename
+        shared_dir = AnchoredDir(root=self._metrics_dir)
 
         point = {
             "timestamp": time.time(),
@@ -915,13 +941,27 @@ class MetricsCollector:
 
         file_disabled = EventSink.FILE in self._disabled_sinks
         if not file_disabled:
+            # Both targets are resolved before either is queued. Resolving the
+            # tenant target inside the buffer append made a rejected tenant
+            # label leave the shared copy of the point queued behind a write
+            # that never completed: the point was recorded for one of its two
+            # destinations and the caller saw the failure, so the buffer no
+            # longer described what had been asked for. Deriving first makes
+            # the *buffer append* all-or-nothing. It says nothing about the
+            # writes: `_flush_buffer` reports per file and one destination can
+            # still fail on its own, which is the same best-effort contract
+            # file metrics have always had.
+            targets: list[AnchoredDir] = [shared_dir]
+            tenant_id = normalize_tenant_id(labels.get("tenant_id"))
+            if tenant_id != "default":
+                tenant_dir = tenant_metrics_target(self._metrics_dir, tenant_id)
+                mkdir_anchored(tenant_dir)
+                targets.append(tenant_dir)
+
+            serialized = json.dumps(point)
             with self._lock:
-                self._buffer.append((filepath, json.dumps(point)))
-                tenant_id = normalize_tenant_id(labels.get("tenant_id"))
-                if tenant_id != "default":
-                    tenant_dir = tenant_metrics_dir(self._metrics_dir, tenant_id)
-                    tenant_dir.mkdir(parents=True, exist_ok=True)
-                    self._buffer.append((tenant_dir / filename, json.dumps(point)))
+                for target in targets:
+                    self._buffer.append((target, filename, serialized, 0))
                 should_flush = (
                     len(self._buffer) >= self._buffer_limit or (time.time() - self._last_flush) >= self._flush_interval
                 )
@@ -941,25 +981,72 @@ class MetricsCollector:
             self._buffer = []
             self._last_flush = time.time()
 
-        # Group lines by file path
-        by_file: dict[Path, list[str]] = {}
-        for filepath, line in batch:
-            by_file.setdefault(filepath, []).append(line)
+        # Group lines by target file. ``AnchoredDir`` is frozen, so the anchor
+        # and filename form the key directly.
+        by_file: dict[tuple[AnchoredDir, str], list[tuple[str, int]]] = {}
+        for directory, filename, line, attempts in batch:
+            by_file.setdefault((directory, filename), []).append((line, attempts))
 
-        for filepath, lines in by_file.items():
+        # Lines whose target write failed. Collected rather than re-queued
+        # inline so the remaining targets in this batch are still attempted.
+        failed: list[tuple[AnchoredDir, str, str, int]] = []
+
+        for (directory, filename), pending in by_file.items():
             try:
                 # Bound per-file growth: rotate *before* appending so the new
                 # write starts a fresh file once the threshold is crossed.
-                # See — previously these JSONL files grew unbounded.
-                rotate_log_file(
-                    filepath,
+                # See - previously these JSONL files grew unbounded.
+                #
+                # Anchored for the same reason the append is, and it is the
+                # more pressing of the two: rotation stats, unlinks and renames.
+                # On a derived path a symlink at a managed parent redirects all
+                # three before the append can refuse anything, so the operation
+                # that destroys files was the one running unprotected.
+                rotate_anchored(
+                    directory,
+                    filename,
                     max_bytes=_METRIC_FILE_ROTATE_BYTES,
                     max_backups=_METRIC_FILE_MAX_BACKUPS,
                 )
-                with filepath.open("a") as f:
-                    f.write("\n".join(lines) + "\n")
+                with anchored_append(directory, filename) as f:
+                    f.write("\n".join(line for line, _ in pending) + "\n")
             except OSError:
-                logger.exception("Failed to flush metrics to %s", filepath)
+                logger.exception("Failed to flush metrics to %s", directory.path / filename)
+                retryable = [(line, n + 1) for line, n in pending if n + 1 < _MAX_FLUSH_ATTEMPTS]
+                exhausted = len(pending) - len(retryable)
+                if exhausted:
+                    # Named, not silent: a dropped metric line is invisible
+                    # downstream, so the count and the target are the only
+                    # record that the buffer stopped describing what was asked.
+                    logger.warning(
+                        "Dropping %d metric line(s) for %s after %d failed flushes",
+                        exhausted,
+                        directory.path / filename,
+                        _MAX_FLUSH_ATTEMPTS,
+                    )
+                failed.extend((directory, filename, line, n) for line, n in retryable)
+
+        if failed:
+            # Put the failed target's lines back so a later flush() can retry
+            # them. They were drained before any write was attempted, so
+            # without this a transient ENOSPC or a briefly unwritable tenant
+            # directory silently destroyed that target's copy while the shared
+            # copy survived - a divergence nothing downstream could detect.
+            #
+            # Prepended, not appended: anything enqueued while this flush was
+            # writing is newer, so putting the retries in front keeps each
+            # target's lines in the order they were recorded. Only the failed
+            # target's lines come back, so a target that wrote successfully is
+            # neither undone nor duplicated.
+            #
+            # Bounded at ``_MAX_FLUSH_ATTEMPTS``: re-queueing forever turns a
+            # permanently unwritable target into unbounded buffer growth, and
+            # every later flush pays for a write that cannot succeed. Past the
+            # bound the lines are dropped with a log line that names the target
+            # and the count, which is the trade this makes explicit - losing
+            # some lines loudly beats losing the whole buffer quietly.
+            with self._lock:
+                self._buffer[:0] = failed
 
     def flush(self) -> None:
         """Flush the write buffer to disk. Call this each orchestrator tick."""
@@ -982,7 +1069,7 @@ class MetricsCollector:
             from bernstein.plugins.manager import get_plugin_manager
 
             pm = get_plugin_manager()
-            pm.hook.on_metric_record(metric_type=metric_type, value=value, labels=labels)  # type: ignore[union-attr]
+            pm.hook.on_metric_record(metric_type=metric_type, value=value, labels=labels)  # type: ignore[attr-defined]
         except Exception:
             logger.debug("Plugin hook on_metric_record failed (swallowed)", exc_info=True)
 
@@ -1069,6 +1156,9 @@ class MetricsCollector:
         tokens_before: int,
         tokens_after: int,
         reason: str = "token_budget",
+        *,
+        trigger: str | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         """Record a context compaction event.
 
@@ -1080,18 +1170,24 @@ class MetricsCollector:
             tokens_before: Token count before compaction.
             tokens_after: Token count after compaction.
             reason: Why compaction was triggered.
+            trigger: Compaction lane (``proactive`` or ``reactive``);
+                omitted from the tags when ``None`` so pre-existing
+                callers produce unchanged points.
+            correlation_id: Receipt correlation id tying the metric
+                point to the ``compaction.receipt`` audit-chain event.
         """
         saved = max(0, tokens_before - tokens_after)
-        self._write_metric_point(
-            MetricType.COMPACTION,
-            float(saved),
-            {
-                "session_id": session_id,
-                "tokens_before": str(tokens_before),
-                "tokens_after": str(tokens_after),
-                "reason": reason,
-            },
-        )
+        tags = {
+            "session_id": session_id,
+            "tokens_before": str(tokens_before),
+            "tokens_after": str(tokens_after),
+            "reason": reason,
+        }
+        if trigger is not None:
+            tags["trigger"] = trigger
+        if correlation_id is not None:
+            tags["correlation_id"] = correlation_id
+        self._write_metric_point(MetricType.COMPACTION, float(saved), tags)
 
     # -- Query Methods -------------------------------------------------------
 
@@ -1105,7 +1201,7 @@ class MetricsCollector:
         Returns:
             Success rate as a float 0-1.
         """
-        agents = self._agent_metrics.values()
+        agents: Iterable[AgentMetrics] = self._agent_metrics.values()
         if agent_id:
             agents = [a for a in agents if a.agent_id == agent_id]
         if role:
@@ -1145,7 +1241,7 @@ class MetricsCollector:
         Returns:
             Total cost in USD.
         """
-        agents = self._agent_metrics.values()
+        agents: Iterable[AgentMetrics] = self._agent_metrics.values()
         if agent_id:
             agents = [a for a in agents if a.agent_id == agent_id]
         return sum(a.total_cost_usd for a in agents)
@@ -1207,7 +1303,7 @@ class MetricsCollector:
 
         Returns:
             Dict with keys ``per_model``, ``overall``, ``guardrail_pass_rate``,
-            ``review_rejection_rate``, and ``gate_stats`` (empty dict — gate
+            ``review_rejection_rate``, and ``gate_stats`` (empty dict - gate
             data is read from JSONL by the API layer).
         """
         import statistics

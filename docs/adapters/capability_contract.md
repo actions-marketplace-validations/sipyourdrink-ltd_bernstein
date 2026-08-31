@@ -9,16 +9,16 @@ stream-json for some, a plain-text signal grammar for others, and upstream
 hooks for the rest.
 
 To keep the orchestrator free of `if adapter == "X"` branches, each adapter
-declares its strategy on three typed axes. The orchestrator dispatches off
+declares its strategy on five typed axes. The orchestrator dispatches off
 the enum, so adding a new adapter is a contract-completion exercise rather
 than a hunt-and-patch across the core.
 
 The enums and the declaration matrix live in
-[`src/bernstein/adapters/_contract.py`](../../src/bernstein/adapters/_contract.py).
+[`src/bernstein/adapters/_contract.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/adapters/_contract.py).
 Strategy is **declared**, not probed: Bernstein never runs the CLI at start
 just to discover its capabilities.
 
-## The three axes
+## The five axes
 
 ### Resume strategy (`ResumeStrategy`)
 
@@ -59,6 +59,35 @@ The surface Bernstein reads for an adapter's lifecycle signals.
 | `poll-pty` | No structured channel; Bernstein polls a PTY or log for liveness. |
 | `none` | No event channel; process-exit detection only. |
 
+### Output mode (`OutputMode`)
+
+What the adapter's run produces as the completion unit for a task - the axis
+that decides which completion check owns the verdict.
+
+| Value | Meaning |
+| --- | --- |
+| `git-diff` | The run's product is a commit on the worktree branch. Completion is workspace HEAD movement (`commit_completion`). |
+| `artifact` | The run's product is a canonical artifact recorded as a signed lineage entry. Completion is the entry hash (`artifact_completion`); HEAD is not consulted. |
+
+Every shipped adapter declares `git-diff` (the default), so the coding path is
+unchanged. See [../operations/artifacts.md](../operations/artifacts.md) for the
+artifact-mode completion path.
+
+### Session state (`SessionState`)
+
+Whether the adapter reaches agent-side state that outlives a single spawn.
+Every other axis describes how Bernstein *drives* a run; this one describes
+what the run leaves behind on the agent's side, which is what decides whether
+replaying the same inputs can be expected to reproduce the same outputs.
+
+| Value | Meaning |
+| --- | --- |
+| `stateless` | Each spawn starts from the inputs Bernstein supplies and nothing else. A replay of those inputs is reproducible. |
+| `persistent-agent` | The agent keeps its own state across spawns - a server-side session, a memory store, a persistent thread. A replay is **not** reproducible: inputs Bernstein never saw can influence the run. |
+
+`stateless` is the default, so every adapter that has not declared otherwise
+keeps its existing meaning.
+
 ## Declaring a strategy
 
 The canonical declaration is a row in `STRATEGY_MATRIX`, keyed by registry
@@ -80,7 +109,8 @@ setting the class attribute `strategy_override` to an `AdapterStrategy`.
 Read the resolved strategy through `CLIAdapter.strategy()`, never the raw
 attribute: the resolver applies the inline override first, then the matrix
 keyed by registry name, then the conservative `DEFAULT_ADAPTER_STRATEGY`
-(no native resume, dangerous mode unsupported, text-signal channel).
+(no native resume, dangerous mode unsupported, text-signal channel,
+git-diff output mode, stateless session state).
 
 ## Conformance
 
@@ -104,7 +134,6 @@ adapters at a glance.
 | `claude` | flag | cli-flag | stream-json |
 | `cline` | unsupported | cli-flag | text-signals |
 | `clm` | unsupported | unsupported | text-signals |
-| `cloudflare` | unsupported | unsupported | hooks |
 | `codebuff` | unsupported | unsupported | text-signals |
 | `codex` | unsupported | cli-flag | text-signals |
 | `cody` | unsupported | unsupported | text-signals |
@@ -117,9 +146,9 @@ adapters at a glance.
 | `forge` | unsupported | unsupported | text-signals |
 | `gemini` | unsupported | cli-flag | stream-json |
 | `generic` | unsupported | unsupported | text-signals |
-| `goose` | unsupported | unsupported | text-signals |
+| `goose` | unsupported | env-var | stream-json |
 | `gptme` | unsupported | unsupported | text-signals |
-| `hermes` | unsupported | unsupported | text-signals |
+| `hermes` | unsupported | always-on | text-signals |
 | `iac` | unsupported | unsupported | text-signals |
 | `junie` | unsupported | unsupported | text-signals |
 | `kilo` | unsupported | unsupported | text-signals |
@@ -128,10 +157,11 @@ adapters at a glance.
 | `letta_code` | unsupported | cli-flag | text-signals |
 | `mistral` | unsupported | unsupported | text-signals |
 | `mock` | unsupported | unsupported | text-signals |
+| `muse` | unsupported | cli-flag | text-signals |
 | `ollama` | unsupported | unsupported | text-signals |
 | `open_interpreter` | unsupported | unsupported | text-signals |
 | `openai_agents` | flag | always-on | hooks |
-| `opencode` | unsupported | unsupported | text-signals |
+| `opencode` | flag | cli-flag | text-signals |
 | `openhands` | unsupported | unsupported | text-signals |
 | `pi` | unsupported | unsupported | text-signals |
 | `plandex` | unsupported | unsupported | text-signals |
@@ -144,3 +174,126 @@ The matrix is the source of truth; this table is regenerated from
 `strategy_conformance_table()`. Out of scope for this contract: runtime
 capability discovery, and removing every adapter-specific conditional (some
 output-formatting quirks remain as overrides).
+
+## Sampling and endpoint parameters
+
+Adapters that can honour per-spawn sampling and endpoint overrides declare
+`AdapterCapability.SUPPORTS_SAMPLING_PARAMS` in their `plugin_info()`
+capabilities. The overrides travel in the per-spawn `mcp_config` and, for
+`openai_agents`, land in the runner manifest as optional fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `temperature` | float | Sampling temperature. Absent = provider default. |
+| `top_p` | float | Nucleus sampling. Absent = provider default. |
+| `top_k` | int | Top-k sampling, forwarded for OpenAI-compatible endpoints that accept it. Absent = provider default. |
+| `max_tokens` | int | Per-spawn completion-token cap. Absent = adapter or provider default. |
+| `base_url` | str | OpenAI-compatible endpoint URL. Absent = default endpoint. |
+| `api_key_env` | str | NAME of the environment variable holding the API key for `base_url`. Never a literal key. |
+
+All fields are optional; a manifest without them behaves exactly as before.
+When `base_url` is set, the runner switches the SDK to the chat-completions
+API (third-party OpenAI-compatible endpoints do not serve `/responses`) and
+excludes the custom client from tracing so the endpoint's key is never sent
+to api.openai.com.
+
+`api_key_env` must match `^[A-Z][A-Z0-9_]*$` AND be a known LLM provider
+key (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, and the
+rest of the built-in allowlist in `openai_agents_runner.py`). Any other
+name - including credential-shaped names of unrelated secrets such as
+`GITHUB_TOKEN` - is rejected at startup with a `config_invalid` error
+(exit code 2), the same failure path as a name whose variable is not set.
+To use a provider key outside the built-in set, the operator sets
+`BERNSTEIN_ALLOWED_API_KEY_ENVS` (comma-separated names) on the host; a
+repo-carried config cannot set host environment variables, so the
+override cannot be forged by the repo. The runner logs every effective
+value in its `start` event; only the env var name is ever logged, never
+the key itself.
+
+The spawn path enforces the capability: requesting any of these keys for an
+adapter that declares neither the coarse `SUPPORTS_SAMPLING_PARAMS` capability
+nor the matching narrow per-field capability raises `SamplingParamsRefusal`
+instead of silently dropping the parameters. `max_tokens` maps to
+`SUPPORTS_MAX_TOKENS`; endpoint fields have no narrow capability. See
+`ensure_sampling_params_supported` in
+[`src/bernstein/adapters/plugin_sdk.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/adapters/plugin_sdk.py).
+
+### Where these values come from
+
+Three sources feed the per-spawn slots above, in ascending precedence:
+
+1. **Mode profile** - the resolved `ModeProfile` for the spawn carries
+   optional `temperature`, `top_p`, `top_k`, and `max_tokens`. They are
+   folded in only when the target adapter declares
+   `SUPPORTS_SAMPLING_PARAMS`, so a default profile never breaks a spawn on
+   an adapter that cannot honour sampling.
+2. **`role_model_policy[<role>]`** - a role may set `base_url` and
+   `api_key_env` in `bernstein.yaml` to target an OpenAI-compatible
+   endpoint other than the default. `api_key_env` is the NAME of an
+   environment variable, validated at parse time against the same
+   fail-closed credential allowlist described above; a rejected name fails
+   `bernstein.yaml` parsing rather than reaching a spawn.
+3. **Explicit `mcp_config`** - an operator-set value always wins over the
+   two derived sources; the merge only fills slots the operator left unset.
+
+A run that sets none of these behaves exactly as before.
+
+## Builtin tool source
+
+By default the runner gives the agent the tools brokered by the Bernstein
+MCP gateway (`tool_source: "gateway"`). Some runs execute with no MCP
+gateway reachable - an isolated worktree with no bridge, a minimal offline
+environment - and would otherwise have no sanctioned way to act on the
+workdir at all.
+
+Setting `tool_source: "builtin"` in the per-spawn `mcp_config` (which the
+adapter forwards to the runner manifest) opts into a small set of builtins.
+They split into two confinement tiers - do not conflate them:
+
+| Tool | Confinement | Purpose |
+| --- | --- | --- |
+| `read_file(path)` | Workdir-confined (builtin layer) | Read a UTF-8 file relative to the run workdir. |
+| `write_file(path, content)` | Workdir-confined (builtin layer) | Write UTF-8 text relative to the run workdir. |
+| `list_dir(path)` | Workdir-confined (builtin layer) | List a directory relative to the run workdir. |
+| `run_command(argv)` | Restricted process-exec primitive; filesystem confinement is the OS sandbox | Run a bare-name command inside the run workdir. |
+
+`read_file`, `write_file`, and `list_dir` are workdir-confined **at the
+builtin layer**: every path argument is resolved against the run workdir, and
+absolute paths and `..` escapes are rejected on the real (symlink-resolved)
+target.
+
+`run_command` is **not** workdir-sandboxed. It runs a child process, and a
+child process can read and write anywhere the runner process can reach, so its
+TRUE filesystem confinement is the configured OS sandbox
+(`docker`/`e2b`/`modal`), not the builtin. The builtin layer applies only
+defense-in-depth: `argv` is a list run with `shell=False` (no shell string, no
+interpolation), and `argv[0]` must be a bare command name - absolute paths,
+path separators, and known shell/interpreters (`sh`, `bash`, `python`, `env`,
+...) are rejected, and the survivor is resolved on `PATH` and run by its
+resolved absolute path. Because true confinement is the OS sandbox,
+`run_command` is exposed **only** when the run has an OS sandbox provider
+configured, or the operator explicitly opts in with
+`BERNSTEIN_BUILTIN_ALLOW_RUN_COMMAND=1`. Under the bare local/worktree path
+with no opt-in, `run_command` is withheld and the three file tools remain
+available.
+
+The builtins never become the default; `gateway` stays the default and any
+value other than `"builtin"` selects it. The builtins enforce these
+properties, each covered by tests in
+[`tests/unit/adapters/test_openai_agents_builtins.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/tests/unit/adapters/test_openai_agents_builtins.py):
+
+1. **Path confinement** (file tools). Every path argument is resolved against
+   the run workdir. Absolute paths and `..` escapes are rejected: the real
+   (symlink-resolved) target must stay inside the real workdir.
+2. **Restricted exec** (`run_command`). `argv` is a list run with
+   `shell=False` (no shell string, no interpolation), and `argv[0]` is a bare
+   command name resolved on `PATH`; absolute paths, path separators, and
+   shell/interpreters are rejected. Availability is gated on an OS sandbox
+   provider or the explicit opt-in.
+3. **Audited.** Every call emits a `tool_call` and a `tool_result` event to
+   the runner's line-delimited JSON event stream, tagged
+   `"tool_source": "builtin"`, with the tool name, arguments, and outcome -
+   so a run with no MCP gateway stays auditable and replayable.
+
+See `build_builtin_tools` in
+[`src/bernstein/adapters/openai_agents_builtins.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/adapters/openai_agents_builtins.py).

@@ -3,20 +3,24 @@
 Exercises the verifier against the real FreeTSA fixture checked into
 ``tests/fixtures/rfc3161/``. Covers:
 
-* Valid chain — token + payload + trust bundle → ``ok=True``.
-* Tampered token — flipped bytes → signature failure surfaces.
-* Wrong payload — messageImprint mismatch flagged.
-* Missing trust bundle — empty list rejected with explicit error.
-* TSA EKU surface — ``id-kp-timeStamping`` is detected.
-* Trust bundle loader — PEM and DER paths parsed.
+* Valid chain - token + payload + trust bundle → ``ok=True``.
+* Tampered token - flipped bytes → signature failure surfaces.
+* Wrong payload - messageImprint mismatch flagged.
+* Missing trust bundle - empty list rejected with explicit error.
+* TSA EKU surface - ``id-kp-timeStamping`` is detected.
+* Trust bundle loader - PEM and DER paths parsed.
 """
 
 from __future__ import annotations
 
+import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import bernstein.core.security.rfc3161_verifier as verifier
 from bernstein.core.security.rfc3161_verifier import (
     RFC3161Verification,
     hash_payload_for_tsa,
@@ -156,6 +160,33 @@ class TestInvalidChain:
         )
         assert not result.ok
 
+    def test_sha1_message_imprint_fails_even_when_other_checks_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        payload_hash = hashlib.sha1(b"payload").digest()
+        tst_info = {
+            "message_imprint": {
+                "hash_algorithm": {"algorithm": _FakeAlgorithm("1.3.14.3.2.26")},
+                "hashed_message": _FakeNative(payload_hash),
+            },
+            "gen_time": _FakeNative(datetime(2026, 1, 1, tzinfo=UTC)),
+        }
+        signed_data = {"encap_content_info": {"content": _FakeContent()}}
+        signing_cert = _FakeSigningCert()
+
+        monkeypatch.setattr(verifier, "_parse_token", lambda _token_bytes: (signed_data, tst_info, [], object()))
+        monkeypatch.setattr(verifier, "_signing_cert", lambda _signer_info, _embedded_certs: signing_cert)
+        monkeypatch.setattr(verifier, "_has_timestamping_eku", lambda _cert: True)
+        monkeypatch.setattr(verifier, "_walk_chain", lambda **_kwargs: None)
+        monkeypatch.setattr(verifier, "_verify_signed_attrs_signature", lambda *_args: None)
+
+        result = verify_rfc3161_token(
+            b"token",
+            payload_hash=payload_hash,
+            trusted_tsa_certs=[signing_cert],
+        )
+
+        assert not result.ok
+        assert any("weak hash algorithm" in error for error in result.errors)
+
 
 # ---------------------------------------------------------------------------
 # Trust bundle loader
@@ -187,6 +218,30 @@ class TestTrustBundleLoader:
         empty.write_bytes(b"")
         with pytest.raises(ValueError, match="empty"):
             load_trusted_tsa_certs(empty)
+
+
+class _FakeAlgorithm:
+    def __init__(self, dotted: str) -> None:
+        self.dotted = dotted
+
+
+class _FakeNative:
+    def __init__(self, native: Any) -> None:
+        self.native = native
+
+
+class _FakeContent:
+    contents = b"tst-info"
+
+
+class _FakeSubject:
+    def rfc4514_string(self) -> str:
+        return "CN=fake-tsa"
+
+
+class _FakeSigningCert:
+    subject = _FakeSubject()
+    not_valid_after_utc = datetime(2026, 1, 2, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------

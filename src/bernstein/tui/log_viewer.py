@@ -55,7 +55,7 @@ def detect_diff_blocks(text: str) -> list[DiffBlock]:
     """Detect unified diff blocks in *text*.
 
     A new block starts at every ``diff --git`` line.  Everything up to (but
-    not including) the next ``diff --git`` line — or the end of the text —
+    not including) the next ``diff --git`` line - or the end of the text -
     belongs to that block.
 
     Args:
@@ -143,7 +143,7 @@ def apply_diff_folding(text: str, max_lines: int = _DIFF_FOLD_THRESHOLD) -> str:
 # Patterns that suggest a line is markdown-formatted.
 _MD_HEADING = re.compile(r"^#{1,6} ")
 _MD_BOLD = re.compile(r"\*\*[^*]+\*\*")
-_MD_ITALIC = re.compile(r"\*.+?\*")
+_MD_ITALIC = re.compile(r"\*[^*\n]+\*")
 _MD_LIST = re.compile(r"^(\s*[-*+]|\s*\d+\.) ")
 _MD_BLOCKQUOTE = re.compile(r"^> ")
 _MD_HR = re.compile(r"^(-{3,}|\*{3,}|_{3,})$")
@@ -247,7 +247,7 @@ class LogViewer:
                 continue
 
             if i % 3 == 1:
-                # language tag — skip, consumed by i%3==2
+                # language tag - skip, consumed by i%3==2
                 continue
             elif i % 3 == 2:
                 language = parts[i - 1] or "text"
@@ -259,7 +259,7 @@ class LogViewer:
                 )
                 yield from console.render(syntax, options)
             else:
-                # Plain text section — try markdown rendering.
+                # Plain text section - try markdown rendering.
                 if self._render_markdown and _looks_like_markdown(part):
                     yield from console.render(Markdown(part), options)
                 else:

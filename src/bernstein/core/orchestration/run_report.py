@@ -5,9 +5,9 @@ structured markdown report covering task breakdown, quality gates,
 cost analysis, and an ASCII timeline.
 
 Data sources (read-only):
-- ``.sdd/metrics/`` — per-task and per-agent metrics (via MetricsCollector)
-- ``.sdd/runtime/costs/{run_id}.json`` — token-level cost data (via CostTracker)
-- ``.sdd/runs/{run_id}/summary.json`` — high-level run summary
+- ``.sdd/metrics/`` - per-task and per-agent metrics (via MetricsCollector)
+- ``.sdd/runtime/costs/{run_id}.json`` - token-level cost data (via CostTracker)
+- ``.sdd/runs/{run_id}/summary.json`` - high-level run summary
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_ANY = "dict[str, Any]"
+type _CAST_DICT_STR_ANY = dict[str, Any]
 
 
 @dataclass

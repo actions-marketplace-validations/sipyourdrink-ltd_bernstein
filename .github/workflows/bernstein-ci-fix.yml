@@ -42,6 +42,16 @@ on:
         required: true
         type: string
     secrets:
+      BERNSTEIN_AUTOSYNC_TOKEN:
+        description: >-
+          PAT used to push the auto-heal branch and open the auto-heal pull
+          request. A reusable workflow sees no secret it was not passed, so
+          this has to be declared here and forwarded by
+          post-ci-dispatcher.yml; without the declaration the reference
+          silently reads as empty and the lane falls back to the Actions
+          token, whose pull requests never trigger workflows. Optional - the
+          fallback is a working degraded mode, see docs/operations/ci.md.
+        required: false
       GEMINI_API_KEY:
         description: >-
           Gemini API key used by the bernstein-ci-fix triage agent.
@@ -90,7 +100,7 @@ jobs:
       failed_jobs: ${{ steps.scope.outputs.failed_jobs }}
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
       - name: Extract failure metadata
@@ -217,16 +227,21 @@ jobs:
       result: ${{ steps.open-pr.outputs.result || steps.oversized-result.outputs.result || steps.no-changes-result.outputs.result }}
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
       # persist-credentials kept: this job pushes back to git (auto-heal branch).
+      #
+      # The persisted credential is the same token the PR step uses, so the
+      # branch push and the pull request carry one identity. A push made with
+      # GITHUB_TOKEN emits no `pull_request: synchronize`, so re-pushing an
+      # already-open auto-heal branch would leave its checks stale.
       - name: Checkout failing commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6  # zizmor: ignore[artipacked]
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7  # zizmor: ignore[artipacked]
         with:
           ref: ${{ needs.triage.outputs.head_sha }}
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
         run: |
@@ -320,7 +335,13 @@ jobs:
         id: open-pr
         if: steps.diff.outputs.has_changes == 'true' && steps.size-check.outputs.within_cap == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A PR created with GITHUB_TOKEN does not trigger workflows, so
+          # neither required context ever reports and branch protection holds
+          # it at BLOCKED while the rollup reads SUCCESS. The GITHUB_TOKEN
+          # fallback keeps forks and secret-less environments working; there
+          # the PR needs a manual close-and-reopen to collect its checks. See
+          # docs/operations/ci.md.
+          GH_TOKEN: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN || secrets.GITHUB_TOKEN }}
           AUTO_HEAL_BRANCH: ${{ needs.triage.outputs.auto_heal_branch }}
           SHORT_SHA: ${{ needs.triage.outputs.short_sha }}
           HEAD_SHA: ${{ needs.triage.outputs.head_sha }}
@@ -421,17 +442,33 @@ jobs:
       OPENROUTER_API_KEY_FREE: ${{ secrets.OPENROUTER_API_KEY_FREE }}
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Checkout main (trusted ref)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.triage.outputs.head_sha }}
+          ref: main
+          fetch-depth: 0
           persist-credentials: false
+      - name: Verify and pin to failing commit
+        env:
+          HEAD_SHA: ${{ needs.triage.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if ! echo "$HEAD_SHA" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::head_sha '$HEAD_SHA' is not a 40-hex SHA"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$HEAD_SHA" origin/main; then
+            echo "::error::head_sha '$HEAD_SHA' is not reachable from origin/main"
+            exit 1
+          fi
+          git -c advice.detachedHead=false checkout "$HEAD_SHA"
       - name: Set up Python via uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: latest
+          version: "0.12.5"
       - name: Capture failing log tail
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -475,6 +512,9 @@ jobs:
     needs: [triage, fix]
     if: |
       always() &&
+      needs.triage.result == 'success' &&
+      needs.triage.outputs.head_sha != '' &&
+      needs.triage.outputs.run_id != '' &&
       needs.triage.outputs.existing_pr == '' &&
       (needs.triage.outputs.safe_for_gemini != 'true' ||
        needs.fix.result == 'failure' ||
@@ -488,10 +528,10 @@ jobs:
       issues: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Create or update ci-fix issue

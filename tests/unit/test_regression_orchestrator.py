@@ -1,4 +1,4 @@
-"""Regression tests for the Orchestrator — task lifecycle, routing, cleanup, cost tracking.
+"""Regression tests for the Orchestrator - task lifecycle, routing, cleanup, cost tracking.
 
 Covers the core orchestration loop end-to-end: dependency filtering, retry
 with model/effort escalation, crash recovery strategies, provider health and
@@ -38,6 +38,7 @@ from bernstein.core.task_lifecycle import (
 from bernstein.core.tick_pipeline import prioritize_starving_roles
 
 from bernstein.adapters.base import CLIAdapter, SpawnResult
+from bernstein.core.agents.spawn_rate_limiter import SpawnRateLimitConfig, SpawnRateLimiter
 from bernstein.core.lifecycle import (
     AGENT_TRANSITIONS,
     TASK_TRANSITIONS,
@@ -140,7 +141,7 @@ def _build_orchestrator(
     adp = adapter or _mock_adapter()
     templates_dir = tmp_path / "templates" / "roles"
     templates_dir.mkdir(parents=True)
-    spawner = AgentSpawner(adp, templates_dir, tmp_path)
+    spawner = AgentSpawner(adp, templates_dir, tmp_path, default_model="mock-model")
     client = httpx.Client(transport=transport, base_url="http://testserver")
     return Orchestrator(cfg, spawner, tmp_path, client=client)
 
@@ -273,6 +274,81 @@ class TestDependencyFiltering:
         assert "C" not in spawned_task_ids
         assert "D" not in spawned_task_ids
 
+    def test_preexisting_cycle_still_schedules_every_task_after_deterministic_break(self, tmp_path: Path) -> None:
+        """A board carrying a declared cycle drains instead of wedging (#4287).
+
+        ``POST /tasks`` rejects a cycle-forming edge today, but legacy board
+        state can still hold one. ``TaskGraph`` opens the cycle by dropping a
+        single edge -- the dropped edge nevertheless stays in the dependent's
+        ``depends_on``, so unless the readiness filter exempts it no task on
+        the cycle ever satisfies its dependencies and the run idles with open
+        tasks no agent will pick up. Driving the real scheduler must dispatch
+        every task on the cycle, starting on the first tick.
+        """
+        # CYC-a -> CYC-b -> CYC-c -> CYC-a, every task open. The break is
+        # deterministic, so which task is released first is stable; the test
+        # asserts the property (the board drains) rather than the choice.
+        task_dicts = [
+            _task_as_dict(
+                _make_task(id="CYC-a", role="backend", status="open", depends_on=["CYC-c"]),
+            ),
+            _task_as_dict(
+                _make_task(id="CYC-b", role="backend", status="open", depends_on=["CYC-a"]),
+            ),
+            _task_as_dict(
+                _make_task(id="CYC-c", role="backend", status="open", depends_on=["CYC-b"]),
+            ),
+        ]
+        by_id = {td["id"]: td for td in task_dicts}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = request.url
+            if request.method == "GET" and url.path == "/tasks":
+                return httpx.Response(200, json=task_dicts)
+            if request.method == "POST" and "/claim" in url.path:
+                task_id = url.path.split("/")[-2]
+                return httpx.Response(200, json=by_id.get(task_id, task_dicts[0]))
+            return httpx.Response(200, json={})
+
+        orch = _build_orchestrator(
+            tmp_path,
+            httpx.MockTransport(handler),
+            config=OrchestratorConfig(
+                max_agents=6,
+                poll_interval_s=1,
+                max_tasks_per_agent=1,
+                server_url="http://testserver",
+            ),
+        )
+        # Three back-to-back spawns would trip the default spawn rate limit
+        # (2 per 10s per provider), which is orthogonal to dependency
+        # readiness and would mask a genuine wedge as a spawn failure.
+        orch._spawner._spawn_rate_limiter = SpawnRateLimiter(
+            SpawnRateLimitConfig(max_spawns=len(task_dicts)),
+        )
+
+        dispatched: list[str] = []
+        for tick_no in range(1, len(task_dicts) + 1):
+            result = orch.tick()
+            newly = [
+                task_id
+                for session_id in result.spawned
+                if (session := orch._agents.get(session_id)) is not None
+                for task_id in session.task_ids
+            ]
+            assert newly, (
+                f"tick {tick_no} dispatched nothing - the cycle-broken board is wedged "
+                f"(dispatched so far: {dispatched})"
+            )
+            dispatched.extend(newly)
+            # The agent finishes: its task becomes a satisfied dependency,
+            # which is what releases the next task on the former cycle.
+            for task_id in newly:
+                by_id[task_id]["status"] = "done"
+
+        assert set(dispatched) == {"CYC-a", "CYC-b", "CYC-c"}
+        assert len(dispatched) == 3, f"a task was dispatched twice: {dispatched}"
+
 
 class TestTaskStateTransitions:
     """Verify all allowed transitions succeed and illegal ones raise."""
@@ -289,10 +365,13 @@ class TestTaskStateTransitions:
         assert event.entity_type == "task"
 
     def test_illegal_task_transition_raises(self) -> None:
-        """DONE -> OPEN is not in the transition table."""
+        """DONE -> IN_PROGRESS is not in the transition table.
+
+        (DONE -> OPEN is intentionally legal now: bounded janitor reopen.)
+        """
         task = _make_task(id="T-bad", status="done")
         with pytest.raises(IllegalTransitionError):
-            transition_task(task, TaskStatus.OPEN)
+            transition_task(task, TaskStatus.IN_PROGRESS)
 
     def test_illegal_agent_transition_raises(self) -> None:
         """dead -> working is not allowed."""
@@ -399,6 +478,10 @@ class TestRetryEscalation:
         task.max_retries = 2
         retried: set[str] = set()
         quarantine = MagicMock()
+        # The exhaustion path asks the store before recording, so a bare Mock
+        # would answer with a truthy Mock and suppress the very call this
+        # test asserts on (#3628).
+        quarantine.is_quarantined.return_value = False
 
         result = maybe_retry_task(
             task,
@@ -988,7 +1071,7 @@ class TestServerCommunicationFailure:
             ),
         )
 
-        # Should not raise — claim failures are handled gracefully
+        # Should not raise - claim failures are handled gracefully
         result = orch.tick()
         assert isinstance(result, TickResult)
 

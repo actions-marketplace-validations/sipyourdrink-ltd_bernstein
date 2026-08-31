@@ -1,8 +1,8 @@
-"""Docker-daemon :class:`SandboxBackend` — first-party, ships in core.
+"""Docker-daemon :class:`SandboxBackend` - first-party, ships in core.
 
 The Docker backend launches a long-running container per session and
 proxies file I/O through ``docker cp`` and command execution through
-``docker exec``. The ``docker`` Python SDK is an optional install —
+``docker exec``. The ``docker`` Python SDK is an optional install -
 when it is missing the backend module still imports cleanly, but
 instantiating :class:`DockerSandboxBackend` raises a clear error so the
 registry can report the state via
@@ -71,7 +71,7 @@ def _safe_extract_single_file(tf: tarfile.TarFile, *, expected_name: str, resolv
       ``resolved.lstrip("/")``. This prevents a crafted or buggy tar
       from smuggling in a member called ``../etc/shadow`` or a
       symlink-style entry that resolves outside our intended target.
-    * Reject non-file members (directories, symlinks, devices) —
+    * Reject non-file members (directories, symlinks, devices) -
       ``session.read`` only ever wants a single file's bytes.
     * Reject any absolute-path member whose name starts with ``/`` or
       contains a ``..`` segment after normalisation. Even a matching
@@ -122,7 +122,7 @@ def _safe_extract_single_file(tf: tarfile.TarFile, *, expected_name: str, resolv
     if not acceptable:
         if saw_any_file:
             # A file member existed but its name did not match. Surface
-            # as FileNotFoundError to match the documented contract —
+            # as FileNotFoundError to match the documented contract -
             # the caller asked for a file that is not present under the
             # name they provided.
             raise FileNotFoundError(resolved)
@@ -137,7 +137,7 @@ def _safe_extract_single_file(tf: tarfile.TarFile, *, expected_name: str, resolv
 class DockerSandboxSession(SandboxSession):
     """A session backed by a running Docker container.
 
-    Construction is internal — obtain instances via
+    Construction is internal - obtain instances via
     :meth:`DockerSandboxBackend.create`.
     """
 
@@ -211,7 +211,7 @@ class DockerSandboxSession(SandboxSession):
             # constructed *here* from trusted inputs (``name`` derives
             # from ``self._resolve_posix`` which pins paths under
             # :attr:`workdir`; ``data`` is caller-supplied bytes with
-            # no path component) — it is then streamed straight to
+            # no path component) - it is then streamed straight to
             # ``put_archive``. There is no extraction step on our
             # side, so S5042 "tar extraction" guidance does not apply:
             # the only consumer is the docker daemon, which treats the
@@ -368,6 +368,23 @@ class DockerSandboxBackend:
                 raise DockerUnavailableError(f"Could not connect to Docker daemon: {exc}") from exc
         return self._client
 
+    def ensure_available(self) -> None:
+        """Verify the SDK imports and the daemon answers a ping.
+
+        Lets callers that provision sessions lazily (one session per
+        agent spawn) fail fast at wiring time instead of at the first
+        spawn, preserving the fall-back-to-legacy-isolation behaviour.
+
+        Raises:
+            DockerUnavailableError: The SDK is missing or the daemon
+                did not respond.
+        """
+        client = self._get_client()
+        try:
+            client.ping()
+        except Exception as exc:
+            raise DockerUnavailableError(f"Docker daemon did not respond to ping: {exc}") from exc
+
     @staticmethod
     def _allocate_session_id(hint: str | None = None) -> str:
         if hint:
@@ -411,27 +428,74 @@ class DockerSandboxBackend:
 
         client = self._get_client()
 
+        # When the manifest carries a repo entry, bind-mount the host
+        # checkout read-only rather than handing the container write
+        # access to it directly - the container clones its own working
+        # copy under ``manifest.root`` below, so host-side git state
+        # (index, HEAD, uncommitted changes) is never touched by the
+        # sandboxed agent.
+        volumes = {manifest.repo.src_path: {"bind": "/host-repo", "mode": "ro"}} if manifest.repo else None
+
         def _spawn_container() -> Any:
-            container = client.containers.run(
-                image=image,
-                name=f"bernstein-{session_id}",
-                command=["sleep", "infinity"],
-                detach=True,
-                tty=False,
-                working_dir=manifest.root,
-                environment=env_list,
-                mem_limit=f"{memory_mb}m",
-                cpu_period=100000,
-                cpu_quota=cpu_quota,
-                network_disabled=network_disabled,
-                labels=labels,
-            )
-            # Ensure the workdir exists inside the container.
-            mkdir = container.exec_run(["mkdir", "-p", manifest.root])
-            if mkdir.exit_code != 0:
-                raise RuntimeError(
-                    f"mkdir -p {manifest.root} failed in container: {mkdir.output.decode('utf-8', 'replace')}"
-                )
+            run_kwargs: dict[str, Any] = {
+                "image": image,
+                "name": f"bernstein-{session_id}",
+                "command": ["sleep", "infinity"],
+                "detach": True,
+                "tty": False,
+                "working_dir": manifest.root,
+                "environment": env_list,
+                "mem_limit": f"{memory_mb}m",
+                "cpu_period": 100000,
+                "cpu_quota": cpu_quota,
+                "labels": labels,
+                "volumes": volumes,
+            }
+            if network_disabled:
+                run_kwargs["network_disabled"] = True
+            else:
+                # Parity with the legacy ContainerManager (NetworkMode.HOST):
+                # agents inside the sandbox reach the host task server on
+                # 127.0.0.1 for POST /tasks and completion callbacks. On
+                # daemons without host networking the container still runs;
+                # only server reachability degrades to the bridge default.
+                run_kwargs["network_mode"] = "host"
+            container = client.containers.run(**run_kwargs)
+            try:
+                if manifest.repo is not None:
+                    # Give the container its own writable git checkout cloned
+                    # from the read-only host bind-mount, then check out the
+                    # requested branch so the sandboxed agent's commits land
+                    # in the container, not on the host working tree.
+                    clone = container.exec_run(["git", "clone", "/host-repo", manifest.root])
+                    if clone.exit_code != 0:
+                        raise RuntimeError(
+                            f"git clone /host-repo {manifest.root} failed in container: "
+                            f"{clone.output.decode('utf-8', 'replace')}"
+                        )
+                    checkout = container.exec_run(["git", "checkout", manifest.repo.branch], workdir=manifest.root)
+                    if checkout.exit_code != 0:
+                        raise RuntimeError(
+                            f"git checkout {manifest.repo.branch} failed in container: "
+                            f"{checkout.output.decode('utf-8', 'replace')}"
+                        )
+                else:
+                    # No repo to seed - just ensure the (empty) workdir exists.
+                    mkdir = container.exec_run(["mkdir", "-p", manifest.root])
+                    if mkdir.exit_code != 0:
+                        raise RuntimeError(
+                            f"mkdir -p {manifest.root} failed in container: {mkdir.output.decode('utf-8', 'replace')}"
+                        )
+            except BaseException:
+                # Never leak a running ``sleep infinity`` container when
+                # provisioning fails after the run: the orchestrator catches
+                # the error and falls back to the legacy path, so nothing
+                # else would ever remove it.
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    logger.warning("Failed to remove container after provisioning error", exc_info=True)
+                raise
             return container
 
         container = await asyncio.to_thread(_spawn_container)
@@ -455,6 +519,22 @@ class DockerSandboxBackend:
     async def destroy(self, session: SandboxSession) -> None:
         await session.shutdown()
         self._sessions.pop(session.session_id, None)
+
+    async def destroy_all(self) -> None:
+        """Destroy every session this backend still tracks.
+
+        Run-teardown safety net for per-agent sessions: any session
+        whose exec-done destroy hook never fired (orchestrator crash,
+        SIGKILL'd worker thread) is stopped and removed here so no
+        ``sleep infinity`` container outlives the run. Failures are
+        logged and never raised - teardown must not mask the run's
+        own exit path.
+        """
+        for session in list(self._sessions.values()):
+            try:
+                await self.destroy(session)
+            except Exception:
+                logger.warning("Failed to destroy sandbox session %s during cleanup", session.session_id, exc_info=True)
 
 
 __all__ = [

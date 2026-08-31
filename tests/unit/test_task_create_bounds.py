@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 from fastapi import FastAPI
@@ -25,7 +25,26 @@ from bernstein.core.server.server_app import (
     ContentLengthMiddleware,
     create_app,
 )
-from bernstein.core.server.server_models import TaskCreate
+from bernstein.core.server.server_models import TaskCreate, TaskSelfCreate
+
+
+class TaskPostPayload(TypedDict, total=False):
+    title: str
+    description: str
+    role: str
+    complexity: str
+    task_type: str
+
+
+class TaskBatchItemPayload(TypedDict, total=False):
+    title: str
+    description: str
+    scope: str
+
+
+class TaskBatchPayload(TypedDict):
+    tasks: list[TaskBatchItemPayload]
+
 
 # ---------------------------------------------------------------------------
 # TaskCreate pydantic caps
@@ -51,7 +70,7 @@ def test_task_create_title_at_limit_accepted() -> None:
 def test_task_create_accepts_long_descriptive_title() -> None:
     """Real audit-169-style title (~210 chars) must round-trip cleanly."""
     long_title = (
-        "audit-169-knowledge-test-only-modules — 10 test-only knowledge "
+        "audit-169-knowledge-test-only-modules - 10 test-only knowledge "
         "modules: doc_generator, file_relevance, graduated_memory_guard, "
         "memory_extractor/sanitizer, repo_index, semantic_diff, synthesis, "
         "web_graph"
@@ -140,6 +159,54 @@ def test_task_create_meta_messages_list_capped() -> None:
         TaskCreate(title="ok", description="ok", meta_messages=["ok"] * 101)
 
 
+def test_task_create_max_turns_zero_rejected() -> None:
+    """max_turns=0 is rejected by pydantic Field(ge=1) with a clean 422-shaped error.
+
+    Without the ge=1 constraint, 0/negative values sailed through to a
+    confusing CLI-level failure downstream (an invalid --max-turns flag).
+    """
+    with pytest.raises(ValidationError):
+        TaskCreate(title="ok", description="ok", max_turns=0)
+
+
+def test_task_create_max_turns_negative_rejected() -> None:
+    """max_turns=-1 is rejected by pydantic Field(ge=1)."""
+    with pytest.raises(ValidationError):
+        TaskCreate(title="ok", description="ok", max_turns=-1)
+
+
+def test_task_create_max_turns_positive_accepted() -> None:
+    """A positive max_turns still round-trips normally."""
+    t = TaskCreate(title="ok", description="ok", max_turns=25)
+    assert t.max_turns == 25
+
+
+def test_task_create_max_turns_none_accepted() -> None:
+    """max_turns is optional - None (the default) is still accepted."""
+    t = TaskCreate(title="ok", description="ok")
+    assert t.max_turns is None
+
+
+def test_task_create_rejects_artifact_spec_with_llm_judge() -> None:
+    """TaskCreate rejects both an artifact_spec and an llm_judge completion signal at parse time."""
+    artifact_spec = {"kind": "report", "output_path": "x.md"}
+    signals = [{"type": "llm_judge", "value": "check it"}]
+    with pytest.raises(ValidationError, match="artifact_spec and an llm_judge completion signal"):
+        TaskCreate(title="ok", description="ok", artifact_spec=artifact_spec, completion_signals=signals)  # type: ignore
+
+
+def test_task_create_artifact_spec_without_llm_judge() -> None:
+    artifact_spec = {"kind": "report", "output_path": "x.md"}
+    t = TaskCreate(title="ok", description="ok", artifact_spec=artifact_spec)
+    assert t.artifact_spec is not None
+
+
+def test_task_create_llm_judge_without_artifact_spec() -> None:
+    signals = [{"type": "llm_judge", "value": "check it"}]
+    t = TaskCreate(title="ok", description="ok", completion_signals=signals)  # type: ignore
+    assert any(s.type == "llm_judge" for s in t.completion_signals)
+
+
 def test_task_create_happy_path_still_works() -> None:
     """Normal-sized input still parses successfully."""
     t = TaskCreate(
@@ -152,6 +219,67 @@ def test_task_create_happy_path_still_works() -> None:
     )
     assert t.title == "Write parser"
     assert t.metadata == {"issue_number": 42}
+
+
+# ---------------------------------------------------------------------------
+# owned_files must name project-relative paths (reject -> 422)
+# ---------------------------------------------------------------------------
+
+#: Entries that must never be stored on a task, because every consumer of
+#: ``owned_files`` joins them onto a working directory.
+BAD_OWNED_FILES = [
+    "/etc/passwd",
+    "/",
+    "../x",
+    "../../etc/passwd",
+    "src/../../etc/passwd",
+    "..",
+    ".",
+    "",
+    "nul\x00byte.py",
+    "src/nul\x00byte.py",
+    "C:/Windows/system32",
+    "..\\..\\windows",
+]
+
+
+@pytest.mark.parametrize("bad", BAD_OWNED_FILES)
+def test_task_create_rejects_non_relative_owned_files(bad: str) -> None:
+    """An entry that does not name a path under the working directory is refused."""
+    with pytest.raises(ValidationError):
+        TaskCreate(title="ok", description="ok", owned_files=[bad])
+
+
+@pytest.mark.parametrize("bad", BAD_OWNED_FILES)
+def test_task_self_create_rejects_non_relative_owned_files(bad: str) -> None:
+    """The self-create copy of ``owned_files`` carries the same rule."""
+    with pytest.raises(ValidationError):
+        TaskSelfCreate(parent_task_id="T-1", title="ok", description="ok", owned_files=[bad])
+
+
+@pytest.mark.parametrize(
+    "good",
+    ["main.py", "src/parser.py", "src/bernstein/core/quality/fast_path.py", "docs/api/schema.json", "./src/x.py"],
+)
+def test_task_create_accepts_ordinary_owned_files(good: str) -> None:
+    """Ordinary project-relative paths are unaffected."""
+    assert TaskCreate(title="ok", description="ok", owned_files=[good]).owned_files == [good]
+    assert TaskSelfCreate(
+        parent_task_id="T-1",
+        title="ok",
+        description="ok",
+        owned_files=[good],
+    ).owned_files == [good]
+
+
+def test_post_tasks_absolute_owned_file_returns_422(_app_with_auth_disabled) -> None:
+    """The API boundary rejects the row rather than storing it."""
+    with TestClient(_app_with_auth_disabled) as client:
+        resp = client.post(
+            "/tasks",
+            json={"title": "ok", "description": "ok", "owned_files": ["/etc/passwd"]},
+        )
+    assert resp.status_code == 422, resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +332,7 @@ def _standalone_app_with_cap(max_bytes: int = _DEFAULT_MAX_BODY_BYTES) -> TestCl
 def test_content_length_reject_100mb_header_with_413() -> None:
     """A 100MB body (declared via Content-Length) is rejected with 413."""
     client = _standalone_app_with_cap()
-    # Build a small actual body but lie about size — middleware must trust the
+    # Build a small actual body but lie about size - middleware must trust the
     # header and reject without buffering 100MB.
     large_length = 100 * 1024 * 1024
     resp = client.post(
@@ -333,9 +461,14 @@ def test_post_tasks_200kb_description_returns_422(_app_with_auth_disabled) -> No
 
     async def _run() -> int:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload: TaskPostPayload = {
+                "title": "big",
+                "description": "z" * 200_000,
+                "role": "backend",
+            }
             resp = await client.post(
                 "/tasks",
-                json={"title": "big", "description": "z" * 200_000, "role": "backend"},
+                json=payload,
             )
             return resp.status_code
 
@@ -371,9 +504,14 @@ def test_post_tasks_small_payload_still_works(_app_with_auth_disabled) -> None:
 
     async def _run() -> tuple[int, dict[str, Any]]:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload: TaskPostPayload = {
+                "title": "ok",
+                "description": "normal task",
+                "role": "backend",
+            }
             resp = await client.post(
                 "/tasks",
-                json={"title": "ok", "description": "normal task", "role": "backend"},
+                json=payload,
             )
             return resp.status_code, resp.json()
 
@@ -393,9 +531,35 @@ def test_post_tasks_empty_complexity_returns_422_not_500(_app_with_auth_disabled
 
     async def _run() -> int:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload: TaskPostPayload = {
+                "title": "x",
+                "description": "x",
+                "complexity": "",
+            }
             resp = await client.post(
                 "/tasks",
-                json={"title": "x", "description": "x", "complexity": ""},
+                json=payload,
+            )
+            return resp.status_code
+
+    assert asyncio.run(_run()) == 422
+
+
+def test_post_tasks_empty_task_type_returns_422_not_500(_app_with_auth_disabled) -> None:
+    """POST /tasks with task_type="" must 422, never 500 (regression)."""
+    transport = ASGITransport(app=_app_with_auth_disabled)
+    import asyncio
+
+    async def _run() -> int:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload: TaskPostPayload = {
+                "title": "x",
+                "description": "x",
+                "task_type": "",
+            }
+            resp = await client.post(
+                "/tasks",
+                json=payload,
             )
             return resp.status_code
 
@@ -409,9 +573,12 @@ def test_post_tasks_batch_invalid_scope_returns_422_not_500(_app_with_auth_disab
 
     async def _run() -> int:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload: TaskBatchPayload = {
+                "tasks": [{"title": "x", "description": "x", "scope": "nope"}],
+            }
             resp = await client.post(
                 "/tasks/batch",
-                json={"tasks": [{"title": "x", "description": "x", "scope": "nope"}]},
+                json=payload,
             )
             return resp.status_code
 

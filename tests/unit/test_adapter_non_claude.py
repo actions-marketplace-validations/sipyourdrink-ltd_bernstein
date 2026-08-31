@@ -12,7 +12,7 @@ import pytest
 from bernstein.core.models import ModelConfig
 
 from bernstein.adapters.codex import CodexAdapter
-from bernstein.adapters.gemini import GeminiAdapter
+from bernstein.adapters.gemini import ANTIGRAVITY_BINARY, GeminiAdapter
 from bernstein.adapters.generic import GenericAdapter
 from bernstein.adapters.qwen import QwenAdapter
 
@@ -212,7 +212,17 @@ class TestGeminiAdapterSpawn:
     def test_wrapped_with_worker(self, tmp_path: Path) -> None:
         adapter = GeminiAdapter()
         proc_mock = _make_popen_mock(pid=201)
-        with patch("bernstein.adapters.gemini.subprocess.Popen", return_value=proc_mock) as popen:
+        # Pin env + resolver so this assertion is deterministic across
+        # CI / local hosts regardless of host PATH or a stray
+        # ``BERNSTEIN_GEMINI_BINARY`` override. Discovery prefers
+        # ``antigravity`` (the new canonical binary) and falls back to
+        # ``gemini``; with both resolver lookups returning ``None`` the
+        # non-strict cascade returns the first entry. See #1740.
+        with (
+            patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
+            patch("bernstein.adapters.gemini.shutil.which", side_effect=lambda _name: None),
+            patch("bernstein.adapters.gemini.subprocess.Popen", return_value=proc_mock) as popen,
+        ):
             adapter.spawn(
                 prompt="hello",
                 workdir=tmp_path,
@@ -221,7 +231,7 @@ class TestGeminiAdapterSpawn:
             )
         cmd = popen.call_args.args[0]
         inner = _inner_cmd(cmd)
-        assert inner[0] == "gemini"
+        assert inner[0] == ANTIGRAVITY_BINARY
 
     def test_model_flag(self, tmp_path: Path) -> None:
         adapter = GeminiAdapter()
@@ -349,7 +359,7 @@ class TestQwenAdapterSpawn:
         inner = _inner_cmd(popen.call_args.args[0])
         assert inner[0] == "qwen"
 
-    def test_yolo_flag_always_present(self, tmp_path: Path) -> None:
+    def test_approval_mode_flag_always_present(self, tmp_path: Path) -> None:
         adapter = QwenAdapter()
         proc_mock = _make_popen_mock(pid=302)
         settings_mock = _make_llm_settings()
@@ -364,7 +374,9 @@ class TestQwenAdapterSpawn:
                 session_id="q2",
             )
         inner = _inner_cmd(popen.call_args.args[0])
-        assert "-y" in inner
+        assert "--approval-mode" in inner
+        assert inner[inner.index("--approval-mode") + 1] == "yolo"
+        assert "-y" not in inner
 
     def test_default_provider_maps_sonnet_to_qwen_plus(self, tmp_path: Path) -> None:
         adapter = QwenAdapter()
@@ -467,7 +479,7 @@ class TestQwenAdapterSpawn:
         # is enabled.
         assert "--tavily-api-key" not in inner
         assert "tv-key-xyz" not in inner
-        assert "--web-search-default" in inner
+        assert "--web-search-default" not in inner
         env = popen.call_args.kwargs.get("env", {})
         assert env.get("TAVILY_API_KEY") == "tv-key-xyz"
 
@@ -619,7 +631,7 @@ class TestGenericAdapterName:
 
 
 # ---------------------------------------------------------------------------
-# is_alive() — all adapters share the same pattern
+# is_alive() - all adapters share the same pattern
 # ---------------------------------------------------------------------------
 
 
@@ -649,7 +661,7 @@ class TestIsAlive:
 
 
 # ---------------------------------------------------------------------------
-# kill() — all adapters call killpg
+# kill() - all adapters call killpg
 # ---------------------------------------------------------------------------
 
 
@@ -668,7 +680,7 @@ class TestKill:
 
     def test_calls_killpg(self, adapter_factory: Callable[[], CLIAdapter]) -> None:
         adapter = adapter_factory()
-        with patch("bernstein.adapters.base.kill_process_group_graceful") as mock_killpg:
+        with patch("bernstein.adapters.base.reap_process_group") as mock_killpg:
             adapter.kill(555)
         # PID is used directly as PGID (start_new_session=True); the helper
         # performs the SIGTERM→poll→SIGKILL escalation required by audit-011.
@@ -676,12 +688,12 @@ class TestKill:
 
     def test_does_not_raise_on_oserror(self, adapter_factory: Callable[[], CLIAdapter]) -> None:
         adapter = adapter_factory()
-        with patch("bernstein.adapters.base.kill_process_group_graceful", return_value=False):
+        with patch("bernstein.adapters.base.reap_process_group", return_value=False):
             adapter.kill(556)  # must not raise
 
 
 # ---------------------------------------------------------------------------
-# spawn() — missing CLI binary / PermissionError
+# spawn() - missing CLI binary / PermissionError
 # ---------------------------------------------------------------------------
 
 

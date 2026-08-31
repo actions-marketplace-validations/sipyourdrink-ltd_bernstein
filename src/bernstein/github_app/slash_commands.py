@@ -4,10 +4,10 @@ Parses ``/bernstein <action> [args]`` from comment bodies and converts them
 into Bernstein task payloads.
 
 Supported actions:
-- ``fix [description]`` — create a targeted fix task for the current issue/PR
-- ``plan [description]`` — create a planning task that decomposes the work
-- ``evolve [description]`` — create an evolution/upgrade proposal task
-- ``qa [description]`` — create a QA verification task
+- ``fix [description]`` - create a targeted fix task for the current issue/PR
+- ``plan [description]`` - create a planning task that decomposes the work
+- ``evolve [description]`` - create an evolution/upgrade proposal task
+- ``qa [description]`` - create a QA verification task
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Matches /bernstein <action> [rest of line]
-_SLASH_RE = re.compile(r"^\s*/bernstein\s+(\w+)(?:\s+(.+))?$", re.MULTILINE | re.IGNORECASE)
+_SLASH_RE = re.compile(r"^[ \t]*/bernstein[ \t]+(\w+)(?:[ \t]+([^\r\n]*))?$", re.MULTILINE | re.IGNORECASE)
 
 # Supported actions and their task_type / role mappings
 _ACTION_MAP: dict[str, dict[str, str]] = {
@@ -71,7 +71,7 @@ def slash_command_to_task(
     """
     spec = _ACTION_MAP.get(action)
     if spec is None:
-        logger.info("Unknown /bernstein action %r — ignoring", action)
+        logger.info("Unknown /bernstein action %r - ignoring", action)
         return None
 
     # Determine context from event payload
@@ -84,7 +84,7 @@ def slash_command_to_task(
     comment_body = comment.get("body", "") or ""
 
     # Build description from available context
-    args_line = f" — {args}" if args else ""
+    args_line = f" - {args}" if args else ""
     description = (
         f"Slash command `/bernstein {action}`{args_line} by @{event.sender} "
         f"on #{issue_number} in {event.repo_full_name}.\n\n"

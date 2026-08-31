@@ -50,7 +50,7 @@ MIN_HEALTHY_SCORE: int = 60  # files below this are "unhealthy"
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_OBJ = "dict[str, object]"
+type _CAST_DICT_STR_OBJ = dict[str, object]
 
 
 @dataclass
@@ -498,7 +498,7 @@ class FileHealthTracker:
             flagged=flagged,
         )
 
-        # Append to health log — rotate before appending to cap disk growth
+        # Append to health log - rotate before appending to cap disk growth
         # . get_all()/get() dedupe by path on read so older entries
         # in the rotated backup are naturally replaced by fresher ones.
         rotate_log_file(self._health_path, max_bytes=JANITOR.file_health_rotate_bytes)

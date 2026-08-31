@@ -5,15 +5,15 @@ auto-discoverable in editors that support ACP (JetBrains Air, Zed,
 Neovim, Emacs) without requiring custom plugins.
 
 Protocol endpoints exposed:
-  GET  /.well-known/acp.json          — discovery document
-  GET  /acp/v0/agents                 — list available agents
-  GET  /acp/v0/agents/{agent_id}      — agent metadata + capabilities
-  POST /acp/v0/runs                   — create a run (→ Bernstein task)
-  GET  /acp/v0/runs/{run_id}          — run status (synced from task server)
-  DELETE /acp/v0/runs/{run_id}        — cancel a run
+  GET  /.well-known/acp.json          - discovery document
+  GET  /acp/v0/agents                 - list available agents
+  GET  /acp/v0/agents/{agent_id}      - agent metadata + capabilities
+  POST /acp/v0/runs                   - create a run (→ Bernstein task)
+  GET  /acp/v0/runs/{run_id}          - run status (synced from task server)
+  DELETE /acp/v0/runs/{run_id}        - cancel a run
 
 ACP "run" maps 1-to-1 with a Bernstein task.  The agent is always
-"bernstein" — the orchestrator itself is the ACP-visible agent.
+"bernstein" - the orchestrator itself is the ACP-visible agent.
 """
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ class ACPHandler:
             "agents": [
                 {
                     "name": "bernstein",
-                    "description": "Multi-agent orchestration system for CLI coding agents",
+                    "description": "The open-source governance layer for AI agents, one git worktree per task",
                     "endpoint": f"{self._server_url}/acp/v0",
                 }
             ],
@@ -173,9 +173,11 @@ class ACPHandler:
         """
         return {
             "name": "bernstein",
-            "description": "Multi-agent orchestration system for CLI coding agents. "
+            "description": "The open-source governance layer for AI agents. "
             "Bernstein hires a team of specialised sub-agents (backend, qa, security) "
-            "to implement goals end-to-end with cost governance and verification.",
+            "to implement goals end-to-end with cost governance and verification. "
+            "No model sits in its coordination loop, so parallel runs in per-task "
+            "git worktrees replay byte-identically.",
             "protocol_version": "v0",
             "capabilities": _BERNSTEIN_CAPABILITIES,
             "endpoint": f"{self._server_url}/acp/v0",

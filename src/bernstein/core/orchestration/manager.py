@@ -1,4 +1,4 @@
-"""Manager Intelligence — LLM-powered task decomposition and review.
+"""Manager Intelligence - LLM-powered task decomposition and review.
 
 This module orchestrates the full Manager workflow: task planning, queue review,
 and completion review using LLM calls. It imports lower-level logic from
@@ -133,6 +133,13 @@ async def _post_task_to_server(
     # Include upgrade_details if present
     if task.upgrade_details:
         body["upgrade_details"] = asdict(task.upgrade_details)
+    # Forward the declared artifact contract (issue #3110). Dropping it here
+    # would silently turn a declared report/dataset/action_log/ops_result task
+    # back into a code_diff task at the server boundary.
+    from bernstein.core.tasks.artifacts import ArtifactKind
+
+    if task.artifact_spec.kind is not ArtifactKind.CODE_DIFF:
+        body["artifact_spec"] = task.artifact_spec.to_dict()
 
     resp = await client.post(f"{server_url}/tasks", json=body)
     resp.raise_for_status()
@@ -267,7 +274,7 @@ class ManagerAgent:
             try:
                 existing = await _fetch_existing_tasks(client, self._server_url)
             except httpx.HTTPError:
-                logger.warning("Could not fetch existing tasks — planning from scratch")
+                logger.warning("Could not fetch existing tasks - planning from scratch")
                 existing = []
 
             # Record metrics start
@@ -688,7 +695,7 @@ Be precise and complete. Include all necessary imports, tests, and documentation
             QueueReviewResult with corrections to apply.
         """
         if budget_remaining_pct < 0.10:
-            logger.info("Manager queue review skipped — budget below 10%%")
+            logger.info("Manager queue review skipped - budget below 10%%")
             return QueueReviewResult(corrections=[], reasoning="skipped: budget < 10%", skipped=True)
 
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -743,7 +750,7 @@ Be precise and complete. Include all necessary imports, tests, and documentation
             return QueueReviewResult(corrections=[], reasoning=f"parse error: {exc}", skipped=True)
 
         logger.info(
-            "Manager queue review: %d correction(s) — %s",
+            "Manager queue review: %d correction(s) - %s",
             len(result.corrections),
             result.reasoning,
         )

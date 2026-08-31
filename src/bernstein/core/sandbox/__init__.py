@@ -2,7 +2,7 @@
 
 Bernstein's agent isolation has historically been git-worktree-only.
 This package introduces a protocol-based abstraction so isolation is
-no longer worktree-hardcoded — new backends (Docker, E2B, Modal ...)
+no longer worktree-hardcoded - new backends (Docker, E2B, Modal ...)
 can register via the ``bernstein.sandbox_backends`` entry-point group.
 
 Phase 1 exposes the protocol, manifest, registry, and four first-party
@@ -59,6 +59,18 @@ from bernstein.core.sandbox.manifest import (
     S3Mount,
     WorkspaceManifest,
 )
+from bernstein.core.sandbox.pool import (
+    PoolManifest,
+    PoolMergeResult,
+    PoolOverrideRefused,
+    PoolWorkspaceTemplate,
+    merge_pool_overrides,
+)
+from bernstein.core.sandbox.pool_registry import (
+    PoolRegistry,
+    PoolStore,
+    project_pool_registry,
+)
 from bernstein.core.sandbox.registry import (
     get_backend,
     list_backend_names,
@@ -98,6 +110,12 @@ __all__ = [
     "FileEntry",
     "GCSMount",
     "GitRepoEntry",
+    "PoolManifest",
+    "PoolMergeResult",
+    "PoolOverrideRefused",
+    "PoolRegistry",
+    "PoolStore",
+    "PoolWorkspaceTemplate",
     "R2Mount",
     "S3Mount",
     "SandboxBackend",
@@ -111,7 +129,9 @@ __all__ = [
     "get_backend",
     "list_backend_names",
     "list_backends",
+    "merge_pool_overrides",
     "parse_docker_sandbox",
+    "project_pool_registry",
     "register_backend",
     "select_sandbox",
     "spawn_in_sandbox",

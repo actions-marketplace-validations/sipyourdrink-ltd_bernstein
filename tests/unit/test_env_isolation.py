@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# build_filtered_env — unit tests
+# build_filtered_env - unit tests
 # ---------------------------------------------------------------------------
 
 
@@ -28,6 +28,29 @@ class TestBuildFilteredEnv:
         assert result["PATH"] == "/usr/bin"
         assert result["HOME"] == "/root"
         assert result["LANG"] == "en_US.UTF-8"
+
+    def test_pathext_in_allowlist(self) -> None:
+        """PATHEXT must be allowlisted so bernstein-worker's shutil.which can
+        recognise .cmd/.bat/.exe shims on Windows (issue #2287).
+
+        nvm-windows installs the Codex/Claude/Gemini CLIs as batch shims
+        (codex.cmd). Without PATHEXT in the spawned env, shutil.which cannot
+        resolve them and the worker exits 127.
+        """
+        assert "PATHEXT" in _BASE_ALLOWLIST
+
+    def test_pathext_passes_through_build_filtered_env(self) -> None:
+        """PATHEXT set in os.environ reaches the filtered agent env."""
+        fake_env = {
+            "PATH": r"C:\nvm4w\nodejs",
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            "DATABASE_URL": "postgres://user:pass@host/db",
+        }
+        with patch("bernstein.adapters.env_isolation.os.environ", fake_env):
+            result = build_filtered_env()
+        assert result["PATHEXT"] == ".COM;.EXE;.BAT;.CMD"
+        # unrelated secret still stripped
+        assert "DATABASE_URL" not in result
 
     def test_secrets_excluded(self) -> None:
         """Database credentials, CI tokens and unrelated keys are stripped."""
@@ -55,7 +78,7 @@ class TestBuildFilteredEnv:
         The agent's Claude-Code hook runner signs ``/hooks/{session_id}``
         POSTs with ``SECRET="${BERNSTEIN_HOOK_SECRET:-$BERNSTEIN_AUTH_TOKEN}"``.
         If the allowlist strips these vars, openssl HMACs over the empty
-        string and every hook event returns 401 — which silently kills
+        string and every hook event returns 401 - which silently kills
         token-tracking, context-util %, and completion markers.
         """
         env = {
@@ -70,6 +93,23 @@ class TestBuildFilteredEnv:
         assert result["BERNSTEIN_AUTH_TOKEN"] == "ephemeral-token"
         assert result["BERNSTEIN_HOOK_SECRET"] == "shared-secret"
         assert result["BERNSTEIN_AUTH_DISABLED"] == "0"
+
+    def test_bernstein_server_url_passes_through(self) -> None:
+        """BERNSTEIN_SERVER_URL must reach the agent.
+
+        Remote workers export it before spawning so the agent's
+        server-facing plumbing targets the central server instead of
+        falling back to http://localhost:8052. It is a URL, not a
+        credential, so the allowlist passes it through.
+        """
+        env = {
+            "PATH": "/bin",
+            "HOME": "/home/u",
+            "BERNSTEIN_SERVER_URL": "http://central:8052",
+        }
+        with patch("bernstein.adapters.env_isolation.os.environ", env):
+            result = build_filtered_env()
+        assert result["BERNSTEIN_SERVER_URL"] == "http://central:8052"
 
     def test_extra_keys_included(self) -> None:
         """API key names passed via extra_keys are included."""
@@ -94,6 +134,47 @@ class TestBuildFilteredEnv:
         ):
             result = build_filtered_env(["ANTHROPIC_API_KEY"])
         assert result == {}
+
+    def test_pythonpath_not_injected_by_default(self, tmp_path: Path) -> None:
+        """Without the opt-in flag, no PYTHONPATH is injected even when the
+        orchestrator's sys.path is non-empty (issue #4221).
+
+        This is the default every external CLI adapter (aider, codex,
+        gemini, ...) gets: their own dependencies must not be shadowed by
+        the orchestrator's site-packages.
+        """
+        fake_env = {"PATH": "/usr/bin"}
+        with (
+            patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+            patch("sys.path", [str(tmp_path)]),
+        ):
+            result = build_filtered_env()
+        assert "PYTHONPATH" not in result
+
+    def test_pythonpath_injected_when_opted_in(self, tmp_path: Path) -> None:
+        """The opt-in flag injects the orchestrator's sys.path entries as
+        PYTHONPATH, for spawn paths that run bernstein's own code via
+        ``sys.executable`` (issue #4221)."""
+        fake_env = {"PATH": "/usr/bin"}
+        with (
+            patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+            patch("sys.path", [str(tmp_path), ""]),
+        ):
+            result = build_filtered_env(inherit_orchestrator_pythonpath=True)
+        assert result["PYTHONPATH"] == str(tmp_path)
+
+    def test_operator_pythonpath_passes_through_unmodified(self, tmp_path: Path) -> None:
+        """An operator-set PYTHONPATH passes through the allowlist unchanged,
+        regardless of the opt-in flag - the injection only fires when the
+        caller's environment carries no PYTHONPATH of its own."""
+        fake_env = {"PATH": "/usr/bin", "PYTHONPATH": "/operator/custom/path"}
+        for flag in (False, True):
+            with (
+                patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+                patch("sys.path", [str(tmp_path)]),
+            ):
+                result = build_filtered_env(inherit_orchestrator_pythonpath=flag)
+            assert result["PYTHONPATH"] == "/operator/custom/path"
 
     def test_result_is_independent_copy(self) -> None:
         """Mutating the result does not affect os.environ or a subsequent call."""
@@ -313,3 +394,316 @@ class TestAdaptersUseFilteredEnv:
         kwargs = popen_spy.call_args.kwargs
         assert "env" in kwargs
         assert kwargs["env"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Call-site gating: only bernstein's own sys.executable spawns opt in
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorPythonPathCallSiteGating:
+    """Regression coverage for issue #4221.
+
+    External CLI adapters must never receive the orchestrator's sys.path
+    as PYTHONPATH - it shadows their own dependencies. Only spawn paths
+    that run bernstein's own code via ``sys.executable`` opt in.
+    """
+
+    def test_aider_does_not_receive_orchestrator_pythonpath(self, tmp_path: Path) -> None:
+        """Aider is an external CLI; it must not see the orchestrator's
+        sys.path even when the caller's environment has no PYTHONPATH of
+        its own (the exact scenario from issue #4221: a 3.12 aider venv
+        poisoned by a 3.14 orchestrator's site-packages)."""
+        from bernstein.core.models import ModelConfig
+
+        from bernstein.adapters.aider import AiderAdapter
+
+        adapter = AiderAdapter()
+        proc_mock = _make_popen_mock()
+        fake_env = {"PATH": "/usr/bin"}
+        with (
+            patch("bernstein.adapters.aider.subprocess.Popen", return_value=proc_mock) as popen_spy,
+            patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+            patch("sys.path", [str(tmp_path)]),
+        ):
+            adapter.spawn(
+                prompt="do work",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="sonnet", effort="high"),
+                session_id="sess-aider-pythonpath",
+            )
+        env = popen_spy.call_args.kwargs["env"]
+        assert "PYTHONPATH" not in env
+
+    def test_manager_adapter_receives_orchestrator_pythonpath(self, tmp_path: Path) -> None:
+        """ManagerAdapter runs ``bernstein.core.orchestration.manager`` via
+        sys.executable - bernstein's own code - so it needs the injection
+        to import bernstein when sys.executable is the uv framework
+        Python."""
+        from bernstein.core.models import ModelConfig
+
+        from bernstein.adapters.manager import ManagerAdapter
+
+        adapter = ManagerAdapter()
+        proc_mock = _make_popen_mock()
+        fake_env = {"PATH": "/usr/bin"}
+        with (
+            patch("bernstein.adapters.manager.subprocess.Popen", return_value=proc_mock) as popen_spy,
+            patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+            patch("sys.path", [str(tmp_path)]),
+        ):
+            adapter.spawn(
+                prompt="do work (id=task-42)",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="sonnet", effort="high"),
+                session_id="sess-manager-pythonpath",
+            )
+        env = popen_spy.call_args.kwargs["env"]
+        assert env["PYTHONPATH"] == str(tmp_path)
+
+    def test_python_runtime_adapter_receives_orchestrator_pythonpath(self, tmp_path: Path) -> None:
+        """PythonRuntimeAdapter runs python_runtime_runner.py - bernstein's
+        own code - via sys.executable, so it needs the injection."""
+        from bernstein.core.models import ModelConfig
+
+        from bernstein.adapters.python_runtime import PythonRuntimeAdapter
+
+        adapter = PythonRuntimeAdapter()
+        proc_mock = _make_popen_mock()
+        fake_env = {"PATH": "/usr/bin"}
+        with (
+            patch("bernstein.adapters.python_runtime.subprocess.Popen", return_value=proc_mock) as popen_spy,
+            patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+            patch("sys.path", [str(tmp_path)]),
+        ):
+            adapter.spawn(
+                prompt="do work",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gpt-5.4", effort="high"),
+                session_id="sess-pyruntime-pythonpath",
+                mcp_config={"runtime_module": "custom_agent"},
+                timeout_seconds=0,
+            )
+        env = popen_spy.call_args.kwargs["env"]
+        assert env["PYTHONPATH"] == str(tmp_path)
+
+    def test_openai_agents_adapter_receives_orchestrator_pythonpath(self, tmp_path: Path) -> None:
+        """OpenAIAgentsAdapter always execs
+        ``bernstein.adapters.openai_agents_runner`` - bernstein's own code -
+        via sys.executable, so it needs the injection."""
+        from bernstein.core.models import ModelConfig
+
+        from bernstein.adapters.openai_agents import OpenAIAgentsAdapter
+
+        adapter = OpenAIAgentsAdapter()
+        proc_mock = _make_popen_mock()
+        fake_env = {"PATH": "/usr/bin"}
+        with (
+            patch("bernstein.adapters.openai_agents.subprocess.Popen", return_value=proc_mock) as popen_spy,
+            patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+            patch("sys.path", [str(tmp_path)]),
+        ):
+            adapter.spawn(
+                prompt="do work",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gpt-5", effort="high"),
+                session_id="sess-oai-agents-pythonpath",
+            )
+        env = popen_spy.call_args.kwargs["env"]
+        assert env["PYTHONPATH"] == str(tmp_path)
+
+    def test_clm_adapter_pythonpath_only_when_mtls_launcher_used(self, tmp_path: Path) -> None:
+        """ClmAdapter routes through ``clm_tls_launcher`` (bernstein's own
+        code) only when mTLS is configured; the plain path execs straight
+        into aider, an external CLI, and must not get the injection."""
+        from bernstein.core.models import ModelConfig
+
+        from bernstein.adapters.clm import (
+            CLM_CA_FILE_ENV,
+            CLM_CERT_FILE_ENV,
+            CLM_ENDPOINT_ENV,
+            CLM_KEY_FILE_ENV,
+            CLM_MODEL_ENV,
+            CLM_TOKEN_ENV,
+            ClmAdapter,
+        )
+
+        base_env = {
+            "PATH": "/usr/bin",
+            CLM_ENDPOINT_ENV: "https://clm.internal.example/v1/",
+            CLM_TOKEN_ENV: "scoped-jwt-customer-001",
+            CLM_MODEL_ENV: "clm-7b-instruct",
+        }
+
+        # -- no mTLS: plain aider exec, no injection --
+        adapter = ClmAdapter()
+        proc_mock = _make_popen_mock()
+        with (
+            patch("bernstein.adapters.clm.subprocess.Popen", return_value=proc_mock) as popen_spy,
+            patch("bernstein.adapters.env_isolation.os.environ", base_env),
+            patch("sys.path", [str(tmp_path)]),
+        ):
+            adapter.spawn(
+                prompt="hello",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="clm-7b-instruct", effort="medium"),
+                session_id="sess-clm-no-mtls",
+            )
+        assert "PYTHONPATH" not in popen_spy.call_args.kwargs["env"]
+
+        # -- mTLS configured: routes through clm_tls_launcher, needs injection --
+        cert, key, ca = tmp_path / "client.crt", tmp_path / "client.key", tmp_path / "ca.crt"
+        for path, label in ((cert, "CERTIFICATE"), (key, "PRIVATE KEY"), (ca, "CERTIFICATE")):
+            path.write_text(f"-----BEGIN {label}-----\nstub\n-----END {label}-----\n", encoding="utf-8")
+        mtls_env = base_env | {
+            CLM_CERT_FILE_ENV: str(cert),
+            CLM_KEY_FILE_ENV: str(key),
+            CLM_CA_FILE_ENV: str(ca),
+        }
+        proc_mock2 = _make_popen_mock()
+        with (
+            patch("bernstein.adapters.clm.subprocess.Popen", return_value=proc_mock2) as popen_spy2,
+            patch("bernstein.adapters.env_isolation.os.environ", mtls_env),
+            patch("sys.path", [str(tmp_path)]),
+        ):
+            adapter.spawn(
+                prompt="hello",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="clm-7b-instruct", effort="medium"),
+                session_id="sess-clm-mtls",
+            )
+        assert popen_spy2.call_args.kwargs["env"]["PYTHONPATH"] == str(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Embedded agent-team spawning gate - deny by default
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddedAgentTeamsDeny:
+    """The embedded agent-team spawning gate is stripped by default.
+
+    A spawned worker that inherits ``CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS``
+    can launch its own teammate instances; those teammates inherit the
+    lead's permission mode and run outside this worker's HMAC audit trail,
+    breaking the one-worker-one-audit-trail invariant.  The gate must be
+    denied even if it somehow reaches the allowlist.
+    """
+
+    def test_gate_stripped_by_default(self) -> None:
+        fake_env = {
+            "PATH": "/usr/bin",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+        }
+        with patch("bernstein.adapters.env_isolation.os.environ", fake_env):
+            result = build_filtered_env()
+        assert "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" not in result
+        assert result["PATH"] == "/usr/bin"
+
+    def test_gate_stripped_even_when_in_extra_keys(self) -> None:
+        """An operator-widened allowlist cannot re-open the hole."""
+        fake_env = {
+            "PATH": "/usr/bin",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+        }
+        with patch("bernstein.adapters.env_isolation.os.environ", fake_env):
+            result = build_filtered_env(["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"])
+        assert "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" not in result
+
+    def test_forward_looking_suffixes_stripped(self) -> None:
+        """A future ``*_AGENT_TEAMS`` gate is denied without a code change."""
+        fake_env = {
+            "PATH": "/usr/bin",
+            "SOMEVENDOR_EXPERIMENTAL_AGENT_TEAMS": "1",
+            "OTHER_AGENT_TEAMS": "yes",
+        }
+        with patch("bernstein.adapters.env_isolation.os.environ", fake_env):
+            result = build_filtered_env(["SOMEVENDOR_EXPERIMENTAL_AGENT_TEAMS", "OTHER_AGENT_TEAMS"])
+        assert "SOMEVENDOR_EXPERIMENTAL_AGENT_TEAMS" not in result
+        assert "OTHER_AGENT_TEAMS" not in result
+
+    def test_opt_in_repermits_gate(self) -> None:
+        """An explicit host opt-in re-permits the gate."""
+        fake_env = {
+            "PATH": "/usr/bin",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+            "BERNSTEIN_ALLOW_EMBEDDED_AGENT_TEAMS": "1",
+        }
+        with patch("bernstein.adapters.env_isolation.os.environ", fake_env):
+            result = build_filtered_env(["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"])
+        assert result["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
+
+    def test_opt_in_falsey_value_still_denies(self) -> None:
+        """A stray empty/``0`` opt-in value keeps deny-by-default."""
+        fake_env = {
+            "PATH": "/usr/bin",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+            "BERNSTEIN_ALLOW_EMBEDDED_AGENT_TEAMS": "0",
+        }
+        with patch("bernstein.adapters.env_isolation.os.environ", fake_env):
+            result = build_filtered_env(["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"])
+        assert "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" not in result
+
+    def test_opt_in_emits_audit_event(self, tmp_path: Path) -> None:
+        """record_embedded_teams_opt_in appends an attestation to the chain."""
+        from bernstein.adapters.env_isolation import record_embedded_teams_opt_in
+        from bernstein.core.security.audit import AuditLog
+
+        audit_dir = tmp_path / ".sdd" / "audit"
+        record_embedded_teams_opt_in(
+            adapter="claude",
+            session_id="qa-abc12345",
+            audit_dir=audit_dir,
+        )
+        events = AuditLog(audit_dir=audit_dir).query(event_type="adapter.embedded_agent_teams_enabled")
+        assert len(events) == 1
+        assert events[0].actor == "claude"
+        assert events[0].resource_id == "qa-abc12345"
+        assert events[0].details["adapter"] == "claude"
+
+    def test_secrets_overlay_cannot_reintroduce_gate(self) -> None:
+        """A secrets provider returning the gate is re-stripped before return.
+
+        The embedded-team strip runs both before and after the secrets
+        overlay.  If an external provider returned the agent-team gate, the
+        post-overlay strip must remove it again so the deny-by-default posture
+        holds right up to the return.
+        """
+        from bernstein.core.security.secrets import SecretsConfig
+
+        cfg = SecretsConfig(provider="vault", path="secret/test")
+        fake_env = {"PATH": "/usr/bin"}
+        provider_secrets = {
+            "SOME_API_KEY": "value",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+        }
+        with (
+            patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+            patch(
+                "bernstein.core.security.secrets.load_secrets",
+                return_value=provider_secrets,
+            ),
+        ):
+            result = build_filtered_env(secrets_config=cfg)
+        assert "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" not in result
+        assert result["SOME_API_KEY"] == "value"
+
+    def test_secrets_overlay_gate_kept_when_opted_in(self) -> None:
+        """When the operator opts in, a provider-returned gate survives."""
+        from bernstein.core.security.secrets import SecretsConfig
+
+        cfg = SecretsConfig(provider="vault", path="secret/test")
+        fake_env = {
+            "PATH": "/usr/bin",
+            "BERNSTEIN_ALLOW_EMBEDDED_AGENT_TEAMS": "1",
+        }
+        provider_secrets = {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}
+        with (
+            patch("bernstein.adapters.env_isolation.os.environ", fake_env),
+            patch(
+                "bernstein.core.security.secrets.load_secrets",
+                return_value=provider_secrets,
+            ),
+        ):
+            result = build_filtered_env(secrets_config=cfg)
+        assert result["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"

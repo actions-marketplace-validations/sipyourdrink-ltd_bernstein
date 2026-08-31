@@ -1,4 +1,4 @@
-"""``PreviewManager`` — orchestrates a single ``bernstein preview`` lifecycle.
+"""``PreviewManager`` - orchestrates a single ``bernstein preview`` lifecycle.
 
 Responsibilities:
 
@@ -35,7 +35,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import builtins
 
 from bernstein.core.preview.command_discovery import (
     DiscoveredCommand,
@@ -55,6 +58,9 @@ from bernstein.core.preview.port_capture import (
 from bernstein.core.preview.token_issuer import IssuedAuth, PreviewTokenIssuer
 from bernstein.core.preview.tunnel_bridge import TunnelBridge, TunnelBridgeError
 from bernstein.core.security.audit import AuditLog
+
+if TYPE_CHECKING:
+    import builtins
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +146,7 @@ class PreviewState:
         sandbox_backend: Backend name (``"worktree"``, ``"docker"``, …).
         sandbox_session_id: Backend-supplied session identifier.
         tunnel_provider: Provider name (``"cloudflared"``, ``"ngrok"`` …).
-        tunnel_name: Tunnel name registered with the registry — used to
+        tunnel_name: Tunnel name registered with the registry - used to
             stop the tunnel on shutdown.
         public_url: Bare tunnel URL (no auth credentials).
         share_url: URL with auth credentials baked in (token query or
@@ -211,7 +217,7 @@ class PreviewStore:
         """Return the state-file path."""
         return self._path
 
-    def list(self) -> list[PreviewState]:
+    def list(self) -> builtins.list[PreviewState]:
         """Return every persisted preview record."""
         with self._lock:
             return self._load()
@@ -245,7 +251,7 @@ class PreviewStore:
     # Internal
     # ------------------------------------------------------------------
 
-    def _load(self) -> list[PreviewState]:
+    def _load(self) -> builtins.list[PreviewState]:
         if not self._path.exists():
             return []
         try:
@@ -254,7 +260,7 @@ class PreviewStore:
             logger.warning("Preview state read failed for %s: %s", self._path, exc)
             return []
         items = raw.get("previews", []) if isinstance(raw, dict) else []
-        out: list[PreviewState] = []
+        out: builtins.list[PreviewState] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -264,7 +270,7 @@ class PreviewStore:
                 logger.debug("Skipping malformed preview state row: %s", exc)
         return out
 
-    def _save(self, records: list[PreviewState]) -> None:
+    def _save(self, records: builtins.list[PreviewState]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"previews": [r.to_dict() for r in records]}
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
@@ -336,7 +342,7 @@ class PreviewManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def list(self) -> list[PreviewState]:
+    def list(self) -> builtins.list[PreviewState]:
         """Return every active preview the manager knows about."""
         return self._store.list()
 
@@ -344,7 +350,7 @@ class PreviewManager:
         """Return state for *preview_id* or ``None``."""
         return self._store.get(preview_id)
 
-    def discover(self, cwd: Path) -> list[DiscoveredCommand]:
+    def discover(self, cwd: Path) -> builtins.list[DiscoveredCommand]:
         """Return every discovered candidate command under *cwd*."""
         return list_candidates(cwd)
 
@@ -371,7 +377,7 @@ class PreviewManager:
                 stays decoupled from the concrete backend selection.
             command: Optional explicit command override. ``None`` means
                 "auto-discover".
-            provider: Tunnel provider — defaults to ``"auto"`` per the
+            provider: Tunnel provider - defaults to ``"auto"`` per the
                 ticket.
             auth_mode: ``"basic"``, ``"token"`` or ``"none"``.
             expire_seconds: ``--expire`` value. Accepts strings like
@@ -446,7 +452,7 @@ class PreviewManager:
         )
         self._store.upsert(state)
 
-        # Audit + metrics — issued before returning so observers see the
+        # Audit + metrics - issued before returning so observers see the
         # preview the moment ``start`` returns.
         self._record_audit(
             "preview.start",
@@ -555,7 +561,7 @@ class PreviewManager:
     ) -> None:
         """Emit an audit entry; demote audit failures to warnings.
 
-        We intentionally never raise here — losing observability is
+        We intentionally never raise here - losing observability is
         bad, but losing the preview because the audit log is wedged
         is worse.
         """
@@ -593,7 +599,7 @@ class PreviewManager:
 class SandboxLike:
     """Structural protocol describing the bits we read off a sandbox session.
 
-    We deliberately accept *anything* with the two attributes — it lets
+    We deliberately accept *anything* with the two attributes - it lets
     callers pass either a real :class:`SandboxSession` or a lightweight
     test stub.
     """
@@ -661,7 +667,7 @@ class SubprocessDevServerRunner(DevServerRunner):
         if not command:
             raise PreviewError("Cannot spawn an empty command")
         # The dev server may be a free-form shell pipeline (``npm run
-        # dev`` is fine, ``cd foo && npm run dev`` is not — we forbid
+        # dev`` is fine, ``cd foo && npm run dev`` is not - we forbid
         # ``;`` and ``&&`` chaining to keep the audit trail honest).
         if any(token in command for token in (";", "&&", "||")):
             raise PreviewError("Pipeline / chained commands are not allowed")
@@ -714,7 +720,7 @@ def _await_port(handle: DevServerHandle, *, timeout_seconds: float) -> int:
     Args:
         handle: Result of :meth:`DevServerRunner.spawn`.
         timeout_seconds: Wall-clock budget. Passed transparently to
-            consumers — the caller is expected to enforce a hard upper
+            consumers - the caller is expected to enforce a hard upper
             bound on the iterable.
 
     Returns:
@@ -746,7 +752,7 @@ def _await_port(handle: DevServerHandle, *, timeout_seconds: float) -> int:
 
 
 def _resolve_command(cwd: Path, command: str | None) -> DiscoveredCommand:
-    """Resolve a command — explicit override beats auto-discovery."""
+    """Resolve a command - explicit override beats auto-discovery."""
     if command and command.strip():
         return DiscoveredCommand(source="--command", command=command.strip())
     discovered = discover_commands(cwd)

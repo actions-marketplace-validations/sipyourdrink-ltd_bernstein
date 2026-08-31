@@ -22,6 +22,33 @@ The implementation lives in
 | Per-server cost-meter | `MCPServerCostMeter` | MCP spend must be attributed and capped per server per task. |
 | Schema-violation containment | every call path | Invalid JSON or missing fields; the server is quarantined for the task. |
 
+## Stateless wire identity
+
+The client is stateless on the wire: it never mints a protocol session id and
+never round-trips the removed `Mcp-Session-Id` header (a legacy header a
+server still sends is ignored). Instead, every request and notification
+carries a per-request `_meta` built by `build_request_meta`
+(`src/bernstein/core/protocols/mcp/stateless_core.py`):
+
+- `traceparent` carries a W3C trace id derived from the run root hash and a
+  span id derived from the call's content hash plus its ordered call index;
+- `baggage` carries the method and the call index;
+- `client.capabilities` advertises the client capability map per request,
+  replacing the `initialize` handshake advertisement.
+
+Because every id is a pure function of run identity and call content, two
+replays of the same run emit byte-identical `_meta`, and any server instance
+can serve any request. Pass `run_root_hash` (the run journal's genesis hash)
+to `MCPClientSession` to bind wire traces to the run; without it, a
+deterministic projection of the server identity keeps replays reproducible.
+
+A tool result of type `input_required` is not an error: the server's opaque
+`requestState` echo surfaces on `result.metadata["request_state"]` alongside
+the prompt. Retry by calling `call_tool` again with the supplied input as
+`arguments` and `request_state=<the echo>`; the echoed state carries
+everything needed to resume, so the retry may be served by a different
+server instance (or issued from a fresh client) with no shared memory.
+
 ## Capability-card validation
 
 Before issuing a tool call the client verifies the tool is declared in the
@@ -32,9 +59,9 @@ client validated against.
 
 ```python
 session = MCPClientSession(RemoteServerConfig(name="github", url="https://..."))
-await session.connect()           # discovers + digests the manifest
-await session.call_tool("create_issue", {...})   # ok: declared
-await session.call_tool("rm_minus_rf", {...})     # raises MCPCapabilityMissing
+await session.connect()  # discovers + digests the manifest
+await session.call_tool("create_issue", {...})  # ok: declared
+await session.call_tool("rm_minus_rf", {...})  # raises MCPCapabilityMissing
 ```
 
 `MCPCapabilityMissing` subclasses `MCPToolNotFoundError`, so callers that
@@ -63,6 +90,7 @@ def stream_factory(resume_from, idempotency_key):
     # resume_from is the last checkpoint token, or None on first attempt.
     return transport.open_stream(resume_from=resume_from, idem=idempotency_key)
 
+
 result = await session.call_tool_streaming("long_query", {...}, stream_factory=stream_factory)
 ```
 
@@ -81,10 +109,8 @@ partial output.
 
 ```python
 handle = StreamedToolCall(server_name="github", tool_name="long_query")
-task = asyncio.create_task(
-    session.call_tool_streaming("long_query", {...}, stream_factory=f, handle=handle)
-)
-handle.cancel()              # cooperative; partial output is preserved
+task = asyncio.create_task(session.call_tool_streaming("long_query", {...}, stream_factory=f, handle=handle))
+handle.cancel()  # cooperative; partial output is preserved
 result = await task
 assert result.metadata["cancelled"] is True
 ```
@@ -107,8 +133,8 @@ manager = MCPClientManager(cost_meter=meter, task_id="task-42")
 await manager.connect(config)
 await manager.call_tool("github", "search", {...}, cost_usd=0.02)
 
-manager.server_cost("github")   # 0.02
-manager.task_cost()             # total across all servers for task-42
+manager.server_cost("github")  # 0.02
+manager.task_cost()  # total across all servers for task-42
 ```
 
 Negative costs are clamped to zero so a misreporting server cannot corrupt

@@ -1,4 +1,4 @@
-"""Lifecycle Governance Kernel — deterministic FSM for task and agent transitions.
+"""Lifecycle Governance Kernel - deterministic FSM for task and agent transitions.
 
 Every task and agent status change flows through this module. Illegal
 transitions raise ``IllegalTransitionError``; legal ones emit a typed
@@ -190,7 +190,11 @@ TASK_TRANSITIONS: dict[tuple[TaskStatus, TaskStatus], Callable[[Task], bool]] = 
     # Verification gate (orchestrator closes after janitor + merge)
     (TaskStatus.DONE, TaskStatus.CLOSED): _always,
     (TaskStatus.DONE, TaskStatus.FAILED): _always,
-    # Abandon primitive (#1350) — agent-initiated structured exit.
+    # Janitor reopen (bounded): a done task that fails janitor verification
+    # is re-queued under the SAME id for another attempt. The reopen budget
+    # is enforced by the orchestrator via metadata['janitor_reopen_count'].
+    (TaskStatus.DONE, TaskStatus.OPEN): _always,
+    # Abandon primitive (#1350) - agent-initiated structured exit.
     # ABANDONED is a terminal state distinct from FAILED so dashboards can
     # split intentional vs. unintentional exits. Downstream consumers move
     # to BLOCKED_BY_ABANDON instead of waiting forever for an output that
@@ -210,11 +214,150 @@ TASK_TRANSITIONS: dict[tuple[TaskStatus, TaskStatus], Callable[[Task], bool]] = 
     (TaskStatus.BLOCKED_BY_ABANDON, TaskStatus.OPEN): _always,
     (TaskStatus.BLOCKED_BY_ABANDON, TaskStatus.CANCELLED): _always,
     (TaskStatus.BLOCKED_BY_ABANDON, TaskStatus.ABANDONED): _always,
+    # Typed refusal outcomes (#2244) - a worker that cannot proceed reports
+    # a contract-validated refusal at the completion boundary. REFUSED is a
+    # terminal state distinct from FAILED so status surfaces can split
+    # "blocked by design" from "broke while trying". OPEN is a legal source
+    # because /complete auto-claims tasks that reverted to open before the
+    # payload is applied.
+    (TaskStatus.OPEN, TaskStatus.REFUSED): _always,
+    (TaskStatus.CLAIMED, TaskStatus.REFUSED): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.REFUSED): _always,
+    # Post-execution sign-off (#3081) - work that finished is held in
+    # PENDING_APPROVAL until a decision is recorded, and the decision that
+    # accepts it completes the task. Without this edge the state has no way
+    # out and the sign-off is rejected by ``transition_task``.
+    (TaskStatus.PENDING_APPROVAL, TaskStatus.DONE): _always,
+    # Failed-dependency cascade (#3452) - the FAILED counterpart of the
+    # abandon cascade above. A task whose dependency ended without
+    # delivering moves here instead of being re-queued forever. Kept
+    # distinct from BLOCKED_BY_ABANDON so the record still says whether the
+    # upstream was abandoned on purpose or broke while trying.
+    (TaskStatus.OPEN, TaskStatus.BLOCKED_BY_FAILED_DEP): _always,
+    (TaskStatus.CLAIMED, TaskStatus.BLOCKED_BY_FAILED_DEP): _always,
+    (TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED_BY_FAILED_DEP): _always,
+    (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.BLOCKED_BY_FAILED_DEP): _always,
+    # Same operator recovery paths the abandon-blocked state has: requeue
+    # once the upstream is retried, or close the branch out.
+    (TaskStatus.BLOCKED_BY_FAILED_DEP, TaskStatus.OPEN): _always,
+    (TaskStatus.BLOCKED_BY_FAILED_DEP, TaskStatus.CANCELLED): _always,
+    (TaskStatus.BLOCKED_BY_FAILED_DEP, TaskStatus.ABANDONED): _always,
 }
 
 # Precompute terminal statuses (no outbound transitions).
 TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
     s for s in TaskStatus if s not in {frm for (frm, _to), _guard in TASK_TRANSITIONS.items()}
+)
+
+
+# ---------------------------------------------------------------------------
+# Dependency-satisfaction classification (#3452)
+# ---------------------------------------------------------------------------
+
+# ``TERMINAL_TASK_STATUSES`` answers "can this status transition at all", which
+# is the wrong question for a dependent waiting on an upstream. FAILED,
+# ORPHANED and both blocked-by states each keep a recovery edge back to OPEN,
+# so they are absent from that set while still stranding every dependent until
+# an operator intervenes. The three sets below answer the dependency question
+# instead, and partition ``TaskStatus`` exhaustively so a newly added status
+# cannot slip through unclassified (asserted by the lifecycle FSM tests).
+
+# A dependency in one of these has delivered; dependents may proceed.
+SUCCESSFUL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.DONE,
+        TaskStatus.CLOSED,
+    }
+)
+
+# A dependency in one of these will never deliver on its own. Dependents are
+# stranded until the upstream is explicitly requeued.
+UNSUCCESSFUL_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.REFUSED,
+        TaskStatus.ORPHANED,
+        TaskStatus.ABANDONED,
+        TaskStatus.BLOCKED_BY_ABANDON,
+        TaskStatus.BLOCKED_BY_FAILED_DEP,
+    }
+)
+
+# The subset of the above that a task reaches because its own dependency was
+# stranded, rather than by running and ending. Members propagate the strand
+# onward but are themselves reported as stranded rather than as a root cause.
+DEPENDENCY_BLOCKED_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.BLOCKED_BY_ABANDON,
+        TaskStatus.BLOCKED_BY_FAILED_DEP,
+    }
+)
+
+# Neither delivered nor ended: the dependent may still become claimable.
+IN_FLIGHT_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.PLANNED,
+        TaskStatus.OPEN,
+        TaskStatus.CLAIMED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.BLOCKED,
+        TaskStatus.WAITING_FOR_SUBTASKS,
+        TaskStatus.SUSPENDED,
+        TaskStatus.PENDING_APPROVAL,
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Approval gates
+# ---------------------------------------------------------------------------
+
+# The task states where the next transition is a decision, mapped to what a
+# per-task approval verb does with that decision.
+#
+#   PENDING_APPROVAL  - post-execution. The work is finished and the result is
+#                       held until the decision is recorded, so accepting it
+#                       completes the task (-> DONE) with the approver's note
+#                       as the result summary. The decision belongs to the
+#                       task, so a per-task verb may grant it.
+#
+# Every other status is running, blocked on something other than a decision,
+# or terminal: there is no approval to grant, so an approval verb must refuse
+# rather than force the task forward.
+TASK_APPROVAL_TARGETS: dict[TaskStatus, TaskStatus] = {
+    TaskStatus.PENDING_APPROVAL: TaskStatus.DONE,
+}
+
+# The statuses an approval verb may act on, derived from the table above so
+# callers cannot drift from the state machine.
+APPROVABLE_TASK_STATUSES: frozenset[TaskStatus] = frozenset(TASK_APPROVAL_TARGETS)
+
+# States whose decision is NOT the task's to grant. PLANNED is the plan gate:
+# plan mode holds every task of a plan in PLANNED until an operator decides
+# the plan as a whole, and ``POST /plans/{plan_id}/approve`` records that
+# decision and promotes the tasks it covers. Promoting a single task instead
+# releases the work while the plan stays undecided, so the operator's later
+# rejection finds nothing left to cancel. A per-task approval verb refuses
+# these and points at the route that owns the decision.
+PLAN_GATED_TASK_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.PLANNED})
+
+# The states a worker may report its own completion from. A worker holds a
+# task it claimed (CLAIMED / IN_PROGRESS), or one that reverted to OPEN under
+# reconciliation, which ``POST /tasks/{id}/complete`` re-claims before
+# applying the payload.
+#
+# The remaining states with a legal edge to DONE are deliberately excluded:
+# WAITING_FOR_SUBTASKS is completed by its last subtask finishing, ORPHANED
+# belongs to crash recovery because its worker is gone, and PENDING_APPROVAL
+# is a decision, not a report of work. Completing any of those on request
+# marks work done that the caller did not do.
+WORKER_COMPLETABLE_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.OPEN,
+        TaskStatus.CLAIMED,
+        TaskStatus.IN_PROGRESS,
+    }
 )
 
 
@@ -232,6 +375,17 @@ AGENT_TRANSITIONS: dict[tuple[AgentStatus, AgentStatus], Callable[[AgentSession]
     ("idle", "working"): _always_agent,
     ("idle", "dead"): _always_agent,  # recycled
 }
+
+
+def is_agent_alive(agent_or_status: Any) -> bool:
+    """Return True if an agent (AgentSession, AgentInfo, dict, or status str) is alive (not dead)."""
+    if isinstance(agent_or_status, str):
+        return agent_or_status != "dead"
+    if hasattr(agent_or_status, "status"):
+        return str(getattr(agent_or_status, "status", "")) != "dead"
+    if isinstance(agent_or_status, dict):
+        return str(agent_or_status.get("status", "")) != "dead"
+    return False
 
 
 # ---------------------------------------------------------------------------

@@ -128,6 +128,125 @@ nodes:
 
 
 # ---------------------------------------------------------------------------
+# Conditional `when` gating (#4464)
+# ---------------------------------------------------------------------------
+
+
+def test_when_false_skips_node_without_failing_the_run(runner_workdir: Path) -> None:
+    """A false `when` predicate skips its node but doesn't abort the DAG."""
+    spec = _spec_from(
+        """
+name: conditional-skip
+description: "A gated node whose predicate never passes"
+version: "1.0.0"
+nodes:
+  - id: setup
+    command: "true"
+  - id: gated
+    depends_on: [setup]
+    command: "echo should-not-run > gated.txt"
+    when: "false"
+"""
+    )
+    runner = _build_runner(workdir=runner_workdir)
+    execution = runner.run(spec)
+
+    by_id = {n.node_id: n for n in execution.nodes}
+    assert by_id["setup"].status == NodeStatus.SUCCESS
+    assert by_id["gated"].status == NodeStatus.SKIPPED
+    assert by_id["gated"].condition_skipped is True
+    assert execution.succeeded is True
+    assert not (runner_workdir / "gated.txt").exists()
+
+
+def test_when_true_runs_the_node_normally(runner_workdir: Path) -> None:
+    """A passing `when` predicate behaves like an ungated node."""
+    spec = _spec_from(
+        """
+name: conditional-run
+description: "A gated node whose predicate always passes"
+version: "1.0.0"
+nodes:
+  - id: gated
+    command: "echo ran > gated.txt"
+    when: "true"
+"""
+    )
+    runner = _build_runner(workdir=runner_workdir)
+    execution = runner.run(spec)
+
+    gated = execution.nodes[0]
+    assert gated.status == NodeStatus.SUCCESS
+    assert gated.condition_skipped is False
+    assert (runner_workdir / "gated.txt").read_text().strip() == "ran"
+
+
+def test_downstream_of_a_condition_skipped_node_still_runs(runner_workdir: Path) -> None:
+    """A node depending on a condition-skipped node is not itself blocked.
+
+    This is what distinguishes `when: false` from a failed dependency: the
+    node was intentionally not needed, not aborted, so anything downstream
+    that only needed the DAG to *reach* this point still proceeds.
+    """
+    spec = _spec_from(
+        """
+name: skip-does-not-cascade
+description: "review -> gated revise -> verify, revise's `when` is false"
+version: "1.0.0"
+nodes:
+  - id: review
+    command: "true"
+  - id: revise
+    depends_on: [review]
+    command: "echo revised > revise.txt"
+    when: "false"
+  - id: verify
+    depends_on: [review, revise]
+    command: "echo verified > verify.txt"
+"""
+    )
+    runner = _build_runner(workdir=runner_workdir)
+    execution = runner.run(spec)
+
+    by_id = {n.node_id: n for n in execution.nodes}
+    assert by_id["review"].status == NodeStatus.SUCCESS
+    assert by_id["revise"].status == NodeStatus.SKIPPED
+    assert by_id["revise"].condition_skipped is True
+    assert by_id["verify"].status == NodeStatus.SUCCESS
+    assert execution.succeeded is True
+    assert (runner_workdir / "verify.txt").read_text().strip() == "verified"
+
+
+def test_failure_skip_still_blocks_downstream_unlike_condition_skip(runner_workdir: Path) -> None:
+    """A cascade skip (from a *failed* dependency) still blocks children.
+
+    Only a `when`-gated skip is "intentionally not needed"; a node skipped
+    because its own dependency failed must keep blocking the DAG exactly
+    as it did before `when` existed.
+    """
+    spec = _spec_from(
+        """
+name: failure-still-cascades
+description: "bad fails; never depends on bad and must stay skipped"
+version: "1.0.0"
+nodes:
+  - id: bad
+    command: "exit 9"
+  - id: never
+    depends_on: [bad]
+    command: "echo nope > never.txt"
+"""
+    )
+    runner = _build_runner(workdir=runner_workdir)
+    execution = runner.run(spec)
+
+    by_id = {n.node_id: n for n in execution.nodes}
+    assert by_id["never"].status == NodeStatus.SKIPPED
+    assert by_id["never"].condition_skipped is False
+    assert execution.succeeded is False
+
+
+# ---------------------------------------------------------------------------
 # Fan-out parallel
 # ---------------------------------------------------------------------------
 
@@ -276,15 +395,52 @@ nodes:
     assert any("@iter2" in tid for tid in captured)
 
 
+def test_agent_node_forwards_routing_hints_to_task(runner_workdir: Path) -> None:
+    """Workflow routing hints reach the Task handed to the spawner."""
+    captured: list[Any] = []
+
+    class StubSpawner:
+        def spawn_for_tasks(self, tasks: list[Any]) -> Any:
+            captured.append(tasks[0])
+            session = MagicMock()
+            session.id = "sess-routed"
+            return session
+
+    spec = _spec_from(
+        """
+name: routed-agent
+description: "Route one workflow node"
+version: "1.0.0"
+nodes:
+  - id: review
+    agent: reviewer
+    prompt: "Review {goal}"
+    cli: pi
+    model: provider/model-name
+    effort: high
+"""
+    )
+    execution = WorkflowRunner(spawner=StubSpawner(), workdir=runner_workdir).run(spec, goal="the patch")
+
+    assert execution.succeeded is True
+    assert len(captured) == 1
+    assert captured[0].cli == "pi"
+    assert captured[0].model == "provider/model-name"
+    assert captured[0].effort == "high"
+
+
 # ---------------------------------------------------------------------------
 # Interactive stub for #1110
 # ---------------------------------------------------------------------------
 
 
-def test_interactive_node_raises_not_implemented_with_ticket(runner_workdir: Path) -> None:
-    """`interactive: true` is a stub that points at #1110."""
-    spec = _spec_from(
-        """
+def test_interactive_node_rejected_at_load_time(runner_workdir: Path) -> None:
+    """`interactive: true` fails fast at load time with #1110 reference."""
+    from bernstein.core.workflows.workflow_spec import WorkflowSpecError
+
+    with pytest.raises(WorkflowSpecError, match="#1110"):
+        _spec_from(
+            """
 name: needs-approval
 description: "Has a human gate"
 version: "1.0.0"
@@ -293,6 +449,35 @@ nodes:
     command: "true"
     interactive: true
 """
+        )
+
+
+def test_interactive_node_defence_in_depth_in_runner(runner_workdir: Path) -> None:
+    """The runner keeps a defence-in-depth `NotImplementedError` for out-of-band loaders.
+
+    A caller that bypasses :func:`load_workflow_spec_from_text` (e.g. via
+    ``model_construct``) must still trip the runner's stub instead of running
+    an unsupported node.
+    """
+    from bernstein.core.workflows.workflow_spec import WorkflowNode
+
+    # ``model_construct`` skips validators, simulating an out-of-band loader.
+    gate_node = WorkflowNode.model_construct(
+        id="gate",
+        depends_on=[],
+        command="true",
+        agent=None,
+        prompt=None,
+        loop=None,
+        fresh_context=False,
+        interactive=True,
+        timeout_seconds=1800,
+    )
+    spec = WorkflowSpec.model_construct(
+        name="needs-approval",
+        description="Has a human gate",
+        version="1.0.0",
+        nodes=[gate_node],
     )
     runner = _build_runner(workdir=runner_workdir)
     with pytest.raises(NotImplementedError, match="#1110"):
@@ -361,6 +546,7 @@ def test_agent_node_dispatches_through_real_spawner(tmp_path: Path) -> None:
         templates_dir=workdir / "templates" / "roles",
         workdir=workdir,
         use_worktrees=False,
+        default_model="mock-model",
     )
 
     spec = _spec_from(
@@ -502,3 +688,248 @@ nodes:
     execution: WorkflowExecution = runner.run(spec)
     assert execution.succeeded is False
     assert any(n.status == NodeStatus.FAILED for n in execution.nodes)
+
+
+# ---------------------------------------------------------------------------
+# State persistence and resume functionality
+# ---------------------------------------------------------------------------
+
+
+def test_state_persistence_functions_work_correctly(tmp_path: Path) -> None:
+    """Test that all state persistence functions work as expected."""
+    from bernstein.core.workflows.workflow_runner import (
+        SPEC_SNAPSHOT_FILE,
+        _run_state_dir,
+        _validated_run_id,
+        load_node_state,
+        load_spec_snapshot,
+        record_node_state,
+        record_run_complete,
+        record_spec_snapshot,
+        run_complete_marker_exists,
+        spec_digest,
+    )
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    sdd_dir = workdir / ".sdd"
+    sdd_dir.mkdir()
+
+    # Create a simple workflow spec
+    spec = _spec_from(
+        """
+name: test-workflow
+description: "Test workflow for state persistence"
+version: "1.0.0"
+nodes:
+  - id: node1
+    command: "echo hello > output1.txt"
+  - id: node2
+    depends_on: [node1]
+    command: "echo world > output2.txt"
+"""
+    )
+
+    run_id = "test-run-123"
+
+    # Test _validated_run_id accepts valid IDs
+    assert _validated_run_id("test-run-123") == "test-run-123"
+    assert _validated_run_id("run.ID-with_underscores") == "run.ID-with_underscores"
+
+    # Test _validated_run_id rejects invalid IDs
+    for invalid_id in [".", "..", "test/run", "test\\run", "", "a" * 129]:
+        try:
+            _validated_run_id(invalid_id)
+            raise AssertionError(f"Expected WorkflowRunError for invalid run_id: {invalid_id}")
+        except Exception:
+            pass  # Expected
+
+    # Test _run_state_dir returns correct path
+    state_dir = _run_state_dir(sdd_dir, run_id)
+    expected_dir = sdd_dir / "runs" / run_id
+    assert state_dir == expected_dir
+
+    # Test spec_digest produces consistent results
+    digest1 = spec_digest(spec)
+    digest2 = spec_digest(spec)
+    assert digest1 == digest2
+    assert len(digest1) == 64  # SHA-256 hex length
+
+    # Test record_spec_snapshot and load_spec_snapshot
+    recorded_digest = record_spec_snapshot(sdd_dir, run_id, spec, manifest_source="test.yaml")
+    assert recorded_digest == digest1  # Should return the digest
+
+    snapshot = load_spec_snapshot(sdd_dir, run_id)
+    assert snapshot is not None
+    assert snapshot["spec_name"] == spec.name
+    assert snapshot["spec_version"] == spec.version
+    assert snapshot["spec_digest"] == digest1
+    assert snapshot["node_ids"] == ["node1", "node2"]
+    assert snapshot["source"] == "test.yaml"
+    assert snapshot["version"] == 1  # STATE_VERSION
+
+    # Test record_node_state and load_node_state
+    node1_exec = type(
+        "NodeExecution",
+        (),
+        {
+            "node_id": "node1",
+            "status": NodeStatus.SUCCESS,
+            "iterations": 1,
+            "exit_code": 0,
+            "stdout": "hello\n",
+            "stderr": "",
+            "session_id": "session-123",
+            "error": "",
+            "wall_time_seconds": 0.5,
+            "condition_skipped": False,
+        },
+    )()
+
+    record_node_state(sdd_dir, run_id, node1_exec, digest1)
+
+    loaded_node1 = load_node_state(sdd_dir, run_id, "node1")
+    assert loaded_node1 is not None
+    assert loaded_node1["node_id"] == "node1"
+    assert loaded_node1["status"] == "success"
+    assert loaded_node1["iterations"] == 1
+    assert loaded_node1["exit_code"] == 0
+    assert loaded_node1["stdout"] == "hello\n"
+    assert loaded_node1["stderr"] == ""
+    assert loaded_node1["session_id"] == "session-123"
+    assert loaded_node1["error"] == ""
+    assert loaded_node1["wall_time_seconds"] == 0.5
+    assert loaded_node1["condition_skipped"] is False
+    assert loaded_node1["version"] == 1
+    assert loaded_node1["spec_digest"] == digest1
+
+    # Test loading non-existent node returns None
+    assert load_node_state(sdd_dir, run_id, "nonexistent") is None
+
+    # Test record_run_complete and run_complete_marker_exists
+    record_run_complete(sdd_dir, run_id, succeeded=True)
+    completion = run_complete_marker_exists(sdd_dir, run_id)
+    assert completion is not None
+    assert completion["succeeded"] is True
+    assert "completed_at_epoch" in completion
+    assert isinstance(completion["completed_at_epoch"], float)
+
+    # Test loading non-existent completion returns None
+    assert run_complete_marker_exists(sdd_dir, "nonexistent-run") is None
+
+    # Test that corrupted JSON is handled gracefully
+    corrupted_file = _run_state_dir(sdd_dir, run_id) / "node1.node.json"
+    corrupted_file.write_text("{ invalid json", encoding="utf-8")
+    assert load_node_state(sdd_dir, run_id, "node1") is None
+
+    corrupted_file = _run_state_dir(sdd_dir, run_id) / SPEC_SNAPSHOT_FILE
+    corrupted_file.write_text("{ invalid json", encoding="utf-8")
+    assert load_spec_snapshot(sdd_dir, run_id) is None
+
+    corrupted_file = _run_state_dir(sdd_dir, run_id) / "run_complete.json"
+    corrupted_file.write_text("{ invalid json", encoding="utf-8")
+    assert run_complete_marker_exists(sdd_dir, run_id) is None
+
+
+def test_workflow_resume_works_correctly(tmp_path: Path) -> None:
+    """Test that workflow resume correctly resumes from completed nodes."""
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    sdd_dir = workdir / ".sdd"
+    sdd_dir.mkdir()
+
+    # Create a workflow spec that will fail on node 2
+    spec = _spec_from(
+        """
+name: resumable-workflow
+description: "Workflow that can be resumed"
+version: "1.0.0"
+nodes:
+  - id: setup
+    command: "mkdir -p output && echo setup > output/setup.txt"
+  - id: fail-node
+    depends_on: [setup]
+    command: "exit 1"
+  - id: verify
+    depends_on: [fail-node]
+    command: "echo verified > output/verify.txt"
+"""
+    )
+
+    runner = WorkflowRunner(workdir=workdir)
+
+    # Run the workflow initially - it will fail at fail-node
+    run_id = "resume-test-123"
+    execution1 = runner.run(spec, run_id=run_id)
+
+    assert execution1.succeeded is False
+    nodes_by_id = {n.node_id: n for n in execution1.nodes}
+    assert nodes_by_id["setup"].status == NodeStatus.SUCCESS
+    assert nodes_by_id["fail-node"].status == NodeStatus.FAILED
+    assert nodes_by_id["verify"].status == NodeStatus.SKIPPED
+
+    # Verify setup output was created
+    assert (workdir / "output" / "setup.txt").read_text().strip() == "setup"
+    # verify.txt should not exist since verify was skipped
+    assert not (workdir / "output" / "verify.txt").exists()
+
+    # Simulate a kill by removing the run-complete marker; a real runner
+    # process would have been SIGKILL'd before writing it.
+    # Note: the runner stores state under workdir/runs/, not workdir/.sdd/runs/
+    run_complete_file = workdir / "runs" / run_id / "run_complete.json"
+    run_complete_file.unlink(missing_ok=True)
+
+    # Resume with the SAME spec - fail-node runs again and fails again
+    execution2 = runner.resume(spec, goal="", run_id=run_id)
+    assert execution2.succeeded is False
+
+    # Completed nodes (setup) are loaded from state, not re-executed;
+    # fail-node ran again and failed; verify was skipped again
+    nodes_by_id = {n.node_id: n for n in execution2.nodes}
+    assert nodes_by_id["setup"].status == NodeStatus.SUCCESS
+    assert nodes_by_id["fail-node"].status == NodeStatus.FAILED
+    assert nodes_by_id["verify"].status == NodeStatus.SKIPPED
+
+    # Test resuming an already completed run fails
+    try:
+        runner.resume(spec, goal="", run_id=run_id)
+        raise AssertionError("Expected WorkflowRunError for already completed run")
+    except Exception as e:
+        assert "already completed" in str(e).lower()
+
+    # Test resume with modified spec fails with digest mismatch
+    modified_spec = _spec_from(
+        """
+name: resumable-workflow
+description: "Workflow that can be resumed - MODIFIED"
+version: "1.0.0"
+nodes:
+  - id: setup
+    command: "mkdir -p output && echo setup-modified > output/setup.txt"
+  - id: fail-node
+    depends_on: [setup]
+    command: "echo fixed > output/fixed.txt"
+  - id: verify
+    depends_on: [fail-node]
+    command: "echo verified > output/verify.txt"
+"""
+    )
+
+    # Use a new run_id for this test to avoid the "already completed" error
+    run_id2 = "resume-test-456"
+    # First run with original spec
+    runner.run(spec, run_id=run_id2)
+    # Then try to resume with modified spec - should fail
+    try:
+        runner.resume(modified_spec, goal="", run_id=run_id2)
+        raise AssertionError("Expected WorkflowRunError due to spec digest mismatch")
+    except Exception as e:
+        assert "spec digest mismatch" in str(e).lower()
+
+    # Test resume with non-existent run_id fails
+    try:
+        runner.resume(spec, goal="", run_id="nonexistent-run")
+        raise AssertionError("Expected WorkflowRunError for nonexistent run")
+    except Exception as e:
+        assert "no workflow run state" in str(e).lower()

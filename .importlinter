@@ -27,8 +27,6 @@ source_modules =
 forbidden_modules =
     bernstein.cli
     bernstein.tui
-ignore_imports =
-    bernstein.core.orchestration.activity_summary_poller -> bernstein.tui.activity_tracker
 
 
 # ---------------------------------------------------------------------------
@@ -38,9 +36,54 @@ ignore_imports =
 name = Adapters are independent of one another
 type = independence
 modules =
-    bernstein.adapters.claude
-    bernstein.adapters.codex
-    bernstein.adapters.gemini
-    bernstein.adapters.cursor
+    bernstein.adapters.agy
+    bernstein.adapters.aichat
     bernstein.adapters.aider
+    bernstein.adapters.amp
+    bernstein.adapters.auggie
+    bernstein.adapters.autohand
+    bernstein.adapters.capability_profile
+    bernstein.adapters.charm
+    bernstein.adapters.claude
+    bernstein.adapters.cline
+    bernstein.adapters.clm
+    bernstein.adapters.codebuff
+    bernstein.adapters.codex
+    bernstein.adapters.cody
+    bernstein.adapters.composio
+    bernstein.adapters.computer_use
+    bernstein.adapters.continue_dev
+    bernstein.adapters.copilot
+    bernstein.adapters.cursor
+    bernstein.adapters.devin_terminal
+    bernstein.adapters.droid
+    bernstein.adapters.forge
+    bernstein.adapters.gemini
+    bernstein.adapters.generic
+    bernstein.adapters.goose
+    bernstein.adapters.gptme
+    bernstein.adapters.hermes
+    bernstein.adapters.holmesgpt
+    bernstein.adapters.iac
+    bernstein.adapters.junie
+    bernstein.adapters.kilo
+    bernstein.adapters.kimchi
+    bernstein.adapters.kimi
+    bernstein.adapters.kiro
+    bernstein.adapters.letta_code
+    bernstein.adapters.mistral
+    bernstein.adapters.mock
+    bernstein.adapters.muse
+    bernstein.adapters.ollama
+    bernstein.adapters.open_interpreter
+    bernstein.adapters.openai_agents
+    bernstein.adapters.opencode
+    bernstein.adapters.openhands
+    bernstein.adapters.pi
+    bernstein.adapters.plandex
+    bernstein.adapters.python_runtime
+    bernstein.adapters.q_dev
+    bernstein.adapters.qwen
+    bernstein.adapters.ralphex
+    bernstein.adapters.rovo
 ignore_imports =

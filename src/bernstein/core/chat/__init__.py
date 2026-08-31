@@ -1,9 +1,9 @@
 """Chat-control bridges for driving Bernstein agents from messaging apps.
 
 This sub-package exposes a small platform-agnostic surface for connecting
-chat clients (Telegram today, Discord and Slack as conformant stubs) to
-the task-server. The pieces are intentionally decoupled so a new driver
-can be added without touching the CLI or the session bookkeeping:
+chat clients (Telegram, Slack, and Discord today) to the task-server.
+The pieces are intentionally decoupled so a new driver can be added
+without touching the CLI or the session bookkeeping:
 
   * :class:`BridgeProtocol` -- the abstract interface every driver
     implements.
@@ -45,7 +45,8 @@ def load_driver(platform: str) -> type[BridgeProtocol]:
     installed) only surfaces when that driver is actually selected.
 
     Args:
-        platform: One of ``"telegram"``, ``"discord"``, ``"slack"``.
+        platform: One of ``"telegram"``, ``"discord"``, ``"slack"``,
+            ``"teams"``.
 
     Returns:
         The driver class. Instantiation is the caller's responsibility.
@@ -66,6 +67,10 @@ def load_driver(platform: str) -> type[BridgeProtocol]:
         from bernstein.core.chat.drivers.slack import SlackBridge
 
         return SlackBridge
+    if normalised == "teams":
+        from bernstein.core.chat.drivers.teams import TeamsBridge
+
+        return TeamsBridge
     raise ValueError(
-        f"Unknown chat platform {platform!r}. Supported: telegram, discord, slack.",
+        f"Unknown chat platform {platform!r}. Supported: telegram, discord, slack, teams.",
     )

@@ -5,12 +5,12 @@ orchestrator emits. Enterprise operators running bernstein on behalf of
 multiple internal customers need to hand each customer (or each external
 auditor) a slice that:
 
-* Contains **only** that customer's events — no leakage of sibling tenants.
+* Contains **only** that customer's events - no leakage of sibling tenants.
 * **Re-verifies offline** so an auditor with the operator's HMAC key can
   replay-check every link without consulting the live orchestrator state.
 * Carries a **tamper-evident anchor** (sha256 of the canonical JSONL) so a
   cross-tenant flip in the slice is detected even without the key.
-* Is **byte-deterministic** — same input window + tenant id produces a
+* Is **byte-deterministic** - same input window + tenant id produces a
   byte-identical bundle on every run, so spot-audit reproducibility holds.
 
 Design:
@@ -34,15 +34,15 @@ exported slice is detectable because:
 
 Schema versions
 ---------------
-* **1.0.0** — HMAC chain + optional RFC 3161 token (spec-only, no
+* **1.0.0** - HMAC chain + optional RFC 3161 token (spec-only, no
   cryptographic chain validation) + optional offline anchor.
-* **2.0.0** — Adds two regulator-friendly extensions, both opt-in:
+* **2.0.0** - Adds two regulator-friendly extensions, both opt-in:
 
-  * ``head_signature`` — Ed25519 signature over the raw ``head_sha256``
+  * ``head_signature`` - Ed25519 signature over the raw ``head_sha256``
     bytes, signed by the operator's lineage KMS adapter (see
     :mod:`bernstein.core.security.lineage_kms`). Lets a key-less auditor
     authenticate the bundle's origin without sharing the HMAC key.
-  * RFC 3161 cryptographic chain validation — the existing
+  * RFC 3161 cryptographic chain validation - the existing
     ``rfc3161_token_b64`` field is now verifiable end-to-end via
     :mod:`bernstein.core.security.rfc3161_verifier`. The bundle field
     layout did not change for this; only the verifier surface did.
@@ -54,18 +54,18 @@ Schema versions
 
 References:
 
-* W3C Verifiable Credentials Data Model 2.0 — conceptually similar
+* W3C Verifiable Credentials Data Model 2.0 - conceptually similar
   citation/proof split, but rejected as the wire format because VC v2 is
   RDF/JSON-LD-shaped and forces JSON-LD context resolution at verify
   time. Audit chains are line-oriented JSONL; a custom schema (see
   ``schemas/audit-multitenant-export-v2.json``) is leaner. The schema
   is versioned (``schema_version: 2.0.0``) so future migrations to VC v2
   or in-toto attestations stay open.
-* RFC 3161 — Time-Stamp Protocol. The token is now cryptographically
+* RFC 3161 - Time-Stamp Protocol. The token is now cryptographically
   validated end-to-end (see :mod:`rfc3161_verifier`).
-* RFC 8037 — JOSE OKP curves. The ``head_signature`` block uses an
+* RFC 8037 - JOSE OKP curves. The ``head_signature`` block uses an
   RFC 8037 JWK to advertise the verifying key.
-* IETF SCITT — future direction; the public-key signature wraps cleanly
+* IETF SCITT - future direction; the public-key signature wraps cleanly
   into a SCITT envelope when the WG locks v1.
 """
 
@@ -85,7 +85,7 @@ from bernstein.core.security.audit_head_signature import (
     build_head_signature,
     verify_head_signature,
 )
-from bernstein.core.security.tenanting import normalize_tenant_id
+from bernstein.core.security.tenanting import normalize_tenant_id, try_normalize_tenant_id
 
 if TYPE_CHECKING:
     from cryptography import x509
@@ -243,17 +243,29 @@ def _read_audit_events(audit_dir: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _event_tenant_id(event: dict[str, Any]) -> str:
+def _event_tenant_id(event: dict[str, Any]) -> str | None:
     """Extract the canonical tenant id for an event.
 
-    Looks at ``details.tenant_id`` first (the canonical opt-in path);
-    falls back to ``DEFAULT_TENANT_ID`` via :func:`normalize_tenant_id`.
+    Looks at ``details.tenant_id`` first (the canonical opt-in path); an
+    absent value falls back to ``DEFAULT_TENANT_ID``.
+
+    The stored value is read as written rather than coerced. ``str()`` on a
+    ``true`` or a ``123`` yields a string the tenant rules accept, so a
+    malformed event would have been exported and matched under a tenant name
+    nothing wrote it for. A value that cannot be read returns ``None``, which
+    matches no tenant.
+
+    ``details`` that is not a mapping is unreadable for the same reason a
+    malformed ``tenant_id`` inside one is: the event carries a details field
+    and nothing can be read out of it. Treating it as an absent details -- the
+    reading that produced ``DEFAULT_TENANT_ID`` -- filed such an event under
+    the default tenant's evidence, which is an attribution no writer made.
     """
-    details = event.get("details") or {}
-    raw = None
-    if isinstance(details, dict):
-        raw = details.get("tenant_id")
-    return normalize_tenant_id(str(raw) if raw is not None else None)
+    details = event.get("details")
+    if details is not None and not isinstance(details, dict):
+        return None
+    raw = details.get("tenant_id") if isinstance(details, dict) else None
+    return try_normalize_tenant_id(raw)
 
 
 def _event_in_window(event: dict[str, Any], since: str, until: str) -> bool:
@@ -269,16 +281,25 @@ def _filter_tenant_events(
     tenant_id: str,
     since: str,
     until: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[int]]:
     """Filter to events that match ``tenant_id`` and ``[since, until)``.
 
     Stable order is preserved (chronological because the source log is
     append-only). If two events share a timestamp we fall back to the
     original ``hmac`` for determinism.
     """
-    matched = [e for e in events if _event_tenant_id(e) == tenant_id and _event_in_window(e, since, until)]
+    matched: list[dict[str, Any]] = []
+    unreadable: list[int] = []
+    for idx, event in enumerate(events):
+        if not _event_in_window(event, since, until):
+            continue
+        observed = _event_tenant_id(event)
+        if observed is None:
+            unreadable.append(idx)
+        elif observed == tenant_id:
+            matched.append(event)
     matched.sort(key=lambda e: (str(e.get("timestamp", "")), str(e.get("hmac", ""))))
-    return matched
+    return matched, unreadable
 
 
 def _rebuild_slice_chain(
@@ -291,10 +312,10 @@ def _rebuild_slice_chain(
     (timestamp, event_type, actor, resource_type, resource_id, details)
     and adds:
 
-    * ``details._original_hmac`` — the HMAC the event carried in the
+    * ``details._original_hmac`` - the HMAC the event carried in the
       orchestrator-wide chain. Witness for cross-reference.
-    * ``prev_hmac`` — the slice-local predecessor HMAC.
-    * ``hmac`` — the slice-local HMAC.
+    * ``prev_hmac`` - the slice-local predecessor HMAC.
+    * ``hmac`` - the slice-local HMAC.
 
     Args:
         events: Filtered events in chronological order (originals).
@@ -436,15 +457,15 @@ def export_tenant_slice(
             ``audit_dir.parent / 'evidence'`` (``.sdd/evidence/``).
         signature_kind: Which verifier path the bundle declares. v2 adds:
 
-            * ``hmac-chain+pubkey`` — HMAC chain + Ed25519 signature
+            * ``hmac-chain+pubkey`` - HMAC chain + Ed25519 signature
               over ``head_sha256``. Requires ``head_kms_adapter``.
-            * ``hmac-chain+rfc3161+pubkey`` — both layers.
+            * ``hmac-chain+rfc3161+pubkey`` - both layers.
 
             v1 kinds remain valid:
 
-            * ``hmac-chain-only`` — bare HMAC.
-            * ``hmac-chain+rfc3161`` — HMAC + TSA token.
-            * ``hmac-chain+offline-anchor`` — air-gap.
+            * ``hmac-chain-only`` - bare HMAC.
+            * ``hmac-chain+rfc3161`` - HMAC + TSA token.
+            * ``hmac-chain+offline-anchor`` - air-gap.
         rfc3161_token_b64: Base64-encoded DER TimeStampToken from a TSA.
             Required iff ``signature_kind`` includes ``rfc3161``.
         rfc3161_tsa_url: URL of the TSA that issued the token.
@@ -456,7 +477,7 @@ def export_tenant_slice(
             material that signs lineage records so operators do not have
             to plumb a second signing key.
         write: When False, build everything in-memory and skip the disk
-            write — useful for ``--dry-run`` and tests.
+            write - useful for ``--dry-run`` and tests.
 
     Returns:
         :class:`TenantScopedExport` with the serialized bundle bytes,
@@ -466,7 +487,9 @@ def export_tenant_slice(
         ValueError: ``since`` is not strictly less than ``until``, or
             ``tenant_id`` is empty after normalization, or required
             signing material (``rfc3161_token_b64`` /
-            ``head_kms_adapter``) is missing for the declared kind.
+            ``head_kms_adapter``) is missing for the declared kind, or an
+            event inside the window carries a ``details.tenant_id`` that
+            cannot be read as a tenant.
     """
     if since >= until:
         raise ValueError(f"since={since!r} must be < until={until!r}")
@@ -480,11 +503,21 @@ def export_tenant_slice(
     if signature_kind in _PUBKEY_KINDS and head_kms_adapter is None:
         raise ValueError(
             f"signature_kind={signature_kind!r} requires head_kms_adapter "
-            "(pass a configured KMSAdapter — file/env/hsm)",
+            "(pass a configured KMSAdapter - file/env/hsm)",
         )
 
     all_events = _read_audit_events(audit_dir)
-    matched = _filter_tenant_events(all_events, normalized_tenant, since, until)
+    matched, unreadable = _filter_tenant_events(all_events, normalized_tenant, since, until)
+    if unreadable:
+        # An event in the window whose tenant cannot be read is evidence this
+        # export cannot place. Dropping it silently is the one outcome an audit
+        # export must not produce: the slice would look complete while omitting
+        # records, and nothing downstream could tell. Name them and stop.
+        msg = (
+            f"{len(unreadable)} event(s) in [{since}, {until}) carry an unreadable details.tenant_id "
+            f"(first at index {unreadable[0]}); repair or remove them before exporting a slice"
+        )
+        raise ValueError(msg)
     rebuilt, head_hmac = _rebuild_slice_chain(matched, key)
 
     events_canonical = _events_jsonl_bytes(rebuilt)
@@ -595,6 +628,18 @@ def _validate_bundle_envelope(bundle: dict[str, Any]) -> list[str]:
             errors.append(f"chain_anchor missing {required_anchor}")
     if not isinstance(bundle.get("events"), list):
         errors.append("events must be a list")
+    # `tenant_id` was checked for presence only, so `null`, `""`, and a number
+    # all reached the tenant check and were read as the default tenant -- a
+    # bundle that declares no usable tenant verified as a clean default-tenant
+    # slice. The declaration is the thing the slice is *about*; a bundle that
+    # cannot state it is malformed here, not defaulted later.
+    declared_tenant = bundle.get("tenant_id")
+    if not isinstance(declared_tenant, str):
+        errors.append(f"tenant_id must be a string, got {type(declared_tenant).__name__}")
+    elif not declared_tenant.strip():
+        errors.append("tenant_id must not be blank")
+    elif try_normalize_tenant_id(declared_tenant) is None:
+        errors.append(f"tenant_id {declared_tenant!r} is not a usable tenant identifier")
     return errors
 
 
@@ -616,15 +661,33 @@ def _verify_anchor_consistency(bundle: dict[str, Any]) -> list[str]:
 def _verify_tenant_purity(
     bundle: dict[str, Any],
 ) -> list[str]:
-    """Ensure every event in the slice carries the declared tenant id."""
-    declared = normalize_tenant_id(str(bundle.get("tenant_id", "")))
+    """Ensure every event in the slice carries the declared tenant id.
+
+    Values are read as stored. Coercing with ``str()`` first turned a bundle
+    carrying a ``true`` or a ``123`` into one declaring a valid-looking tenant,
+    so a malformed slice verified clean. Reading them as written also keeps
+    this a verifier: an unreadable value is one more error in the returned
+    list, where strict normalization would have raised out of the check and
+    left the caller with no findings at all.
+    """
+    declared = try_normalize_tenant_id(bundle.get("tenant_id"))
     errors: list[str] = []
+    if declared is None:
+        errors.append(f"tenant_id: unreadable declared tenant {bundle.get('tenant_id')!r}")
     for idx, event in enumerate(bundle.get("events") or []):
+        # An event is whatever the bundle says it is. A list or a string has
+        # no `.get`, and reading one raised out of the verifier, which is the
+        # one thing a verifier must not do: the caller gets an exception where
+        # it asked for a list of findings.
+        if not isinstance(event, dict):
+            errors.append(f"events[{idx}]: expected object, got {type(event).__name__}")
+            continue
         details = event.get("details") or {}
-        observed = normalize_tenant_id(
-            str(details.get("tenant_id", "")) if isinstance(details, dict) else None,
-        )
-        if observed != declared:
+        raw = details.get("tenant_id") if isinstance(details, dict) else None
+        observed = try_normalize_tenant_id(raw)
+        if observed is None:
+            errors.append(f"events[{idx}]: unreadable tenant_id {raw!r}")
+        elif observed != declared:
             errors.append(
                 f"events[{idx}]: tenant_id mismatch (declared {declared!r}, observed {observed!r})",
             )
@@ -722,26 +785,26 @@ def verify_tenant_slice(
 ) -> TenantSliceVerification:
     """Re-verify a tenant-scoped audit slice offline.
 
-    Runs without orchestrator state — the verifier needs only the bundle
+    Runs without orchestrator state - the verifier needs only the bundle
     bytes and the operator's HMAC key. Performs the v1 checks plus two
     optional v2 cryptographic checks when the matching trust material
     is supplied:
 
     1. Envelope structure (schema_version, required fields, types).
-    2. Tenant purity — every event carries the declared tenant id.
-    3. Chain integrity — re-derive each event's HMAC, confirm the chain
+    2. Tenant purity - every event carries the declared tenant id.
+    3. Chain integrity - re-derive each event's HMAC, confirm the chain
        links forward correctly, and confirm the declared ``head_hmac``
        matches the recomputed tail.
-    4. Anchor consistency — recompute ``head_sha256`` from the canonical
+    4. Anchor consistency - recompute ``head_sha256`` from the canonical
        JSONL and compare. (Catches single-byte flips even when the key
        is leaked or the chain check is somehow bypassed.)
-    5. Signature block sanity — base64 validity, offline anchor formula.
-    6. **(v2, opt-in)** RFC 3161 cryptographic chain validation —
+    5. Signature block sanity - base64 validity, offline anchor formula.
+    6. **(v2, opt-in)** RFC 3161 cryptographic chain validation -
        confirm the embedded TSA token actually covers ``head_sha256``
        and that the TSA cert chains to the supplied trust anchor. Skipped
        silently with a log warning when ``rfc3161_trusted_tsa_certs`` is
        not supplied (back-compat with v1 verifier callers).
-    7. **(v2, opt-in)** Public-key signature — when the bundle carries
+    7. **(v2, opt-in)** Public-key signature - when the bundle carries
        a ``head_signature`` block, verify the Ed25519 signature against
        the embedded JWK. When ``head_signature_trusted_jwk`` is also
        supplied, the embedded JWK must match it (key pinning).
@@ -806,7 +869,7 @@ def _verify_rfc3161_chain(
 
     * The bundle declares no RFC 3161 path (``signature_kind`` does not
       include ``rfc3161``).
-    * The caller did not supply trust anchors (back-compat — the v1
+    * The caller did not supply trust anchors (back-compat - the v1
       verifier never did chain validation).
 
     Returns a non-empty list iff trust anchors were supplied AND the
@@ -819,7 +882,7 @@ def _verify_rfc3161_chain(
     if not trusted_tsa_certs:
         logger.warning(
             "Bundle declares signature_kind=%s but no rfc3161_trusted_tsa_certs "
-            "were supplied — RFC 3161 chain validation skipped (set "
+            "were supplied - RFC 3161 chain validation skipped (set "
             "rfc3161_trusted_tsa_certs to enable).",
             kind,
         )
@@ -834,7 +897,7 @@ def _verify_rfc3161_chain(
 
     head_sha256 = str((bundle.get("chain_anchor") or {}).get("head_sha256", ""))
     if not head_sha256:
-        return ["chain_anchor.head_sha256 missing — cannot validate RFC 3161 imprint"]
+        return ["chain_anchor.head_sha256 missing - cannot validate RFC 3161 imprint"]
 
     # Lazy import: keeps verifier callers that never enable RFC 3161 free
     # of the asn1crypto dep at import time.
@@ -846,7 +909,7 @@ def _verify_rfc3161_chain(
         return [f"chain_anchor.head_sha256 not valid hex: {exc}"]
 
     # The TSA's messageImprint covers the ``head_sha256`` digest bytes
-    # directly — the operator timestamps the bundle anchor, not the raw
+    # directly - the operator timestamps the bundle anchor, not the raw
     # JSONL. The verifier compares the digest bytes to
     # ``TSTInfo.messageImprint.hashedMessage`` directly.
     result = verify_rfc3161_token(
@@ -879,7 +942,7 @@ def _verify_head_signature(
         return ["head_signature is not an object"]
     head_sha256 = str((bundle.get("chain_anchor") or {}).get("head_sha256", ""))
     if not head_sha256:
-        return ["chain_anchor.head_sha256 missing — cannot verify head_signature"]
+        return ["chain_anchor.head_sha256 missing - cannot verify head_signature"]
     result = verify_head_signature(
         head_sha256,
         head_signature,

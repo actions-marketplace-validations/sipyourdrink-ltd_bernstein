@@ -2,7 +2,7 @@
 
 On graceful stop, the orchestrator saves session state to
 ``.sdd/runtime/session.json``.  On the next start, bootstrap reads this file
-and — if it is fresh enough — skips the manager planning phase entirely,
+and - if it is fresh enough - skips the manager planning phase entirely,
 resuming from where the previous run left off.
 """
 
@@ -41,6 +41,11 @@ class SessionState:
         goal: The goal or description for this run.
         completed_task_ids: Task IDs that finished successfully this run.
         pending_task_ids: Task IDs that were claimed or in-progress when stopped.
+        open_task_ids: Task IDs that were still ``open`` (queued but not yet
+            claimed) when stopped. Persisted so a resumed run can tell it was
+            paused mid-flight rather than finished (issue #2798); dropping them
+            let a resume declare the run complete with the deliverable
+            unproduced.
         cost_spent: Cumulative USD cost accumulated this run.
     """
 
@@ -48,7 +53,18 @@ class SessionState:
     goal: str = ""
     completed_task_ids: list[str] = field(default_factory=list[str])
     pending_task_ids: list[str] = field(default_factory=list[str])
+    open_task_ids: list[str] = field(default_factory=list[str])
     cost_spent: float = 0.0
+
+    def has_unfinished_work(self) -> bool:
+        """Return True if the run was stopped with work still queued.
+
+        Open or pending (claimed/in-progress) tasks at stop time mean the run
+        was paused mid-flight. A resume must not treat such a session as a
+        completed run (issue #2798) -- there is still work to do even though
+        the runtime task queue was cleared on the next start.
+        """
+        return bool(self.open_task_ids or self.pending_task_ids)
 
     def is_stale(self, stale_minutes: int = DEFAULT_STALE_MINUTES) -> bool:
         """Return True if this session is too old to resume.
@@ -81,11 +97,12 @@ class SessionState:
             ValueError: If ``saved_at`` cannot be cast to float.
         """
         return cls(
-            saved_at=float(data["saved_at"]),  # type: ignore[arg-type]
+            saved_at=float(cast(int, data["saved_at"])),
             goal=str(data.get("goal", "")),
-            completed_task_ids=list(data.get("completed_task_ids", [])),  # type: ignore[arg-type]
-            pending_task_ids=list(data.get("pending_task_ids", [])),  # type: ignore[arg-type]
-            cost_spent=float(data.get("cost_spent", 0.0)),  # type: ignore[arg-type]
+            completed_task_ids=list(cast("list[str]", data.get("completed_task_ids", []))),
+            pending_task_ids=list(cast("list[str]", data.get("pending_task_ids", []))),
+            open_task_ids=list(cast("list[str]", data.get("open_task_ids", []))),
+            cost_spent=float(cast(float, data.get("cost_spent", 0.0))),
         )
 
 
@@ -100,6 +117,56 @@ def save_session(workdir: Path, state: SessionState) -> None:
     """
     session_path = workdir / _SESSION_FILE
     write_atomic_json(session_path, state.to_dict())
+
+
+def read_session_regardless_of_age(workdir: Path) -> SessionState | None:
+    """Read the session file ignoring the resume-staleness window.
+
+    :func:`load_session` answers "can this session be resumed?", so it
+    discards anything older than the staleness threshold.  A run that lasted
+    longer than that threshold still owns the file it wrote at start, and the
+    facts recorded in it - the goal above all - stay true no matter how long
+    the run took.  Readers that want those facts rather than a resume
+    decision come here.
+
+    Args:
+        workdir: Project root directory.
+
+    Returns:
+        :class:`SessionState` if the file exists and parses; else None.
+    """
+    session_path = workdir / _SESSION_FILE
+    try:
+        data = json.loads(session_path.read_text())
+        return SessionState.from_dict(data)
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def record_run_goal(workdir: Path, goal: str) -> None:
+    """Write the goal this run was given into the session file.
+
+    The goal is the run's identity: the PR the run opens is titled and
+    summarised from it, and a resumed run describes itself with it.  Nothing
+    else on the run path persists it, so it is recorded here at start, on top
+    of whatever session state already exists rather than replacing it.
+
+    An empty or whitespace-only goal is not recorded - a backlog-driven run
+    has no goal to write, and blanking a goal already on disk is the failure
+    this function exists to prevent.
+
+    Args:
+        workdir: Project root directory.
+        goal: The resolved goal, from ``--goal``, a seed, or a plan file.
+    """
+    if not goal.strip():
+        return
+    state = read_session_regardless_of_age(workdir)
+    if state is None:
+        state = SessionState(saved_at=time.time(), goal=goal)
+    else:
+        state.goal = goal
+    save_session(workdir, state)
 
 
 def load_session(
@@ -152,6 +219,9 @@ class WrapUpBrief:
         learnings: Insights or observations worth carrying forward.
         next_session_brief: Suggested starting point for the next session.
         git_diff_stat: Output of ``git diff --stat`` at wrap-up time.
+        completed_task_ids: Ids of tasks that finished successfully this
+            session. The PR-open path reads these to link each task's sealed
+            verification-evidence bundle (issue #2362).
     """
 
     timestamp: float
@@ -160,6 +230,7 @@ class WrapUpBrief:
     learnings: list[str] = field(default_factory=list[str])
     next_session_brief: str = ""
     git_diff_stat: str = ""
+    completed_task_ids: list[str] = field(default_factory=list[str])
 
     def to_dict(self) -> dict[str, object]:
         """Serialise to a JSON-compatible dict."""
@@ -180,12 +251,13 @@ class WrapUpBrief:
             ValueError: If ``timestamp`` cannot be cast to float.
         """
         return cls(
-            timestamp=float(data["timestamp"]),  # type: ignore[arg-type]
+            timestamp=float(cast(int, data["timestamp"])),
             session_id=str(data.get("session_id", "")),
             changes_summary=str(data.get("changes_summary", "")),
-            learnings=list(data.get("learnings", [])),  # type: ignore[arg-type]
+            learnings=list(cast("list[str]", data.get("learnings", []))),
             next_session_brief=str(data.get("next_session_brief", "")),
             git_diff_stat=str(data.get("git_diff_stat", "")),
+            completed_task_ids=[str(t) for t in cast("list[object]", data.get("completed_task_ids", []))],
         )
 
 
@@ -555,18 +627,18 @@ GateStartupStatus = Literal["enabled", "disabled", "cached"]
 class StartupGateCheckpoint:
     """Typed checkpoint for one quality gate captured at startup time.
 
-    Records whether the gate was enabled, disabled, or served from cache —
+    Records whether the gate was enabled, disabled, or served from cache -
     plus where the config came from.  Persisted to disk so operators can
     diff gate state between restarts and diagnose stale-cache issues.
 
     Attributes:
         captured_at: Unix timestamp when the checkpoint was taken.
         gate_name: Gate identifier (e.g. ``'lint'``, ``'type_check'``).
-        status: Gate status at startup — ``'enabled'``, ``'disabled'``,
+        status: Gate status at startup - ``'enabled'``, ``'disabled'``,
             or ``'cached'`` (result loaded from prior run cache).
         cached: Whether the gate result was loaded from cache.
         cache_age_seconds: Age of the cached result in seconds, if applicable.
-        provenance: Config source — ``'seed'`` (bernstein.yaml),
+        provenance: Config source - ``'seed'`` (bernstein.yaml),
             ``'env'`` (environment variable override), or ``'default'``.
         config_hash: Hash of the gate's resolved config, for change detection.
     """

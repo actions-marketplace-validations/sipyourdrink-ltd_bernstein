@@ -1,6 +1,6 @@
 """Regression tests for the issues found by the end-to-end GUI smoke test.
 
-These are unit-level (no live server required) — they verify the specific
+These are unit-level (no live server required) - they verify the specific
 helpers/behaviours that the smoke run revealed as broken or under-tested.
 
 Findings exercised here:
@@ -32,7 +32,7 @@ PLAYGROUND_ROOT = REPO_ROOT.parent / "bernstein_playground"
 def _run_idle_mock_script(env: dict[str, str], *, tmp_path: Path) -> tuple[int, str]:
     """Spawn the embedded mock idle script with *env* and return (exit, log).
 
-    Reuses the same script source that the production adapter builds — keeps
+    Reuses the same script source that the production adapter builds - keeps
     this regression in lockstep with the runtime behaviour without faking the
     code path.
     """
@@ -98,7 +98,7 @@ class TestMockIdleEnvValidation:
 
     def test_idle_clamps_inverted_range(self, tmp_path: Path) -> None:
         # Original code used random.randint(min(lo,hi), max(lo,hi)) which works
-        # for swapped values but BREAKS if either is negative — we now clamp.
+        # for swapped values but BREAKS if either is negative - we now clamp.
         env = {
             "BERNSTEIN_MOCK_IDLE_MIN_S": "-5",
             "BERNSTEIN_MOCK_IDLE_MAX_S": "0",
@@ -111,15 +111,17 @@ class TestMockIdleEnvValidation:
 
 
 class TestIdleHelpText:
-    """The ``bernstein run --idle`` help text documents the cli pinning caveat.
+    """The ``bernstein run --idle`` help text documents the mock pinning story.
 
-    Regression guard: the smoke run found that operators are confused by
-    ``--idle`` because it does not propagate ``cli=mock`` to the orchestrator
-    subprocess.  The help text must mention the workaround so the doc and
-    behaviour stay in sync.
+    Regression guard: the smoke run found that operators are confused by how
+    ``--idle`` selects the mock backend. Since the fix for the seed-crash
+    instruction, ``--idle`` forces the mock backend internally (it exports
+    ``BERNSTEIN_ADAPTER=mock``) and the help must say so instead of telling
+    operators to hand-edit ``bernstein.yaml`` with a seed that the parser
+    rejects.
     """
 
-    def test_idle_help_mentions_cli_pinning(self) -> None:
+    def test_idle_help_documents_internal_mock_pinning(self) -> None:
         # Read the option declaration directly so we do not require Click
         # to render help (which depends on terminal width).
         path = REPO_ROOT / "src" / "bernstein" / "cli" / "run_bootstrap.py"
@@ -128,10 +130,12 @@ class TestIdleHelpText:
         m = re.search(r'"--idle".*?\)\n', text, flags=re.DOTALL)
         assert m is not None, "did not find --idle option declaration"
         block = m.group(0)
-        assert "cli: mock" in block, (
-            "--idle help must mention pinning ``cli: mock`` so operators are "
-            "warned that the orchestrator subprocess otherwise defaults to "
-            "Claude Code"
+        assert "BERNSTEIN_ADAPTER=mock" in block, (
+            "--idle help must document that the mock backend is forced internally via BERNSTEIN_ADAPTER=mock"
+        )
+        assert "cli: mock" not in block, (
+            "--idle help must not resurrect the hand-edit ``cli: mock`` "
+            "instruction; that seed is rejected by the parser"
         )
 
 
@@ -142,7 +146,7 @@ class TestIdleHelpText:
 class TestPlaygroundConfig:
     """Lightweight smoke checks on the playground workdir config.
 
-    These do not require a running orchestrator — just that the operator-
+    These do not require a running orchestrator - just that the operator-
     facing yaml files have the right pins for GUI development.
     """
 

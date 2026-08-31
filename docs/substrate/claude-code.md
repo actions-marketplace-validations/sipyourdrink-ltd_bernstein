@@ -46,6 +46,33 @@ are preserved verbatim.
 
 Reopen the project in Claude Code so it reloads `.mcp.json`.
 
+## Telemetry DSN
+
+To route Bernstein's side-channel telemetry (lineage, cost, run lifecycle,
+tracker events) from Claude Code into any Sentry-compatible error tracker, add an
+`env` block to the `bernstein` entry with `BERNSTEIN_TELEMETRY_DSN` set to a
+Sentry-compatible DSN:
+
+```json
+{
+  "mcpServers": {
+    "bernstein": {
+      "command": "/path/to/python",
+      "args": ["-m", "bernstein.mcp"],
+      "env": {
+        "BERNSTEIN_TELEMETRY_DSN": "https://<public_key>@<host>/<project_id>"
+      }
+    }
+  }
+}
+```
+
+The same env-var name and wire format are honoured by every host
+(see [docs/observability/side-channel.md](../observability/side-channel.md)),
+so operators running several hosts in parallel can point them all at one
+project. Verify with `bernstein telemetry probe` after reopening the
+project.
+
 ## Verify
 
 ```bash
@@ -76,3 +103,10 @@ created during install.
   reports an error rather than overwriting it.
 - `bernstein init` may also write `.claude/mcp.json` for orchestration
   auto-discovery; the two mechanisms are independent and can coexist.
+- `.claude/mcp.json` is only edited where its shape is understood. A file
+  whose root is not a JSON object, or whose `mcpServers` is not a map,
+  carries nothing either command can act on: `bernstein init` starts from
+  an empty configuration and writes its own entry, and `bernstein stop`
+  treats the file as having nothing to remove and leaves it byte-for-byte
+  alone. Neither command fails on such a file, and neither discards
+  top-level keys it did not write.

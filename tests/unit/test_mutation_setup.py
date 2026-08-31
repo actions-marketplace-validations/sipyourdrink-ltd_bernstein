@@ -113,10 +113,12 @@ class TestKeyMutationScenarios:
 
         from bernstein.core.tasks.lifecycle import IllegalTransitionError, transition_task
 
-        # DONE -> OPEN should be illegal (mutant might allow all transitions)
+        # DONE -> IN_PROGRESS should be illegal (mutant might allow all
+        # transitions). Note DONE -> OPEN is intentionally legal now (bounded
+        # janitor reopen), so this guard uses a transition that stays illegal.
         task = Task(id="mut-1", title="t", description="d", role="r", status=TaskStatus.DONE)
         with pytest.raises(IllegalTransitionError):
-            transition_task(task, TaskStatus.OPEN)
+            transition_task(task, TaskStatus.IN_PROGRESS)
 
     def test_env_expansion_blocked_vars(self) -> None:
         """Blocked env vars must stay blocked (mutant might remove the check)."""
@@ -151,7 +153,13 @@ class TestKeyMutationScenarios:
             os.environ.pop("BERNSTEIN_SANDBOX", None)
 
     def test_guardrails_sandbox_relaxes_deny(self) -> None:
-        """DENY decisions on relaxable checks must become ALLOW in sandbox (mutant might skip relaxation)."""
+        """DENY decisions on isolation-relaxable checks must become ALLOW in sandbox (mutant might skip relaxation).
+
+        ``file_permissions`` is relaxed on container isolation alone.
+        ``scope_enforcement`` is deliberately NOT relaxed here because a
+        whole-repo mount (the Docker backend) still exposes every file; that
+        boundary is covered by ``test_guardrails_sandbox_scope.py``.
+        """
         import os
 
         from bernstein.core.guardrails import relax_sandboxed
@@ -159,20 +167,31 @@ class TestKeyMutationScenarios:
 
         os.environ["BERNSTEIN_SANDBOX"] = "1"
         try:
-            deny_decision = PermissionDecision(type=DecisionType.DENY, reason="out of scope file")
-            result = relax_sandboxed([deny_decision], check_name="scope_enforcement")
+            deny_decision = PermissionDecision(type=DecisionType.DENY, reason="role cannot write path")
+            result = relax_sandboxed([deny_decision], check_name="file_permissions")
             assert result[0].type == DecisionType.ALLOW
         finally:
             os.environ.pop("BERNSTEIN_SANDBOX", None)
 
-    def test_guardrails_no_relax_outside_sandbox(self) -> None:
-        """Outside a sandbox, DENY decisions must stay DENY (mutant might always relax)."""
-        import os
+    def test_guardrails_no_relax_outside_sandbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Outside a sandbox, DENY decisions must stay DENY (mutant might always relax).
 
+        ``BERNSTEIN_SANDBOX`` is only one of the signals ``is_sandboxed()``
+        reads; ``/.dockerenv`` and the cgroup markers are others. Clearing the
+        env var alone therefore does not describe "outside a sandbox" when the
+        suite itself runs in a container - which is how the fleet's own
+        verification gate runs it - and the test failed there for a reason
+        that had nothing to do with the code under test. Pinning
+        ``is_sandboxed`` states the precondition the assertion actually needs,
+        so the test means the same thing on a runner VM and in a container.
+        """
         from bernstein.core.guardrails import relax_sandboxed
         from bernstein.core.policy_engine import DecisionType, PermissionDecision
 
-        os.environ.pop("BERNSTEIN_SANDBOX", None)
+        from bernstein.core import guardrails
+
+        monkeypatch.delenv("BERNSTEIN_SANDBOX", raising=False)
+        monkeypatch.setattr(guardrails, "is_sandboxed", lambda: False)
         deny_decision = PermissionDecision(type=DecisionType.DENY, reason="outside sandbox")
         result = relax_sandboxed([deny_decision], check_name="file_permissions")
         # Without sandbox, no relaxation should occur

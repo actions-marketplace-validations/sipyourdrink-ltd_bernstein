@@ -9,15 +9,84 @@ git clone https://github.com/sipyourdrink-ltd/bernstein && cd bernstein
 uv venv && uv pip install -e ".[dev]"
 ```
 
+## Picking something to work on
+
+[ROADMAP.md](ROADMAP.md) says what is being built and when.
+
+**Start here:** the volunteer workers program
+([#3863](https://github.com/sipyourdrink-ltd/bernstein/issues/3863)) is
+the current focus — donated AI compute working through open-source
+backlogs. It is greenfield, every sub-issue is sliced to be workable on
+its own with acceptance criteria written out, and design comments on
+the RFC count as contributions too.
+
+### Milestone triage and targeting
+
+Bernstein follows a **two-track release model**: patch releases (every 3 days) and minor releases (every 2 weeks). Details in [docs/operations/release.md](docs/operations/release.md).
+
+Issues are assigned to milestones to plan what ships in each release. A milestone is **not a parking lot** — every issue in a milestone should be on track to ship in that release.
+
+**Triage rules:**
+
+- **Small issues** (size/xs, size/s) and **high priority** (P0, P1) land in the *nearest* milestone
+- **Larger** (size/m, size/l) or **lower priority** (P2, P3) issues move to the *next* milestone out
+- An open issue with **no milestone** is *untriaged* — say so on the issue so it gets attention
+- **Advanced-tier issues** (lineage/audit-chain/verifiability/replay) can ship in an earlier minor release once the underlying dependencies are mature and the feature is ready for early adopters
+
+The fastest path in is still `size/s` + `up-for-grabs` — those issues are sliced for quick completion and explicitly marked as beginner-friendly.
+
+Beyond that, three labelled queues cover the rest:
+
+- [good first issue](https://github.com/sipyourdrink-ltd/bernstein/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)
+  — self-contained, acceptance criteria written out, no prior context needed.
+- [help wanted](https://github.com/sipyourdrink-ltd/bernstein/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22)
+  — larger, still scoped.
+- [adapter](https://github.com/sipyourdrink-ltd/bernstein/issues?q=is%3Aopen+is%3Aissue+label%3Aadapter)
+  — support for another coding CLI: one module, one conformance test,
+  one doc entry.
+
+Every issue in those queues states what "done" looks like before you
+start. If one does not, that is a defect in the issue — say so on it.
+
+Comment to claim an issue. If it is assigned but has been quiet for a
+couple of weeks, ask anyway; stalled is not the same as taken.
+
+Before proposing something large, read [Scope](docs/scope.md). It lists
+the boundaries that are already decided and the reason for each, with
+the [decision records](docs/decisions/index.md) behind them. Arguing
+with a stated reason is a good way to start a discussion. Spending a
+week working against one is not.
+
+### Areas
+
+Land three changes in one area and the area is yours if you want it -
+open an issue saying so. As the area's steward you get triage access,
+and every pull request touching the area is routed to you for review
+automatically (`.github/workflows/area-steward-review.yml`). Areas are
+adapters, the web dashboard, the terminal UI, docs, and packaging.
+
+Stewardship starts at triage rather than write, because write access
+on this repository reaches the release workflows and their publishing
+credentials, and that surface is kept least-privilege. After a
+stretch of established stewardship the write grant follows, and with
+it your entry in [CODEOWNERS](.github/CODEOWNERS) - GitHub only
+honors code owners who hold write.
+
+This is not ceremonial. An area with a name against it gets a second
+reader who knows it; an area with nobody against it accumulates
+whatever the last person in a hurry did.
+
 ## Testing
 
 ```bash
 uv run python scripts/run_tests.py -x        # all tests (isolated per-file, stops on first failure)
 uv run python scripts/run_tests.py -k router  # filter by keyword
-uv run pytest tests/unit/test_foo.py -x -q    # single file (fast)
+uv run python scripts/run_tests.py tests/unit/test_foo.py            # single file
+uv run python scripts/run_tests.py tests/unit/test_foo.py::test_bar  # single test
+uv run pytest tests/unit/test_foo.py -x -q    # single file, straight pytest
 ```
 
-> **WARNING: Never run `uv run pytest tests/ -x -q`** — the full suite keeps references across 2000+ tests and can leak 100+ GB RAM. The isolated runner in `scripts/run_tests.py` caps each file at ~200 MB.
+> **WARNING: Never run `uv run pytest tests/ -x -q`** - the full suite keeps references across 2000+ tests and can leak 100+ GB RAM. The isolated runner in `scripts/run_tests.py` caps each file at ~200 MB.
 
 ## Linting & type checking
 
@@ -45,6 +114,18 @@ All three must pass before committing. No exceptions, no "fix later."
 
 All non-trivial changes land via PR with at least one approving review. Security-touching changes need two approvals or operator-only push. Full process and reviewer expectations: [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md).
 
+### If you cannot open a pull request
+
+Some contributors cannot reach GitHub from where they work. Post the diff as a
+comment on the issue it addresses -- inline in a fenced block, not as a link to
+a file elsewhere. Maintainers do not fetch patches from external hosts, so a
+download link is a dead end; a diff in the thread is reviewable where it lands,
+and if the issue is already assigned, the assignee can take it or decline it
+without anyone having to fetch anything.
+
+Include what a PR would carry: what changed, the tests that prove it, and the
+commit the diff applies to.
+
 ### Docs alongside code
 
 Every PR that adds or changes a feature MUST update docs in the same PR:
@@ -56,6 +137,15 @@ Every PR that adds or changes a feature MUST update docs in the same PR:
 - New test layer: also update `docs/contributing/testing.md`.
 
 PRs without the matching docs change will be sent back. Docs and code ship together.
+
+### Release notes
+
+Add `docs/release-notes/fragments/<issue-or-slug>.md` describing a
+user-visible change: a `## <title>` heading and a short paragraph, same as
+any existing entry. One file per PR means two PRs never conflict on the
+same line the way appending to `docs/release-notes/unreleased.md` did.
+Editing `unreleased.md` directly still works during the transition; see
+`docs/release-notes/README.md`.
 
 ### Pre-push hook
 
@@ -91,7 +181,7 @@ the `BERNSTEIN_CI_FIX_ENABLED` repo variable, refuses to recurse on
 - `from __future__ import annotations` at the top of every module
 - Max line length: 120 (enforced by ruff)
 - Ruff rules: E, F, W, I, UP, B, SIM, TCH, RUF
-- No dict soup — use `@dataclass` or `TypedDict`, not raw `dict[str, Any]`
+- No dict soup - use `@dataclass` or `TypedDict`, not raw `dict[str, Any]`
 - Enums over string literals for any value with a fixed set of options
 - Google-style docstrings on all public symbols
 - Async only for IO-bound code; sync for CPU-bound/pure logic
@@ -125,7 +215,7 @@ Run locally before committing:
 uv run python scripts/check_routes_broad_except.py
 ```
 
-See [AGENTS.md](AGENTS.md) for the full doctrine, including doctrine, change classification, conflict protocol, and zero-tolerance failures.
+See [AGENTS.md](AGENTS.md) for the full doctrine, including change classification, conflict protocol, and zero-tolerance failures.
 
 ## CLI Structure
 
@@ -158,14 +248,13 @@ When adding a new CLI command, create a new `*_cmd.py` module in `cli/commands/`
 
 ## Supported CLI Adapters
 
-Bernstein ships with 44 adapters (43 named + 1 generic catch-all). Before writing a new adapter, check `src/bernstein/adapters/registry.py` for the full list — a subset is shown here for orientation:
+Bernstein ships with 40+ CLI agent adapters, plus a generic catch-all. `src/bernstein/adapters/registry.py` is the source of truth for the exact set - check it before writing a new adapter. A subset is shown here for orientation:
 
 | Adapter | File | Agent |
 |---------|------|-------|
 | `aider` | `adapters/aider.py` | [Aider](https://aider.chat) |
 | `amp` | `adapters/amp.py` | [Amp](https://ampcode.com) |
 | `claude` | `adapters/claude.py` | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) |
-| `cloudflare` | `adapters/cloudflare_agents.py` | [Cloudflare Agents](https://developers.cloudflare.com/agents/) |
 | `codex` | `adapters/codex.py` | [Codex CLI](https://github.com/openai/codex) |
 | `cody` | `adapters/cody.py` | [Cody](https://sourcegraph.com/cody) |
 | `continue` | `adapters/continue_dev.py` | [Continue](https://continue.dev) |
@@ -207,7 +296,7 @@ Steps:
 1. Create `src/bernstein/adapters/mycli.py` implementing all four abstract methods. See `adapters/claude.py` for a complete reference.
 2. Register in `adapters/registry.py`: `_ADAPTERS["mycli"] = MyCLIAdapter`
 3. Run checks: `uv run ruff check src/ && uv run pyright src/ && uv run python scripts/run_tests.py -x`
-4. Open a PR — include a short note on how you tested it.
+4. Open a PR - include a short note on how you tested it.
 
 **Important:** All adapter `.spawn()` implementations must wrap the CLI command with `build_worker_cmd()` from `adapters/base.py`. This sets the process title and writes the PID metadata file that the orchestrator uses for `bernstein ps` and crash detection.
 
@@ -218,6 +307,7 @@ CI parsers implement the `CILogParser` protocol from `core/ci_log_parser.py`:
 ```python
 class CILogParser(Protocol):
     name: str
+
     def parse(self, raw_log: str) -> list[CIFailure]: ...
 ```
 
@@ -230,9 +320,9 @@ Steps:
 
 Role templates live in `templates/roles/<role-name>/` with three files:
 
-- `system_prompt.md` — agent persona and standing instructions
-- `task_prompt.md` — per-task instructions template
-- `config.yaml` — default model and effort
+- `system_prompt.md` - agent persona and standing instructions
+- `task_prompt.md` - per-task instructions template
+- `config.yaml` - default model and effort
 
 Built-in roles: `adversary`, `analyst`, `architect`, `backend`, `ci-fixer`, `devops`, `docs`, `frontend`, `manager`, `ml-engineer`, `prompt-engineer`, `qa`, `resolver`, `retrieval`, `reviewer`, `security`, `visionary`, `vp`.
 
@@ -242,20 +332,20 @@ Copy an existing role and customize:
 cp -r templates/roles/backend templates/roles/data-engineer
 ```
 
-The new role is available immediately — no code changes required.
+The new role is available immediately - no code changes required.
 
 ## Architecture Principles
 
-- **Deterministic orchestrator** — no LLM calls for scheduling/coordination
-- **Short-lived agents** — spawn per task batch, exit when done
-- **File-based state** — everything in `.sdd/`, no databases
-- **Pluggable adapters** — new CLI agents via `adapters/base.py` ABC
-- **Branch is `main`** — never `master`
-- **No monoliths** — don't create or extend god-files (>400 LOC soft, >600 LOC hard stop)
+- **Deterministic orchestrator** - no LLM calls for scheduling/coordination
+- **Short-lived agents** - spawn per task batch, exit when done
+- **File-based state** - everything in `.sdd/`, no databases
+- **Pluggable adapters** - new CLI agents via `adapters/base.py` ABC
+- **Branch is `main`** - never `master`
+- **No monoliths** - don't create or extend god-files (>400 LOC soft, >600 LOC hard stop)
 
 ## Process management
 
-Bernstein writes PID metadata to `.sdd/runtime/pids/`. Use those to find and stop processes. **Never** `pkill -f bernstein` or `pgrep bernstein` — it will kill the orchestrator indiscriminately.
+Bernstein writes PID metadata to `.sdd/runtime/pids/`. Use those to find and stop processes. **Never** `pkill -f bernstein` or `pgrep bernstein` - it will kill the orchestrator indiscriminately.
 
 ```bash
 # Correct: signal via file
@@ -274,6 +364,12 @@ All contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md).
 Outstanding contributions are featured in our
 [monthly Community Spotlight](https://alexchernysh.com/blog)
 blog posts, which are shared on Twitter/X, LinkedIn, and dev.to.
+
+## Naming
+
+Forks and derivative builds are welcome and ship under their own name.
+The Apache-2.0 code grant does not cover the project name itself — the
+short version of what that means is in [TRADEMARKS.md](TRADEMARKS.md).
 
 ## License
 

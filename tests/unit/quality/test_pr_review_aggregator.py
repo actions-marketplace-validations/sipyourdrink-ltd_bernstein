@@ -4,10 +4,12 @@ Covers parsing, clustering, voting (including critical/high single-vote
 veto), ranking + top-K, file grouping, and the end-to-end
 ``aggregate_pr_review`` and ``aggregate_from_pipeline`` flows.
 
-Pure unit tests — no LLM, no subprocess calls.
+Pure unit tests - no LLM, no subprocess calls.
 """
 
 from __future__ import annotations
+
+import time
 
 from bernstein.core.quality.pr_review_aggregator import (
     DEFAULT_TOP_K,
@@ -71,7 +73,7 @@ class TestParseFinding:
 
     def test_handles_no_file_or_line(self) -> None:
         f = parse_finding(
-            "scope creep — diff touches stuff outside ticket",
+            "scope creep - diff touches stuff outside ticket",
             source_role="reviewer",
             source_model="claude",
         )
@@ -111,6 +113,28 @@ class TestParseFinding:
         )
         assert f is not None
         assert f.confidence == 0.4
+
+    def test_does_not_extract_path_inside_larger_token(self) -> None:
+        f = parse_finding(
+            "prefixsrc/auth.py:42suffix should not be treated as a file citation",
+            source_role="r",
+            source_model="m",
+        )
+        assert f is not None
+        assert f.file == ""
+        assert f.line is None
+
+    def test_slash_only_non_path_input_is_fast(self) -> None:
+        text = "/" * 10_000 + " no path here"
+
+        started = time.perf_counter()
+        f = parse_finding(text, source_role="r", source_model="m")
+        elapsed = time.perf_counter() - started
+
+        assert f is not None
+        assert f.file == ""
+        assert f.line is None
+        assert elapsed < 0.5
 
 
 # ---------------------------------------------------------------------------

@@ -31,8 +31,27 @@ JSON) without paying for one.
 - `index.jsonl` carries the searchable metadata: `trace_id`, `task_id`,
   `sha256`, `byte_size`, `started_at`, `ended_at`, `model`, `cost_usd`,
   `codec`. The viewer reads this file; nothing else.
-- The sha256 is the source of truth. `bernstein trace verify <id>`
-  rereads the blob bytes and rehashes them.
+- The sha256 is the source of truth. `store.get()` rereads the blob,
+  decompresses it, rehashes, and raises `CASIntegrityError` if the bytes
+  no longer match the indexed digest - so the "index does not have to be
+  trusted" property holds on the hot read path, not only when an operator
+  runs `bernstein trace verify <id>` explicitly. The explicit verify
+  command remains for an on-demand check that returns a boolean.
+
+## Credential safety
+
+Both live trace persistence and the content-addressed archive redact PII and
+credential-shaped text before writing. This covers authorization headers,
+known API-key prefixes, private-key blocks, and random-looking values assigned
+to names containing `token`, `secret`, `password`, or `key`. Entropy by itself
+does not trigger redaction, so ordinary content hashes, UUIDs, and base64
+payloads remain intact.
+
+For content-addressed blobs, redaction happens before sha256 calculation. The
+index digest therefore identifies the exact safe bytes on disk, and a redacted
+trace continues to pass `store.verify()`. Debug and ticket bundles copy these
+already-redacted trace bytes; they cannot restore a credential removed at the
+write boundary.
 
 ## CLI
 
@@ -79,8 +98,9 @@ store = ContentAddressedTraceStore(Path(".sdd/traces"))
 # Store finalised trace bytes (idempotent).
 entry = store.put(trace_bytes, hints=TraceMetadataHints(task_id="T-12"))
 
-# Read back, verify, search.
-raw = store.get(entry.trace_id)
+# Read back (verifies the bytes against the indexed digest by default),
+# verify on demand, search.
+raw = store.get(entry.trace_id)  # raises CASIntegrityError on a mismatch
 assert store.verify(entry.trace_id)
 results = store.search(task_id="T-12", model="sonnet")
 

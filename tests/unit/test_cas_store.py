@@ -1,15 +1,21 @@
-"""Tests for bernstein.core.persistence.cas_store — content-addressable storage."""
+"""Tests for bernstein.core.persistence.cas_store - content-addressable storage."""
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
+import shutil
+import sys
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
 
 from bernstein.core.persistence.cas_store import (
     CASEntry,
+    CASIntegrityError,
     CASStats,
     CASStore,
     put_file,
@@ -71,7 +77,7 @@ class TestCASStats:
 
 
 # ---------------------------------------------------------------------------
-# CASStore — put / get / has
+# CASStore - put / get / has
 # ---------------------------------------------------------------------------
 
 
@@ -106,7 +112,62 @@ class TestCASStorePutGet:
 
 
 # ---------------------------------------------------------------------------
-# CASStore — deduplication
+# CASStore - read-path integrity verification
+# ---------------------------------------------------------------------------
+
+
+class TestCASStoreIntegrity:
+    def _corrupt_blob(self, cas: CASStore, digest: str) -> None:
+        """Flip one byte of the on-disk blob for *digest* in place."""
+        blob = cas.root / digest[:2] / digest
+        data = bytearray(blob.read_bytes())
+        data[0] ^= 0xFF
+        blob.write_bytes(bytes(data))
+
+    def test_get_raises_on_corrupted_blob(self, cas: CASStore) -> None:
+        digest = cas.put(b"authentic content")
+        self._corrupt_blob(cas, digest)
+        with pytest.raises(CASIntegrityError) as exc_info:
+            cas.get(digest)
+        # The error must name the requested key so a caller can act on it.
+        assert digest in str(exc_info.value)
+
+    def test_get_corruption_error_carries_expected_and_actual(self, cas: CASStore) -> None:
+        digest = cas.put(b"authentic content")
+        self._corrupt_blob(cas, digest)
+        corrupted = (cas.root / digest[:2] / digest).read_bytes()
+        actual = hashlib.sha256(corrupted).hexdigest()
+        with pytest.raises(CASIntegrityError) as exc_info:
+            cas.get(digest)
+        assert exc_info.value.expected == digest
+        assert exc_info.value.actual == actual
+
+    def test_get_does_not_mask_corruption_as_miss(self, cas: CASStore) -> None:
+        # A corrupted blob must surface as an integrity error, never as None
+        # (which would let tampering look like a cache miss).
+        digest = cas.put(b"authentic content")
+        self._corrupt_blob(cas, digest)
+        with pytest.raises(CASIntegrityError):
+            cas.get(digest)
+
+    def test_intact_round_trip_passes_verification(self, cas: CASStore) -> None:
+        digest = cas.put(b"authentic content")
+        assert cas.get(digest) == b"authentic content"
+
+    def test_verify_off_returns_corrupted_bytes(self, cas: CASStore) -> None:
+        # The opt-out is explicit and bypasses the rehash for callers that
+        # have already verified upstream or read enormous blobs in tight loops.
+        digest = cas.put(b"authentic content")
+        self._corrupt_blob(cas, digest)
+        corrupted = (cas.root / digest[:2] / digest).read_bytes()
+        assert cas.get(digest, verify=False) == corrupted
+
+    def test_missing_blob_still_returns_none_with_verify_on(self, cas: CASStore) -> None:
+        assert cas.get("0" * 64, verify=True) is None
+
+
+# ---------------------------------------------------------------------------
+# CASStore - deduplication
 # ---------------------------------------------------------------------------
 
 
@@ -129,7 +190,7 @@ class TestCASStoreDedup:
 
 
 # ---------------------------------------------------------------------------
-# CASStore — sharding layout
+# CASStore - sharding layout
 # ---------------------------------------------------------------------------
 
 
@@ -150,7 +211,7 @@ class TestCASStoreSharding:
 
 
 # ---------------------------------------------------------------------------
-# CASStore — get_entry
+# CASStore - get_entry
 # ---------------------------------------------------------------------------
 
 
@@ -169,7 +230,7 @@ class TestCASStoreGetEntry:
 
 
 # ---------------------------------------------------------------------------
-# CASStore — delete
+# CASStore - delete
 # ---------------------------------------------------------------------------
 
 
@@ -203,7 +264,7 @@ class TestCASStoreDelete:
 
 
 # ---------------------------------------------------------------------------
-# CASStore — list_entries
+# CASStore - list_entries
 # ---------------------------------------------------------------------------
 
 
@@ -226,7 +287,7 @@ class TestCASStoreListEntries:
 
 
 # ---------------------------------------------------------------------------
-# CASStore — stats
+# CASStore - stats
 # ---------------------------------------------------------------------------
 
 
@@ -332,7 +393,7 @@ class TestPutText:
 
 
 # ---------------------------------------------------------------------------
-# CASStore — constructor
+# CASStore - constructor
 # ---------------------------------------------------------------------------
 
 
@@ -346,3 +407,174 @@ class TestCASStoreInit:
         root = tmp_path / "cas"
         store = CASStore(root)
         assert store.root == root
+
+
+# ---------------------------------------------------------------------------
+# CASStore.get - symlink safety (O_NOFOLLOW, race-free)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlink semantics")
+class TestCASStoreSymlinkSafety:
+    def test_get_entry_refuses_to_follow_a_symlinked_sidecar(self, cas: CASStore, tmp_path: Path) -> None:
+        """Metadata lookup must not follow a sidecar replaced by a link."""
+        digest = cas.put(b"authentic blob")
+        sidecar = cas.root / digest[:2] / f"{digest}.meta.json"
+        target = tmp_path / "attacker-meta.json"
+        target.write_text(sidecar.read_text())
+        sidecar.unlink()
+        sidecar.symlink_to(target)
+
+        with pytest.raises(OSError) as excinfo:
+            cas.get_entry(digest)
+        assert not isinstance(excinfo.value, FileNotFoundError)
+
+    def test_get_entry_refuses_to_follow_a_symlinked_shard_directory(
+        self,
+        cas: CASStore,
+        tmp_path: Path,
+    ) -> None:
+        """Metadata lookup must anchor every component below the CAS root."""
+        digest = cas.put(b"authentic blob")
+        shard = cas.root / digest[:2]
+        sidecar = shard / f"{digest}.meta.json"
+        decoy = tmp_path / "attacker-shard"
+        decoy.mkdir()
+        (decoy / sidecar.name).write_text(sidecar.read_text())
+        shutil.rmtree(shard)
+        shard.symlink_to(decoy, target_is_directory=True)
+
+        with pytest.raises(OSError) as excinfo:
+            cas.get_entry(digest)
+        assert not isinstance(excinfo.value, FileNotFoundError)
+        assert excinfo.value.errno in {errno.ELOOP, errno.ENOTDIR}
+
+    def test_get_refuses_to_follow_a_symlinked_blob(self, cas: CASStore, tmp_path: Path) -> None:
+        """A blob path replaced by a symlink must be rejected by the read itself
+        (O_NOFOLLOW), atomically - never followed to its target. This is the
+        race-free replacement for an is_symlink() pre-check, which would leave a
+        TOCTOU window (swap in the symlink between check and read)."""
+        digest = cas.put(b"authentic blob")
+        blob = cas.blob_path(digest)
+        # Repoint the blob at an attacker-controlled file with different content.
+        target = tmp_path / "attacker-target"
+        target.write_bytes(b"attacker bytes")
+        blob.unlink()
+        blob.symlink_to(target)
+        # OSError (ELOOP) from O_NOFOLLOW refusing the symlink.
+        with pytest.raises(OSError):
+            cas.get(digest, verify=True)
+
+    def test_get_returns_none_for_a_genuinely_absent_blob(self, cas: CASStore) -> None:
+        """A blob that was never stored still reads as None (absent), so the
+        O_NOFOLLOW change does not turn a normal miss into an error."""
+        missing = hashlib.sha256(b"never stored").hexdigest()
+        assert cas.get(missing) is None
+
+    def test_get_refuses_to_follow_a_symlinked_shard_directory(
+        self,
+        cas: CASStore,
+        tmp_path: Path,
+    ) -> None:
+        """O_NOFOLLOW on the blob open guards the final component only, so the
+        shard directory above it was still followed (#3561). The anchored walk
+        refuses a link at that component too, and the refusal must arrive as an
+        OSError - never as bytes, and never as a miss."""
+        digest = cas.put(b"authentic blob")
+        shard = cas.root / digest[:2]
+        # A shard directory the attacker controls, holding a blob at the same
+        # name whose bytes are not the ones the digest promises.
+        decoy = tmp_path / "attacker-shard"
+        decoy.mkdir()
+        (decoy / digest).write_bytes(b"attacker bytes")
+        shutil.rmtree(shard)
+        shard.symlink_to(decoy, target_is_directory=True)
+
+        # The errno is platform-dependent (ELOOP on Linux, ENOTDIR on macOS and
+        # the BSDs, which check directory-ness before reporting the refusal);
+        # both mean the link was not traversed. What has to hold everywhere is
+        # that no bytes come back and the failure is not FileNotFoundError.
+        with pytest.raises(OSError) as excinfo:
+            cas.get(digest, verify=True)
+        assert not isinstance(excinfo.value, FileNotFoundError)
+        assert excinfo.value.errno in {errno.ELOOP, errno.ENOTDIR}
+
+    def test_symlinked_shard_is_not_reported_as_absent(
+        self,
+        cas: CASStore,
+        tmp_path: Path,
+    ) -> None:
+        """The refusal must not be widened into a cache miss. `receipt verify`
+        splits absent (an operational event) from unreadable (a property of this
+        host); returning None here would file a refused symlink under the wrong
+        one and clear the blob of suspicion it has not earned."""
+        digest = cas.put(b"authentic blob")
+        shard = cas.root / digest[:2]
+        empty = tmp_path / "empty-shard"
+        empty.mkdir()
+        shutil.rmtree(shard)
+        shard.symlink_to(empty, target_is_directory=True)
+
+        # The link resolves to a directory with no blob in it, so following it
+        # would surface ENOENT and read as absent. The refusal must land on the
+        # shard component, before the blob name is ever looked up - which is
+        # what makes this test distinct from the one above: here the wrong
+        # answer is available and quiet.
+        with pytest.raises(OSError) as excinfo:
+            cas.get(digest, verify=True)
+        assert not isinstance(excinfo.value, FileNotFoundError)
+        assert excinfo.value.errno in {errno.ELOOP, errno.ENOTDIR}
+
+    def test_get_returns_none_when_the_shard_directory_is_missing(
+        self,
+        cas: CASStore,
+    ) -> None:
+        """A shard directory that was never created is an ordinary miss, not a
+        reader-side failure - the walk adds a component that can raise ENOENT,
+        and that has to keep reading as absent."""
+        digest = cas.put(b"blob in its own shard")
+        shutil.rmtree(cas.root / digest[:2])
+        assert cas.get(digest) is None
+
+    def test_get_refuses_a_fifo_at_the_blob_path_without_stalling(self, cas: CASStore) -> None:
+        """The reader stall #3561 is about does not need a symlink: a FIFO at
+        the blob's own name blocks a plain open until a writer appears, and
+        O_NOFOLLOW never had anything to say about it. The read must refuse the
+        type instead of waiting - so this asserts on a worker thread and fails
+        on the timeout, because the regression here is a hang, not an error."""
+        digest = cas.put(b"authentic blob")
+        blob = cas.blob_path(digest)
+        blob.unlink()
+        os.mkfifo(blob)
+
+        finished = threading.Event()
+        result: list[BaseException | None] = []
+
+        def attempt() -> None:
+            try:
+                cas.get(digest, verify=True)
+                result.append(None)
+            except BaseException as exc:
+                result.append(exc)
+            finished.set()
+
+        threading.Thread(target=attempt, daemon=True).start()
+        assert finished.wait(timeout=10), "CASStore.get stalled on a FIFO blob"
+        # OSError, never None: a refused type is a reader-side failure the
+        # verifier reports as unreadable, not a blob that is simply absent.
+        assert isinstance(result[0], OSError)
+        assert not isinstance(result[0], FileNotFoundError)
+
+    def test_a_symlinked_store_root_is_still_readable(self, tmp_path: Path) -> None:
+        """Pointing the store root at another volume is operator configuration,
+        not an attack: the walk anchors on the root and only refuses links
+        *below* it. Refusing a symlinked root would break working installs to
+        defend against someone who already controls where the operator put it."""
+        real_root = tmp_path / "real-cas"
+        real_root.mkdir()
+        linked_root = tmp_path / "linked-cas"
+        linked_root.symlink_to(real_root, target_is_directory=True)
+
+        store = CASStore(linked_root)
+        digest = store.put(b"blob under a symlinked root")
+        assert store.get(digest) == b"blob under a symlinked root"

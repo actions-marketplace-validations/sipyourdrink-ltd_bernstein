@@ -1,4 +1,4 @@
-"""Gateway CLI commands — start and replay MCP proxy sessions.
+"""Gateway CLI commands - start and replay MCP proxy sessions.
 
 Commands:
     bernstein gateway start --upstream <cmd>   Transparent MCP proxy (stdio or SSE).
@@ -11,10 +11,14 @@ import asyncio
 import shlex
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from bernstein.cli.helpers import console
+
+if TYPE_CHECKING:
+    from bernstein.core.mcp_gateway import MCPGateway
 
 _DEFAULT_PORT = 8054
 _SDD_DIR = Path(".sdd")
@@ -71,7 +75,7 @@ def gateway_group() -> None:
 def start_cmd(upstream: str, transport: str, port: int, run_id: str | None, server_name: str) -> None:
     """Start the MCP gateway proxy.
 
-    In stdio mode the gateway acts as an MCP stdio server — point your MCP
+    In stdio mode the gateway acts as an MCP stdio server - point your MCP
     client at ``bernstein gateway start --upstream <cmd>`` instead of the
     real server command.
 
@@ -104,7 +108,7 @@ def start_cmd(upstream: str, transport: str, port: int, run_id: str | None, serv
         console.print(f"  Upstream: [cyan]{upstream}[/cyan]")
         console.print(f"  Server: [cyan]{server_name}[/cyan]")
     else:
-        # stdio: suppress console output — stdout is the MCP transport
+        # stdio: suppress console output - stdout is the MCP transport
         pass
 
     asyncio.run(_run_gateway(gateway, transport=transport, port=port))
@@ -133,7 +137,7 @@ def start_cmd(upstream: str, transport: str, port: int, run_id: str | None, serv
 def replay_cmd(run_id: str, transport: str, port: int) -> None:
     """Replay recorded MCP tool calls from a previous gateway run.
 
-    Serves responses from the WAL without connecting to an upstream server —
+    Serves responses from the WAL without connecting to an upstream server -
     useful for offline debugging and development.
 
     \b
@@ -166,11 +170,53 @@ def replay_cmd(run_id: str, transport: str, port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# gateway settlements
+# ---------------------------------------------------------------------------
+
+
+@gateway_group.command("settlements")
+@click.option(
+    "--workdir",
+    "-w",
+    type=click.Path(file_okay=False, exists=True),
+    default=".",
+    show_default=True,
+    help="Project root containing .sdd/.",
+)
+def settlements_cmd(workdir: str) -> None:
+    """List recorded x402 settlements (issue #2528).
+
+    Each row is a chain-anchored spend receipt binding a settled upstream tool
+    call to the WAL invocation it paid for. Verify one offline with
+    ``bernstein mandate verify-settlement <hash> --intent <file>``.
+    """
+    from bernstein.core.protocols.payments.x402 import iter_spend_receipts
+
+    root = Path(workdir).resolve()
+    receipts = sorted(iter_spend_receipts(root), key=lambda r: (r.timestamp, r.server_name, r.tool_name))
+    if not receipts:
+        console.print("[dim]No x402 settlements recorded.[/dim]")
+        return
+
+    console.print()
+    console.print("[bold]x402 settlements[/bold]")
+    # One receipt per block, values on their own short lines so long hashes are
+    # never truncated and the output stays greppable when piped.
+    for r in receipts:
+        console.print(
+            f"[cyan]{r.receipt_hash()[:20]}[/cyan]  {r.server_name} / {r.tool_name}"
+            f"  ${r.settlement_ref.amount_usd:.4f}  wal_seq={r.wal_invocation_seq}"
+        )
+        console.print(f"  mandate {r.mandate_hash}")
+    console.print(f"[dim]{len(receipts)} settlement(s) under {root}/.sdd/x402/settlements[/dim]")
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
-async def _run_gateway(gateway: MCPGateway, *, transport: str, port: int) -> None:  # noqa: F821
+async def _run_gateway(gateway: MCPGateway, *, transport: str, port: int) -> None:
     """Start the gateway and block until done."""
     from bernstein.core.mcp_gateway import MCPGateway, create_gateway_sse_app
 

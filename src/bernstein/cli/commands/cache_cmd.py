@@ -15,6 +15,13 @@ from bernstein.core.persistence.action_cache import (
     ActionRecord,
     open_cache,
 )
+from bernstein.core.persistence.cache_eviction import (
+    open_ledger,
+    open_tombstones,
+    recall_report_path,
+    write_recall_report,
+)
+from bernstein.core.persistence.cache_policy import CachePolicy, UnsafeCacheKeyError
 from bernstein.core.semantic_cache import ResponseCacheManager, SemanticCacheEntry
 
 
@@ -85,7 +92,7 @@ def list_cache_entries(workdir: Path, limit: int, as_json: bool) -> None:
 
     for entry in entries:
         table.add_row(
-            entry.source_task_id or "—",
+            entry.source_task_id or "-",
             "yes" if entry.verified else "no",
             str(entry.git_diff_lines),
             str(entry.hit_count),
@@ -157,8 +164,110 @@ def clear_cache_entries(workdir: Path, unverified_only: bool, yes: bool) -> None
 
 
 # ---------------------------------------------------------------------------
+# Cache-policy engine: surgical transitive eviction + policy inspection (#2551).
+# ---------------------------------------------------------------------------
+
+
+@cache_group.command("evict")
+@click.argument("key")
+@click.option("--reason", required=True, help="Machine-readable revocation reason (e.g. 'pr_reverted').")
+@click.option(
+    "--workdir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path(),
+    show_default=True,
+    help="Project root containing .sdd/caching/policy/.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output the recall set as JSON.")
+def evict_cache_key(key: str, reason: str, workdir: Path, as_json: bool) -> None:
+    """Surgically evict a cache KEY and everything derived from it.
+
+    \b
+    Tombstones the key and every entry reachable over ``served_from`` lineage
+    edges, prints the recall set of consuming runs, emits a ``cache.eviction``
+    audit-chain event, and writes a recall report under
+    ``.sdd/caching/policy/``. A tombstoned key can never serve again, even when
+    its drift verdict is fresh.
+
+    KEY must be a single cache key, not a path: a value that would address a
+    file outside ``.sdd/caching/policy/`` is refused before anything is written.
+    """
+    root = workdir.resolve()
+    # Resolve the report path first: an unsafe key is refused before the
+    # tombstone journal, the audit chain, or the filesystem is touched.
+    try:
+        report_path = recall_report_path(root, key)
+    except UnsafeCacheKeyError as exc:
+        console.print(f"[red]Refusing to evict: {exc}[/red]")
+        raise SystemExit(2) from exc
+
+    ledger = open_ledger(root)
+    tombstones = open_tombstones(root)
+    recall = tombstones.evict(key, reason, ledger=ledger, ts=int(time.time()))
+    write_recall_report(report_path, recall)
+
+    # Chain-attest the eviction. Best-effort: a missing audit key must not fail
+    # the operator's revocation, which is already durable in the tombstone log.
+    try:
+        from bernstein.core.security.audit import load_or_create_audit_key
+        from bernstein.core.security.audit_chain import AuditChainStore, record_cache_eviction
+
+        chain = AuditChainStore(root / ".sdd" / "audit", key=load_or_create_audit_key())
+        record_cache_eviction(
+            chain=chain,
+            cache_key=key,
+            reason=reason,
+            tombstoned_count=len(recall.tombstoned),
+            recall_count=len(recall.consumers),
+        )
+    except Exception as exc:  # eviction durability must not depend on the audit key
+        console.print(f"[yellow]warning: eviction not chain-attested ({exc}); tombstone still applied[/yellow]")
+
+    if as_json:
+        click.echo(json.dumps(recall.to_dict(), indent=2))
+        return
+
+    consumers = ", ".join(recall.consumers) or "(none)"
+    console.print(f"[green]Evicted {len(recall.tombstoned)} key(s) for reason '{reason}'.[/green]")
+    console.print(f"[bold]Root key:[/bold] {key}")
+    console.print(f"[bold]Tombstoned:[/bold] {', '.join(recall.tombstoned) or '(none)'}")
+    console.print(f"[bold]Recall set ({len(recall.consumers)} run(s)):[/bold] {consumers}")
+    console.print(f"[dim]Recall report: {report_path}[/dim]")
+
+
+@cache_group.command("policy")
+@click.option(
+    "--file",
+    "policy_file",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    required=True,
+    help="JSON file declaring a CachePolicy.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output the resolved policy as JSON.")
+def show_cache_policy(policy_file: Path, as_json: bool) -> None:
+    """Resolve a cache policy file and print its canonical form and hash.
+
+    \b
+    Loads the JSON policy declaration, validates it, and prints the canonical
+    policy plus its ``sha256`` policy hash - the value bound into every cache
+    hit, miss, dedup, and eviction audit event for tasks under this policy.
+    """
+    policy = CachePolicy.from_dict(json.loads(policy_file.read_text(encoding="utf-8")))
+    if as_json:
+        click.echo(json.dumps({"policy": policy.to_dict(), "policy_hash": policy.policy_hash()}, indent=2))
+        return
+    console.print(f"[bold]Policy hash:[/bold] {policy.policy_hash()}")
+    console.print(f"[bold]Ingredients:[/bold] {', '.join(policy.ingredients) or '(mandatory only)'}")
+    console.print(f"[bold]Expiry mode:[/bold] {policy.expiry_mode} (drift window={policy.drift_window})")
+    console.print(f"[bold]TTL seconds:[/bold] {policy.ttl_seconds}")
+    console.print(f"[bold]Verified only:[/bold] {policy.verified_only}")
+    console.print(f"[bold]World facing:[/bold] {policy.world_facing}")
+    console.print(f"[bold]Store scope:[/bold] {policy.store_scope}")
+
+
+# ---------------------------------------------------------------------------
 # Action-cache subgroup: deterministic replay of recorded LLM/tool actions.
-# Storage layer is bernstein.core.persistence.fingerprint.MemoStore — we
+# Storage layer is bernstein.core.persistence.fingerprint.MemoStore - we
 # only inspect/replay the typed records on top of it.
 # ---------------------------------------------------------------------------
 

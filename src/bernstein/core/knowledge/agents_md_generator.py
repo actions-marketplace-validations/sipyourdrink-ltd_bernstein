@@ -1,4 +1,4 @@
-"""Canonical AGENTS.md generator — single source of truth for agent context.
+"""Canonical AGENTS.md generator - single source of truth for agent context.
 
 Teams running more than one CLI coding agent (Cursor + Claude Code + Codex
 is the common 2026 stack) end up maintaining three to five near-identical
@@ -8,9 +8,9 @@ weeks. The test command in one file diverges from another, conventions
 disagree, and nobody notices until an agent picks the stale one.
 
 This module derives a *canonical* list of :class:`AgentsMdSection` records
-from the repository — module docstrings, git history, ``pyproject.toml``,
+from the repository - module docstrings, git history, ``pyproject.toml``,
 shipped role templates, optionally curated overlays under
-``.sdd/agents-md/`` — and renders the full ``AGENTS.md``. The companion
+``.sdd/agents-md/`` - and renders the full ``AGENTS.md``. The companion
 :mod:`bernstein.core.knowledge.agents_md_bridge` then translates that
 canonical IR into the Cursor / Claude Code / Aider / Goose target formats
 without inventing new conventions.
@@ -29,7 +29,7 @@ Architecture
    ``.sdd/agents-md/`` when present so curated prose can live next to
    the auto-derived sections in one source of truth.
 
-The generator is deliberately *not* an opinionated framework — it follows
+The generator is deliberately *not* an opinionated framework - it follows
 the canonical https://agents.md/ guidance ("AGENTS.md is just standard
 Markdown") and the community-converged section set surfaced in the GitHub
 ``how-to-write-a-great-agents-md`` post analysis of 2,500+ repos.
@@ -37,11 +37,11 @@ Markdown") and the community-converged section set surfaced in the GitHub
 References
 ----------
 
-* AGENTS.md canonical site — https://agents.md/
-* AAIF AGENTS.md project page — https://aaif.io/projects/agents-md/
-* Agentic AI readthedocs mirror — https://agentic-ai.readthedocs.io/en/latest/Standards/agents-md/
-* GitHub blog write-up — https://github.blog/ai-and-ml/github-copilot/how-to-write-a-great-agents-md-lessons-from-over-2500-repositories/
-* OpenAI Codex AGENTS.md guide — https://developers.openai.com/codex/guides/agents-md
+* AGENTS.md canonical site - https://agents.md/
+* AAIF AGENTS.md project page - https://aaif.io/projects/agents-md/
+* Agentic AI readthedocs mirror - https://agentic-ai.readthedocs.io/en/latest/Standards/agents-md/
+* GitHub blog write-up - https://github.blog/ai-and-ml/github-copilot/how-to-write-a-great-agents-md-lessons-from-over-2500-repositories/
+* OpenAI Codex AGENTS.md guide - https://developers.openai.com/codex/guides/agents-md
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Public dataclass — canonical IR for one AGENTS.md section
+# Public dataclass - canonical IR for one AGENTS.md section
 # ---------------------------------------------------------------------------
 
 
@@ -86,7 +86,7 @@ sections. Any other ``kind`` value is a programming error.
 class AgentsMdSection:
     """One canonical section of the agent-context document.
 
-    Sections are deliberately small structurally — just an identifier, a
+    Sections are deliberately small structurally - just an identifier, a
     heading, and a markdown body. The complexity of "what to write" lives
     in the section builders below, not in the dataclass.
 
@@ -116,7 +116,7 @@ class AgentsMdSection:
 
 
 # ---------------------------------------------------------------------------
-# Configuration — known packages + ordering hints (mirrors gen_agents_md.py)
+# Configuration - known packages + ordering hints (mirrors gen_agents_md.py)
 # ---------------------------------------------------------------------------
 
 _INIT_PY = "__init__.py"
@@ -166,7 +166,7 @@ _SKIP_IN_MULTI: frozenset[str] = frozenset({"store_redis.py", "store_postgres.py
 # Documented non-package directories. Hand-curated; no auto-derivation.
 _NON_PACKAGE_DIRS: tuple[tuple[str, str], ...] = (
     ("templates/roles/", "Jinja2 role prompts (manager, backend, qa, security, devops, etc.)"),
-    ("templates/prompts/", "Prompt templates (judge.md, etc.) — bundled into wheel"),
+    ("templates/prompts/", "Prompt templates (judge.md, etc.) - bundled into wheel"),
     (".sdd/", "All runtime state (never commit `.sdd/runtime/`)"),
     (".sdd/backlog/open/", "YAML task specs waiting to be picked up"),
     (".sdd/backlog/claimed/", "Tasks currently being worked"),
@@ -184,10 +184,28 @@ _NON_PACKAGE_DIRS: tuple[tuple[str, str], ...] = (
 # under version control next to the auto-derived data.
 _OVERLAY_DIR = ".sdd/agents-md"
 
+# Top-level roots searched for nested per-directory ``AGENTS.md`` files.
+# Deliberately narrow: a fixed allowlist keeps the derived section
+# byte-stable across environments (a stray untracked AGENTS.md in an
+# unrelated tool directory must not change the render).
+_DIRECTORY_CONTEXT_ROOTS: tuple[str, ...] = ("src", "tests")
+
 
 # ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
+
+
+class DefaultBranchUnresolvedError(RuntimeError):
+    """Raised when a git checkout's default branch cannot be determined.
+
+    The default branch is a property of the repository, not of the working
+    tree. When no probe (explicit config, ``origin/HEAD``, conventional
+    ``main``/``master`` refs, merge-queue ref shape) can resolve it, writing
+    anything -- including the current checkout's branch name -- would make
+    the generated context files depend on where the command happened to run.
+    Refusing to render is safer than rendering a wrong default branch.
+    """
 
 
 @dataclass(frozen=True)
@@ -200,6 +218,11 @@ class GenerateOptions:
             layout where the table would mislead.
         include_git_workflow: When ``False``, skip git-derived workflow data.
             Useful when running outside a git working tree.
+        default_branch: Explicit default branch to render in the git-workflow
+            section. Consulted before any git probe; overrides
+            ``origin/HEAD`` and the conventional ``main``/``master`` refs.
+            Lets operators pin the value for CI clones that never fetch the
+            remote's ``HEAD`` ref (see :func:`_git_default_branch`).
         max_module_map_lines: Soft cap on rows per package table; when a
             package would render more rows than this it is summarised.
             ``0`` disables the cap.
@@ -209,6 +232,7 @@ class GenerateOptions:
 
     include_module_map: bool = True
     include_git_workflow: bool = True
+    default_branch: str | None = None
     max_module_map_lines: int = 0
     overlay_dir: str = _OVERLAY_DIR
 
@@ -219,7 +243,7 @@ def generate(repo_path: Path, options: GenerateOptions | None = None) -> list[Ag
     The order is fixed: overview → module-map → build-test → setup →
     architecture → conventions → git-workflow → roles → custom overlays.
     A section that has no content (e.g. no ``pyproject.toml`` for
-    build-test) is *omitted* rather than emitted empty — readers expect
+    build-test) is *omitted* rather than emitted empty - readers expect
     every section heading to carry information.
 
     Args:
@@ -239,11 +263,12 @@ def generate(repo_path: Path, options: GenerateOptions | None = None) -> list[Ag
     builders: list[tuple[str, object]] = [
         ("overview", _build_overview(repo_path)),
         ("module-map", _build_module_map(repo_path, opts) if opts.include_module_map else None),
+        ("directory-context", _build_directory_context(repo_path)),
         ("build-test", _build_build_test(repo_path)),
         ("setup", _build_setup(repo_path)),
         ("architecture", _build_architecture(repo_path)),
         ("conventions", _build_conventions(repo_path, opts)),
-        ("git-workflow", _build_git_workflow(repo_path) if opts.include_git_workflow else None),
+        ("git-workflow", _build_git_workflow(repo_path, opts) if opts.include_git_workflow else None),
         ("roles", _build_roles(repo_path)),
         ("documentation-duty", _build_documentation_duty()),
     ]
@@ -260,7 +285,7 @@ def generate(repo_path: Path, options: GenerateOptions | None = None) -> list[Ag
 
 
 _CANONICAL_PREAMBLE = (
-    "<!-- AUTO-GENERATED by `bernstein agents-md sync` — DO NOT edit by hand. "
+    "<!-- AUTO-GENERATED by `bernstein agents-md sync` - DO NOT edit by hand. "
     "Curated content lives under `.sdd/agents-md/`. -->\n"
 )
 
@@ -280,7 +305,7 @@ def render_canonical(sections: list[AgentsMdSection], *, repo_name: str | None =
         Complete markdown text ending in a single trailing newline.
     """
     name = repo_name or "Project"
-    parts: list[str] = [f"# {name} — AGENTS.md\n", _CANONICAL_PREAMBLE]
+    parts: list[str] = [f"# {name} - AGENTS.md\n", _CANONICAL_PREAMBLE]
     for sec in sections:
         parts.append(f"\n## {sec.title}\n\n{sec.body.rstrip()}\n")
     text = "".join(parts).rstrip() + "\n"
@@ -288,7 +313,7 @@ def render_canonical(sections: list[AgentsMdSection], *, repo_name: str | None =
 
 
 # ---------------------------------------------------------------------------
-# Section builders — each is pure, returns AgentsMdSection | None
+# Section builders - each is pure, returns AgentsMdSection | None
 # ---------------------------------------------------------------------------
 
 
@@ -315,11 +340,100 @@ def _build_overview(repo_path: Path) -> AgentsMdSection | None:
     return None
 
 
+MODULE_MAP_PAGE = "docs/sdd/module-map.md"
+"""Where the full per-file table lives now (#4142). See :func:`render_module_map_page`."""
+
+
 def _build_module_map(repo_path: Path, opts: GenerateOptions) -> AgentsMdSection | None:
-    """Port of ``scripts/gen_agents_md.py`` — Python-package docstring table.
+    """Compact subsystem index; the full per-file table lives in :data:`MODULE_MAP_PAGE`.
+
+    Until #4142 this section embedded the complete per-file docstring
+    table for every package - roughly 85% of each generated mirror's line
+    count, duplicated five ways (AGENTS.md, CLAUDE.md, CONVENTIONS.md,
+    .goosehints, and one ``.mdc`` per section), and paid for by every
+    coding-agent session regardless of which subsystem the task touched.
+
+    This section is now one row per package: its name, a one-phrase
+    purpose (from :data:`PACKAGE_META`), and a pointer to where the detail
+    actually lives - that package's own directory ``AGENTS.md`` when it
+    has one (``adapters/``, ``cli/``), its source directory otherwise
+    (``core/`` has four nested ``AGENTS.md`` files one level down, not one
+    of its own, so it points at the directory). The full per-file table
+    moves to :func:`render_module_map_page`, linked from the top of this
+    section's body; agents fetch it on demand instead of paying for it
+    unconditionally.
 
     Returns ``None`` when ``src/bernstein/`` (or equivalent) is absent.
     """
+    src_root = repo_path / "src" / "bernstein"
+    if not src_root.is_dir():
+        return None
+
+    direct_agents_md = _direct_agents_md_by_package(repo_path)
+
+    rows: list[tuple[str, str]] = []
+    for pkg, meta in PACKAGE_META.items():
+        pkg_dir = src_root / pkg
+        if not pkg_dir.is_dir():
+            continue
+        pointer = direct_agents_md.get(pkg, f"`src/bernstein/{pkg}/`")
+        rows.append((f"`{pkg}/`", f"{meta} - {pointer}"))
+
+    if not rows:
+        return None
+
+    body = f"Full per-file map: `{MODULE_MAP_PAGE}` (generated).\n\n" + _render_two_column_table(
+        rows, "Package", right_header="Purpose / detail"
+    )
+    return AgentsMdSection(
+        key="module-map",
+        title="Module map",
+        body=body,
+        kind="module-map",
+        always_apply=False,
+        target_globs=("src/**", "tests/**"),
+    )
+
+
+def _direct_agents_md_by_package(repo_path: Path) -> dict[str, str]:
+    """Map each top-level package to a link for its *own* directory ``AGENTS.md``.
+
+    Only a direct child counts: ``src/bernstein/adapters/AGENTS.md`` maps
+    ``adapters``, but ``src/bernstein/core/lineage/AGENTS.md`` does not map
+    ``core`` - ``core`` has four nested files one level down, not one of
+    its own, and the compact index needs exactly one pointer per package.
+    Packages with no direct file are simply absent from the result;
+    :func:`_build_module_map` falls back to the source directory for those.
+
+    Uses the same git-tracked-files trust model as
+    :func:`_build_directory_context` (and every other builder that reads
+    the tree): inside a work tree, only a *tracked* ``AGENTS.md`` counts,
+    so an untracked scratch file cannot change the render.
+    """
+    tracked = _git_tracked_files(repo_path)
+    result: dict[str, str] = {}
+    for pkg in PACKAGE_META:
+        rel = f"src/bernstein/{pkg}/AGENTS.md"
+        is_tracked = rel in tracked if tracked is not None else (repo_path / rel).is_file()
+        if is_tracked:
+            result[pkg] = f"`{rel}`"
+    return result
+
+
+def render_module_map_page(repo_path: Path, opts: GenerateOptions | None = None) -> str | None:
+    """Full per-file module map, as a standalone reference page (#4142).
+
+    Moved out of the embedded ``AGENTS.md`` "Module map" section so the
+    five generated agent-context mirrors carry a compact index instead of
+    the complete per-file table - see :func:`_build_module_map`. This is
+    that table's new home: everything the embedded section used to render
+    inline, now in one generated page linked from there.
+
+    Returns ``None`` when there is nothing to document (no
+    ``src/bernstein/`` tree), matching :func:`_build_module_map`'s
+    not-applicable case.
+    """
+    opts = opts or GenerateOptions()
     src_root = repo_path / "src" / "bernstein"
     if not src_root.is_dir():
         return None
@@ -336,7 +450,7 @@ def _build_module_map(repo_path: Path, opts: GenerateOptions) -> AgentsMdSection
             extra = len(rows) - opts.max_module_map_lines
             rows = rows[: opts.max_module_map_lines]
             rows.append((f"_… +{extra} more_", "_truncated_"))
-        blocks.append(f"### `src/bernstein/{pkg}/` — {meta}\n\n{_render_two_column_table(rows, 'File')}")
+        blocks.append(f"### `src/bernstein/{pkg}/` - {meta}\n\n{_render_two_column_table(rows, 'File')}")
 
     if not blocks:
         return None
@@ -345,15 +459,106 @@ def _build_module_map(repo_path: Path, opts: GenerateOptions) -> AgentsMdSection
         "### Key non-package directories\n\n"
         + _render_two_column_table([(f"`{p}`", purpose) for p, purpose in _NON_PACKAGE_DIRS], "Path")
     )
+    preamble = (
+        "<!-- AUTO-GENERATED by `bernstein agents-md sync` - DO NOT edit by hand. -->\n\n"
+        'Full per-file module map. `AGENTS.md`\'s own "Module map" section links '
+        "here instead of embedding this table, so the five generated agent-context "
+        "mirrors carry a compact one-line-per-package index and fetch this page on "
+        "demand rather than paying for it on every session.\n"
+    )
     body = "\n\n".join(blocks)
+    return "# Module map\n\n" + preamble + "\n" + body.rstrip() + "\n"
+
+
+def _build_directory_context(repo_path: Path) -> AgentsMdSection | None:
+    """One row per committed nested ``AGENTS.md`` under the search roots.
+
+    Nested files are hand-curated per-directory context (purpose, key
+    files, invariants, how to test the subtree) that coding-agent
+    harnesses read when working inside that directory. This section is
+    the root-level map of them, derived purely from the tree: sorted
+    relative path plus the file's own H1 as the description. Because the
+    map is part of the canonical render, ``bernstein agents-md verify``
+    fails whenever a nested file is added, removed, or retitled without
+    rerunning ``bernstein agents-md sync`` - the map cannot silently
+    disagree with the tree.
+
+    Inside a git work tree only *tracked* files are listed, so an
+    untracked scratch ``AGENTS.md`` in someone's working copy cannot
+    change the render (and thereby fail ``verify`` or rewrite mirrors
+    on ``sync``) - the same environment-stability rule
+    :func:`_build_git_workflow` documents. Outside git (no repo, git
+    binary missing) the on-disk tree is trusted as-is, matching every
+    other section builder.
+
+    Returns ``None`` when no nested file exists (the common case for
+    repos that have not adopted per-directory context).
+    """
+    tracked = _git_tracked_files(repo_path)
+    rows: list[tuple[str, str]] = []
+    for root in _DIRECTORY_CONTEXT_ROOTS:
+        base = repo_path / root
+        if not base.is_dir():
+            continue
+        found = sorted(base.rglob("AGENTS.md"), key=lambda p: p.relative_to(repo_path).as_posix())
+        for path in found:
+            rel = path.relative_to(repo_path).as_posix()
+            if tracked is not None and rel not in tracked:
+                continue
+            title = _first_h1_text(path) or f"{path.parent.name}/ context"
+            rows.append((f"`{rel}`", title))
+    if not rows:
+        return None
+    body = (
+        "Per-directory context files for agents working inside a subtree. "
+        "Each covers: what the directory is for, key files, invariants, and "
+        "how to test that subtree.\n\n" + _render_two_column_table(rows, "Path", right_header="Covers")
+    )
     return AgentsMdSection(
-        key="module-map",
-        title="Module map",
+        key="directory-context",
+        title="Directory context files",
         body=body,
-        kind="module-map",
+        kind="custom",
         always_apply=False,
         target_globs=("src/**", "tests/**"),
     )
+
+
+def _git_tracked_files(repo_path: Path) -> frozenset[str] | None:
+    """Return repo-relative POSIX paths of git-tracked files, or ``None``.
+
+    ``None`` means tracking state cannot be determined (not a git work
+    tree, git binary missing, or timeout); callers fall back to trusting
+    the on-disk tree, which is the trust model every other section
+    builder already uses. An empty result from a real work tree is
+    returned as-is - "nothing is tracked" is an answer, not an error.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return frozenset(p for p in result.stdout.split("\0") if p)
+
+
+def _first_h1_text(path: Path) -> str:
+    """Return the text of the first markdown H1 line in ``path`` (or ``""``)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+    return ""
 
 
 def _build_build_test(repo_path: Path) -> AgentsMdSection | None:
@@ -363,44 +568,68 @@ def _build_build_test(repo_path: Path) -> AgentsMdSection | None:
     likely *one* command for each role (install / test / lint / type-check
     / build), or several when the project clearly distinguishes (e.g. uv
     plus pip fallbacks). Avoids dumping every script entry.
+
+    Two derivations are load-bearing and keyed off files in the tree rather
+    than a static guess, so the rendered command never drifts from how the
+    repo is actually built:
+
+    * **uv detection.** A ``uv.lock`` at the root means the project is
+      uv-managed even when ``pyproject.toml`` carries no ``[tool.uv]``
+      table (hatchling-built repos are the common case). Prior versions
+      only inspected the pyproject text and silently fell back to
+      ``pip install`` / bare ``pytest`` for these repos, contradicting the
+      ``uv run`` lint/type-check lines emitted right below.
+    * **Isolated test runner.** When the repo ships ``scripts/run_tests.py``
+      that command is emitted instead of a bare ``pytest``. A bare
+      ``pytest`` over the whole suite retains every collected test object
+      for the session, which on a large suite grows into tens of GB; the
+      per-file runner (the command CI shards actually invoke) caps memory
+      at one file's worth. Emitting the safe command here keeps the
+      contributor-facing guidance consistent with the role prompts under
+      ``templates/roles/`` and with CI.
     """
-    cmds: list[str] = []
+    pairs: list[tuple[str, str]] = []
 
     pyproj = repo_path / "pyproject.toml"
     if pyproj.is_file():
         text = pyproj.read_text(encoding="utf-8", errors="replace")
-        if "[tool.uv]" in text or "uv" in text.split("\n", 1)[0].lower():
-            cmds.extend(("uv sync                    # install + lock", "uv run pytest              # tests"))
+        uses_uv = (repo_path / "uv.lock").is_file() or "[tool.uv]" in text or "uv" in text.split("\n", 1)[0].lower()
+        run = "uv run " if uses_uv else ""
+        pairs.append(("uv sync", "install + lock") if uses_uv else ("pip install -e .[dev]", "install"))
+        if (repo_path / "scripts" / "run_tests.py").is_file():
+            pairs.append((f"{run}python scripts/run_tests.py", "tests (isolated per-file runner)"))
         else:
-            cmds.extend(("pip install -e .[dev]      # install", "pytest                     # tests"))
+            pairs.append((f"{run}pytest", "tests"))
         if "ruff" in text:
-            cmds.extend(("uv run ruff check .        # lint", "uv run ruff format .       # format"))
+            pairs.extend(((f"{run}ruff check .", "lint"), (f"{run}ruff format .", "format")))
         if "mypy" in text or "pyright" in text:
-            cmds.append("uv run mypy src            # type-check")
+            pairs.append((f"{run}mypy src", "type-check"))
 
     makefile = repo_path / "Makefile"
     if makefile.is_file():
         targets = _parse_make_targets(makefile)
         for t in ("test", "lint", "build", "install"):
             if t in targets:
-                cmds.append(f"make {t}")
+                pairs.append((f"make {t}", ""))
 
     package_json = repo_path / "package.json"
     if package_json.is_file():
         scripts = _parse_package_json_scripts(package_json)
         for s in ("build", "test", "lint", "dev"):
             if s in scripts:
-                cmds.append(f"npm run {s}")
+                pairs.append((f"npm run {s}", ""))
 
-    if not cmds:
+    if not pairs:
         return None
     seen: set[str] = set()
-    deduped: list[str] = []
-    for c in cmds:
-        if c not in seen:
-            seen.add(c)
-            deduped.append(c)
-    body = "```\n" + "\n".join(deduped) + "\n```"
+    deduped: list[tuple[str, str]] = []
+    for cmd, note in pairs:
+        if cmd not in seen:
+            seen.add(cmd)
+            deduped.append((cmd, note))
+    width = max((len(cmd) for cmd, note in deduped if note), default=0)
+    lines = [f"{cmd:<{width}}  # {note}" if note else cmd for cmd, note in deduped]
+    body = "```\n" + "\n".join(lines) + "\n```"
     return AgentsMdSection(
         key="build-test",
         title="Build & test",
@@ -450,7 +679,7 @@ def _build_architecture(repo_path: Path) -> AgentsMdSection | None:
     redirect map declared in ``src/<pkg>/core/__init__.py``.
 
     Skipped silently when no entry points are declared. We deliberately
-    don't pull every callable out of ast_symbol_graph — for AGENTS.md the
+    don't pull every callable out of ast_symbol_graph - for AGENTS.md the
     operator wants ~5 starting points, not the full call graph.
 
     The redirect-map detection covers a load-bearing audit invariant
@@ -487,7 +716,7 @@ def _detect_back_compat_redirect_map(repo_path: Path) -> str | None:
 
     Looks for the canonical pair ``_REDIRECT_MAP`` + ``_CoreRedirectFinder``
     inside any ``src/*/core/__init__.py`` file. Both names must be present
-    for the section to fire — finding only one is ambiguous (could be
+    for the section to fire - finding only one is ambiguous (could be
     a renamed-but-not-replaced alias) and we'd rather emit nothing than
     misdescribe.
     """
@@ -512,7 +741,7 @@ def _detect_back_compat_redirect_map(repo_path: Path) -> str | None:
             f"`{pkg_dir.name}.core.orchestrator`) are served by a "
             "`sys.meta_path` finder, not by physical shim files. The mechanism "
             f"lives in `{rel}` as `_CoreRedirectFinder` driven by the "
-            "`_REDIRECT_MAP` dict — add new aliases there rather than creating "
+            "`_REDIRECT_MAP` dict - add new aliases there rather than creating "
             "shim modules at the old path."
         )
     return None
@@ -522,7 +751,7 @@ def _build_conventions(repo_path: Path, opts: GenerateOptions) -> AgentsMdSectio
     """Read ``<overlay_dir>/conventions.md`` if present.
 
     This is the single curated section the operator owns. The generator
-    does not invent style rules from a static cheat sheet — that would
+    does not invent style rules from a static cheat sheet - that would
     rot the moment the project's actual style drifts.
     """
     overlay = repo_path / opts.overlay_dir / "conventions.md"
@@ -540,7 +769,7 @@ def _build_conventions(repo_path: Path, opts: GenerateOptions) -> AgentsMdSectio
     )
 
 
-def _build_git_workflow(repo_path: Path) -> AgentsMdSection | None:
+def _build_git_workflow(repo_path: Path, opts: GenerateOptions) -> AgentsMdSection | None:
     """Default branch line, deterministic across environments.
 
     The previous version included ``git_context.hot_files`` output in
@@ -550,9 +779,25 @@ def _build_git_workflow(repo_path: Path) -> AgentsMdSection | None:
     different "hot files" tables in CI vs on a developer machine,
     causing ``bernstein agents-md verify`` to flag drift even after a
     fresh local sync. Returns ``None`` outside a git working tree.
+
+    Raises:
+        DefaultBranchUnresolvedError: Inside a git working tree when no
+            probe resolves the repository's default branch. Writing the
+            checked-out branch name would recreate the defect this
+            function exists to prevent (the branch you are on is a
+            working-tree property, the default branch is a repository
+            property).
     """
-    default_branch = _git_default_branch(repo_path)
+    default_branch = _git_default_branch(repo_path, opts.default_branch)
     if default_branch is None:
+        if (repo_path / ".git").exists():
+            raise DefaultBranchUnresolvedError(
+                "cannot determine the repository's default branch for "
+                f"{repo_path}; set one explicitly via --default-branch (or "
+                "GenerateOptions.default_branch), configure "
+                "`git remote set-head origin -a`, or fetch the default "
+                "branch ref (e.g. `git fetch origin main`)"
+            )
         return None
     return AgentsMdSection(
         key="git-workflow",
@@ -650,7 +895,7 @@ def _build_overlay_sections(repo_path: Path, opts: GenerateOptions) -> list[Agen
 
 
 # ---------------------------------------------------------------------------
-# Helpers — small, well-tested
+# Helpers - small, well-tested
 # ---------------------------------------------------------------------------
 
 
@@ -714,7 +959,7 @@ _SUBPACKAGE_FILE_LIST_CAP = 6
 
 A sub-package with 30+ modules dumped inline turns a useful module-map into
 a wall of names. When the sub-package's own ``__init__.py`` already has a
-docstring, the file list is omitted entirely — the docstring is the
+docstring, the file list is omitted entirely - the docstring is the
 authoritative description. When there's no docstring we list at most this
 many module stems and append ``+N more`` for the rest.
 """
@@ -788,7 +1033,7 @@ _README_SKIP_PREFIXES = (
     "> ",  # blockquote
     "![",  # inline image
     "<!--",  # html comment
-    "<",  # raw HTML — divs, picture, source, br, etc. README chrome
+    "<",  # raw HTML - divs, picture, source, br, etc. README chrome
     "---",  # horizontal rule
     "===",  # setext underline
 )
@@ -883,7 +1128,7 @@ def _parse_pyproject_scripts(pyproj: Path) -> dict[str, str]:
     """
     try:
         import tomllib  # py311+
-    except ImportError:  # pragma: no cover — handled at runtime
+    except ImportError:  # pragma: no cover - handled at runtime
         return {}
     try:
         data = tomllib.loads(pyproj.read_text(encoding="utf-8"))
@@ -893,25 +1138,60 @@ def _parse_pyproject_scripts(pyproj: Path) -> dict[str, str]:
     return {str(k): str(v) for k, v in scripts.items()} if isinstance(scripts, dict) else {}
 
 
-def _git_default_branch(repo_path: Path) -> str | None:
+#: A GitHub merge-queue ref: ``gh-readonly-queue/<base>/pr-<n>-<base_sha>``.
+#: The base branch may itself contain slashes, so the trailing ``pr-`` segment
+#: is what anchors the split.
+_MERGE_QUEUE_REF = re.compile(r"^gh-readonly-queue/(?P<base>.+)/pr-\d+-[0-9a-f]{7,40}$")
+
+
+def _base_branch_of_merge_queue_ref(branch: str) -> str | None:
+    """Return the base branch a merge-queue ref was built against.
+
+    A queued group is checked out as a real branch named after the ephemeral
+    ref, so the detached-HEAD guard in :func:`_git_default_branch` does not
+    fire and the ref name would otherwise be rendered into AGENTS.md as the
+    repository's default branch. Every entry in the queue would then fail the
+    mirror-drift guard, which blocks the queue rather than reporting a defect.
+    """
+    match = _MERGE_QUEUE_REF.match(branch)
+    return match.group("base") if match else None
+
+
+def _git_default_branch(repo_path: Path, default_branch: str | None = None) -> str | None:
     """Return the default branch (``main``/``master``/...) or ``None``.
 
     Resolution order is deliberate so that the answer is *deterministic
-    across environments* — local checkouts, CI shallow clones, detached
+    across environments* - local checkouts, CI shallow clones, detached
     HEADs, and worktrees must all agree:
 
-    1. ``git symbolic-ref refs/remotes/origin/HEAD`` — set when ``git
+    1. Explicit ``default_branch`` argument (when provided) - an operator
+       pin wins over every git probe. Useful for CI clones that never
+       fetch the remote's ``HEAD`` ref.
+    2. ``git symbolic-ref refs/remotes/origin/HEAD`` - set when ``git
        remote set-head origin -a`` ran. Authoritative on developer
        machines; usually absent on ``actions/checkout`` runners.
-    2. ``git rev-parse --verify main`` then ``master`` — recognises the
+    3. ``git rev-parse --verify main`` then ``master`` - recognises the
        conventional default-branch names. Works even in shallow clones
        and detached HEAD. This step is what keeps CI render output
        byte-stable against a freshly committed local sync.
-    3. ``git rev-parse --abbrev-ref HEAD`` — last resort. Returns the
-       current branch name when neither ``main`` nor ``master`` exists.
-       Skipped when HEAD is detached (returns the literal ``HEAD``)
-       because that would inject the PR-branch name into AGENTS.md.
+    4. The merge-queue ref shape - ``gh-readonly-queue/<base>/pr-<n>-<sha>``
+       encodes the branch the queue group was built against. A merge-queue
+       ref is checked out *as a branch*, not detached, so the
+       detached-HEAD guard does not cover it; the base branch is recovered
+       from the ref's own shape instead (see
+       ``_base_branch_of_merge_queue_ref``).
+
+    The current checkout's branch name is deliberately *never* used. The
+    default branch is a property of the repository; the branch you are on
+    is a property of the working tree. On a feature branch, a detached
+    HEAD, or a shallow CI clone of a non-``main`` PR, the checked-out
+    branch is guaranteed to be the wrong answer, and writing it silently
+    is what makes ``bernstein agents-md sync`` corrupt its own mirrors
+    (see issue #4578). When every probe comes up empty the function
+    returns ``None`` and the caller decides how to fail.
     """
+    if default_branch:
+        return default_branch
     try:
         result = subprocess.run(
             ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
@@ -953,17 +1233,15 @@ def _git_default_branch(repo_path: Path) -> str | None:
         )
         if result.returncode == 0:
             branch = result.stdout.strip()
-            if branch and branch != "HEAD":
-                return branch
+            queue_base = _base_branch_of_merge_queue_ref(branch)
+            if queue_base:
+                return queue_base
     except (subprocess.TimeoutExpired, OSError):
         return None
-    # Final fallback — only if we're inside a git checkout. ``main`` is
-    # the modern default; older repos that adopted ``master`` will have
-    # been resolved earlier in the chain. Keeps the rendered section
-    # deterministic across shallow CI clones, worktrees, and detached
-    # heads where every prior probe came up empty.
-    if (repo_path / ".git").exists():
-        return "main"
+    # Every probe failed. Deliberately no ``main``-as-last-resort: a repo
+    # whose default is ``trunk`` (or anything else non-conventional) would
+    # then get a wrong value written verbatim into committed context files,
+    # the same class of bug as writing the checked-out branch name.
     return None
 
 
@@ -984,10 +1262,12 @@ def _split_title_and_body(text: str, *, fallback: str) -> tuple[str, str]:
 
 
 __all__ = [
+    "MODULE_MAP_PAGE",
     "PACKAGE_META",
     "AgentsMdSection",
     "GenerateOptions",
     "SectionKind",
     "generate",
     "render_canonical",
+    "render_module_map_page",
 ]

@@ -1,13 +1,26 @@
 name: Post-CI dispatcher
 
+# ---------------------------------------------------------------------------
+# DO NOT PRUNE THIS WORKFLOW FOR RUNNER CAPACITY.
+#
+# `.github/workflows/auto-release.yml` declares `on: workflow_call:` and
+# nothing else, and so do auto-heal.yml, bernstein-ci-fix.yml and
+# bisect-on-red.yml. This dispatcher is their ONLY invocation path. A
+# dispatcher run that is cancelled, disabled or filtered away takes the
+# release automation with it, and nothing anywhere reports a failing check
+# when that happens - the release simply does not occur.
+#
+# Any change to the routing below has to keep `conclusion == 'success'` on
+# `main` reaching the auto-release job.
+# ---------------------------------------------------------------------------
+#
 # Single workflow_run: CI completed listener that consolidates the fanout
-# previously paid out across five sibling workflows (auto-release, auto-heal,
-# bernstein-ci-fix, bisect-on-red, telegram-notify). Each child is now a
-# reusable workflow (on: workflow_call:) and runs only when the dispatcher's
-# routing logic selects it.
+# previously paid out across sibling workflows (auto-release, auto-heal,
+# bernstein-ci-fix, bisect-on-red). Each child is now a reusable workflow
+# (on: workflow_call:) and runs only when the dispatcher's routing logic
+# selects it.
 #
 # Routing summary:
-#   - telegram-notify    -> fires on any non-success, non-skipped conclusion.
 #   - auto-release       -> fires on the main branch only.
 #   - auto-heal          -> fires on failure on main, gated on canonical repo
 #                            and recursion guards.
@@ -35,6 +48,19 @@ concurrency:
   group: post-ci-dispatcher-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
+# Workflow-level permissions stay minimal. Each reusable child below
+# declares its own per-job `permissions:` block scoped to the union of
+# the scopes that the called workflow's jobs request. A reusable
+# workflow inherits the *calling job's* GITHUB_TOKEN permissions, and
+# the GitHub Actions validator rejects the call at workflow_run boot
+# (zero check_runs, conclusion: startup_failure) when the caller grants
+# less than any callee job requests. The repo default for GITHUB_TOKEN
+# is `read` only, so an empty `permissions: {}` at this level grants
+# nothing and every callee with a `contents: write` /
+# `pull-requests: write` / `issues: write` / `attestations: write` /
+# `id-token: write` job failed the call before any job was scheduled.
+# That was the cause of the silent startup_failure on every dispatcher
+# run since the consolidation merged.
 permissions: {}
 
 jobs:
@@ -45,6 +71,28 @@ jobs:
     name: Resolve upstream metadata
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    # Do not boot a runner for an upstream conclusion no route can act on.
+    #
+    # Every job in auto-release.yml gates on `inputs.conclusion == 'success'`
+    # except its stale-trigger alert, which gates on the explicit list
+    # ["failure", "timed_out", "action_required"] and documents `cancelled`
+    # as deliberately excluded. auto-heal, bernstein-ci-fix and bisect-on-red
+    # each require exactly `failure`. So `cancelled` and `skipped` route
+    # nothing: today they boot this job, resolve metadata, and every child
+    # then skips.
+    #
+    # That is not a rare case. ci.yml keys push-to-main runs per SHA and
+    # never cancels them, so a merge wave leaves a long tail of main CI runs
+    # that an operator mass-cancels to reclaim the pool; `workflow_run` fires
+    # on `completed`, which includes `cancelled`, and each one paid a runner
+    # slot here for no routing decision.
+    #
+    # `success` is admitted unconditionally, so the release path is
+    # untouched. tests/unit/test_post_ci_dispatcher_workflow_yaml.py pins
+    # that: the inert set may not intersect any conclusion a child acts on.
+    if: >-
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.conclusion != 'skipped'
     permissions:
       contents: read
     outputs:
@@ -61,7 +109,7 @@ jobs:
       event: ${{ steps.out.outputs.event }}
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
       - name: Capture event metadata
@@ -93,38 +141,22 @@ jobs:
             echo "event=${EVENT}"
           } >> "$GITHUB_OUTPUT"
 
-  telegram-notify:
-    name: Telegram notify
-    needs: meta
-    if: >-
-      needs.meta.outputs.conclusion != 'success' &&
-      needs.meta.outputs.conclusion != 'skipped' &&
-      needs.meta.outputs.conclusion != 'neutral'
-    uses: ./.github/workflows/telegram-notify.yml
-    # Pass only the secrets this child actually reads. Avoids the
-    # `secrets: inherit` blanket pass that zizmor flags as
-    # `secrets-inherit`: every secret in the repo would otherwise be
-    # silently available to the called workflow.
-    secrets:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-    with:
-      conclusion: ${{ needs.meta.outputs.conclusion }}
-      head_branch: ${{ needs.meta.outputs.head_branch }}
-      head_sha: ${{ needs.meta.outputs.head_sha }}
-      run_id: ${{ needs.meta.outputs.run_id }}
-      html_url: ${{ needs.meta.outputs.html_url }}
-
   auto-release:
     name: Auto-release
     needs: meta
     if: needs.meta.outputs.head_branch == 'main'
+    # Union of permissions the called workflow's jobs request: it tags
+    # the release commit (contents:write), opens / closes the
+    # auto-release-skipped issue (issues:write), and dispatches the
+    # publish chain (actions:write). Granting less than any callee job
+    # requests rejects the call at boot: the whole dispatcher run ends
+    # as conclusion: startup_failure with zero check_runs.
+    permissions:
+      contents: write
+      issues: write
+      actions: write
     uses: ./.github/workflows/auto-release.yml
-    # auto-release only needs Telegram credentials for its alert job.
     # GITHUB_TOKEN is provided automatically to reusable workflows.
-    secrets:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     with:
       conclusion: ${{ needs.meta.outputs.conclusion }}
       head_branch: ${{ needs.meta.outputs.head_branch }}
@@ -142,13 +174,27 @@ jobs:
       !startsWith(needs.meta.outputs.display_title, 'fix(ci-heal-v2):') &&
       !startsWith(needs.meta.outputs.display_title, 'fix(ci-heal):') &&
       needs.meta.outputs.actor_login != 'github-actions[bot]'
+    # Union of permissions the called workflow's jobs request: it pushes
+    # heal branches and opens heal PRs (contents:write,
+    # pull-requests:write), attests provenance on the heal commit
+    # (attestations:write, id-token:write), and reads upstream CI run
+    # metadata (actions:read).
+    permissions:
+      contents: write
+      pull-requests: write
+      attestations: write
+      id-token: write
+      actions: read
     uses: ./.github/workflows/auto-heal.yml
-    # auto-heal optionally pings Telegram on heal outcomes. GITHUB_TOKEN
-    # is auto-provided. Both Telegram secrets are declared `required:
-    # false` on the called workflow so unset repos still run cleanly.
+    # GITHUB_TOKEN is auto-provided to the reusable workflow. Nothing else
+    # is: a reusable workflow sees only the secrets passed here, so the
+    # token the heal lane uses to open its pull request has to be forwarded
+    # explicitly or the reference reads as empty and the lane degrades to
+    # the Actions token, whose pull requests never trigger workflows. The
+    # callee declares it `required: false`, so an environment without the
+    # secret still boots.
     secrets:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      BERNSTEIN_AUTOSYNC_TOKEN: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN }}
     with:
       head_sha: ${{ needs.meta.outputs.head_sha }}
       run_id: ${{ needs.meta.outputs.run_id }}
@@ -175,26 +221,33 @@ jobs:
         needs.auto-heal.outputs.heal_outcome == '' ||
         needs.auto-heal.outputs.heal_outcome == 'skipped_no_jobs' ||
         needs.auto-heal.outputs.heal_outcome == 'failed_validation')
+    # Union of permissions the called workflow's jobs request: it pushes
+    # auto-heal branches and opens auto-heal PRs (contents:write,
+    # pull-requests:write), opens fallback ci-fix issues (issues:write),
+    # and reads upstream CI run + PR metadata (actions:read).
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
     uses: ./.github/workflows/bernstein-ci-fix.yml
     # bernstein-ci-fix uses GEMINI_API_KEY for the LLM triage agent.
     # GITHUB_TOKEN is auto-provided. GEMINI_API_KEY is declared
     # `required: false` on the called workflow so jobs that need it gate
     # on a non-empty value rather than failing the whole reusable call.
     secrets:
+      # See the auto-heal call above: a reusable workflow sees only what it
+      # is passed, so the pull-request token has to be forwarded explicitly.
+      BERNSTEIN_AUTOSYNC_TOKEN: ${{ secrets.BERNSTEIN_AUTOSYNC_TOKEN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      # NOTE: OPENROUTER_API_KEY_FREE was previously passed here for the
-      # Tier-3 shadow-mode escalation (#1715). When the operator has NOT
-      # defined that repo secret, the `secrets.OPENROUTER_API_KEY_FREE`
-      # reference fails the reusable-workflow startup with
-      # `startup_failure` (GitHub Actions resolves the secrets block at
-      # workflow_call start, before the called workflow's own
-      # `required: false` declaration applies). That broke the entire
-      # post-CI dispatcher chain (auto-release, auto-heal, bisect)
-      # silently from cbc95847 onward.
-      #
-      # Restore the pass once OPENROUTER_API_KEY_FREE is defined on the
-      # repo. Until then, the Tier-3 job inside bernstein-ci-fix degrades
-      # to flag_off / skipped, which is the documented default behaviour.
+      # OPENROUTER_API_KEY_FREE: ${{ secrets.OPENROUTER_API_KEY_FREE }}
+      # Re-enable the pass once OPENROUTER_API_KEY_FREE is defined on
+      # the repo. The Tier-3 shadow-mode job (#1715) gates on
+      # vars.BERNSTEIN_CI_SELF_DRIVE == 'tier3' (default off) so leaving
+      # the pass commented while the operator has not defined the secret
+      # is the documented graceful-degrade posture: Tier-3 records a
+      # flag_off / skipped outcome and the rest of the dispatcher chain
+      # continues to run.
     with:
       head_sha: ${{ needs.meta.outputs.head_sha }}
       head_branch: ${{ needs.meta.outputs.head_branch }}
@@ -208,6 +261,14 @@ jobs:
     if: >-
       needs.meta.outputs.conclusion == 'failure' &&
       needs.meta.outputs.head_branch == 'main'
+    # Union of permissions the called workflow's jobs request: it reads
+    # the failing commit's git history (contents:read) and posts the
+    # culprit comment on the suspected PR plus opens a bisect-on-red
+    # issue (pull-requests:write, issues:write).
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     uses: ./.github/workflows/bisect-on-red.yml
     # bisect-on-red reads only inputs and GITHUB_TOKEN (auto-provided).
     # No repository secrets are forwarded, replacing the prior

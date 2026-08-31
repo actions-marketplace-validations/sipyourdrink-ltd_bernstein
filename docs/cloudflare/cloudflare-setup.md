@@ -82,8 +82,8 @@ config = R2Config(
     account_id="abc123",
     api_token="cf_token_...",
     bucket_name="my-custom-bucket",  # default: "bernstein-workspaces"
-    max_file_size_mb=50,             # skip files larger than this
-    exclude_patterns=(               # default exclusions
+    max_file_size_mb=50,  # skip files larger than this
+    exclude_patterns=(  # default exclusions
         ".git",
         "__pycache__",
         "node_modules",
@@ -105,18 +105,7 @@ D1 is Cloudflare's serverless SQLite. Bernstein uses it for usage metering, bill
 wrangler d1 create bernstein-analytics
 ```
 
-Note the `database_id` from the output. The schema is created automatically on first use via `D1AnalyticsClient.initialize_schema()`.
-
-```python
-from bernstein.core.cost.d1_analytics import D1Config
-
-config = D1Config(
-    account_id="abc123",
-    api_token="cf_token_...",
-    database_id="d1-uuid-from-create",
-    database_name="bernstein-analytics",  # human-readable name
-)
-```
+Note the `database_id` from the output. The schema is created automatically on first use.
 
 ---
 
@@ -126,25 +115,30 @@ config = D1Config(
 
 
 
-If you want to run agents on Cloudflare Workers (not just use Workers AI locally), deploy the agent worker:
+If you want to run agents on Cloudflare Workers (not just use Workers AI locally), scaffold and deploy the agent worker. `bernstein cloud init` writes a free-tier `wrangler.toml` and a runnable `src/index.js` entry point (this works from the published wheel, which does not ship the repo `templates/` directory):
 
 ```bash
-# From the Bernstein repo root
-cd templates/bernstein-cloud
+bernstein cloud init                 # writes wrangler.toml + src/index.js
+# set account_id in wrangler.toml, then:
 npx wrangler deploy --name bernstein-agent
 ```
 
-Or use the CLI shortcut:
-
-```bash
-bernstein cloud deploy --worker-name bernstein-agent
-```
+`bernstein cloud init` only scaffolds; the deploy itself is a wrangler step
+run against your own Cloudflare account.
 
 ---
 
 ## 6. Authenticate the Cloud CLI
 
-For the hosted Bernstein Cloud service (api.bernstein.run):
+!!! warning "Hosted service is experimental"
+    The hosted Bernstein Cloud service at `api.bernstein.run` is experimental
+    and **not currently available** (the host does not resolve in DNS). The
+    `bernstein cloud login/run/status/runs/cost` commands target it and will
+    report that the service is not reachable. Everything else in this guide
+    (Workers AI, R2, D1, worker deployment) works against your own Cloudflare
+    account and does not depend on the hosted service.
+
+For the hosted Bernstein Cloud service (when available):
 
 ```bash
 bernstein cloud login --api-key YOUR_KEY

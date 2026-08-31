@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Bernstein GitHub Action entrypoint.
 # Handles four trigger modes:
-#   fix-ci      — download failed CI logs, attempt a fix (workflow_run failure)
-#   review-pr   — review an open pull request and post a comment
-#   decompose   — decompose a labeled GitHub issue into agent tasks
-#   <any text>  — run bernstein with the provided task description directly
+#   fix-ci      - download failed CI logs, attempt a fix (workflow_run failure)
+#   review-pr   - review an open pull request and post a comment
+#   decompose   - decompose a labeled GitHub issue into agent tasks
+#   <any text>  - run bernstein with the provided task description directly
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ post_pr_comment() {
             return 0
             ;;
         *)
-            # Unknown event type — no PR comment target available.
+            # Unknown event type - no PR comment target available.
             ;;
     esac
 
@@ -140,11 +140,11 @@ build_comment() {
 | Tasks completed | ${tasks_completed} |
 | Total cost | \$${total_cost} |
 | Trigger | \`${TASK}\` |
-| Run | [${GITHUB_RUN_ID:-—}](${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}) |
+| Run | [${GITHUB_RUN_ID:--}](${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}) |
 
 <details>
 <summary>What is Bernstein?</summary>
-Bernstein is a multi-agent orchestration system that hires short-lived CLI coding agents to complete tasks autonomously.
+Bernstein is a deterministic orchestrator that hires short-lived CLI coding agents, one git worktree per task. No model sits in its coordination loop, so runs replay byte-identically.
 Learn more at https://github.com/sipyourdrink-ltd/bernstein
 </details>
 MARKDOWN
@@ -152,7 +152,7 @@ MARKDOWN
 }
 
 # ---------------------------------------------------------------------------
-# Fix-CI mode  (on: workflow_run — triggered when CI fails)
+# Fix-CI mode  (on: workflow_run - triggered when CI fails)
 # ---------------------------------------------------------------------------
 run_fix_ci() {
     gha_group "fix-ci: downloading failed job logs"
@@ -250,7 +250,14 @@ run_plan() {
     fi
 
     local status="${STATUS_SUCCESS}"
-    bernstein run "$PLAN" --budget "$BUDGET" --headless || status="${STATUS_FAILURE}"
+    # `--headless` is declared on the root `bernstein` group, not on the `run`
+    # subcommand, so passing it here made Click exit 2 at option parsing and
+    # plan mode never started. `--quiet` is the option `run` actually declares
+    # for this purpose, and it is the one this step needs: it waits for the run
+    # to reach a terminal state instead of detaching. Without that wait the
+    # `|| status=` capture below reports the exit code of a launch rather than
+    # of a run, and the run summary is read before it has been written.
+    bernstein run "$PLAN" --budget "$BUDGET" --quiet || status="${STATUS_FAILURE}"
 
     gha_endgroup
 

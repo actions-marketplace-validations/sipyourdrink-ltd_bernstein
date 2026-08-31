@@ -19,7 +19,13 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
-from bernstein.core.tenanting import request_tenant_id, resolve_tenant_scope
+from bernstein.core.routes._sse import SSE_RESPONSES
+from bernstein.core.tenanting import (
+    request_tenant_cross_scope,
+    request_tenant_id,
+    requested_tenant_override,
+    resolve_tenant_scope,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -54,16 +60,47 @@ def _get_tenant_registry(request: Request) -> TenantRegistry | None:
 
 
 def _resolve_request_tenant_scope(request: Request, requested_tenant: str | None = None) -> str:
+    """Resolve the tenant scope for the current request.
+
+    Same rule as the task routes: the bound tenant comes from the
+    authenticated principal, and a caller-supplied selector is authorized
+    against it - naming your own scope is fine, naming a different one needs
+    the operator scope.
+    """
+    override = requested_tenant if requested_tenant is not None else requested_tenant_override(request)
     try:
         return resolve_tenant_scope(
             request_tenant_id(request),
-            requested_tenant,
+            override,
             registry=_get_tenant_registry(request),
+            allow_cross_tenant=request_tenant_cross_scope(request),
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _tenant_cap_overrides(request: Request, tenant_id: str) -> dict[str, float]:
+    """Return the ``CostTracker.load`` cap overrides for a tenant-scoped read.
+
+    A run file's persisted caps bound the whole run: everything every tenant
+    may spend against it.  Reporting one tenant's spend against them yields a
+    percentage of the wrong cap, so where the deployment configures per-tenant
+    caps, the tenant's own cap replaces the run-wide pair.  Tenant
+    configuration carries a soft cap only, so the run's hard cap - which does
+    not bound a single tenant either - is dropped rather than inherited.
+
+    A deployment that configures no tenants gets no overrides: there the run
+    and the tenant are the same thing and the persisted caps are correct.
+    """
+    registry = _get_tenant_registry(request)
+    if registry is None or not registry.is_configured:
+        return {}
+    config = registry.get(tenant_id)
+    if config is None:
+        return {}
+    return {"budget_usd": float(config.budget_usd or 0.0), "hard_budget_usd": 0.0}
 
 
 def _build_breakdowns(tracker: Any) -> dict[str, Any]:
@@ -100,7 +137,7 @@ def _extract_cost_event(message: str) -> str | None:
     return None
 
 
-@router.get("/events/cost")
+@router.get("/events/cost", response_class=StreamingResponse, responses=SSE_RESPONSES)
 def cost_events(request: Request) -> StreamingResponse:
     """SSE endpoint for real-time cost updates.
 
@@ -111,7 +148,7 @@ def cost_events(request: Request) -> StreamingResponse:
     sse_bus = _get_sse_bus(request)
     queue = sse_bus.subscribe()
 
-    # Timeout for individual queue.get() calls — if no message arrives
+    # Timeout for individual queue.get() calls - if no message arrives
     # within this window (including heartbeats), the connection is dead.
     _READ_TIMEOUT_S = 60.0
 
@@ -154,7 +191,7 @@ def get_costs(request: Request, tenant: str | None = None) -> JSONResponse:
     Scans every persisted cost file in ``.sdd/runtime/costs/``, aggregates
     per-agent and per-model totals, and computes cost attainment as
     ``(total_spent / total_budget) * 100``.  Budget of zero is treated as
-    unlimited — attainment is reported as 0.0 in that case.
+    unlimited - attainment is reported as 0.0 in that case.
     """
     from bernstein.core.cost_tracker import CostTracker
 
@@ -190,10 +227,14 @@ def get_costs(request: Request, tenant: str | None = None) -> JSONResponse:
 
     for cost_file in cost_files:
         run_id = cost_file.stem
-        tracker = CostTracker.load(sdd_dir, run_id)
+        tracker = CostTracker.load(sdd_dir, run_id, tenant_id=tenant_id)
         if tracker is None:
             continue
-        tenant_usages = [usage for usage in tracker.usages if usage.tenant_id == tenant_id]
+        # Already narrowed by the scoped load, which compares normalized
+        # tenant ids.  Re-filtering on the raw field here would drop rows the
+        # load admitted - a usage persisted as "  default  " normalizes into
+        # this scope but is not equal to it - and undercount the totals.
+        tenant_usages = tracker.usages
         if not tenant_usages:
             continue
         total_spent += sum(usage.cost_usd for usage in tenant_usages)
@@ -252,13 +293,15 @@ def get_cost_live(request: Request, tenant: str | None = None) -> JSONResponse:
         )
 
     run_id = cost_files[0].stem
-    tracker = CostTracker.load(sdd_dir, run_id)
+    tracker = CostTracker.load(sdd_dir, run_id, tenant_id=tenant_id)
     if tracker is None:
         return JSONResponse(
             content={"spent_usd": 0.0, "budget_usd": 0.0, "per_agent": {}, "per_model": {}, "tenant_id": tenant_id}
         )
 
-    tenant_usages = [usage for usage in tracker.usages if usage.tenant_id == tenant_id]
+    # Narrowed by the scoped load; see ``get_costs`` for why the raw field is
+    # not re-compared here.
+    tenant_usages = tracker.usages
     spent_usd = sum(usage.cost_usd for usage in tenant_usages)
     per_agent: dict[str, float] = defaultdict(float)
     per_model: dict[str, float] = defaultdict(float)
@@ -290,12 +333,12 @@ def _now_iso() -> str:
 
 
 def _aggregate_window_spend(
-    sdd_dir: Any, costs_dir: Any, *, since_ts: float, until_ts: float | None = None
+    sdd_dir: Any, costs_dir: Any, *, tenant_id: str, since_ts: float, until_ts: float | None = None
 ) -> tuple[float, float | None]:
     """Sum cost-tracker usages whose ``timestamp`` falls within the window.
 
     Returns:
-        Tuple of (cost_usd, latest_usage_ts) — ``latest_usage_ts`` is ``None``
+        Tuple of (cost_usd, latest_usage_ts) - ``latest_usage_ts`` is ``None``
         when the window saw no usages.
     """
     from bernstein.core.cost_tracker import CostTracker
@@ -307,7 +350,7 @@ def _aggregate_window_spend(
     total = 0.0
     latest_ts: float | None = None
     for cost_file in sorted(costs_dir.glob(_JSON_GLOB)):
-        tracker = CostTracker.load(sdd_dir, cost_file.stem)
+        tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
         if tracker is None:
             continue
         for usage in tracker.usages:
@@ -333,10 +376,17 @@ def get_cost_current(request: Request) -> JSONResponse:
     ``prior_week_usd``, ``delta_hour_usd``, ``resets_at`` and
     ``last_sync_at`` fields. Existing TUI/CLI callers keep reading
     ``spent_usd`` / ``percentage_used`` etc. unchanged.
+
+    Scope: every figure here is the caller's tenant's, not the run's or the
+    deployment's - spend is replayed from the caller's scope only, and the
+    cap it is measured against is that tenant's configured cap where one is
+    configured.  ``tenant_id`` in the response names the scope, so a client
+    aggregating across tenants can tell these apart from run-wide totals.
     """
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     now_epoch = time.time()
@@ -356,7 +406,7 @@ def get_cost_current(request: Request) -> JSONResponse:
         "per_model": [],
         "per_agent": {},
         "timestamp": now_epoch,
-        # Web GUI additive fields — friendly defaults so the dashboard
+        # Web GUI additive fields - friendly defaults so the dashboard
         # never sees ``null`` and breaks the KPI cards.
         "today_usd": 0.0,
         "week_usd": 0.0,
@@ -375,7 +425,7 @@ def get_cost_current(request: Request) -> JSONResponse:
         return JSONResponse(content=empty)
 
     run_id = cost_files[0].stem
-    tracker = CostTracker.load(sdd_dir, run_id)
+    tracker = CostTracker.load(sdd_dir, run_id, tenant_id=tenant_id, **_tenant_cap_overrides(request, tenant_id))
     if tracker is None:
         return JSONResponse(content=empty)
 
@@ -390,14 +440,18 @@ def get_cost_current(request: Request) -> JSONResponse:
 
     remaining = budget_status.remaining_usd if math.isfinite(budget_status.remaining_usd) else 0.0
 
-    # Web GUI rollups — derived from on-disk usages across all runs so the
+    # Web GUI rollups - derived from on-disk usages across all runs so the
     # numbers don't reset when a new run rotates the active cost file.
-    today_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=today_start)
-    week_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=week_start)
-    prior_week_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=prior_week_start, until_ts=week_start)
-    last_hour_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=last_hour_start)
-    prior_hour_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=prior_hour_start, until_ts=last_hour_start)
-    _, latest_usage_ts = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=0.0)
+    today_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=today_start, tenant_id=tenant_id)
+    week_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=week_start, tenant_id=tenant_id)
+    prior_week_usd, _ = _aggregate_window_spend(
+        sdd_dir, costs_dir, since_ts=prior_week_start, until_ts=week_start, tenant_id=tenant_id
+    )
+    last_hour_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=last_hour_start, tenant_id=tenant_id)
+    prior_hour_usd, _ = _aggregate_window_spend(
+        sdd_dir, costs_dir, since_ts=prior_hour_start, until_ts=last_hour_start, tenant_id=tenant_id
+    )
+    _, latest_usage_ts = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=0.0, tenant_id=tenant_id)
 
     daily_budget = float(budget_status.budget_usd or 0.0)
     used_pct = (today_usd / daily_budget * 100.0) if daily_budget > 0 else 0.0
@@ -429,6 +483,7 @@ def get_cost_current(request: Request) -> JSONResponse:
             "used_pct": round(used_pct, 2),
             "resets_at": _next_utc_reset_iso(),
             "last_sync_at": last_sync_iso,
+            "tenant_id": tenant_id,
         }
     )
 
@@ -440,11 +495,20 @@ def get_cost_alerts(request: Request) -> JSONResponse:
     Reads the live cost data for the most recent run, checks whether spend
     has reached the 80% or 95% alert threshold, and returns trend data
     computed from ``.sdd/metrics/cost_history.jsonl``.
+
+    Both halves of this response are scoped to ``tenant_id``: ``alerts`` is
+    computed from the caller's tenant's spend against the caller's tenant's
+    cap, and ``trend`` / ``history_days`` are narrowed to snapshots recorded
+    for that same tenant.  A history snapshot written before per-tenant
+    attribution existed carries no tenant and is excluded from every scoped
+    trend, so a fresh deployment's 30/90-day averages start empty and fill in
+    as new, attributed snapshots accumulate.
     """
     from bernstein.core.cost_history import compute_trends, get_active_alerts, load_history
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
 
     spent_usd = 0.0
     budget_usd = 0.0
@@ -452,13 +516,15 @@ def get_cost_alerts(request: Request) -> JSONResponse:
     if costs_dir.exists():
         cost_files = sorted(costs_dir.glob(_JSON_GLOB), key=lambda p: p.stat().st_mtime, reverse=True)
         if cost_files:
-            tracker = CostTracker.load(sdd_dir, cost_files[0].stem)
+            tracker = CostTracker.load(
+                sdd_dir, cost_files[0].stem, tenant_id=tenant_id, **_tenant_cap_overrides(request, tenant_id)
+            )
             if tracker is not None:
                 spent_usd = tracker.spent_usd
                 budget_usd = tracker.budget_usd
 
     alerts = get_active_alerts(sdd_dir, spent_usd, budget_usd)
-    history = load_history(sdd_dir)
+    history = load_history(sdd_dir, tenant_id=tenant_id)
     trend = compute_trends(history)
 
     return JSONResponse(
@@ -466,6 +532,11 @@ def get_cost_alerts(request: Request) -> JSONResponse:
             "alerts": [a.to_dict() for a in alerts],
             "trend": trend.to_dict(),
             "history_days": len(history),
+            "tenant_id": tenant_id,
+            # Both halves are now narrowed to ``tenant_id``; this label
+            # stays so an existing consumer that special-cased "run-wide"
+            # sees the scope change rather than silently reinterpreting it.
+            "trend_scope": "tenant",
         }
     )
 
@@ -474,6 +545,7 @@ def _bucket_usages(
     sdd_dir: Any,
     costs_dir: Any,
     *,
+    tenant_id: str,
     since_ts: float,
     granularity: str,
 ) -> list[dict[str, Any]]:
@@ -485,7 +557,7 @@ def _bucket_usages(
     if not costs_dir.exists():
         return []
     for cost_file in sorted(costs_dir.glob(_JSON_GLOB)):
-        tracker = CostTracker.load(sdd_dir, cost_file.stem)
+        tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
         if tracker is None:
             continue
         for usage in tracker.usages:
@@ -516,12 +588,13 @@ def get_cost_history(
 
     Two response modes share one endpoint:
 
-    * ``GET /costs/history?hours=24&granularity=hour`` (web GUI sparkline) —
+    * ``GET /costs/history?hours=24&granularity=hour`` (web GUI sparkline) -
       returns a flat ``[{ts, usd}]`` array bucketed from cost-tracker
       usages over the last *hours* window.
-    * ``GET /costs/history`` *or* ``?envelope=1`` (legacy/CLI) — returns the
+    * ``GET /costs/history`` *or* ``?envelope=1`` (legacy/CLI) - returns the
       original ``{history, trend, burn_rate_*, history_days}`` envelope
-      built from ``.sdd/metrics/cost_history.jsonl`` daily snapshots.
+      built from ``.sdd/metrics/cost_history.jsonl`` daily snapshots, narrowed
+      to the caller's tenant the same way ``/costs/alerts`` is.
 
     The sparkline branch lets the GUI feed `recharts` directly without
     unwrapping a ``.history`` field.
@@ -529,17 +602,19 @@ def get_cost_history(
     from bernstein.core.cost_history import compute_trends, load_history
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
 
-    # Web GUI sparkline branch — array form bucketed from live usages.
+    # Web GUI sparkline branch - array form bucketed from live usages.
     if hours is not None and not envelope:
         gran = granularity if granularity in {"hour", "day"} else "hour"
         since = time.time() - max(1, hours) * 3600
         costs_dir = sdd_dir / "runtime" / "costs"
-        series = _bucket_usages(sdd_dir, costs_dir, since_ts=since, granularity=gran)
+        series = _bucket_usages(sdd_dir, costs_dir, since_ts=since, granularity=gran, tenant_id=tenant_id)
         return JSONResponse(content=series)
 
-    # Legacy envelope — unchanged shape so TUI / CLI keep working.
-    history = load_history(sdd_dir)
+    # Legacy envelope - shape unchanged so TUI / CLI keep working; the
+    # snapshots feeding it are now narrowed to the caller's tenant.
+    history = load_history(sdd_dir, tenant_id=tenant_id)
     trend = compute_trends(history)
     recent_7d = history[-7:] if len(history) >= 7 else history
     daily_avg = sum(s.spent_usd for s in recent_7d) / len(recent_7d) if recent_7d else 0.0
@@ -569,6 +644,7 @@ def export_costs(request: Request, format: str = "json") -> Response:
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     if not costs_dir.exists():
@@ -586,7 +662,7 @@ def export_costs(request: Request, format: str = "json") -> Response:
 
     for cost_file in cost_files:
         run_id = cost_file.stem
-        tracker = CostTracker.load(sdd_dir, run_id)
+        tracker = CostTracker.load(sdd_dir, run_id, tenant_id=tenant_id)
         if tracker is None:
             continue
         total_spent += tracker.spent_usd
@@ -638,10 +714,11 @@ def forecast_costs(request: Request) -> JSONResponse:
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     week_start = time.time() - 7 * 86_400
-    week_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=week_start)
+    week_usd, _ = _aggregate_window_spend(sdd_dir, costs_dir, since_ts=week_start, tenant_id=tenant_id)
     projected_month_usd = round((week_usd / 7.0) * 30.0, 6) if week_usd > 0 else 0.0
     trend_label = "trending within budget" if projected_month_usd >= 0 else "trend unknown"
 
@@ -665,7 +742,7 @@ def forecast_costs(request: Request) -> JSONResponse:
 
     for cost_file in cost_files[:5]:  # Last 5 runs
         run_id = cost_file.stem
-        tracker = CostTracker.load(sdd_dir, run_id)
+        tracker = CostTracker.load(sdd_dir, run_id, tenant_id=tenant_id)
         if tracker is None:
             continue
         file_mtime = cost_file.stat().st_mtime
@@ -729,6 +806,7 @@ def compare_model_costs(request: Request) -> JSONResponse:
     from typing import cast
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     # Get current spending by model
@@ -745,7 +823,7 @@ def compare_model_costs(request: Request) -> JSONResponse:
         for cost_file in cost_files[:3]:  # Last 3 runs
             from bernstein.core.cost_tracker import CostTracker
 
-            tracker = CostTracker.load(sdd_dir, cost_file.stem)
+            tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
             if tracker is None:
                 continue
             for u in tracker.usages:
@@ -787,6 +865,7 @@ def cache_stats(request: Request) -> JSONResponse:
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     total_calls = 0
@@ -797,7 +876,7 @@ def cache_stats(request: Request) -> JSONResponse:
     if costs_dir.exists():
         cost_files = sorted(costs_dir.glob(_JSON_GLOB), key=lambda p: p.stat().st_mtime)
         for cost_file in cost_files:
-            tracker = CostTracker.load(sdd_dir, cost_file.stem)
+            tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
             if tracker is None:
                 continue
             for u in tracker.usages:
@@ -846,14 +925,14 @@ def cache_stats(request: Request) -> JSONResponse:
     )
 
 
-def _collect_model_costs(sdd_dir: Any, costs_dir: Any) -> dict[str, dict[str, Any]]:
+def _collect_model_costs(sdd_dir: Any, costs_dir: Any, *, tenant_id: str) -> dict[str, dict[str, Any]]:
     """Collect per-model cost data from the most recent cost file."""
     from bernstein.core.cost_tracker import CostTracker
 
     model_costs: dict[str, dict[str, Any]] = {}
     cost_files = sorted(costs_dir.glob(_JSON_GLOB), key=lambda p: p.stat().st_mtime, reverse=True)
     for cost_file in cost_files[:1]:
-        tracker = CostTracker.load(sdd_dir, cost_file.stem)
+        tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
         if tracker is None:
             continue
         for u in tracker.usages:
@@ -895,13 +974,14 @@ def model_cost_comparison(request: Request) -> JSONResponse:
     from bernstein.core.cost import MODEL_COSTS_PER_1M_TOKENS
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     # Get current spending by model
     model_costs: dict[str, dict[str, Any]] = {}
 
     if costs_dir.exists():
-        model_costs = _collect_model_costs(sdd_dir, costs_dir)
+        model_costs = _collect_model_costs(sdd_dir, costs_dir, tenant_id=tenant_id)
 
     # Calculate alternatives
     comparison: list[dict[str, Any]] = []
@@ -934,6 +1014,7 @@ def token_efficiency(request: Request) -> JSONResponse:
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     model_stats: dict[str, _EfficiencyStats] = {}
@@ -941,7 +1022,7 @@ def token_efficiency(request: Request) -> JSONResponse:
     if costs_dir.exists():
         cost_files = sorted(costs_dir.glob(_JSON_GLOB), key=lambda p: p.stat().st_mtime)
         for cost_file in cost_files:
-            tracker = CostTracker.load(sdd_dir, cost_file.stem)
+            tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
             if tracker is None:
                 continue
             for u in tracker.usages:
@@ -986,7 +1067,7 @@ def token_efficiency(request: Request) -> JSONResponse:
     )
 
 
-def _build_adapter_breakdown(sdd_dir: Any, costs_dir: Any, *, hours: int) -> list[dict[str, Any]]:
+def _build_adapter_breakdown(sdd_dir: Any, costs_dir: Any, *, tenant_id: str, hours: int) -> list[dict[str, Any]]:
     """Build a per-adapter cost-tracker breakdown for the web GUI Costs tab.
 
     "Adapter" here is the model id (sonnet, opus, gpt-4, …); these are the
@@ -1009,7 +1090,7 @@ def _build_adapter_breakdown(sdd_dir: Any, costs_dir: Any, *, hours: int) -> lis
     prior_cost: dict[str, float] = defaultdict(float)
 
     for cost_file in sorted(costs_dir.glob(_JSON_GLOB)):
-        tracker = CostTracker.load(sdd_dir, cost_file.stem)
+        tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
         if tracker is None:
             continue
         for usage in tracker.usages:
@@ -1054,31 +1135,32 @@ def get_costs_by_tag(
 
     The endpoint serves three callers:
 
-    * Web GUI (``Costs.tsx`` adapter table) — calls ``GET /costs/by-tag``
+    * Web GUI (``Costs.tsx`` adapter table) - calls ``GET /costs/by-tag``
       and expects an array of ``{adapter, calls, tokens, cost_usd,
       share_pct, delta_7d_pct}`` rows. With ``shape=auto`` (default) and
       no ``tag_key``, this is what we return.
-    * Legacy callers passing ``tag_key=…`` — receive the existing
+    * Legacy callers passing ``tag_key=…`` - receive the existing
       ``{by_tag: {key: {value: cost}}}`` envelope.
-    * Legacy callers wanting the envelope explicitly — pass
+    * Legacy callers wanting the envelope explicitly - pass
       ``shape=tags`` and get the envelope without supplying a key.
 
     The ``hours`` parameter controls the GUI window (default 24h).
     """
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     if shape == "tags" or tag_key is not None:
         by_tag: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         if costs_dir.exists():
-            _accumulate_tag_costs(sdd_dir, costs_dir, tag_key, by_tag)
+            _accumulate_tag_costs(sdd_dir, costs_dir, tag_key, by_tag, tenant_id=tenant_id)
         result: dict[str, dict[str, float]] = {
             k: {v: round(c, 6) for v, c in vals.items()} for k, vals in by_tag.items()
         }
         return JSONResponse(content={"by_tag": result})
 
-    # Default (web GUI) — adapter array.
-    rows = _build_adapter_breakdown(sdd_dir, costs_dir, hours=hours)
+    # Default (web GUI) - adapter array.
+    rows = _build_adapter_breakdown(sdd_dir, costs_dir, hours=hours, tenant_id=tenant_id)
     return JSONResponse(content=rows)
 
 
@@ -1091,8 +1173,9 @@ def get_costs_by_adapter(request: Request, hours: int = 24) -> JSONResponse:
     the legacy "by-tag" naming.
     """
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
-    rows = _build_adapter_breakdown(sdd_dir, costs_dir, hours=hours)
+    rows = _build_adapter_breakdown(sdd_dir, costs_dir, hours=hours, tenant_id=tenant_id)
     return JSONResponse(content=rows)
 
 
@@ -1107,6 +1190,7 @@ def get_costs_top_tasks(request: Request, limit: int = 10, hours: int = 24) -> J
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
     if not costs_dir.exists():
         return JSONResponse(content=[])
@@ -1116,7 +1200,7 @@ def get_costs_top_tasks(request: Request, limit: int = 10, hours: int = 24) -> J
     # task_id -> {cost, agent}
     task_cost: dict[str, dict[str, Any]] = defaultdict(lambda: {"cost": 0.0, "agent": ""})
     for cost_file in sorted(costs_dir.glob(_JSON_GLOB)):
-        tracker = CostTracker.load(sdd_dir, cost_file.stem)
+        tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
         if tracker is None:
             continue
         for usage in tracker.usages:
@@ -1131,7 +1215,7 @@ def get_costs_top_tasks(request: Request, limit: int = 10, hours: int = 24) -> J
                 task_cost[task_id]["agent"] = str(getattr(usage, "agent_id", "") or "")
 
     # Resolve titles from the task store when available. Only look up the
-    # task ids that appear in the cost data (issue #1728 finding 3) — the
+    # task ids that appear in the cost data (issue #1728 finding 3) - the
     # previous full ``store.list_tasks()`` walk materialised every task in
     # the store just to read a handful of titles.
     store = getattr(request.app.state, "store", None)
@@ -1145,7 +1229,10 @@ def get_costs_top_tasks(request: Request, limit: int = 10, hours: int = 24) -> J
                 # bot-ack: pre-existing-1723 (best-effort title enrichment for costs view)
                 except Exception:
                     continue
-                if task is not None:
+                # The ids already come from in-scope usages; the row itself is
+                # checked too, so a title is only ever read off a task that
+                # resolves inside the same scope.
+                if task is not None and getattr(task, "tenant_id", tenant_id) == tenant_id:
                     titles[task_id] = task.title
 
     rows = sorted(
@@ -1153,7 +1240,7 @@ def get_costs_top_tasks(request: Request, limit: int = 10, hours: int = 24) -> J
             {
                 "id": task_id,
                 "title": titles.get(task_id, task_id),
-                "agent": data["agent"] or "—",
+                "agent": data["agent"] or "-",
                 "cost_usd": round(float(data["cost"]), 6),
             }
             for task_id, data in task_cost.items()
@@ -1165,14 +1252,14 @@ def get_costs_top_tasks(request: Request, limit: int = 10, hours: int = 24) -> J
 
 
 def _accumulate_tag_costs(
-    sdd_dir: Any, costs_dir: Any, tag_key: str | None, by_tag: dict[str, dict[str, float]]
+    sdd_dir: Any, costs_dir: Any, tag_key: str | None, by_tag: dict[str, dict[str, float]], *, tenant_id: str
 ) -> None:
     """Accumulate cost-tag data from all cost files into *by_tag*."""
     from bernstein.core.cost_tracker import CostTracker
 
     cost_files = sorted(costs_dir.glob(_JSON_GLOB), key=lambda p: p.stat().st_mtime)
     for cost_file in cost_files:
-        tracker = CostTracker.load(sdd_dir, cost_file.stem)
+        tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
         if tracker is None:
             continue
         for u in tracker.usages:
@@ -1185,6 +1272,8 @@ def _find_session_breakdown(
     sdd_dir: Any,
     session_id: str,
     load_session_breakdown: Any,
+    *,
+    tenant_id: str,
 ) -> Any:
     """Find token breakdown for a single session by scanning cost files."""
     from bernstein.core.cost_tracker import CostTracker
@@ -1193,7 +1282,7 @@ def _find_session_breakdown(
     if costs_dir.exists():
         cost_files = sorted(costs_dir.glob(_JSON_GLOB), key=lambda p: p.stat().st_mtime, reverse=True)
         for cost_file in cost_files:
-            tracker = CostTracker.load(sdd_dir, cost_file.stem)
+            tracker = CostTracker.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
             if tracker is None:
                 continue
             for usage in tracker.usages:
@@ -1221,7 +1310,7 @@ def get_token_breakdown(request: Request, session_id: str | None = None) -> JSON
     system prompt (Bernstein overhead), context files, task description,
     tool call results accumulated at runtime, and assistant output.
 
-    Identifies optimization opportunities — e.g. if 60% of tokens are
+    Identifies optimization opportunities - e.g. if 60% of tokens are
     context files the agent never used.
 
     Args:
@@ -1234,9 +1323,10 @@ def get_token_breakdown(request: Request, session_id: str | None = None) -> JSON
     from bernstein.core.agent_session_token_breakdown import load_all_session_breakdowns, load_session_breakdown
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
 
     if session_id is not None:
-        breakdown = _find_session_breakdown(sdd_dir, session_id, load_session_breakdown)
+        breakdown = _find_session_breakdown(sdd_dir, session_id, load_session_breakdown, tenant_id=tenant_id)
         return JSONResponse(content={"sessions": [breakdown.to_dict()], "summary": None})
 
     breakdowns = load_all_session_breakdowns(sdd_dir)
@@ -1331,12 +1421,14 @@ def _compute_historical_efficiency(
     sdd_dir: Any,
     lines_dir: Any,
     cost_tracker_cls: Any,
+    *,
+    tenant_id: str,
 ) -> tuple[float, int]:
     """Compute historical cost and lines across all runs."""
     hist_cost = 0.0
     hist_lines = 0
     for cost_file in cost_files:
-        tracker = cost_tracker_cls.load(sdd_dir, cost_file.stem)
+        tracker = cost_tracker_cls.load(sdd_dir, cost_file.stem, tenant_id=tenant_id)
         if tracker is None:
             continue
         hist_cost += tracker.spent_usd
@@ -1358,7 +1450,7 @@ def _build_efficiency_message(
         parts.append(f"Run average: ${run_cost_per_line:.3f}/line")
     if hist_cost_per_line is not None:
         parts.append(f"Historical average: ${hist_cost_per_line:.3f}/line")
-    return ". ".join(parts) + "." if parts else "Insufficient data — no lines_changed recorded yet."
+    return ". ".join(parts) + "." if parts else "Insufficient data - no lines_changed recorded yet."
 
 
 def _build_current_data(
@@ -1397,6 +1489,7 @@ def get_cost_efficiency(request: Request) -> JSONResponse:
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
+    tenant_id = _resolve_request_tenant_scope(request)
     costs_dir = sdd_dir / "runtime" / "costs"
 
     empty: dict[str, Any] = {
@@ -1413,14 +1506,16 @@ def get_cost_efficiency(request: Request) -> JSONResponse:
         return JSONResponse(content=empty)
 
     lines_dir = sdd_dir / "runtime" / "lines_changed"
-    current_tracker = CostTracker.load(sdd_dir, cost_files[0].stem)
+    current_tracker = CostTracker.load(sdd_dir, cost_files[0].stem, tenant_id=tenant_id)
     run_cost, run_lines, _current_cost, current_lines, current_cost_per_line = _compute_current_run_efficiency(
         current_tracker,
         lines_dir,
     )
     run_cost_per_line = round(run_cost / run_lines, 6) if run_lines > 0 else None
 
-    hist_cost, hist_lines = _compute_historical_efficiency(cost_files, sdd_dir, lines_dir, CostTracker)
+    hist_cost, hist_lines = _compute_historical_efficiency(
+        cost_files, sdd_dir, lines_dir, CostTracker, tenant_id=tenant_id
+    )
     hist_cost_per_line = round(hist_cost / hist_lines, 6) if hist_lines > 0 else None
 
     message = _build_efficiency_message(current_cost_per_line, run_cost_per_line, hist_cost_per_line)
@@ -1452,7 +1547,7 @@ def get_cost_efficiency(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# /costs/{run_id} — must be registered LAST.
+# /costs/{run_id} - must be registered LAST.
 #
 # FastAPI matches routes in registration order. Putting the path-parameter
 # route ahead of any sibling like /costs/by-tag, /costs/forecast, … makes
@@ -1464,18 +1559,25 @@ def get_cost_efficiency(request: Request) -> JSONResponse:
 
 @router.get("/costs/{run_id}", responses={404: {"description": "No cost data for run"}})
 def get_cost_budget(run_id: str, request: Request) -> JSONResponse:
-    """Return budget status for a specific run.
+    """Return budget status for a specific run, within the caller's scope.
 
     Loads the persisted cost tracker from ``.sdd/runtime/costs/{run_id}.json``
     and returns its ``BudgetStatus`` as JSON.
+
+    Scope: every figure is the caller's tenant's share of the run, not the
+    run's total - the run file holds the spend of every tenant that spent
+    against it, and only the caller's is replayed.  ``tenant_id`` in the
+    response names the scope the figures belong to.
     """
     from bernstein.core.cost_tracker import CostTracker
 
     sdd_dir = _get_sdd_dir(request)
-    tracker = CostTracker.load(sdd_dir, run_id)
+    tenant_id = _resolve_request_tenant_scope(request)
+    tracker = CostTracker.load(sdd_dir, run_id, tenant_id=tenant_id, **_tenant_cap_overrides(request, tenant_id))
     if tracker is None:
         raise HTTPException(status_code=404, detail=f"No cost data for run '{run_id}'")
 
     result = tracker.status().to_dict()
     result.update(_build_breakdowns(tracker))
+    result["tenant_id"] = tenant_id
     return JSONResponse(content=result)

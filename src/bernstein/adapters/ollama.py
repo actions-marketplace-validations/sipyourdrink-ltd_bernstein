@@ -1,11 +1,12 @@
-"""Ollama / OpenAI-compatible local LLM adapter — run coding agents without cloud API keys.
+"""Ollama / OpenAI-compatible local LLM adapter - run coding agents without cloud API keys.
 
 Uses Aider as the coding frontend with Ollama (or any OpenAI-compatible
 local server such as vLLM, llama.cpp's HTTP server, LM Studio) as the LLM
 backend.  This enables full code editing capabilities in air-gapped,
 privacy-sensitive, EU-residency, or cost-zero environments.
 
-Last verified against upstream Ollama 0.21.x on 2026-05-05.
+Last verified against upstream Ollama 0.21.x on 2026-08-10 (CLI surface
+verified against aider 0.86.2, which this adapter actually drives).
 
 Prerequisites:
     - Ollama: https://ollama.com  (``brew install ollama`` or
@@ -18,7 +19,7 @@ Prerequisites:
 EU-residency / vLLM note:
     For DeepSeek V4-Pro (1.6T MoE / 49B active) the single-GPU Ollama
     profile is too small; deploy via vLLM tensor-parallel and point
-    ``OLLAMA_API_BASE`` at the vLLM ``/v1`` endpoint — aider/litellm's
+    ``OLLAMA_API_BASE`` at the vLLM ``/v1`` endpoint - aider/litellm's
     OpenAI-compatible path treats the two interchangeably.  Callers
     that need an EU-residency guarantee MUST pass ``eu_residency=True``
     AND pin ``base_url`` to a self-hosted (e.g. RFC-1918 / *.internal /
@@ -31,16 +32,20 @@ EU-residency / vLLM note:
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from typing import TYPE_CHECKING, Any
 
 from bernstein.adapters.base import DEFAULT_TIMEOUT_SECONDS, CLIAdapter, SpawnResult, build_worker_cmd
 from bernstein.adapters.env_isolation import build_filtered_env
+from bernstein.adapters.plugin_sdk import AdapterPluginInfo
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from bernstein.core.models import ModelConfig
+
+logger = logging.getLogger(__name__)
 
 # Default Ollama API endpoint
 OLLAMA_BASE_URL = "http://localhost:11434"
@@ -48,10 +53,10 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 # Maps Bernstein abstract model names to Ollama / OpenAI-compatible model IDs.
 # Users can also pass native model IDs directly (e.g. "qwen2.5-coder:32b").
 #
-# DeepSeek V4 entries (added 2026-05-07 — FEAT deepseek-v4-flash-eu):
-#   - ``deepseek-v4-flash`` — 284B / 13B-active MoE, MIT-licensed, fits a
+# DeepSeek V4 entries (added 2026-05-07 - FEAT deepseek-v4-flash-eu):
+#   - ``deepseek-v4-flash`` - 284B / 13B-active MoE, MIT-licensed, fits a
 #     single H100/A100; primary cheap-first arm for EU-residency runs.
-#   - ``deepseek-v4-pro``   — 1.6T / 49B-active MoE, MIT-licensed, requires
+#   - ``deepseek-v4-pro``   - 1.6T / 49B-active MoE, MIT-licensed, requires
 #     vLLM tensor-parallel deployment (does not fit single-GPU Ollama).
 #     Set ``OLLAMA_API_BASE`` to the vLLM ``/v1`` endpoint to route here.
 _MODEL_MAP: dict[str, str] = {
@@ -131,6 +136,27 @@ class OllamaAdapter(CLIAdapter):
         """Return whether the EU-residency self-hosted guard is active."""
         return self._eu_residency
 
+    def plugin_info(self) -> AdapterPluginInfo:
+        """Declare the sampling surface OllamaAdapter genuinely wires.
+
+        This adapter drives Aider (see the module docstring), which exposes
+        no sampling flags at all: ``--temperature``, ``--top-p``, ``--top-k``
+        and completion ``--max-tokens`` are all absent (``--max-chat-history-
+        tokens`` controls a different thing - chat history truncation, not the
+        completion length). Passing any of them makes Aider exit with
+        "unrecognized arguments", so none are declared -
+        :func:`bernstein.adapters.plugin_sdk.ensure_sampling_params_supported`
+        refuses such a spawn rather than building an argv Aider rejects.
+        Sampling for local models is set on the Ollama model itself.
+        """
+        return AdapterPluginInfo(
+            name="ollama",
+            version="0.1.0",
+            author="bernstein",
+            description="Ollama / OpenAI-compatible local LLM adapter (via Aider)",
+            capabilities=(),
+        )
+
     def _resolve_model(self, model_name: str) -> str:
         """Map Bernstein model name to Ollama / OpenAI-compatible model ID."""
         return _MODEL_MAP.get(model_name, model_name)
@@ -168,7 +194,7 @@ class OllamaAdapter(CLIAdapter):
 
         host = (urlparse(base_url).hostname or "").lower()
         if not host:
-            # Empty / malformed URL — fail closed under residency mode.
+            # Empty / malformed URL - fail closed under residency mode.
             return False
         if host == "localhost":
             return True
@@ -195,7 +221,9 @@ class OllamaAdapter(CLIAdapter):
         task_scope: str = "medium",
         budget_multiplier: float = 1.0,
         system_addendum: str = "",
+        multimodal_context: Any | None = None,
     ) -> SpawnResult:
+        self.refuse_multimodal_if_needed(multimodal_context)
         from urllib.parse import urlparse
 
         from bernstein.core.security.network_policy import policy_from_env
@@ -240,6 +268,21 @@ class OllamaAdapter(CLIAdapter):
             "1024",
             "--no-auto-lint",
         ]
+
+        if mcp_config:
+            # aider exposes no --temperature flag; argparse aborts the run with
+            # "unrecognized arguments: --temperature". Nothing is wired, and
+            # plugin_info() declares no sampling capability so the spawn is
+            # refused before an unusable argv is built.
+            for dropped_key in ("temperature", "top_p", "top_k", "max_tokens"):
+                if mcp_config.get(dropped_key) is not None:
+                    logger.warning(
+                        "ollama adapter: %s=%r requested but not wired (aider has no matching "
+                        "CLI flag) - ensure_sampling_params_supported should have refused this "
+                        "spawn before reaching here",
+                        dropped_key,
+                        mcp_config.get(dropped_key),
+                    )
 
         pid_dir = workdir / ".sdd" / "runtime" / "pids"
         wrapped_cmd = build_worker_cmd(

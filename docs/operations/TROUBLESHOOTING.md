@@ -1,3 +1,8 @@
+---
+search:
+  boost: 2
+---
+
 # Troubleshooting Guide
 
 Comprehensive reference for diagnosing and resolving Bernstein failures.
@@ -7,7 +12,7 @@ Each entry follows the pattern: symptom, cause, diagnosis, resolution.
 1. [Adapter Not Found](#1-adapter-not-found)
 2. [CLI Binary Not in PATH](#2-cli-binary-not-in-path)
 3. [API Key Not Set](#3-api-key-not-set)
-4. [Rate Limiting / Provider Throttling](#4-rate-limiting--provider-throttling)
+4. [Rate Limiting / Provider Throttling](#4-rate-limiting-provider-throttling)
 5. [Budget Exceeded](#5-budget-exceeded)
 6. [Permission Denied on Agent Spawn](#6-permission-denied-on-agent-spawn)
 7. [Task Server Unreachable](#7-task-server-unreachable)
@@ -43,7 +48,7 @@ cli: claude   # must match a registered name exactly
 ```
 
 **Resolution:**
-- Use one of the built-in names: `aider`, `amp`, `claude`, `codex`, `cody`, `continue`, `cursor`, `gemini`, `generic`, `goose`, `iac`, `kilo`, `kiro`, `mock`, `ollama`, `opencode`, `qwen`, `roo-code`, `tabby`.
+- Use a registered adapter name; run `bernstein integrations list` (one line per adapter) to see the built-in set.
 - For third-party adapters, ensure the package exposes a `bernstein.adapters` entry point and is installed in the same virtualenv.
 - For arbitrary CLIs, use `cli: generic` with `cli_command`, `prompt_flag`, and `model_flag` settings.
 
@@ -65,6 +70,22 @@ claude --version  # should print version info
 - Install the CLI: `npm install -g @anthropic-ai/claude-code` (Claude), `npm install -g @openai/codex` (Codex), `pip install aider-chat` (Aider), etc.
 - If installed but not on PATH, add its directory: `export PATH="$HOME/.npm-global/bin:$PATH"`.
 - If running inside a virtualenv or container, ensure the binary is available in that environment.
+
+### 2a. Windows: `.cmd`/`.bat` shim not found (nvm-windows)
+
+**Symptom:** `bernstein-worker: command not found: codex` (exit 127) on Windows, even though `where.exe codex` and `python -c "import shutil; print(shutil.which('codex'))"` both resolve `C:\...\codex.cmd`.
+
+**Cause:** Node version managers such as nvm-windows install the Codex/Claude/Gemini CLIs as batch shims (`codex.cmd`), not real `.exe` files. `CreateProcess` (what `subprocess.Popen` calls without a shell) does not consult `PATHEXT` for `argv[0]`, so a bare `codex` never resolves the `.cmd`, and even a full path to a `.cmd` cannot be launched directly.
+
+**Resolution:** Bernstein now resolves the bare name via `shutil.which` and, on Windows, routes a resolved `.cmd`/`.bat` shim through `cmd.exe /c` automatically. Ensure `PATHEXT` is present in your environment (it is passed through to spawned agents). No manual action is needed on current versions; if you see this on an older build, upgrade Bernstein.
+
+### 2b. Windows: long prompt fails silently through a `.cmd`/`.bat` shim
+
+**Symptom:** On Windows, a task with a large prompt (roughly 8000+ characters) spawns and exits almost immediately with no useful output; Bernstein treats it as an agent that started and produced no work.
+
+**Cause:** Routing a resolved `.cmd`/`.bat` shim through `cmd.exe /c` (see 2a) makes the *whole* command line subject to cmd.exe's own ~8191-character internal line buffer -- a much smaller limit than the ~32767 characters `CreateProcess` itself allows. A long prompt passed as a command-line argument can push the line past that buffer; cmd.exe then refuses the launch with `The command line is too long.` before the adapter binary starts.
+
+**Resolution:** For the `claude` adapter, Bernstein now writes an oversized prompt to a file under `.sdd/runtime/prompts/` and pipes it to the CLI's stdin instead of passing it on the command line, so the shim's command line stays under cmd.exe's limit regardless of prompt size. No manual action is needed. Other adapters whose CLI is not yet confirmed to accept a stdin-piped prompt still fail the same way on an oversized prompt; installing the CLI's native `.exe` build (bypassing the Node version manager's `.cmd` shim) avoids the cmd.exe hop entirely.
 
 ---
 
@@ -120,6 +141,45 @@ grep -i "rate limit\|429\|hit your limit\|resets" .sdd/runtime/*.log
 - Use the `TierAwareRouter` to balance across multiple providers (Claude + Codex + Gemini).
 - For batch-eligible tasks, set `batch_eligible: true` to route to provider batch APIs at reduced cost.
 
+### 4a. Healthy worker killed as a false-positive rate-limit hit
+
+**Symptom:** A worker that was making normal progress gets killed and the
+run falls back to a more expensive sticky provider, even though the
+provider dashboard shows no throttling. `.sdd/runtime/*.log` shows a
+`_scan_log_for_patterns: matched RISKY pattern ...` line pointing at a
+structured `tool_call`/`tool_result` JSON line, a `"max_tokens": ...`
+manifest dump, or a `"timeout": <n>` tool argument.
+
+**Cause:** `core/observability/rate_limit_tracker.py`'s log-scanning
+classifier (`_scan_log_for_patterns`) infers 429/throttle events from raw
+agent subprocess output. Bare substrings (`"413"`, `"429"`, `"401"`,
+`"403"`, `"504"`) and generic English words (`timeout`, `rate limit`,
+`unauthorized`, ...) previously matched anywhere in the log tail,
+including inside an agent's own JSON tool traffic where those tokens
+carry zero relation to a real provider error (byte counts, arg names,
+target-repo code being read). Fixed 2026-07-02 (#2183): structured
+`tool_call`/`tool_result`/`heartbeat` lines are now skipped entirely, and
+every remaining risky bare token/word only counts as a match when it
+appears on a line that also carries explicit error context
+(`error|status|http|code|exception|failed|failure|traceback`, matched
+with a word boundary via `_ERROR_CONTEXT_RE`).
+
+**Diagnosis:**
+```bash
+# Every classifier match is logged with the matched line - one read
+# tells you whether it was a real provider error or a data false-positive.
+grep "_scan_log_for_patterns: matched" .sdd/runtime/*.log
+```
+
+**Resolution:**
+- If the matched line is agent-produced data (tool JSON, code being
+  read) rather than a real HTTP/provider error, it's a classifier gap -
+  file an issue with the matched line so the pattern/context list can be
+  tightened further.
+- No operator action needed for the fixed patterns above; upgrade to a
+  release containing #2183 if you're still seeing this on unrelated data
+  lines.
+
 ---
 
 ## 5. Budget Exceeded
@@ -140,7 +200,7 @@ cat .sdd/runtime/cost_report.json
 - Use cheaper models for low-complexity tasks: the router maps `Complexity.LOW` tasks to `haiku` automatically (see `PLAN.model_by_complexity` in `src/bernstein/core/defaults.py`).
 - Enable `batch_eligible` for non-urgent tasks (approximately 50% cost reduction via batch APIs).
 - Review per-agent cost with `bernstein cost --by model` and kill runaway agents.
-- Use peak-hour routing (`core/cost/peak_hour_router.py`) to shift non-urgent work to off-peak windows.
+- Mark non-urgent tasks `batch_eligible` so they run through the batch router instead of the interactive path.
 
 ---
 
@@ -225,6 +285,21 @@ git diff main...agent/<session-id>
 - Prevent future conflicts by adding explicit `owned_files` to tasks in plan YAML files.
 - Increase the `depends_on` declarations between tasks that touch the same code.
 
+**Injected skill files (`.claude/skills/bernstein-*.md`) causing conflicts on
+*every* worker merge:** See [issue #2187](https://github.com/sipyourdrink-ltd/bernstein/issues/2187).
+Each worker's worktree gets its own rendered copy of the always-injected
+skills (`bernstein-completion-protocol.md`, `bernstein-signal-check.md`, plus
+role-specific skills), with session-specific content
+(`{{SESSION_ID}}`/`{{TASK_IDS}}`). If an agent's `git add -A` stages these
+files, every worker merge conflicts on them - not because of real work
+overlap, but because two agents' injected boilerplate collides. As of this
+fix, `inject_skills()` registers each injected path in the target repo's
+`.git/info/exclude` (resolved correctly for worktrees via
+`git rev-parse --git-path info/exclude`), so the skills stay readable by
+Claude Code but are never staged or committed. If you still see this on an
+older Bernstein version, manually run `git rm --cached .claude/skills/bernstein-*.md`
+and add the paths to `.git/info/exclude` to unblock merges.
+
 ---
 
 ## 10. Config File Errors (bernstein.yaml)
@@ -267,7 +342,7 @@ grep mcp_servers bernstein.yaml           # project-level overrides
 
 ## 12. Agent Timeout (Watchdog Kill)
 
-**Symptom:** Agent is killed mid-task. Log shows `"Timeout after Xds: pid=... — sending SIGTERM"`.
+**Symptom:** Agent is killed mid-task. Log shows `"Timeout after Xds: pid=... - sending SIGTERM"`.
 
 **Cause:** The agent exceeded its wall-clock timeout. Default is 1800s (30 min). Scope-based timeouts: small=15min, medium=30min, large=60min. XL roles (architect, security, manager) get 120min. Adaptive timeouts (`core/orchestration/adaptive_timeout.py`) can adjust these based on historical task durations. All timeout constants are in `src/bernstein/core/defaults.py` (`TASK.scope_timeout_s`, `TASK.xl_timeout_s`).
 
@@ -363,15 +438,15 @@ The `bernstein stop` command cleans these up, but hard kills (SIGKILL, power los
 
 ## 17. JSONL State File Corruption
 
-**Symptom:** Task server fails to start with a JSON parse error. `backlog.jsonl` or `tasks.jsonl` contains incomplete lines.
+**Symptom:** Task server fails to start with a JSON parse error. A JSONL state file (for example `.sdd/metrics/tasks.jsonl`) contains incomplete lines, or the shared JSON backlog `.sdd/runtime/task-backlog.json` fails to parse.
 
-**Cause:** The in-memory task store persists to JSONL via append writes. If the process is killed mid-write, the last line may be truncated.
+**Cause:** JSONL state files are persisted via append writes. If the process is killed mid-write, the last line may be truncated.
 
 **Diagnosis:**
 ```bash
 python3 -c "
 import json
-for i, line in enumerate(open('.sdd/backlog.jsonl'), 1):
+for i, line in enumerate(open('.sdd/metrics/tasks.jsonl'), 1):
     try: json.loads(line)
     except: print(f'Bad line {i}: {line[:80]!r}')
 "
@@ -456,6 +531,82 @@ print(yaml.dump(plan, default_flow_style=False))
 
 ---
 
+## 21. Janitor `path_exists` Fails on a Correctly-Placed File (Acceptance-Path Mismatch)
+
+**Symptom:** A task's actual code/test changes are correct and merge cleanly, but the janitor still fails it with `path_exists: <some/guessed/path>`, the task retries and fails again with the identical mismatch, and enough of these in a run trip the `>75% of tasks failing` sev1 orchestration pause. See issue [#2186](https://github.com/sipyourdrink-ltd/bernstein/issues/2186).
+
+**Cause:** The manager's decomposition writes `completion_signals` with exact literal file paths guessed at planning time (e.g. `path_exists: packages/db/test/seed-workers.test.ts`), before any code exists. Workers legitimately place new files at the repo's actual idiomatic location (e.g. `packages/db/src/__tests__/seed-workers-demo-link.test.ts`). The literal path never existed and never will; the check is a coin flip decided before implementation starts, and retries can't fix a decomposition-time guess.
+
+**Diagnosis:**
+```bash
+grep "janitor failed" .sdd/runtime/*.log
+# Look for `path_exists: <path>` entries where the referenced directory
+# convention (e.g. `test/` vs `src/__tests__/`) doesn't match what's
+# actually in the repo:
+find . -name "*<basename-without-extension>*"
+```
+
+**Resolution:**
+- **Default behavior is unchanged**: `path_exists` with a plain literal
+  path still means exactly that path - operators can rely on the check
+  meaning the path they wrote.
+- **Explicit glob syntax always works**: a criterion that itself contains
+  glob characters (e.g. `path_exists: packages/db/**/seed-workers*.test.ts`)
+  is evaluated as a glob pattern. This is opt-in per-check by
+  construction, and the recommended way for plans/decompositions to
+  express "a test file matching this shape exists" without guessing the
+  repo's directory convention.
+- **Opt-in fuzzy fallback**: set `BERNSTEIN_JANITOR_FUZZY_PATHS=1` to make
+  a literal miss fall back to a fuzzy pattern derived from the basename
+  (`**/<stem>*<suffix>`), tolerating a different directory
+  depth/convention. Default OFF. When a fuzzy match satisfies a check, the
+  janitor logs a WARNING (`janitor path_exists: FUZZY MATCH ...`) naming
+  the literal path that missed, the pattern tried, and the path that
+  matched - check `.sdd/runtime/*.log`. See
+  [CONFIG.md](CONFIG.md#3-environment-variables).
+- **Known limitation:** `test_passes` signals (e.g. `pnpm exec vitest run
+  test/seed-workers.test.ts`) still reference the manager's guessed literal
+  path and are not rewritten by this fix - a command-level mismatch there
+  will still fail. If you hit this, prefer directory-wide test commands
+  (`pnpm --filter db test`) in the plan/decomposition rather than a single
+  guessed file path.
+- If the manager's decompositions repeatedly guess paths for a repo with an
+  unusual layout, consider using `glob_exists` (already supported) instead
+  of `path_exists` in hand-authored plan YAML.
+
+---
+
+## 22. Task Fails Verification with "pointed inside an ephemeral agent worktree" or a Gitignore Cause
+
+**Symptom:** A task the agent reported as complete fails janitor verification
+with a `path_exists` detail like `signal path '...' pointed inside an
+ephemeral agent worktree; repo-relative path '...' does not exist in the
+operator checkout`, possibly followed by `matches gitignore rule [...]`. See
+issue [#2760](https://github.com/sipyourdrink-ltd/bernstein/issues/2760).
+
+**Cause:** Filesystem completion signals (`path_exists`, `glob_exists`,
+`file_contains`) are verified against the operator checkout, not the agent's
+worktree. Agent worktrees (`.sdd/worktrees/<session>/`,
+`.sdd/runtime/worktrees/<session>/`) are deleted after the run, so a file
+that exists only there was never delivered. Signals whose path points inside
+a worktree are translated to their repo-relative form and checked against
+the merged result. The most common delivery failure is a `.gitignore` rule
+matching the deliverable: the git-based merge-back stages only tracked-able
+files, so an ignored artifact silently never leaves the worktree. Previously
+this reported done/HEALTHY with zero deliverable in the checkout; now it
+fails verification with the cause named.
+
+**Resolution:**
+- If the detail names a gitignore rule, either write the deliverable to a
+  non-ignored path or amend the ignore rule, then rerun.
+- If no gitignore rule is named, the artifact was not merged back at all -
+  check `merge_preflight` lines in `.sdd/runtime/*.log` for a refused or
+  conflicted merge (see also issue #2756).
+- Verify delivery manually: the path in the detail message is repo-relative;
+  check it exists in your checkout after the run.
+
+---
+
 ## Quick Reference: Exit Codes
 
 | Exit code | Meaning | Likely cause |
@@ -475,7 +626,8 @@ print(yaml.dump(plan, default_flow_style=False))
 |------|---------|
 | `.sdd/runtime/<session>.log` | Per-agent stdout/stderr |
 | `.sdd/runtime/pids/<session>.json` | PID metadata for `bernstein ps` |
-| `.sdd/backlog.jsonl` | Persistent task backlog |
+| `.sdd/backlog/{open,claimed,closed}/` | YAML task specs (persistent backlog tree) |
+| `.sdd/runtime/task-backlog.json` | Shared JSON backlog for external workers (`bernstein backlog claim`) |
 | `.sdd/runtime/cost_report.json` | Run cost tracking |
 | `.sdd/runtime/access.jsonl` | HTTP request log (rotated at 10 MiB, 1 backup retained) |
 | `.sdd/runtime/server.log` | Task server logs |
@@ -522,8 +674,8 @@ bernstein doctor
 
 If you cannot resolve an issue with this guide:
 
-1. **Run `bernstein doctor`** — the built-in diagnostic prints the most common configuration problems.
-2. **Run `bernstein debug`** — generates a debug bundle with logs, config, metrics, and git state for sharing.
-3. **Check agent logs** — `.sdd/runtime/<session>.log` contains the full CLI output including provider error messages.
-4. **Search GitHub Issues** — many error messages are already tracked at `https://github.com/sipyourdrink-ltd/bernstein/issues`.
-5. **File a bug report** — include the output of `bernstein debug`, the relevant log snippet, and your `bernstein.yaml` (redact API keys).
+1. **Run `bernstein doctor`** - the built-in diagnostic prints the most common configuration problems.
+2. **Run `bernstein debug`** - generates a debug bundle with logs, config, metrics, and git state for sharing.
+3. **Check agent logs** - `.sdd/runtime/<session>.log` contains the full CLI output including provider error messages.
+4. **Search GitHub Issues** - many error messages are already tracked at `https://github.com/sipyourdrink-ltd/bernstein/issues`.
+5. **File a bug report** - include the output of `bernstein debug`, the relevant log snippet, and your `bernstein.yaml` (redact API keys).

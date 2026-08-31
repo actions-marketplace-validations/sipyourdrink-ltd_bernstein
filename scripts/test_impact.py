@@ -7,24 +7,29 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).parent.parent
 CACHE_PATH = ROOT / ".sdd" / "test_deps.json"
 SRC_ROOT = ROOT / "src"
 TEST_DIRS = [ROOT / "tests" / "unit", ROOT / "tests" / "integration"]
-CACHE_VERSION = "1"
 
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from bernstein.core.test_impact import _path_to_module as _core_path_to_module  # noqa: E402
 from bernstein.core.test_impact import (  # noqa: E402
+    _COMPAT_CACHE_VERSION,
     build_compat_dep_map,
     compat_cache_is_fresh,
     compat_get_affected_tests,
     extract_project_imports,
 )
+from bernstein.core.test_impact import _path_to_module as _core_path_to_module  # noqa: E402
+
+# Re-exported so the CLI and the map builder cannot disagree about the version
+# stamped into .sdd/test_deps.json; two constants would let a stale cache pass
+# the freshness check after the map's shape changed.
+CACHE_VERSION = _COMPAT_CACHE_VERSION
 
 
 def _path_to_module(path: Path) -> str:
@@ -51,9 +56,12 @@ def load_or_build_dep_map() -> dict[str, Any]:
     """Return the cached dependency map, rebuilding it if stale."""
     if CACHE_PATH.exists():
         try:
-            cached: dict[str, Any] = json.loads(CACHE_PATH.read_text())
-            if _cache_is_fresh(cached):
-                return cached
+            # A cache whose root is not an object reaches `.get` as an
+            # AttributeError, which this handler does not catch: a truncated or
+            # hand-edited file would abort the selector rather than rebuild.
+            cached: object = json.loads(CACHE_PATH.read_text())
+            if isinstance(cached, dict) and _cache_is_fresh(cast("dict[str, Any]", cached)):
+                return cast("dict[str, Any]", cached)
         except (json.JSONDecodeError, KeyError, OSError):
             pass
 
@@ -83,13 +91,24 @@ def get_changed_files(base: str = "HEAD") -> list[str]:
             ).stdout.splitlines()
             files = list(set(unstaged) | set(staged))
         else:
-            files = subprocess.run(
-                ["git", "diff", "--name-only", f"{base}...HEAD"],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.splitlines()
+            try:
+                files = subprocess.run(
+                    ["git", "diff", "--name-only", f"{base}...HEAD"],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.splitlines()
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 128:
+                    raise
+                files = subprocess.run(
+                    ["git", "diff", "--name-only", f"{base}..HEAD"],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.splitlines()
         return [f for f in files if f]
     except subprocess.CalledProcessError:
         return []

@@ -1,3 +1,8 @@
+---
+search:
+  boost: 2
+---
+
 # Interactive Quickstart Tutorial
 
 Get Bernstein running and orchestrating agents in under 10 minutes.
@@ -8,7 +13,7 @@ isolated git worktrees, and merges verified results back to your branch automati
 **What you'll need**:
 - [ ] Python 3.12 or later
 - [ ] Git (any recent version)
-- [ ] At least one CLI coding agent (Claude Code, Codex, or Gemini — see Step 2)
+- [ ] At least one CLI coding agent (Claude Code, Codex, or Gemini - see Step 2)
 - [ ] An API key for your chosen agent
 
 ---
@@ -16,7 +21,7 @@ isolated git worktrees, and merges verified results back to your branch automati
 ## Step 1: Install Bernstein
 
 ```bash
-# Recommended — uv installs into an isolated tool environment
+# Recommended - uv installs into an isolated tool environment
 uv tool install bernstein
 
 # Alternatives
@@ -33,7 +38,7 @@ bernstein --version
 You should see something like:
 
 ```
-bernstein 1.9.3
+bernstein 3.5.0
 ```
 
 > **If you see "command not found"**: Make sure your tool bin directory is on `$PATH`.
@@ -43,24 +48,25 @@ bernstein 1.9.3
 
 ## Step 2: Check for CLI agents
 
-Bernstein does not run models directly — it orchestrates CLI coding agents that you install
+Bernstein does not run models directly - it orchestrates CLI coding agents that you install
 separately. Check which ones are available on your system:
 
 ```bash
-bernstein agents
+bernstein doctor
 ```
 
 Example output:
 
 ```
-Available agents:
-  claude    ✓  Claude Code (claude)
-  codex     ✓  Codex CLI (codex)
-  gemini    ✗  Not found — install: npm i -g @google/gemini-cli
-  aider     ✗  Not found — install: pip install aider-chat
+ Check              Status  Detail               Fix
+ Adapter: claude    ✗       not in PATH          Install claude CLI - see docs
+ Adapter: codex     ✗       not in PATH          Install codex CLI - see docs
+ Adapter: gemini    ✗       not in PATH          Install gemini CLI - see docs
 ```
 
-You need at least one `✓`. If none are installed:
+You need at least one adapter row to turn ✓ (`doctor` also checks auth, ports,
+and your `.sdd` workspace - those stay red until later steps). If none are
+installed:
 
 ```bash
 # Claude Code (Anthropic)
@@ -78,7 +84,7 @@ npm install -g @google/gemini-cli
 ## Step 3: Set your API key
 
 Each CLI agent authenticates with its own provider. Bernstein passes the environment
-through to the agents — set the key for whichever agent you installed:
+through to the agents - set the key for whichever agent you installed:
 
 ```bash
 # Claude Code
@@ -109,12 +115,12 @@ Expected output:
 ```
 ✓ Initialized .sdd/ state directory
 ✓ Created bernstein.yaml (edit to configure agents and budget)
-✓ Ready — run `bernstein -g "your goal"` to start
+✓ Ready - run `bernstein -g "your goal"` to start
 ```
 
 This creates:
-- `.sdd/` — file-based state (backlog, logs, metrics, signals)
-- `bernstein.yaml` — project configuration
+- `.sdd/` - file-based state (backlog, logs, metrics, signals)
+- `bernstein.yaml` - project configuration
 
 > **No git repository?** Run `git init && git commit --allow-empty -m "init"` first.
 > Bernstein requires git for worktree isolation.
@@ -140,7 +146,7 @@ Bernstein will:
 Watch it work in real time:
 
 ```bash
-# In another terminal — live TUI dashboard
+# In another terminal - live TUI dashboard
 bernstein live
 
 # Or a quick status snapshot
@@ -151,7 +157,7 @@ Example `bernstein status` output:
 
 ```
 Tasks: 3 open · 1 in-progress · 0 done · 0 failed
-Agents: 1 running (agent/abc12345 — backend)
+Agents: 1 running (agent/abc12345 - backend)
 Spend:  $0.04 so far
 ```
 
@@ -168,7 +174,7 @@ bernstein recap
 Example output:
 
 ```
-Run summary — 3 tasks completed in 4m 12s
+Run summary - 3 tasks completed in 4m 12s
 
   ✓ backend-abc12345  Add hello() to utils.py          $0.03  2m 10s
   ✓ qa-def67890       Write tests for hello()           $0.01  1m 45s
@@ -182,7 +188,7 @@ Inspect a specific task's changes:
 ```bash
 bernstein diff <task-id>     # Git diff produced by the agent
 bernstein trace <task-id>    # Decision trace (which rules fired, what was approved)
-bernstein logs -a <task-id>  # Full agent output
+bernstein logs tail -a <task-id>  # Full agent output
 ```
 
 ---
@@ -222,7 +228,7 @@ bernstein run plans/hello.yaml
 ```
 
 The `tests` stage waits for `implementation` to finish. Bernstein manages the dependency
-automatically — you do not need to sequence the commands yourself.
+automatically - you do not need to sequence the commands yourself.
 
 ---
 
@@ -235,7 +241,7 @@ bernstein cost
 Example output:
 
 ```
-Cost breakdown — last run
+Cost breakdown - last run
 
   claude (backend)    2,341 tokens   $0.012
   claude (qa)         1,102 tokens   $0.006
@@ -247,10 +253,13 @@ Cost breakdown — last run
 Set a per-run budget limit in `bernstein.yaml`:
 
 ```yaml
-budget:
-  per_task_max_tokens: 100000
-  per_run_max_cost_usd: 5.00     # Hard stop if exceeded
+# Spending cap for the run. Accepts "$5", 5, or 5.0.
+budget: "$5"
 ```
+
+For a hard stop that refuses further agent spawns past the cap, configure a
+cost envelope with `hard_budget_usd` (see
+[CONFIG.md](../operations/CONFIG.md)).
 
 ---
 
@@ -277,7 +286,7 @@ The dashboard shows:
 bernstein stop
 ```
 
-This gracefully drains in-progress tasks (10-second timeout by default), then shuts down
+This gracefully drains in-progress tasks (30-second timeout by default), then shuts down
 the task server and all agents.
 
 ```bash
@@ -290,18 +299,18 @@ bernstein stop --force   # Hard kill without draining
 
 You have a working Bernstein setup. Here are common next steps:
 
-- **Add more agents**: Run `bernstein agents` to see what else is installable
+- **Add more adapters**: Run `bernstein integrations list` to see what else is installable
 - **Configure model routing**: Set `model_policy` in `bernstein.yaml` to use cheaper models for simple tasks
 - **Write a plan file**: For real project work, a plan file gives you more control than an inline goal
 - **Set up guardrails**: Add `.bernstein/rules.yaml` to control what agents are allowed to do
 
 Useful references:
 
-- [Configuration reference](../operations/CONFIG.md) — full `bernstein.yaml` options
-- [Security Hardening Guide](../security/security-hardening.md) — permission modes, sandboxing, audit logging
-- [Architecture guide](../architecture/ARCHITECTURE.md) — how the orchestrator, spawner, and janitor work
-- [Deployment guide](../operations/deployment-guide.md) — Docker, Kubernetes, CI/CD
-- [Cost optimization](../operations/cost-optimization.md) — reduce API spend
+- [Configuration reference](../operations/CONFIG.md) - full `bernstein.yaml` options
+- [Security Hardening Guide](../security/security-hardening.md) - permission modes, sandboxing, audit logging
+- [Architecture guide](../architecture/ARCHITECTURE.md) - how the orchestrator, spawner, and janitor work
+- [Deployment guide](../operations/deployment-guide.md) - Docker, Kubernetes, CI/CD
+- [Cost optimization](../operations/cost-optimization.md) - reduce API spend
 
 ---
 
@@ -310,7 +319,7 @@ Useful references:
 ### "No agents available"
 
 ```bash
-bernstein agents    # See which agents are installed and which are missing
+bernstein doctor    # See which agent CLIs are installed and authenticated
 ```
 
 Install at least one:
@@ -352,11 +361,11 @@ roles:
 Bernstein detects stalled agents automatically and retries the task. To check status manually:
 
 ```bash
-bernstein status --agents   # Show agent heartbeat times
-bernstein stop --agent <agent-id>   # Manually kill a specific agent
+bernstein status --mode expert   # Show agent detail, including heartbeats
+bernstein agents showcase        # List available agents grouped by role
 ```
 
-### "bernstein init fails — not a git repository"
+### "bernstein init fails - not a git repository"
 
 ```bash
 git init

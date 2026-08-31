@@ -1,4 +1,4 @@
-"""Unit tests for the Archon-style YAML workflow manifest schema.
+"""Unit tests for the declarative YAML workflow manifest schema.
 
 Covers parser round-trips, structural validation (cycles, missing
 references, duplicate ids), kind detection (command vs agent vs loop),
@@ -195,6 +195,41 @@ nodes:
         load_workflow_spec_from_text(text)
 
 
+def test_agent_node_accepts_routing_hints() -> None:
+    """Agent nodes may pin an adapter, model, and effort independently."""
+    text = """
+name: routed
+description: "Agent routing hints"
+version: "1.0.0"
+nodes:
+  - id: review
+    agent: reviewer
+    prompt: "Review the change"
+    cli: pi
+    model: provider/model-name
+    effort: high
+"""
+    node = load_workflow_spec_from_text(text).nodes[0]
+    assert node.cli == "pi"
+    assert node.model == "provider/model-name"
+    assert node.effort == "high"
+
+
+def test_command_node_rejects_routing_hints() -> None:
+    """Routing hints must not be silently ignored on command nodes."""
+    text = """
+name: invalid-routing
+description: "Command routing hints"
+version: "1.0.0"
+nodes:
+  - id: tests
+    command: "pytest"
+    model: provider/model-name
+"""
+    with pytest.raises(WorkflowSpecError, match="require an agent node"):
+        load_workflow_spec_from_text(text)
+
+
 def test_command_node_rejects_prompt() -> None:
     """Command-typed nodes carrying a prompt must be rejected."""
     text = """
@@ -208,6 +243,54 @@ nodes:
 """
     with pytest.raises(WorkflowSpecError, match="prompt"):
         load_workflow_spec_from_text(text)
+
+
+def test_rejects_interactive_node_at_load_time() -> None:
+    """``interactive: true`` is stubbed until #1110 ships, so it must fail at load.
+
+    Without this gate, manifests parse cleanly and only crash mid-run after
+    upstream nodes have already produced state. The validator collapses the
+    failure to the load step so authors learn at lint / load time instead of
+    after side-effects have landed.
+    """
+    text = """
+name: needs-approval
+description: "Has an approval gate"
+version: "1.0.0"
+nodes:
+  - id: research
+    agent: manager
+    prompt: "Research {goal}"
+  - id: approve
+    depends_on: [research]
+    agent: manager
+    prompt: "Approve the brief"
+    interactive: true
+"""
+    with pytest.raises(WorkflowSpecError, match="#1110") as exc_info:
+        load_workflow_spec_from_text(text)
+    assert "interactive" in str(exc_info.value)
+    assert "approve" in str(exc_info.value)
+
+
+def test_accepts_interactive_false_default() -> None:
+    """Existing valid workflows (no ``interactive: true``) parse identically."""
+    text = """
+name: no-gate
+description: "No interactive gate"
+version: "1.0.0"
+nodes:
+  - id: research
+    agent: manager
+    prompt: "Research {goal}"
+    interactive: false
+  - id: ship
+    depends_on: [research]
+    command: "echo done"
+"""
+    spec = load_workflow_spec_from_text(text)
+    assert spec.nodes[0].interactive is False
+    assert spec.nodes[1].interactive is False
 
 
 # ---------------------------------------------------------------------------

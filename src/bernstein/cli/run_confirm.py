@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -15,7 +16,6 @@ from bernstein.cli.helpers import (
     SDD_DIRS,
     auth_headers,
     console,
-    is_alive,
     print_banner,
     server_get,
 )
@@ -30,8 +30,8 @@ _STYLE_BOLD_MAGENTA = "bold magenta"
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_ANY = "dict[str, Any]"
-_CAST_LIST_OBJ = "list[object]"
+type _CAST_DICT_STR_ANY = dict[str, Any]
+type _CAST_LIST_OBJ = list[object]
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,41 @@ class RecipeStage:
     name: str
     depends_on: list[str]
     step_titles: list[str]
+
+
+_FINALIZATION_START_TIMEOUT = 10.0
+_FINALIZATION_TOTAL_TIMEOUT = 30.0
+_FINALIZATION_POLL_INTERVAL = 0.05
+
+
+def _wait_for_finalization(project_dir: Path) -> None:
+    """Bounded wait for the orchestrator to finish finalization.
+
+    Two phases, both bounded by _FINALIZATION_TOTAL_TIMEOUT:
+    1. Wait for .finalizing — proves finalization has started.
+    2. Wait for .finalized — proves finalization is complete.
+
+    On timeout, proceed to reap anyway. This degrades to the pre-fix
+    behaviour (which may SIGKILL a still-finalizing orchestrator) — no
+    worse than today, and strictly bounded.
+    """
+    signals_dir = Path(project_dir) / ".sdd" / "runtime"
+    finalizing = signals_dir / ".finalizing"
+    finalized = signals_dir / ".finalized"
+    deadline = time.monotonic() + _FINALIZATION_TOTAL_TIMEOUT
+
+    # Phase 1: wait for finalization to start
+    start_deadline = min(time.monotonic() + _FINALIZATION_START_TIMEOUT, deadline)
+    while time.monotonic() < start_deadline:
+        if finalizing.exists() or finalized.exists():
+            break
+        time.sleep(_FINALIZATION_POLL_INTERVAL)
+
+    # Phase 2: wait for finalization to complete
+    while time.monotonic() < deadline:
+        if finalized.exists():
+            return
+        time.sleep(_FINALIZATION_POLL_INTERVAL)
 
 
 def _parse_stage_entry(idx: int, raw_stage: object) -> RecipeStage | None:
@@ -312,7 +347,7 @@ def detect_available_adapter() -> str | None:
 
 
 def setup_demo_project(project_dir: Path, adapter: str) -> None:
-    """Copy demo template files and seed three backlog tasks.
+    """Copy demo template files, seed the backlog, and init a git repo.
 
     Args:
         project_dir: Destination directory (should be empty / temp dir).
@@ -404,24 +439,91 @@ def setup_demo_project(project_dir: Path, adapter: str) -> None:
     )
     (project_dir / ".sdd" / "runtime" / ".gitignore").write_text("*.pid\n*.log\ntasks.jsonl\n")
 
-    # Seed the three backlog tasks
+    # Seed the backlog tasks
     backlog_open = project_dir / ".sdd" / "backlog" / "open"
     for task in DEMO_TASKS:
         (backlog_open / task["filename"]).write_text(task["content"])
 
+    # Keep bernstein's runtime state (including per-agent worktrees under
+    # .sdd/worktrees/) out of git; the project files are what agents fix.
+    if not (project_dir / ".gitignore").exists():
+        (project_dir / ".gitignore").write_text(".sdd/\n__pycache__/\n*.pyc\n")
+
+    # Agent spawns run in per-task git worktrees (isolation is always on), which
+    # require a git repository with a HEAD commit. The demo project is a
+    # throwaway temp dir, so initialise it here (issue #2799).
+    _git_init_demo_repo(project_dir)
+
+
+def _git_init_demo_repo(project_dir: Path) -> None:
+    """Initialize the demo project as a git repo with an initial commit.
+
+    Uses a repo-local identity so the demo never depends on - or mutates - the
+    operator's global git config. Best-effort: if git is unavailable the demo
+    degrades to the same spawn failure it had before rather than crashing setup.
+
+    Args:
+        project_dir: Demo project root to initialise.
+    """
+    import subprocess
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(project_dir), check=True, capture_output=True)
+
+    with suppress(OSError, subprocess.CalledProcessError):
+        _git("init", "-b", "main")
+        _git("config", "user.email", "demo@bernstein.local")
+        _git("config", "user.name", "Bernstein Demo")
+        _git("config", "commit.gpgsign", "false")
+        _git("add", "-A")
+        _git("commit", "-m", "Bernstein demo: Flask app with intentional bugs")
+
+
+def _process_group_of(pid: int) -> int:
+    """Return ``pid``'s process-group id, falling back to the pid itself.
+
+    On POSIX the demo's server, spawner and watchdog are session leaders
+    (``start_new_session=True``), so their pgid equals their pid; ``os.getpgid``
+    still resolves the real group for any child pid. On platforms without
+    ``getpgid`` (Windows) the pid doubles as the group handle that
+    :func:`reap_process_group` consumes.
+
+    Args:
+        pid: Process id to resolve a group for.
+
+    Returns:
+        The process-group id, or ``pid`` when it cannot be resolved.
+    """
+    getpgid = getattr(os, "getpgid", None)
+    if getpgid is None:
+        return pid
+    try:
+        return int(getpgid(pid))
+    except OSError:
+        return pid
+
 
 def _stop_demo_processes(project_dir: Path) -> None:
-    """Terminate server, spawner and watchdog started in project_dir.
+    """Reap the demo server, spawner, watchdog and their child processes.
+
+    Each tracked process is launched in its own session
+    (``start_new_session=True``), so the tracked pid leads a process group. A
+    lone SIGTERM to the leader leaves the orchestrator's mock-agent children
+    alive (issue #2799). This reaps the whole group with the standard
+    SIGTERM -> poll -> SIGKILL escalation and confirms the leader is gone
+    before removing its pid file.
 
     Args:
         project_dir: Demo project root whose .sdd/runtime/ holds PID files.
     """
+    from bernstein.core.config.platform_compat import process_alive, reap_process_group
+
+    # Wait for the orchestrator to finish writing its run record before we
+    # tear down its process group. Bounded; on timeout we proceed anyway.
+    _wait_for_finalization(project_dir)
+
     runtime_dir = project_dir / ".sdd" / "runtime"
-    for pid_filename, _label in (
-        ("watchdog.pid", "Watchdog"),
-        ("spawner.pid", "Spawner"),
-        ("server.pid", "Task server"),
-    ):
+    for pid_filename in ("watchdog.pid", "spawner.pid", "server.pid"):
         pid_file = runtime_dir / pid_filename
         if not pid_file.exists():
             continue
@@ -429,35 +531,100 @@ def _stop_demo_processes(project_dir: Path) -> None:
             pid = int(pid_file.read_text().strip())
         except (ValueError, OSError):
             continue
-        if is_alive(pid):
-            from bernstein.core.platform_compat import kill_process
-
-            kill_process(pid, sig=15)
+        if pid > 0 and process_alive(pid):
+            reap_process_group(_process_group_of(pid), grace_seconds=3.0)
         pid_file.unlink(missing_ok=True)
 
 
-def _print_demo_summary(project_dir: Path, server_url: str, elapsed_secs: float = 0.0) -> None:
-    """Print final demo summary: bugs fixed, files changed, cost, next steps.
+@dataclass(frozen=True)
+class _DemoOutcome:
+    """Task outcome of a demo run, counted against the seeded task set.
+
+    ``total`` is the seeded task count (a single source of truth), not the live
+    server list length, so retries that spawn fresh task ids cannot inflate the
+    denominator (issue #2799). ``done`` is clamped to ``total`` and ``failed`` is
+    the number of seeded bugs left unfixed.
+
+    ``server_reachable`` records whether the snapshot actually reached the task
+    server. A snapshot taken from a dead server is all zeros, which is
+    indistinguishable from a run in which every task failed - and the two call
+    for different reactions, so the summary has to be able to tell them apart
+    (issue #3902).
+    """
+
+    done: int
+    failed: int
+    total: int
+    cost_usd: float
+    server_reachable: bool = True
+
+    @property
+    def all_fixed(self) -> bool:
+        """Return True only when every seeded task reached ``done``."""
+        return self.total > 0 and self.done >= self.total
+
+
+def _fetch_demo_outcome(server_url: str, *, expected_total: int) -> _DemoOutcome:
+    """Snapshot the demo task outcome from the live server ``/status``.
+
+    Must be called while the task server is still alive - the demo tears it down
+    during cleanup, so a later query would read nothing.
 
     Args:
-        project_dir: Demo project root.
         server_url: Base URL of the demo task server.
-        elapsed_secs: Wall-clock seconds the orchestration took.
-    """
-    from rich.table import Table
+        expected_total: Number of tasks the demo seeded (the reporting
+            denominator).
 
+    Returns:
+        A :class:`_DemoOutcome` whose ``total`` is ``expected_total``, ``done``
+        is the number of done tasks clamped to that total, and ``failed`` is the
+        remaining unfixed count.
+    """
     tasks_data: list[dict[str, Any]] = []
-    total_cost: float = 0.0
+    total_cost = 0.0
+    reachable = False
     with suppress(Exception):
         resp = httpx.get(f"{server_url}/status", timeout=3.0, headers=auth_headers())
         if resp.status_code == 200:
             payload = resp.json()
-            tasks_data = payload.get("tasks", [])
-            total_cost = payload.get("total_cost_usd", 0.0)
+            tasks_data = _status_task_rows(payload)
+            total_cost = float(payload.get("total_cost_usd", 0.0) or 0.0)
+            reachable = True
 
-    done = sum(1 for t in tasks_data if t.get("status") == "done")
-    failed = sum(1 for t in tasks_data if t.get("status") == "failed")
-    total = len(tasks_data)
+    # Count done LINEAGES against the seeded set. A failed task spawns a retry
+    # task with a fresh id, so the live list balloons past the seeded count
+    # (banner said 4, summary said 12) and a retried lineage can carry several
+    # done rows - counting rows would let duplicates satisfy the seeded total
+    # while another bug has no successful attempt at all. Clamp to the seeded
+    # total and derive "not fixed" from it so banner, progress and summary
+    # never disagree.
+    done_lineages, _, _ = _lineage_progress(tasks_data)
+    done = min(len(done_lineages), expected_total)
+    failed = max(expected_total - done, 0)
+    return _DemoOutcome(
+        done=done,
+        failed=failed,
+        total=expected_total,
+        cost_usd=total_cost,
+        server_reachable=reachable,
+    )
+
+
+def _print_demo_summary(project_dir: Path, outcome: _DemoOutcome | None, elapsed_secs: float = 0.0) -> None:
+    """Print final demo summary: bugs fixed, files changed, cost, next steps.
+
+    Args:
+        project_dir: Demo project root.
+        outcome: Task outcome snapshot taken before cleanup, or None when no
+            snapshot was captured (e.g. an interrupted or crashed run).
+        elapsed_secs: Wall-clock seconds the orchestration took.
+    """
+    from rich.table import Table
+
+    done = outcome.done if outcome is not None else 0
+    failed = outcome.failed if outcome is not None else len(DEMO_TASKS)
+    total = outcome.total if outcome is not None else len(DEMO_TASKS)
+    total_cost = outcome.cost_usd if outcome is not None else 0.0
 
     elapsed_str = f"{elapsed_secs:.0f}s" if elapsed_secs > 0 else "\u2014"
 
@@ -470,6 +637,8 @@ def _print_demo_summary(project_dir: Path, server_url: str, elapsed_secs: float 
     table.add_row("Bugs fixed", f"[green]{done}[/green] / {total}")
     if failed:
         table.add_row("Tasks failed", f"[red]{failed}[/red]")
+    if outcome is not None and not outcome.server_reachable:
+        table.add_row("Task server", "[red]unreachable - counts unread[/red]")
     table.add_row("Elapsed", elapsed_str)
 
     # Count Python files in the project dir (excluding .sdd/)
@@ -481,7 +650,7 @@ def _print_demo_summary(project_dir: Path, server_url: str, elapsed_secs: float 
     # Governance story
     console.print(
         "\n[dim]Every agent decision was logged. "
-        "Run [bold]bernstein audit verify --merkle[/bold] to inspect the audit trail.[/dim]"
+        "Run [bold]bernstein audit verify --merkle-only[/bold] to inspect the audit trail.[/dim]"
     )
 
     # Primary CTA
@@ -561,8 +730,84 @@ def cook(
         console.print("[yellow]Recipe monitor timed out before a final status snapshot was available.[/yellow]")
 
 
-def _poll_demo_completion(server_url: str, deadline: float) -> None:
-    """Poll demo server for task completion with live progress output."""
+def _status_task_rows(payload: Any) -> list[dict[str, Any]]:
+    """Unwrap the ``/status`` payload's task rows.
+
+    ``/status`` returns ``tasks`` as ``{"count": N, "items": [...]}``;
+    tolerate a bare list too. Iterating the dict form yields its string
+    keys and crashes on ``t.get`` - the historical AttributeError
+    (#2075), fixed in ``_fetch_demo_outcome`` but re-grown in the
+    completion poll, where the enclosing ``suppress()`` ate the crash on
+    every tick and the demo always ran to its full timeout (issue
+    #3433). One shared unwrap, so the next ``/status`` shape change
+    breaks one place, loudly, under test.
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw_tasks = payload.get("tasks", [])
+    if isinstance(raw_tasks, dict):
+        raw_tasks = raw_tasks.get("items", [])
+    if not isinstance(raw_tasks, list):
+        return []
+    return [t for t in raw_tasks if isinstance(t, dict)]
+
+
+def _lineage_id(row: dict[str, Any]) -> str:
+    """Return the retry-lineage root for a ``/status`` task row.
+
+    The server exposes ``lineage_id`` (``metadata.original_task_id`` of a
+    retry, or the task's own id); modern rows always carry it. The
+    fallbacks exist only for older payload shapes, and their order is
+    deliberate: ``title`` BEFORE ``id``. In that regime a retry keeps its
+    title but gets a fresh id, so id-first would re-open the premature
+    green exit this ordering guards against (duplicate done rows
+    satisfying the seeded total while a bug has no successful attempt).
+    Title-first fails safe instead - distinct same-title rows collapse,
+    the count can only be too LOW, and the poll waits out its deadline
+    rather than tearing the run down early.
+    """
+    return str(row.get("lineage_id") or row.get("title") or row.get("id") or "")
+
+
+def _lineage_progress(rows: list[dict[str, Any]]) -> tuple[set[str], set[str], set[str]]:
+    """Return ``(done, failed, all)`` lineage-id sets for ``/status`` rows.
+
+    Counting rows double-counts retried work: a failed task's retry is a
+    NEW row with a fresh id, and duplicate ``done`` rows for one lineage
+    were observed live (a "6/8 bugs fixed" frame on a 4-bug demo). A
+    lineage is done when ANY of its rows is done; it is failed only while
+    none is.
+    """
+    done: set[str] = set()
+    failed: set[str] = set()
+    all_ids: set[str] = set()
+    for index, row in enumerate(rows):
+        # A row with no identity at all counts as its own lineage, so
+        # counting degrades to the raw per-row behaviour instead of
+        # silently dropping work from the tally.
+        lid = _lineage_id(row) or f"row-{index}"
+        all_ids.add(lid)
+        status = row.get("status")
+        if status == "done":
+            done.add(lid)
+        elif status == "failed":
+            failed.add(lid)
+    return done, failed - done, all_ids
+
+
+def _poll_demo_completion(server_url: str, deadline: float, *, expected_total: int = 0) -> None:
+    """Poll demo server for task completion with live progress output.
+
+    ``expected_total`` is the seeded task count - the same denominator
+    ``_fetch_demo_outcome`` clamps against. The live list balloons past it
+    as failed tasks spawn retry tasks with fresh ids, and a failed original
+    stays ``failed`` forever even after its retry succeeds, so neither
+    "all rows done" nor "all rows terminal" can ever hold on a retried
+    run. Distinct DONE LINEAGES reaching the seeded count is the one exit
+    condition that matches what the summary will report - done *rows*
+    would double-count a retried lineage and tear the demo down with a
+    seeded bug still unfixed.
+    """
     from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
     seen_done: set[str] = set()
@@ -579,23 +824,38 @@ def _poll_demo_completion(server_url: str, deadline: float) -> None:
         poll_task = progress.add_task("Agents working\u2026", total=None)
 
         while time.monotonic() < deadline:
-            with suppress(Exception):
+            # Suppress only the fetch (server not up yet, transient HTTP
+            # errors, non-JSON body). Row processing runs OUTSIDE the
+            # suppress: a payload-shape crash here must be loud - eating
+            # it silently is exactly how the early-exit condition below
+            # became unreachable for every demo run (issue #3433).
+            payload: Any = None
+            with suppress(httpx.HTTPError, ValueError):
                 resp = httpx.get(f"{server_url}/status", timeout=3.0, headers=auth_headers())
                 if resp.status_code == 200:
                     payload = resp.json()
-                    tasks_list: list[dict[str, Any]] = payload.get("tasks", [])
-                    done_count, failed_count = _emit_task_events(tasks_list, seen_done, seen_failed, progress)
-                    total_tasks = len(tasks_list)
-                    progress.update(
-                        poll_task,
-                        description=(
-                            f"Agents working\u2026 "
-                            f"[green]{done_count}[/green]/{total_tasks} bugs fixed"
-                            + (f"  [red]{failed_count} failed[/red]" if failed_count else "")
-                        ),
-                    )
-                    if total_tasks > 0 and done_count + failed_count >= total_tasks:
-                        break
+            if payload is not None:
+                tasks_list = _status_task_rows(payload)
+                _emit_task_events(tasks_list, seen_done, seen_failed, progress)
+                done_lineages, failed_lineages, all_lineages = _lineage_progress(tasks_list)
+                target = expected_total if expected_total > 0 else len(all_lineages)
+                progress.update(
+                    poll_task,
+                    description=(
+                        f"Agents working\u2026 "
+                        f"[green]{len(done_lineages)}[/green]/{target} bugs fixed"
+                        + (f"  [red]{len(failed_lineages)} failed[/red]" if failed_lineages else "")
+                    ),
+                )
+                # Leave early only when the seeded count of LINEAGES is
+                # done. A failed row is not terminal (the lifecycle
+                # schedules a retry with a fresh id after retry_delay_s),
+                # so exiting on done+failed tears the demo down while a
+                # retry that would have fixed the bug is still pending.
+                # Runs that never reach the seeded count wait out the
+                # deadline, exactly as before.
+                if target > 0 and len(done_lineages) >= target:
+                    break
             time.sleep(2)
 
 
@@ -626,6 +886,89 @@ def _emit_task_events(
     return done_count, failed_count
 
 
+def _demo_exit_code(outcome: _DemoOutcome | None, *, bootstrap_error: Exception | None) -> int:
+    """Map the demo outcome to a process exit code.
+
+    Args:
+        outcome: Task outcome snapshot, or None when none was captured.
+        bootstrap_error: The bootstrap exception if one was swallowed, else None.
+
+    Returns:
+        0 only when the bootstrap succeeded and every seeded task reached done;
+        1 on any failed task, a missing snapshot, or a crashed bootstrap.
+    """
+    if bootstrap_error is not None:
+        return 1
+    if outcome is None:
+        return 1
+    return 0 if outcome.all_fixed else 1
+
+
+def _run_flask_todo_scenario(
+    *,
+    real: bool,
+    adapter: str | None,
+    timeout: int,
+    keep: bool,
+    dry_run: bool,
+) -> None:
+    """Forward ``bernstein demo --flask-todo`` to the Flask TODO scenario.
+
+    The scenario body used to be reachable as its own top-level command with
+    its own defaults, so forwarding it verbatim silently changes three
+    contracts that belong to ``demo``:
+
+    * ``demo`` spends money only behind ``--real``. The scenario body resolves
+      ``adapter or detect_available_adapter() or "mock"``, so handing it an
+      unresolved ``None`` makes it pick up an installed CLI and spawn paid
+      agents on a bare ``demo --flask-todo``. The adapter is resolved here,
+      under ``demo``'s rule, and passed through already decided.
+    * ``--dry-run`` promises no agents are spawned. The scenario has no
+      preview mode, so the combination is refused rather than executed.
+    * ``demo --timeout`` defaults to 120s while the scenario budgets 300s.
+      An operator who did not name a timeout gets the scenario's own default;
+      one who did gets exactly what they asked for.
+
+    Args:
+        real: True when the operator opted into real agents.
+        adapter: Explicit adapter name, or None to auto-detect under --real.
+        timeout: Timeout as parsed on ``demo``.
+        keep: Preserve the scenario's temp project directory.
+        dry_run: True when the operator asked for a preview.
+
+    Raises:
+        click.UsageError: When ``--dry-run`` is combined with ``--flask-todo``.
+        SystemExit: When ``--real`` is set and no adapter can be resolved.
+    """
+    if dry_run:
+        raise click.UsageError(
+            "--dry-run is not supported with --flask-todo: the Flask TODO scenario has no preview mode. "
+            "Run `bernstein demo --dry-run` for the plan preview, or drop --dry-run to run the scenario."
+        )
+
+    from click.core import ParameterSource
+
+    from bernstein.cli.commands.quickstart_cmd import quickstart_cmd
+
+    if real:
+        resolved = adapter or detect_available_adapter()
+        if resolved is None:
+            from bernstein.cli.errors import no_cli_agent_found
+
+            no_cli_agent_found().print()
+            raise SystemExit(1)
+    else:
+        resolved = "mock"
+
+    ctx = click.get_current_context()
+    forwarded: dict[str, object] = {"keep": keep, "adapter": resolved}
+    # Omitting the key lets ``Context.invoke`` fill the scenario's own default,
+    # so the two defaults can never drift apart here.
+    if ctx.get_parameter_source("timeout") is not ParameterSource.DEFAULT:
+        forwarded["timeout"] = timeout
+    ctx.invoke(quickstart_cmd, **forwarded)
+
+
 @click.command("demo")
 @click.option(
     "--dry-run",
@@ -647,24 +990,49 @@ def _emit_task_events(
 )
 @click.option(
     "--timeout",
-    default=60,
+    default=120,
     show_default=True,
     help="Maximum seconds to wait for tasks to complete.",
 )
-def demo(dry_run: bool, real: bool, adapter: str | None, timeout: int) -> None:
-    """Zero-config demo: fix 4 bugs in a Flask app in under 60 seconds.
+@click.option(
+    "--flask-todo",
+    "flask_todo",
+    is_flag=True,
+    default=False,
+    help="Run the Flask TODO API scenario instead (3 tasks on a Flask TODO API).",
+)
+@click.option(
+    "--keep",
+    is_flag=True,
+    default=False,
+    help="Preserve the temp project directory after the run (--flask-todo only; the standard demo always keeps it).",
+)
+def demo(
+    dry_run: bool,
+    real: bool,
+    adapter: str | None,
+    timeout: int,
+    flask_todo: bool = False,
+    keep: bool = False,
+) -> None:
+    """Zero-config demo: fix 4 bugs in a Flask app with mock agents.
 
     \b
     Creates a temp Flask app with 4 intentional bugs, seeds fix tasks,
-    then runs agents to resolve them — all while showing live progress.
-    No API key required in mock mode.
+    then runs agents to resolve them - all while showing live progress.
+    Each agent runs in its own git worktree, so the demo needs about a
+    minute or two to complete. No API key required in mock mode.
 
     \b
-      bernstein demo              # mock agents (no API key, ~30 seconds)
+      bernstein demo              # mock agents (no API key)
       bernstein demo --real       # real agents (requires API key, ~$0.15)
       bernstein demo --dry-run    # preview the plan without spawning
-      bernstein demo --real --timeout 120
+      bernstein demo --flask-todo # run the Flask TODO API scenario
     """
+    if flask_todo:
+        _run_flask_todo_scenario(real=real, adapter=adapter, timeout=timeout, keep=keep, dry_run=dry_run)
+        return
+
     import tempfile
 
     print_banner()
@@ -682,10 +1050,12 @@ def demo(dry_run: bool, real: bool, adapter: str | None, timeout: int) -> None:
         detected = "mock"
         cost_estimate = "[green]free[/green] (simulated agents, no API calls)"
 
-    # Always print cost estimate before doing anything
+    # Always print cost estimate before doing anything. The task count is driven
+    # off len(DEMO_TASKS) - the same source the summary reports against - so the
+    # banner and summary can never disagree (issue #2799).
     console.print(
         f"\n[bold yellow]Cost estimate:[/bold yellow] "
-        f"{cost_estimate} (4 bug-fix tasks)\n"
+        f"{cost_estimate} ({len(DEMO_TASKS)} bug-fix tasks)\n"
         f"[dim]Adapter: {detected}  |  Mode: {'real' if real else 'demo'}  |  Timeout: {timeout}s[/dim]"
     )
 
@@ -718,38 +1088,71 @@ def demo(dry_run: bool, real: bool, adapter: str | None, timeout: int) -> None:
     console.print(f"\n[dim]Creating demo project in {project_dir}\u2026[/dim]")
 
     setup_demo_project(project_dir, detected)
-    console.print("[green]\u2713[/green] Flask app with 4 intentional bugs created")
+    console.print(f"[green]\u2713[/green] Flask app with {len(DEMO_TASKS)} intentional bugs created")
     console.print(
-        "[green]\u2713[/green] 4 bug-fix tasks seeded: "
+        f"[green]\u2713[/green] {len(DEMO_TASKS)} bug-fix tasks seeded: "
         "off-by-one \u00b7 missing import \u00b7 wrong status code \u00b7 broken test"
     )
 
     server_url = f"http://127.0.0.1:{_DEMO_PORT}"
     orchestration_start = time.monotonic()
 
+    # The demo project is a throwaway temp repo whose default branch IS the
+    # intended integration target: without the documented escape hatch every
+    # agent merge is refused with ``target-is-default-branch`` and the summary
+    # can only ever report 0 fixed bugs (issue #3431). Scoped to this run and
+    # restored on exit so an in-process caller does not inherit demo policy.
+    from bernstein.core.agents.spawner_merge import ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH
+
+    prior_allow_merge = os.environ.get(ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH)
+    os.environ[ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH] = "1"
+
+    outcome: _DemoOutcome | None = None
+    bootstrap_error: Exception | None = None
     try:
-        # Bootstrap: start server + spawner in the demo project dir
+        # Bootstrap: start server + spawner in the demo project dir. The demo's
+        # work is the seeded backlog, so no goal is passed: a seeded goal would
+        # be shadowed by the non-empty backlog and leak the internal precedence
+        # WARNING into this first-run experience (issue #2799).
         console.print("\n[bold]Starting orchestration\u2026[/bold]")
         from bernstein.core.bootstrap import bootstrap_from_goal  # pyright: ignore[reportUnknownVariableType]
 
         bootstrap_from_goal(
-            goal="Fix the four bugs in the demo Flask app.",
+            goal="",
             workdir=project_dir,
             port=_DEMO_PORT,
             cli=detected,
         )
 
-        _poll_demo_completion(server_url, orchestration_start + timeout)
-        console.print("[green]\u2713[/green] Orchestration finished")
-
+        _poll_demo_completion(server_url, orchestration_start + timeout, expected_total=len(DEMO_TASKS))
+        # Snapshot the outcome while the server is still alive: cleanup below
+        # tears it down, so a query after that would read an empty list.
+        outcome = _fetch_demo_outcome(server_url, expected_total=len(DEMO_TASKS))
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
     except RuntimeError as exc:
         from bernstein.cli.errors import bootstrap_failed
 
         bootstrap_failed(exc).print()
+        bootstrap_error = exc
     finally:
+        if prior_allow_merge is None:
+            os.environ.pop(ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH, None)
+        else:
+            os.environ[ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH] = prior_allow_merge
         _stop_demo_processes(project_dir)
 
+    if outcome is not None and outcome.all_fixed:
+        console.print("[green]\u2713[/green] Orchestration finished")
+    else:
+        console.print("[yellow]![/yellow] Orchestration finished with unresolved tasks")
+
     elapsed = time.monotonic() - orchestration_start
-    _print_demo_summary(project_dir, server_url, elapsed_secs=elapsed)
+    _print_demo_summary(project_dir, outcome, elapsed_secs=elapsed)
+
+    # Exit code reflects the result: 0 only when every seeded task succeeded,
+    # nonzero on any failure or a crashed bootstrap, so a wrapper or CI smoke
+    # check cannot read a broken run as green (issue #2799).
+    exit_code = _demo_exit_code(outcome, bootstrap_error=bootstrap_error)
+    if exit_code != 0:
+        raise SystemExit(exit_code)

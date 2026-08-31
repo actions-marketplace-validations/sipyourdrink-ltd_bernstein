@@ -17,19 +17,22 @@ name: Adapter contract drift
 # there is no batched auto-PR.
 #
 # Triggers:
-#   * Three times daily on schedule so upstream releases surface fast.
-#   * On PRs touching adapters or contracts so contract edits get
-#     validated immediately.
+#   * Once daily on schedule so upstream releases surface within 24h.
 #   * Manual dispatch for operator-driven re-runs.
+#   * NOT on merge_group. Only `CI gate` is required there, so this lane
+#     never gated a queue merge; it competed with ci.yml for runners on
+#     every queue entry and reshuffle. Upstream drift is a function of
+#     upstream releases, not of what a queue entry changes - the daily
+#     schedule is the right cadence for it.
 
 on:
   schedule:
-    - cron: "0 6,14,22 * * *"
-  pull_request:
-    paths:
-      - "src/bernstein/adapters/**"
-      - "tests/contract/**"
-      - ".github/workflows/adapter-contract-drift.yml"
+    # Daily. The matrix is 16 jobs per fire, so the previous 6/14/22
+    # cadence cost 48 jobs a day against the same 20-slot pool that PR
+    # verdicts queue behind. Upstream adapter CLIs do not release often
+    # enough to justify three sweeps a day; workflow_dispatch covers an
+    # immediate re-check after a known upstream release.
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -67,21 +70,21 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           # aider-chat does not yet support Python 3.14; pin the aider
           # matrix row to 3.13 until upstream lands 3.14 compatibility.
-          python-version: ${{ matrix.adapter == 'aider' && '3.13' || '3.14' }}
+          python-version: ${{ matrix.adapter == 'aider' && '3.12' || '3.14' }}
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
 
@@ -175,9 +178,9 @@ jobs:
           echo "--- stderr ---"
           cat "drift-out/$ADAPTER.err" || true
           # Exit codes:
-          #   0 — contract holds.
-          #   2 — capability/model drift (hard fail by design).
-          #   3 — upstream CLI runtime failure (--help broken in the
+          #   0 - contract holds.
+          #   2 - capability/model drift (hard fail by design).
+          #   3 - upstream CLI runtime failure (--help broken in the
           #       sandbox env). Not drift; surface as a warning so an
           #       operator investigates the CLI install without
           #       blocking unrelated PRs on a transient upstream issue.
@@ -219,11 +222,11 @@ jobs:
       issues: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 

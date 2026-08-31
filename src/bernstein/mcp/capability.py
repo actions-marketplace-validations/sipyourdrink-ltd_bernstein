@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+from importlib.metadata import PackageNotFoundError, metadata, version
 from typing import TYPE_CHECKING, Any
 
 from bernstein.core.protocols.mcp.tool_tiers import (
@@ -40,11 +41,29 @@ if TYPE_CHECKING:
 #: card and the HTTP ``initialize`` response cannot drift apart.
 SPEC_REVISION: str = "2025-03-26"
 
-#: Stable server version reported in the card and server info.
-SERVER_VERSION: str = "1.0.0"
-
 #: URI under which the capability card is exposed as an MCP resource.
 CAPABILITY_RESOURCE_URI: str = "bernstein://capability"
+
+
+def package_version() -> str:
+    """Return the installed Bernstein distribution version."""
+    try:
+        return version("bernstein")
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
+def package_repo_url() -> str:
+    """Return the repository URL declared in installed package metadata."""
+    try:
+        meta = metadata("bernstein")
+        for project_url in meta.get_all("Project-URL") or []:
+            name, _, url = project_url.partition(",")
+            if name.strip().lower() in ("repository", "source"):
+                return url.strip()
+    except PackageNotFoundError:
+        pass
+    return ""
 
 
 def _auth_modes() -> dict[str, Any]:
@@ -100,21 +119,29 @@ def _transports() -> list[dict[str, Any]]:
     ]
 
 
-def build_capability_card() -> dict[str, Any]:
+def build_capability_card(spec_revision: str | None = None) -> dict[str, Any]:
     """Build the runtime capability card from live process state.
 
     The card is intentionally self-describing and stable in shape so a client
     can consume it without a Bernstein-specific schema.
 
+    Args:
+        spec_revision: The revision actually negotiated for the transport
+            serving the card. The remote transport passes the per-request
+            negotiated value so the card describes the live connection
+            rather than a constant (#3084); ``None`` falls back to the
+            targeted :data:`SPEC_REVISION`.
+
     Returns:
         A JSON-serialisable dict describing transports, auth, tool tiers, the
-        cost-meter state, and the targeted spec revision.
+        cost-meter state, and the negotiated spec revision.
     """
     active_tier = resolve_active_tier()
     return {
         "name": "bernstein",
-        "version": SERVER_VERSION,
-        "specRevision": SPEC_REVISION,
+        "version": package_version(),
+        "repo_url": package_repo_url(),
+        "specRevision": spec_revision or SPEC_REVISION,
         "transports": _transports(),
         "auth": _auth_modes(),
         "tools": {

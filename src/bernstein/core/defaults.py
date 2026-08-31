@@ -15,7 +15,7 @@ To override at runtime (e.g., from parsed bernstein.yaml)::
 
 Safety model
 ------------------------
-All ``*Defaults`` dataclasses are ``frozen=True`` — direct attribute mutation
+All ``*Defaults`` dataclasses are ``frozen=True`` - direct attribute mutation
 (``COST.foo = 1``) raises :class:`dataclasses.FrozenInstanceError`.  Dict
 default-factory fields are wrapped in :class:`types.MappingProxyType`, so
 inner-item mutation (``COST.effort_base_turns['max'] = 0``) raises
@@ -35,7 +35,62 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Final, Literal
+
+PY_IDENTIFIER_RE_FRAGMENT = r"[A-Z_][A-Z0-9_]*"
+"""Regex fragment for Python identifiers when compiled with ``re.IGNORECASE``."""
+
+SKILLS_AUTO_ROUTE_ENV: Final[str] = "BERNSTEIN_SKILLS_AUTO_ROUTE"
+"""Environment variable enabling deterministic skill auto-routing."""
+
+SKILLS_AUTO_ROUTE_DEFAULT_LIMIT: Final[int] = 2
+"""Default number of auto-routed skill templates to inject."""
+
+COPILOT_DEFAULT_MODEL: Final[str] = "auto"
+"""Copilot model used when no operator-pinned model reaches the adapter; ``auto``
+lets Copilot's own router pick the best available model."""
+
+SDD_SERVER_PORT: Final[str] = ".sdd/runtime/server.port"
+"""Workspace-relative file containing the active task-server port."""
+
+SDD_AUTH_TOKEN: Final[str] = ".sdd/runtime/auth.token"
+"""Workspace-relative ``0600`` file holding the active run's Bearer token.
+
+Written on startup when the launcher auto-generates a token so out-of-process
+CLI monitors (``status``/``recap``/``checkpoint``) and the TUI poller can
+authenticate to the local server without inheriting the launcher env. The
+token *value* must never be logged (see #2762 / #2763)."""
+
+JOURNAL_EVENT_ARTIFACT_POSTED: Final[str] = "artifact_posted"
+"""Journal event emitted when a worker posts a task artifact."""
+
+JOURNAL_EVENT_PERSISTENT_AGENT_STEP: Final[str] = "persistent_agent_step"
+"""Journal event emitted when a step runs under a persistent-agent adapter.
+
+A persistent-agent adapter carries agent-side state Bernstein never hashed, so
+a replay of the same inputs is not guaranteed reproducible. Recording this
+event lets verification mark the run's artifacts ``unverifiable``.
+"""
+
+ARTIFACT_TYPE_REPORT: Final[str] = "report"
+ARTIFACT_TYPE_TABLE: Final[str] = "table"
+ARTIFACT_TYPE_LINK: Final[str] = "link"
+ARTIFACT_TYPE_FINDING: Final[str] = "finding"
+ARTIFACT_TYPES: Final[frozenset[str]] = frozenset(
+    {ARTIFACT_TYPE_REPORT, ARTIFACT_TYPE_TABLE, ARTIFACT_TYPE_LINK, ARTIFACT_TYPE_FINDING}
+)
+"""Artifact types accepted by the worker posting boundary."""
+
+LINK_KINDS: Final[frozenset[str]] = frozenset({"preview", "dashboard", "document"})
+"""Declared kinds accepted for link artifacts."""
+
+COPILOT_CLAUDE_TIER_MODELS: Final[frozenset[str]] = frozenset({"opus", "sonnet", "haiku"})
+"""Claude cascade tier names that are not valid Copilot model ids; any that reach
+the Copilot adapter are remapped to ``COPILOT_DEFAULT_MODEL``."""
+
+QWEN_INSTALL_HINT: Final[str] = "npm install -g @qwen-code/qwen-code"
+"""Install command for the Qwen CLI package that provides the ``qwen`` binary."""
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator defaults
@@ -46,27 +101,78 @@ from typing import Any, Literal
 class OrchestratorDefaults:
     """Run loop, tick scheduling, drain, and convergence."""
 
-    tick_interval_s: float = 3.0  # arbitrary; tune in tuning:orchestrator
+    tick_interval_s: float = 3.0
     normal_tick_phase: int = 6  # run normal ops every N ticks
     slow_tick_phase: int = 30  # run slow ops every N ticks
 
     max_consecutive_failures: int = 10  # tick failures before abort
     max_spawn_failures: int = 3  # consecutive spawn failures → mark failed
-    spawn_backoff_base_s: float = 30.0  # arbitrary; tune in tuning:orchestrator
+    spawn_backoff_base_s: float = 30.0
     spawn_backoff_max_s: float = 300.0  # cap exponential backoff at 5 min
 
-    drain_timeout_s: float = 60.0  # arbitrary; tune in tuning:orchestrator
+    drain_timeout_s: float = 60.0
     server_failure_threshold: int = 12  # ticks of server unreachability → stop
     server_failure_warn: int = 3  # warn after N consecutive server failures
 
     stale_claim_timeout_s: float = 900.0  # 15 min
     deadline_warning_window_s: float = 300.0  # 5 min warning before deadline
 
+    # Terminal state for a run that reaches quiescence having produced zero
+    # terminal tasks (issue #3010). The tick loop's only self-stop is gated
+    # on at least one done/failed task, so a run where nothing ever finished
+    # idles indefinitely. See core.orchestration.run_stall for the full
+    # criterion. Tunable via ``tuning.orchestrator.stalled_run_*``, or the
+    # ``BERNSTEIN_STALLED_RUN_GRACE_S`` / ``BERNSTEIN_STALLED_RUN_TICKS``
+    # env vars (checked first).
+    #
+    # 1800s is chosen against two fixed points rather than picked round:
+    #   * strictly ABOVE stale_claim_timeout_s (900s), so the stale-claim
+    #     release always gets its chance first - its outcome is strictly
+    #     more informative, since it produces a real failed task carrying a
+    #     reason instead of a task frozen mid-flight, and
+    #   * strictly BELOW the CLI's default wait for run completion (3600s),
+    #     so a synchronous ``bernstein run`` observes a genuine terminal
+    #     state rather than timing out against a still-idling orchestrator.
+    stalled_run_grace_s: float = 1800.0  # 30 min of zero forward progress
+    stalled_run_ticks: int = 10  # consecutive no-progress quiescent ticks
+
+    # Planning window: if the planner fails and no tasks are ever spawned,
+    # terminate the run after this many seconds of an empty ledger (no tasks
+    # in any state) *after* having seen at least one task (i.e., planning
+    # ran and failed). This prevents idling indefinitely when the planning
+    # task fails and the ledger stays empty. Tunable via
+    # ``tuning.orchestrator.planning_window_s`` or the
+    # ``BERNSTEIN_PLANNING_WINDOW_S`` env var, which takes precedence and is
+    # read at the use site by ``run_stall.resolve_planning_window_s``.
+    planning_window_s: float = 300.0  # 5 minutes
+
     max_dead_agents_kept: int = 20  # bounded dead-agent history for debugging
     max_processed_done: int = 500  # bounded done-task cache to limit memory
 
     manager_review_completion_threshold: int = 7  # trigger review every 7 done
     manager_review_stall_s: float = 900.0  # 15 min
+
+    # How long a manager session may run with zero child tasks before
+    # ``core.orchestration.stalled_manager`` declares a stall and aborts the
+    # run. Tunable via ``tuning.orchestrator.stalled_manager_threshold_s`` in
+    # bernstein.yaml, or the ``BERNSTEIN_STALL_THRESHOLD_S`` env var (checked
+    # first). See ``stalled_manager.py`` module docstring for the detection
+    # logic and its relationship to ``AGENT.idle_log_age_threshold_s``.
+    stalled_manager_threshold_s: float = 170.0
+
+    # Starting wall-clock kill deadline for a spawned agent (OrchestratorConfig.
+    # max_agent_runtime_s). Self-extends +600s/tick up to a 5400s hard cap while
+    # the agent is heartbeating (see core/agents/agent_lifecycle.py); this is
+    # only the initial value before any extension. Tunable via
+    # ``tuning.orchestrator.max_agent_runtime_s``.
+    max_agent_runtime_s: int = 1800  # 30 min
+
+    # Fair scheduling priority age-boost tuning (#4675).
+    # Tasks waiting longer than priority_age_threshold_s receive a priority
+    # boost of priority_boost_step per elapsed block, capped at max_priority_age_boost.
+    priority_age_threshold_s: float = 300.0  # 5 minutes
+    priority_boost_step: int = 1  # priority step boosted per threshold period
+    max_priority_age_boost: int = 2  # maximum cumulative boost allowed from aging
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +187,9 @@ class SpawnDefaults:
     disk_free_threshold_gb: float = 1.0  # refuse spawns below 1 GiB free
     spawn_failure_cooldown_s: float = 300.0  # 5 min
     lesson_cache_ttl_s: float = 300.0  # 5 min
+    memory_lessons_horizon_s: float = 7 * 24 * 3600  # 7 days horizon for lessons
+    memory_lessons_weight_decay_factor: float = 0.5  # stepwise decay per age bucket
+    memory_lessons_max_per_author: int = 3  # cap lessons per author in window
 
 
 @dataclass(frozen=True)
@@ -88,6 +197,33 @@ class AgentDefaults:
     """Heartbeat, idle detection, escalation tiers."""
 
     heartbeat_stale_s: float = 120.0  # 2 min
+    # Time-to-first-turn cap for the `starting` phase. Adapters that emit no
+    # heartbeats (e.g. `consumes_heartbeat_dir=False`) rely on log/git mtime
+    # for liveness, so a slow/free-tier model that needs longer than
+    # `heartbeat_stale_s` to produce its first turn used to be flagged stale
+    # and reaped while still working (issue #3012). The starting phase gets a
+    # larger, separately-configurable window sized above a realistic slow
+    # first turn. Override via `tuning.agent.heartbeat_starting_timeout_s`.
+    heartbeat_starting_timeout_s: float = 300.0  # 5 min
+    # A log/git-tree mtime fresher than this window is a POSITIVE liveness
+    # signal: the agent is demonstrably alive regardless of heartbeat age, so
+    # the heartbeat-staleness incident is suppressed and no SIGTERM is sent
+    # (issue #3012). Mirrors agent_lifecycle._ORPHAN_LIVENESS_GRACE_S, which
+    # already defers the reap-cycle death judgment on the same signal.
+    liveness_grace_s: float = 90.0  # 1.5 min
+    # Upper bound on how long `liveness_grace_s` may keep deferring a
+    # heartbeat-staleness incident. The liveness signal is the runner log's
+    # mtime, and every CLI adapter except claude merges the child's stderr
+    # into that same file (`stderr=subprocess.STDOUT`), so provider retry
+    # chatter, a progress spinner, or a runtime deprecation warning refreshes
+    # the mtime with no real progress. Past this much continuous heartbeat
+    # silence the mtime is treated as output noise rather than proof of work,
+    # and the incident is raised (issue #3058). Sits well above
+    # `heartbeat_starting_timeout_s` so a slow first turn keeps its grace, and
+    # well below the wall-clock reaper's 5400s hard cap so a stalled agent
+    # stops holding a worker slot for the full cap. Override via
+    # `tuning.agent.liveness_suppression_cap_s`.
+    liveness_suppression_cap_s: float = 900.0  # 15 min
     idle_log_age_threshold_s: float = 180.0  # 3 min
 
     # Escalation tiers (seconds of heartbeat silence)
@@ -97,11 +233,36 @@ class AgentDefaults:
     escalation_sigkill_s: float = 150.0  # 2.5 min → hard SIGKILL
 
     # Escalation count thresholds
-    escalation_kill_count: int = 7  # arbitrary; tune in tuning:agent
-    escalation_high_count: int = 5  # arbitrary; tune in tuning:agent
-    escalation_med_count: int = 3  # arbitrary; tune in tuning:agent
+    escalation_kill_count: int = 7
+    escalation_high_count: int = 5
+    escalation_med_count: int = 3
 
     zombie_pid_max_age_s: float = 7 * 24 * 3600  # 7 days
+
+    # Max SDK turns forwarded to ``Runner.run_sync`` by the openai_agents
+    # runner (adapters/openai_agents_runner.py). Bug 13 (D2 minimax
+    # attempt-e938bd33, 2026-07-02): the SDK's own default of 10 was the
+    # dominant failure mode for builtin-tool workflows - backend hit
+    # MaxTurnsExceeded AFTER committing + POSTing /complete (wasted-work
+    # kill) and qa hit it 3x mid-exploration. 30 is the saner default for
+    # multi-tool workflows. Override via ``tuning.agent.max_turns``, the
+    # ``BERNSTEIN_MAX_TURNS`` env var, or the runner manifest's
+    # ``max_turns`` field. Set to ``None`` to omit the kwarg and fall back
+    # to the SDK's own default (10).
+    max_turns: int | None = 30
+
+
+@dataclass(frozen=True)
+class SLODefaults:
+    """Error-budget floor for the observability SLO/incident subsystem."""
+
+    # ErrorBudget.budget_total always tolerates at least this many failures,
+    # even when total_tasks * (1 - slo_target) rounds below it (e.g. a small
+    # task count). Raising this delays IncidentManager's auto-pause-on-
+    # error-budget-depletion response, useful when early infra-death retries
+    # (rate limits, transient auth) shouldn't count against a healthy run.
+    # Tunable via ``tuning.slo.error_budget_min_failures``.
+    error_budget_min_failures: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +310,7 @@ class TaskDefaults:
     subtask_wait_timeout_s: float = 30 * 60  # 30 min
     max_combined_estimated_minutes: int = 60  # cap batched-task total minutes
     max_tasks_per_compacted_batch: int = 5  # cap tasks per batch for focus
-    min_batch_size: int = 3  # don't batch below this — single-task faster
+    min_batch_size: int = 3  # don't batch below this - single-task faster
 
     max_io_retries: int = 3  # retry transient filesystem ops up to 3x
 
@@ -176,6 +337,9 @@ class TokenDefaults:
     truncation_threshold_pct: float = 80.0  # truncate tool output above 80%
     rejection_threshold_pct: float = 95.0  # reject new work above 95%
 
+    spawn_prompt_budget_pct: float = 25.0  # warn when assembled prompt exceeds 25% of context window
+    spawn_prompt_budget_abs: int = 32_768  # absolute fallback budget in tokens when model context unknown
+
     code_block_max_lines: int = 100  # truncate code blocks >100 lines
     file_listing_max_entries: int = 50  # truncate ls/find listings >50 items
 
@@ -195,9 +359,9 @@ class CostDefaults:
     scope_budget_usd: Mapping[str, float] = field(
         default_factory=lambda: _freeze_dict_str_float(
             {
-                "small": 2.0,  # arbitrary; tune in tuning:cost
-                "medium": 5.0,  # arbitrary; tune in tuning:cost
-                "large": 15.0,  # arbitrary; tune in tuning:cost
+                "small": 2.0,
+                "medium": 5.0,
+                "large": 15.0,
             }
         )
     )
@@ -213,11 +377,11 @@ class CostDefaults:
     effort_base_turns: Mapping[str, int] = field(
         default_factory=lambda: _freeze_dict_str_int(
             {
-                "max": 100,  # arbitrary; tune in tuning:cost
-                "high": 50,  # arbitrary; tune in tuning:cost
-                "medium": 30,  # arbitrary; tune in tuning:cost
-                "normal": 25,  # arbitrary; tune in tuning:cost
-                "low": 15,  # arbitrary; tune in tuning:cost
+                "max": 100,
+                "high": 50,
+                "medium": 30,
+                "normal": 25,
+                "low": 15,
             }
         )
     )
@@ -290,7 +454,7 @@ class ProtocolDefaults:
 
     cluster_autoscale_cooldown_s: float = 120.0  # 2 min between scale decisions
     cluster_min_nodes: int = 1  # always keep at least one node alive
-    cluster_max_nodes: int = 20  # arbitrary; tune in tuning:protocol
+    cluster_max_nodes: int = 20
     cluster_steal_threshold: int = 3  # steal work if queue >3 deeper than peer
     cluster_steal_cooldown_s: float = 10.0  # 10s between work-steal attempts
 
@@ -307,9 +471,9 @@ class PlanDefaults:
     tokens_by_scope: Mapping[str, int] = field(
         default_factory=lambda: _freeze_dict_str_int(
             {
-                "small": 30_000,  # arbitrary; tune in tuning:plan
-                "medium": 80_000,  # arbitrary; tune in tuning:plan
-                "large": 200_000,  # arbitrary; tune in tuning:plan
+                "small": 30_000,
+                "medium": 80_000,
+                "large": 200_000,
             }
         )
     )
@@ -334,17 +498,21 @@ class PlanDefaults:
 class PhasePipelineDefaults:
     """Opt-in research/plan/implement phase separation.
 
-    The pipeline is OFF by default for back-compat — single-phase plan files
+    The pipeline is OFF by default for back-compat - single-phase plan files
     keep their existing behaviour.  Steps opt in by declaring
     ``phases: [research, plan, implement]`` and the global flag below must be
     True for the orchestrator to route through :class:`PhasedRunner`.
     """
 
     enabled: bool = False
-    research_model: str = "opus"
-    plan_model: str = "opus"
-    implement_model: str = "sonnet"
-    verify_model: str = "sonnet"
+    # No built-in defaults - Bernstein never silently falls back to a Claude
+    # tier name. These are currently unread by any consumer (dead code); if a
+    # future PhasedRunner reads them, it must treat None as "not configured"
+    # and raise/skip rather than guessing a model.
+    research_model: str | None = None
+    plan_model: str | None = None
+    implement_model: str | None = None
+    verify_model: str | None = None
     artifact_root: str = ".sdd/runtime/phase_artifacts"
     gc_on_task_close: bool = True
     # Mechanical exit-criteria gate (R001..R005) at every phase boundary.
@@ -353,7 +521,7 @@ class PhasePipelineDefaults:
     gate_enabled: bool = True
     # Number of retries the failing phase is re-fired before the task is
     # marked ``failed`` with ``failure_kind="phase_gate"``.  v1 default is
-    # 1 — one retry is the value that actually closes the loop without
+    # 1 - one retry is the value that actually closes the loop without
     # busy-looping on a fundamentally broken artefact.
     gate_max_retries: int = 1
     # ``R005-byte-budget`` rejection counts as a hard fail rather than a
@@ -371,7 +539,7 @@ class PhasePipelineDefaults:
 class BestOfNDefaults:
     """Opt-in best-of-N candidate fan-out.
 
-    OFF by default for back-compat — single-agent task assignment is
+    OFF by default for back-compat - single-agent task assignment is
     unchanged.  Tasks opt in by setting ``Task.best_of_n=K``; callers
     must also flip ``BEST_OF_N.enabled`` (typically via the
     ``best_of_n`` section of ``bernstein.yaml``) for the orchestrator to
@@ -431,6 +599,11 @@ class JanitorDefaults:
     # Persistent fingerprint memoization store cap (MiB).  See
     # bernstein.core.persistence.fingerprint.MemoStore.
     memo_max_mb: int = 200
+
+    # CAS blob retention window (days).  Unreferenced blobs older than this
+    # are eligible for GC via ``bernstein gc cas``.  See
+    # bernstein.core.persistence.cas_gc.
+    cas_retention_days: int = 30
 
 
 # ---------------------------------------------------------------------------
@@ -497,15 +670,15 @@ class ActionCacheDefaults:
     """Action-level cache for deterministic LLM/tool replay.
 
     Layered on :class:`bernstein.core.persistence.fingerprint.MemoStore`
-    — the action cache contributes the record schema and key derivation;
+    - the action cache contributes the record schema and key derivation;
     eviction and on-disk format come from MemoStore.
 
     Modes:
-      * ``record`` — always live, append every call to the cache.
-      * ``replay`` — cache-only; misses raise ``CacheMiss``.  Used by the
+      * ``record`` - always live, append every call to the cache.
+      * ``replay`` - cache-only; misses raise ``CacheMiss``.  Used by the
         $0 CI smoke test.
-      * ``hybrid`` — try cache, fall through to live on miss (default).
-      * ``off``   — disable lookups and writes entirely.
+      * ``hybrid`` - try cache, fall through to live on miss (default).
+      * ``off``   - disable lookups and writes entirely.
     """
 
     enabled: bool = True
@@ -538,9 +711,9 @@ class ReworkLedgerDefaults:
     reports a rework-rate that the cascade router consults when picking
     a writer model. Auto-promotion fires when both gates pass:
 
-    * ``samples >= min_samples`` — guard against premature decisions
+    * ``samples >= min_samples`` - guard against premature decisions
       from a handful of noisy observations.
-    * ``rate >= promotion_threshold`` — only promote when the cheap tier
+    * ``rate >= promotion_threshold`` - only promote when the cheap tier
       is observably costing more rework than it saves.
 
     ``window_hours`` bounds the freshness of considered samples so that
@@ -560,7 +733,7 @@ class LineageDefaults:
 
     The customer-signing layer is opt-in: when ``customer_signing_enabled``
     is False (the default), records continue to be written without a
-    ``customer_signature`` field — the writer is fully back-compat with
+    ``customer_signature`` field - the writer is fully back-compat with
     the v1 chain shipped in PR #996. When True, ``customer_signing_key_path``
     must point at a customer-controlled Ed25519 private key (PEM PKCS#8 or
     raw 32 bytes).
@@ -612,6 +785,38 @@ class CompactionDefaults:
     max_block_age_turns: int = 5
     # Shared token estimator: characters per token for English text.
     chars_per_token: int = 4
+    # Sensitive-content gate over compaction input (bernstein.yaml tuning
+    # section ``compaction``, keys ``sensitive_gate_*``). The gate refuses
+    # to forward credential-shaped content to the LLM summary stage.
+    sensitive_gate_enabled: bool = True
+    # Extra operator-supplied deny patterns (regex strings). Hits are
+    # redacted with a typed placeholder.
+    sensitive_gate_extra_deny: tuple[str, ...] = ()
+    # Allowlist entries: a rule id (``content.aws-access-key``) or a rule
+    # id plus the first 8 hex chars of the span hash
+    # (``content.aws-access-key:1a2b3c4d``). Suppressions are audit-logged.
+    sensitive_gate_allow: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MemoryChainDefaults:
+    """Configuration for the tamper-evident memory write chain (issue #2298).
+
+    Used by :mod:`bernstein.core.memory.chain`. The chain is append-only
+    and never deletes; ``retention_days`` is a *reporting* horizon only --
+    it bounds how far back tooling surfaces live (non-tombstoned) facts,
+    never how much of the hash chain is retained, since dropping any row
+    would break verifiability. ``default_scope`` names the identity scope
+    a bare memory write lands in when the caller does not pass one.
+    """
+
+    #: Default identity scope for a memory write when none is supplied.
+    #: One of ``user`` / ``agent`` / ``run`` / ``app``.
+    default_scope: str = "user"
+    #: Reporting horizon in days for surfacing live facts. ``0`` disables
+    #: the horizon (surface every live fact). The full hash chain is
+    #: always retained regardless of this value.
+    retention_days: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +846,10 @@ SCHEMA_RETRY = SchemaRetryDefaults()
 LINEAGE = LineageDefaults()
 REWORK_LEDGER = ReworkLedgerDefaults()
 COMPACTION = CompactionDefaults()
+MEMORY_CHAIN = MemoryChainDefaults()
+SLO = SLODefaults()
 
-# Module-level constant for direct import — preferred when only the
+# Module-level constant for direct import - preferred when only the
 # numeric cap is needed (no need to import the whole singleton).
 SCHEMA_RETRY_MAX_ATTEMPTS: int = SCHEMA_RETRY.max_attempts
 MCP_TOOL_SEARCH_ENABLED: bool = MCP_TOOL_SEARCH.enabled
@@ -653,7 +860,7 @@ ABSTRACT_DIFF_ENABLED: bool = True
 ABSTRACT_DIFF_MAX_FILES: int = 50
 
 # Per-model agent mode profiles (smart/deep/fast).  When ``False`` the
-# spawner skips preamble injection and tool filtering — useful as a kill
+# spawner skips preamble injection and tool filtering - useful as a kill
 # switch while the feature is rolled out.
 MODE_PROFILES_ENABLED: bool = True
 
@@ -696,6 +903,8 @@ _SECTION_TO_ATTR: Mapping[str, str] = MappingProxyType(
         "lineage": "LINEAGE",
         "rework_ledger": "REWORK_LEDGER",
         "compaction": "COMPACTION",
+        "memory_chain": "MEMORY_CHAIN",
+        "slo": "SLO",
     }
 )
 
@@ -726,6 +935,8 @@ _ATTR_TO_FACTORY: Mapping[str, type[Any]] = MappingProxyType(
         "LINEAGE": LineageDefaults,
         "REWORK_LEDGER": ReworkLedgerDefaults,
         "COMPACTION": CompactionDefaults,
+        "MEMORY_CHAIN": MemoryChainDefaults,
+        "SLO": SLODefaults,
     }
 )
 
@@ -746,7 +957,7 @@ def override(section: str, overrides: dict[str, Any]) -> None:
     """Apply runtime overrides from bernstein.yaml ``tuning:`` section.
 
     The targeted singleton is rebuilt via :func:`dataclasses.replace` and the
-    module-level attribute is rebound atomically — no mutation of the existing
+    module-level attribute is rebound atomically - no mutation of the existing
     frozen instance occurs.  For mapping fields, the override payload is merged
     with the current view (new keys win, omitted keys are preserved) and the
     merged result is re-wrapped in :class:`MappingProxyType` to keep the

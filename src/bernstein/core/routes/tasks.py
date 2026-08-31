@@ -1,4 +1,4 @@
-"""Task routes — backward-compatibility shim.
+"""Task routes - backward-compatibility shim.
 
 All route handlers have been decomposed into focused sub-modules:
 - task_crud: Task CRUD, agent heartbeats, bulletin, direct channel
@@ -13,11 +13,19 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from bernstein.core.routes.task_a2a import router as _a2a_router
+from bernstein.core.routes.task_artifacts import router as _artifacts_router
+from bernstein.core.routes.task_claim_receipt import router as _claim_receipt_router
 from bernstein.core.routes.task_cluster import router as _cluster_router
 from bernstein.core.routes.task_crud import router as _crud_router
+from bernstein.core.routes.task_mailbox import router as _mailbox_router
+from bernstein.core.routes.task_steer import router as _steer_router
 
 router = APIRouter()
 router.include_router(_crud_router)
+router.include_router(_claim_receipt_router)
+router.include_router(_mailbox_router)
+router.include_router(_artifacts_router)
+router.include_router(_steer_router)
 router.include_router(_cluster_router)
 router.include_router(_a2a_router)
 

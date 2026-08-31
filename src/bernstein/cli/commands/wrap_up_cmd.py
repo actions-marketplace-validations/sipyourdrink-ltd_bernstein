@@ -13,7 +13,8 @@ import click
 from rich.panel import Panel
 from rich.table import Table
 
-from bernstein.cli.helpers import console, server_get
+from bernstein.cli.helpers import console, require_server_reachable, server_get
+from bernstein.core.integrations.pr_gen import load_session_summary
 from bernstein.core.session import WrapUpBrief, save_wrapup
 
 
@@ -42,7 +43,11 @@ def _get_git_diff_stat(start_sha: str) -> str:
             check=False,
         )
         if result.returncode == 0:
-            return result.stdout.strip() or "(no uncommitted changes)"
+            # An empty stat means "nothing to describe", and that is what
+            # gets recorded. The old placeholder string here ended up
+            # published as pull-request diff-stats by every consumer that
+            # treated any non-empty string as an answer.
+            return result.stdout.strip()
     return ""
 
 
@@ -223,9 +228,7 @@ def wrap_up(do_stop: bool, timeout: int) -> None:
     workdir = Path.cwd()
 
     # 1. Check server reachability
-    if server_get("/status") is None:
-        console.print("[red]Cannot reach task server.[/red] Is Bernstein running? Run [bold]bernstein[/bold] to start.")
-        raise SystemExit(1)
+    require_server_reachable()
 
     # 2. Gather tasks
     done_tasks = _fetch_tasks_by_status("done")
@@ -240,7 +243,13 @@ def wrap_up(do_stop: bool, timeout: int) -> None:
     git_diff_stat = _get_git_diff_stat(start_sha)
 
     # 5. Build brief fields
-    changes_summary = _build_changes_summary(done_tasks)
+    # If there are no completed tasks, fall back to the session summary's changes.
+    if done_tasks:
+        changes_summary = _build_changes_summary(done_tasks)
+    else:
+        # Load the most recent session summary as a fallback.
+        session_summary = load_session_summary(None, workdir=workdir)
+        changes_summary = session_summary.changes_summary or "No tasks completed this session."
     learnings = _extract_learnings(failed_tasks)
     next_session_brief = _build_next_session_brief(open_tasks)
 
@@ -252,6 +261,9 @@ def wrap_up(do_stop: bool, timeout: int) -> None:
         learnings=learnings,
         next_session_brief=next_session_brief,
         git_diff_stat=git_diff_stat,
+        # Record completed task ids so the PR-open path can link each task's
+        # sealed verification-evidence bundle (issue #2362, AC3).
+        completed_task_ids=[str(t.get("id")) for t in done_tasks if t.get("id")],
     )
 
     # 7. Save to .sdd/sessions/<timestamp>-wrapup.json

@@ -65,7 +65,7 @@ def _capture_client() -> tuple[MagicMock, list[dict]]:
             resp.json.return_value = {"id": f"NEW-{len(posted)}"}
             resp.status_code = 201
             return resp
-        # /tasks/{id}/fail and similar — return a benign 200.
+        # /tasks/{id}/fail and similar - return a benign 200.
         resp = MagicMock()
         resp.raise_for_status.return_value = None
         resp.status_code = 200
@@ -131,6 +131,10 @@ def test_maybe_retry_dlq_fires_from_typed_field():
     task = _build_task(retry_count=3, max_retries=3)
     client, posted = _capture_client()
     quarantine = MagicMock()
+    # The exhaustion path asks the store before recording, so a bare Mock
+    # would answer with a truthy Mock and suppress the very call this
+    # test asserts on (#3628).
+    quarantine.is_quarantined.return_value = False
 
     created = maybe_retry_task(
         task,
@@ -147,8 +151,47 @@ def test_maybe_retry_dlq_fires_from_typed_field():
     assert posted == []
     quarantine.record_failure.assert_called_once()
     (recorded_title, _reason) = quarantine.record_failure.call_args.args
-    # Title is not mutated — no stripping of a legacy prefix needed.
+    # Title is not mutated - no stripping of a legacy prefix needed.
     assert recorded_title == task.title
+
+
+def test_maybe_retry_enforces_hard_ceiling_matching_retry_or_fail():
+    """`maybe_retry_task` must apply the same `_MAX_REGULAR_TASK_RETRIES=2`
+    hard ceiling that `retry_or_fail_task` already enforces.
+
+    Regression for #2806: the tick-loop retry path (`maybe_retry_task`) and
+    the reap path (`retry_or_fail_task`) disagreed on the cap. A task at
+    retry_count=2 with a higher `max_retries`/`max_task_retries` was refused
+    by the reap path but still retried by the tick path, so a
+    structurally-dead lineage could exceed the intended ceiling.
+    """
+    from bernstein.core.task_lifecycle import _MAX_REGULAR_TASK_RETRIES
+
+    assert _MAX_REGULAR_TASK_RETRIES == 2
+    # retry_count already at the hard ceiling, but task.max_retries (3) and
+    # max_task_retries (3) would both otherwise permit another attempt.
+    task = _build_task(retry_count=2, max_retries=3)
+    client, posted = _capture_client()
+    quarantine = MagicMock()
+    # The exhaustion path asks the store before recording, so a bare Mock
+    # would answer with a truthy Mock and suppress the very call this
+    # test asserts on (#3628).
+    quarantine.is_quarantined.return_value = False
+
+    created = maybe_retry_task(
+        task,
+        retried_task_ids=set(),
+        max_task_retries=3,
+        client=client,
+        server_url="http://server",
+        quarantine=quarantine,
+        workdir=None,
+        session_id=None,
+    )
+
+    assert created is False
+    assert posted == []
+    quarantine.record_failure.assert_called_once()
 
 
 def test_maybe_retry_ignores_legacy_title_prefix_when_typed_field_disagrees():
@@ -177,6 +220,87 @@ def test_maybe_retry_ignores_legacy_title_prefix_when_typed_field_disagrees():
 
 
 # ---------------------------------------------------------------------------
+# Planning-retry race guard (#4309), tick-loop path.
+#
+# maybe_retry_task and retry_or_fail_task are independent retry-creation
+# call sites for the same failed task (see the hard-ceiling comment above
+# and retry_or_fail_task's own docstring) -- both must refuse to leave a
+# planning-role retry claimable once a sibling planning task sharing its
+# decomposition lineage has already finished. This function has no
+# tasks_snapshot to consult, so the guard falls back to a live GET.
+# ---------------------------------------------------------------------------
+
+
+def _capture_client_with_done_sibling(sibling: Task) -> tuple[MagicMock, list[dict]]:
+    """Like _capture_client, but GET /tasks?status=done returns *sibling*."""
+    client, posted = _capture_client()
+
+    def get_side_effect(url: str, params: dict | None = None, **_: object) -> MagicMock:
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        status = (params or {}).get("status")
+        resp.json.return_value = [sibling.to_dict()] if status == "done" else []
+        return resp
+
+    client.get.side_effect = get_side_effect
+    return client, posted
+
+
+def test_maybe_retry_planning_task_cancelled_when_sibling_done(tmp_path):
+    """A planning ('manager') task's retry is created and then immediately
+    cancelled once a sibling sharing its decomposition lineage is DONE."""
+    task = _build_task(task_id="planning-A", retry_count=0)
+    task.role = "manager"
+
+    sibling = _build_task(task_id="planning-B", retry_count=0)
+    sibling.role = "manager"
+    sibling.status = TaskStatus.DONE
+    sibling.metadata = {"original_task_id": "planning-A"}
+
+    client, posted = _capture_client_with_done_sibling(sibling)
+
+    created = maybe_retry_task(
+        task,
+        retried_task_ids=set(),
+        max_task_retries=3,
+        client=client,
+        server_url="http://server",
+        quarantine=MagicMock(),
+        workdir=tmp_path,
+        session_id=None,
+    )
+
+    assert created is True
+    assert len(posted) == 1  # the retry row was still created -- visible on the board
+
+    cancel_calls = [call for call in client.post.call_args_list if call[0][0].endswith("/NEW-1/cancel")]
+    assert cancel_calls, f"expected the duplicate retry to be cancelled, got: {client.post.call_args_list}"
+    assert "planning-B" in cancel_calls[0].kwargs["json"]["reason"]
+
+
+def test_maybe_retry_planning_task_unaffected_when_no_sibling_done(tmp_path):
+    """Control: no completed sibling -> the planning retry stays open."""
+    task = _build_task(task_id="planning-C", retry_count=0)
+    task.role = "manager"
+    client, posted = _capture_client()  # GET is unmocked; MagicMock default -> no siblings found
+
+    created = maybe_retry_task(
+        task,
+        retried_task_ids=set(),
+        max_task_retries=3,
+        client=client,
+        server_url="http://server",
+        quarantine=MagicMock(),
+        workdir=tmp_path,
+        session_id=None,
+    )
+
+    assert created is True
+    assert len(posted) == 1
+    assert not any(call[0][0].endswith("/cancel") for call in client.post.call_args_list)
+
+
+# ---------------------------------------------------------------------------
 # retry_or_fail_task
 # ---------------------------------------------------------------------------
 
@@ -186,7 +310,9 @@ def test_maybe_retry_ignores_legacy_title_prefix_when_typed_field_disagrees():
     [
         (0, 3, 1, 1),
         (1, 3, 1, 2),
-        (2, 3, 1, 3),
+        # _MAX_REGULAR_TASK_RETRIES=2 hard ceiling: after 2 retries a task
+        # is dead-lettered regardless of task.max_retries or dynamic_limit.
+        (2, 3, 0, None),
         (3, 3, 0, None),  # DLQ: at limit => fail with "Max retries exceeded".
     ],
 )
@@ -231,7 +357,7 @@ def test_retry_or_fail_task_uses_typed_field_and_triggers_dlq(
 
 
 def test_retry_or_fail_task_does_not_consult_description_marker():
-    """``[retry:N]`` description marker is ignored — the typed field wins."""
+    """``[retry:N]`` description marker is ignored - the typed field wins."""
     task = _build_task(
         retry_count=0,
         description="[retry:7] Stale marker from pre-audit-017 data.",
@@ -252,7 +378,7 @@ def test_retry_or_fail_task_does_not_consult_description_marker():
     assert len(posted) == 1
     # Counter came from the typed field (0 -> 1), not the marker (7).
     assert posted[0]["retry_count"] == 1
-    # The description is passed through verbatim — no new marker is added,
+    # The description is passed through verbatim - no new marker is added,
     # and the stale one is not stripped (migration-safe).
     assert posted[0]["description"] == task.description
 

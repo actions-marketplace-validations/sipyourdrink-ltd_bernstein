@@ -1,9 +1,9 @@
 # Adapter Selection Guide
 
-Bernstein ships 44 CLI agent adapters in `src/bernstein/adapters/`
-(43 named adapters plus a `generic` catch-all), along with support
-modules (caching, conformance testing, environment isolation, plugin SDK,
-etc.).
+Bernstein ships adapters for the full roster of CLI coding agents in
+`src/bernstein/adapters/` (including a `generic` catch-all), along with
+support modules (caching, conformance testing, environment isolation,
+plugin SDK, etc.). Run `bernstein integrations list` for the current set.
 
 All CLI agent adapters implement the `CLIAdapter` interface (`adapters/base.py`):
 `spawn()`, process monitoring via PID, log capture to `.sdd/runtime/<session>.log`,
@@ -12,15 +12,15 @@ and timeout watchdog with SIGTERM-then-SIGKILL cleanup.
 Source of truth: `src/bernstein/adapters/registry.py`, individual adapter files.
 
 > **Quick pick**: Need the strongest results? → `claude` with `model: opus`.
-> Free tier? → `gemini` or `qwen`. Air-gapped? → `ollama` or `tabby`.
+> Free tier? → `gemini` or `qwen`. Air-gapped? → `ollama`.
 > Multi-provider resilience? → combine `claude` + `codex` + `gemini`.
 
 ### Dual role: agents AND scheduler
 
 Every adapter can serve two roles in Bernstein:
 
-1. **As an agent** — spawned per-task to write code, run tests, commit changes
-2. **As the internal scheduler LLM** — used by the orchestrator for task decomposition, cost estimation, and plan optimization
+1. **As an agent** - spawned per-task to write code, run tests, commit changes
+2. **As the internal scheduler LLM** - used by the Manager for goal decomposition into tasks, and by the quality gates for automated review (quality gates, review rubric, cross-model verification, janitor cleanup checks)
 
 Set the scheduler model in `bernstein.yaml`:
 ```yaml
@@ -28,7 +28,7 @@ internal_llm_provider: gemini            # any adapter name
 internal_llm_model: gemini-pro
 ```
 
-This means you can run Bernstein with **zero Claude Code dependency** — use `qwen` or `gemini` for everything, or run fully air-gapped with `ollama`.
+This means you can run Bernstein with **zero Claude Code dependency** - use `qwen` or `gemini` for everything, or run fully air-gapped with `ollama`.
 
 ---
 
@@ -36,14 +36,14 @@ This means you can run Bernstein with **zero Claude Code dependency** — use `q
 
 | Adapter | Provider | Models | Reasoning | Cost Tier | Tool Use | Structured Output | MCP | Recommended Use Case |
 |---------|----------|--------|-----------|-----------|----------|-------------------|-----|----------------------|
-| `claude` | Anthropic | opus, sonnet, haiku | ★★★★★ (opus) / ★★★★ (sonnet) / ★★ (haiku) | $$–$$$ | Full (role-scoped) | JSON schema enforced | Yes | Primary workhorse — architecture, features, tests, docs |
+| `claude` | Anthropic | opus, sonnet, haiku | ★★★★★ (opus) / ★★★★ (sonnet) / ★★ (haiku) | $$–$$$ | Full (role-scoped) | JSON schema enforced | Yes | Primary workhorse - architecture, features, tests, docs |
 | `codex` | OpenAI | GPT-5, GPT-5 mini | ★★★★★ (GPT-5) / ★★★★ (mini) | $$–$$$ | Full | JSON (`--json`) | No | Provider diversity; OpenAI reasoning models |
 | `openai_agents` | OpenAI (Agents SDK v2) | GPT-5, GPT-5 mini, o4 | ★★★★ | $–$$$ | Full (SDK tool protocol) | JSONL event stream | Yes (Bernstein-bridged) | OpenAI sandboxed execution with E2B / Modal / Docker |
 | `gemini` | Google | Gemini Pro, Gemini Flash | ★★★★★ (Pro) / ★★★★ (Flash) | Free–$$$ | Full | JSON (`--output-format json`) | No | Free-tier usage; cost-effective medium tasks |
 | `aider` | Multi | Any (Anthropic/OpenAI/Azure) | Inherited from model | $–$$$ | File editing | No | Commit-per-change workflows; focused file edits |
 | `amp` | Sourcegraph | Anthropic + OpenAI models | ★★★★★ (opus/o3) | $$–$$$ | Full | No | Sourcegraph-integrated teams; codebase-aware context |
 | `qwen` | Multi | qwen3-coder, qwen3.6-plus | ★★★ | Free–$$ | Full | No | Cost-sensitive; low-complexity tasks; free OpenRouter |
-| `ollama` | Local | deepseek-r1, qwen2.5-coder, phi4, deepseek-v4-flash, deepseek-v4-pro | ★★★★ (v4-pro) / ★★★ (r1:70b) / ★★ (7b) | Free | File editing (via Aider) | No | Air-gapped; privacy-sensitive; zero API cost; EU-residency profile via DeepSeek V4 — see [deepseek.md](deepseek.md) |
+| `ollama` | Local | deepseek-r1, qwen2.5-coder, phi4, deepseek-v4-flash, deepseek-v4-pro | ★★★★ (v4-pro) / ★★★ (r1:70b) / ★★ (7b) | Free | File editing (via Aider) | No | Air-gapped; privacy-sensitive; zero API cost; EU-residency profile via DeepSeek V4 - see [deepseek.md](deepseek.md) |
 | `cody` | Sourcegraph | Anthropic/OpenAI/Google (via SG) | Inherited from model | $$ | Chat only | No | Sourcegraph-integrated with codebase-level context |
 | `cursor` | Cursor | Cursor's model routing | ★★★★ | $$ | Full | No | Teams with Cursor subscriptions |
 | `goose` | Block | Anthropic models | ★★★★ | $$–$$$ | Full | No | Teams already using Block's Goose |
@@ -51,9 +51,10 @@ This means you can run Bernstein with **zero Claude Code dependency** — use `q
 | `opencode` | Multi | Any configured provider | Inherited from model | $–$$$ | Full | JSON (`--format json`) | No | Multi-provider setups; single CLI interface |
 | `kiro` | AWS | AWS-managed models | ★★★ | $$ | Full | No | AWS-centric teams using AWS AI services |
 | `kilo` | Stackblitz | Any (via provider routing) | Inherited from model | $–$$$ | Full | No | Web development; Stackblitz-integrated teams |
-| `cloudflare` | Cloudflare | Workers AI models | ★★★ | Free–$$ | Full | No | Cloudflare Workers / Agents SDK users |
-| `iac` | N/A | N/A (Terraform/Pulumi) | N/A | N/A | IaC plan+apply | No | Infrastructure tasks — pair with LLM adapter for codegen |
+| `kimchi` | Open-weight / Hosted | Open-weight, Ollama, hosted | ★★★★ | $–$$$ | Full | ACP (`--mode acp`) | No | Open-weight or Ollama-hosted models; unattended runs completing on a commit |
+| `iac` | N/A | N/A (Terraform/Pulumi) | N/A | N/A | IaC plan+apply | No | Infrastructure tasks - pair with LLM adapter for codegen |
 | `generic` | Any | Pass-through | Depends on CLI | Varies | Depends on CLI | No | Unlisted CLIs; prototyping new adapters |
+| `python_runtime` | Any (Python-invoked runtime) | Pass-through to the configured runtime | Depends on runtime | Varies | Depends on runtime | Stream JSON (runner events) | No | Agent runtimes with a Python API and no CLI - configure `runtime_module` + `runtime_entrypoint` |
 | `mock` | None | None (simulated) | N/A | Free | Simulated | Simulated | Unit and integration tests only |
 
 **Reasoning key:** ★★★★★ Exceptional (frontier reasoning) · ★★★★ Strong · ★★★ Good · ★★ Basic · ★ Minimal  
@@ -138,6 +139,17 @@ npm install -g @google/gemini-cli
 
 **Best for:** Free tier users (generous free quota). Cost-effective for medium-complexity tasks. Good as a tertiary provider for rate-limit resilience.
 
+**Lane split:** the `gemini` key also resolves the `antigravity` binary; the same adapter discovers `antigravity` first on PATH and falls back to `gemini`. The `gemini`/`antigravity` keys cover the enterprise / API-key lane; consumer-lane operators should route through the separate `agy` adapter (see [agy.md](agy.md)).
+
+---
+
+### agy (Google Antigravity successor CLI)
+
+Successor CLI for the discontinued non-enterprise hosted Gemini backend. A
+separate registry entry from `gemini`/`antigravity`, which stay on the
+dual-binary enterprise / API-key lane. See [agy.md](agy.md) for the full
+split and configuration knobs.
+
 ---
 
 ### aider
@@ -198,7 +210,7 @@ npm install -g @sourcegraph/amp
 
 ### qwen
 
-**Install:** No separate CLI install required — Qwen uses OpenAI-compatible APIs via env vars.
+**Install:** No separate CLI install required - Qwen uses OpenAI-compatible APIs via env vars.
 Optionally install the web search extension:
 ```bash
 pip install tavily-python  # for web search support
@@ -245,7 +257,7 @@ pip install aider-chat
 - Uses Aider as the coding frontend with Ollama as the LLM backend
 - Works in air-gapped and privacy-sensitive environments
 - Supports all Ollama-compatible models
-- **DeepSeek V4 + EU-residency guard** — when the requested model is `deepseek-v4-flash` or `deepseek-v4-pro` (or the adapter is constructed with `eu_residency=True`), `spawn()` refuses to dispatch against any host that is not loopback, RFC-1918, IPv6 unique-local, or an internal-suffix FQDN. Octet-aware host parsing catches the `10.example.com` / `192.168.evil.tld` rebinding shape. See the [DeepSeek V4 page](deepseek.md) for the full guard surface.
+- **DeepSeek V4 + EU-residency guard** - when the requested model is `deepseek-v4-flash` or `deepseek-v4-pro` (or the adapter is constructed with `eu_residency=True`), `spawn()` refuses to dispatch against any host that is not loopback, RFC-1918, IPv6 unique-local, or an internal-suffix FQDN. Octet-aware host parsing catches the `10.example.com` / `192.168.evil.tld` rebinding shape. See the [DeepSeek V4 page](deepseek.md) for the full guard surface.
 
 **Model mapping:**
 | Short name | Ollama / vLLM model |
@@ -259,7 +271,7 @@ pip install aider-chat
 | `deepseek-v4-pro` | `deepseek-v4-pro` (vLLM tensor-parallel) |
 | `phi4` | `phi4` |
 
-**Env vars:** None required. `OLLAMA_BASE_URL` / `OLLAMA_API_BASE` (optional, default `http://localhost:11434`). For `deepseek-v4-pro`, point either env var at the vLLM `/v1` endpoint — aider/litellm treats Ollama and vLLM interchangeably over the OpenAI-compatible wire format.
+**Env vars:** None required. `OLLAMA_BASE_URL` / `OLLAMA_API_BASE` (optional, default `http://localhost:11434`). For `deepseek-v4-pro`, point either env var at the vLLM `/v1` endpoint - aider/litellm treats Ollama and vLLM interchangeably over the OpenAI-compatible wire format.
 
 **Prerequisites:** `ollama` running locally + `aider-chat` installed + model pulled (`ollama pull qwen2.5-coder:7b`).
 
@@ -299,7 +311,7 @@ npm install -g @sourcegraph/cody
 
 **Install:**
 ```bash
-curl -fsSL https://github.com/block/goose/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash
 # or via Homebrew
 brew install block/tap/goose
 ```
@@ -332,7 +344,7 @@ pip install 'bernstein[openai]'
 
 **Env vars:** `OPENAI_API_KEY` (required), plus optional `OPENAI_BASE_URL`, `OPENAI_ORGANIZATION`, `OPENAI_PROJECT`.
 
-**Best for:** OpenAI plans that benefit from SDK-native tool-use, sandboxed execution (E2B / Modal), or where the Agents SDK event protocol is a better fit than the `codex` CLI. See the [dedicated `openai_agents` doc](openai-agents.md) and the [decision guide](../compare/openai-agents.md) for when to pick `openai_agents` vs `codex` vs `claude`.
+**Best for:** OpenAI plans that benefit from SDK-native tool-use, sandboxed execution (E2B / Modal), or where the Agents SDK event protocol is a better fit than the `codex` CLI. See the [dedicated `openai_agents` doc](openai-agents.md) and the [decision guide](openai-agents-comparison.md) for when to pick `openai_agents` vs `codex` vs `claude`.
 
 ---
 
@@ -428,7 +440,7 @@ npm install -g kilocode
 
 ---
 
-### cloudflare_agents (Cloudflare Agents SDK)
+### cloudflare (Cloudflare Agents SDK)
 
 **Install:**
 ```bash
@@ -448,17 +460,35 @@ wrangler login
 
 ### codex_cloudflare (Codex on Cloudflare Sandboxes)
 
-Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
+Runs OpenAI Codex inside a Cloudflare sandbox container, driven over HTTP through
+a bridge Worker the operator deploys (`@cloudflare/sandbox` 0.12.4, API contract
+`1.0.0`).
 
 **Unique features:**
-- Full container sandbox with configurable memory (default 512 MiB), CPU, and network access
-- Workspace synced via R2 (same bucket as other Cloudflare bridges)
-- Automatic cleanup on timeout or error
-- Polls sandbox status every 5 seconds until completion
+- Container-isolated execution off the orchestrator host, over REST + SSE
+- Output streamed as it arrives (base64 SSE frames decoded per chunk), not buffered to the end
+- Workspace seeded and collected as a tar (`hydrate` / `persist`), returning a real file diff
+- Cancellation issues the explicit sandbox delete, so remote work actually stops
+- Records content-addressed sandbox evidence that signs into a selection receipt
 
-**Configuration:** `CodexSandboxConfig` with `cloudflare_account_id`, `cloudflare_api_token`, `openai_api_key`, `sandbox_image`, `max_execution_minutes`, `memory_mb`, `cpu_cores`, `network_access`, `r2_bucket`.
+**Prerequisites:** a Cloudflare Workers Paid plan, an operator-deployed bridge
+Worker with its `SANDBOX_API_KEY` secret set, and a container image carrying the
+`codex` CLI at `instance_type` `standard-3` or larger. Unconfigured, every method
+refuses — it never falls back to local execution.
 
-**Best for:** Running Codex agents in isolated environments where you need container-level security and R2-based workspace sync. See the [Cloudflare Adapters guide](../cloudflare/cloudflare-adapters.md) for full details.
+**Configuration:** `CodexSandboxConfig` with `bridge_url`, `bridge_api_key`,
+`openai_api_key`, `workdir`, `agent_command`, `extra_env`,
+`max_execution_minutes`, `request_timeout_seconds`, `persist_excludes`,
+`require_supported_api_version`. Per-request memory/CPU sizing and network
+restriction are absent: container sizing is a deploy-time wrangler setting and the
+bridge applies no egress restrictions.
+
+**Status:** built against the published bridge contract with recorded HTTP and SSE
+fixtures; end-to-end verification against a live deployment is pending.
+
+**Best for:** running Codex off-host in a container you control, when you already
+run on Cloudflare. See [Codex on Cloudflare Sandboxes](../cloudflare/cloudflare-codex-sandbox.md)
+for deploy steps, the authentication warning, and the stated limitations.
 
 ---
 
@@ -476,7 +506,9 @@ Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
 
 **Install:** `npm install -g @github/copilot`
 
-**Env vars:** `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_COPILOT_TOKEN`.
+**Env vars:** `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` (in order of precedence).
+
+**Invocation:** `copilot -p '<prompt>' -s --allow-all-tools --no-ask-user --model <model>`. The non-interactive print mode (`-p`) runs a single prompt and exits; `-s` keeps stdout to the agent's final response; `--allow-all-tools` plus `--no-ask-user` make the run autonomous so it never blocks on a permission prompt or a clarifying question. `--model` passes through (`auto` lets Copilot pick); Claude tier names map to `auto`. The deterministic session id is pinned via `--session-id` for replay isolation.
 
 **Best for:** GitHub-Copilot-subscribed teams who want to reuse existing GitHub auth.
 
@@ -486,7 +518,13 @@ Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
 
 **Install:** `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash`
 
-**Env vars:** `HERMES_API_KEY`, `NOUS_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`.
+**Env vars:** `NOUS_API_KEY` (the `nous-api` provider), `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`, `NOVITA_API_KEY`, `DEEPINFRA_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `GLM_API_KEY`, `KIMI_API_KEY`, `MINIMAX_API_KEY`, `HF_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `HERMES_HOME`. `HOME` is forwarded for every adapter, so a provider configured interactively through the CLI's own setup is picked up from its config file without any of these being set.
+
+**Invocation:** `hermes --oneshot='<prompt>'`. One-shot mode runs a single prompt and exits, printing only the final response. The prompt is passed inside the flag rather than as a following argument for two reasons: this CLI has no top-level positional parameter, so a bare prompt is parsed as a subcommand name and the process exits 2; and a prompt beginning with a dash would otherwise be read as flags. Empty prompts are refused before spawning — one-shot dispatches on the prompt being truthy, so a blank one starts an interactive session — and stdin is closed so no interactive path can block until the task timeout.
+
+**Permissions:** one-shot auto-bypasses approvals and offers no opt-out, which is why the capability contract declares this adapter `always-on` on the permission axis.
+
+Note what that means for containment. Bernstein gives each task its own worktree and spawns the agent with that as its working directory, but the direct spawn path mediates no filesystem access — the wrapper it goes through provides process visibility, not a sandbox. Since this agent will not stop to ask, a run can read or write any path the bernstein process itself can reach. Treat the worktree as where the work is expected to happen, not as a boundary that is enforced. Configure a sandbox backend if the boundary needs to hold; see `docs/sandbox/`.
 
 **Best for:** Teams running Nous Research's Hermes open-weight models.
 
@@ -598,7 +636,7 @@ Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
 
 **Env vars:** `LLM_API_KEY`, `LLM_MODEL`, `LLM_BASE_URL` (OpenHands-native), plus `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (LiteLLM provider keys).
 
-**Invocation:** `openhands --headless --override-with-envs -t '<task>'`. The `--override-with-envs` flag is mandatory — without it OpenHands ignores env vars and reads persisted config from `~/.openhands/agent_settings.json`.
+**Invocation:** `openhands --headless --override-with-envs -t '<task>'`. The `--override-with-envs` flag is mandatory - without it OpenHands ignores env vars and reads persisted config from `~/.openhands/agent_settings.json`.
 
 **Best for:** Teams who want OpenHands' autonomous multi-step loop (plan + edit + execute) as a single Bernstein agent. Bernstein wraps the whole loop and only sees the final exit code; OpenHands' own sub-agent steps are not visible to Bernstein's accounting.
 
@@ -610,7 +648,7 @@ Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
 
 **Env vars:** `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (Open Interpreter uses LiteLLM).
 
-**Invocation:** `interpreter -y --model <model> '<prompt>'`. The `-y` (auto-run) flag is mandatory — without it the subprocess hangs forever on the per-code-block confirmation prompt.
+**Invocation:** `interpreter -y --model <model> '<prompt>'`. The `-y` (auto-run) flag is mandatory - without it the subprocess hangs forever on the per-code-block confirmation prompt.
 
 **Best for:** Tasks that benefit from Open Interpreter's local code-execution loop. Bernstein's worktree isolation handles the host-level sandbox concern.
 
@@ -634,7 +672,7 @@ Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
 
 **Env vars:** `PLANDEX_API_KEY`, `PLANDEX_ENV`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`.
 
-**Invocation:** `plandex tell '<prompt>' --apply --auto-exec --skip-menu --stop`. The full flag combo is required to bypass Plandex's interactive REPL — `--auto-exec` skips per-command approval, `--apply` applies pending changes, `--skip-menu` avoids the post-response menu, `--stop` exits after one response.
+**Invocation:** `plandex tell '<prompt>' --apply --auto-exec --skip-menu --stop`. The full flag combo is required to bypass Plandex's interactive REPL - `--auto-exec` skips per-command approval, `--apply` applies pending changes, `--skip-menu` avoids the post-response menu, `--stop` exits after one response.
 
 **Server requirement:** Plandex uses a client-server architecture. The CLI must reach Plandex Cloud or a self-hosted server (default `http://localhost:8099`). When no server is reachable, `plandex` exits early with a connection error and Bernstein surfaces it via the standard early-exit fast-fail path.
 
@@ -662,7 +700,7 @@ Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
 
 **Invocation:** `letta --yolo -p '<prompt>'`. The `-p` flag is the documented one-off prompt mode; `--yolo` bypasses most permission prompts.
 
-**Caveats:** Letta Code's signature feature is cross-task memory via Letta Cloud. **Bernstein wraps Letta as a leaf-node one-shot agent** — Bernstein does not coordinate Letta's memory across tasks. Cross-task memory still works in Letta's own backend; it's just opaque to Bernstein's accounting and routing.
+**Caveats:** Letta Code's signature feature is cross-task memory via Letta Cloud. **Bernstein wraps Letta as a leaf-node one-shot agent** - Bernstein does not coordinate Letta's memory across tasks. Cross-task memory still works in Letta's own backend; it's just opaque to Bernstein's accounting and routing.
 
 **Best for:** Teams running Letta Cloud who want one-shot Letta sessions inside a larger Bernstein plan.
 
@@ -672,7 +710,7 @@ Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
 
 **Install:** `curl -fsSL https://junie.jetbrains.com/install.sh | bash`
 
-**Env vars:** Provider-keyed by routed model — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `GH_COPILOT_TOKEN`, `MISTRAL_API_KEY`. Set `JUNIE_PROVIDER=<name>` so the adapter forwards the right key bundle.
+**Env vars:** Provider-keyed by routed model - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `GH_COPILOT_TOKEN`, `MISTRAL_API_KEY`. Set `JUNIE_PROVIDER=<name>` so the adapter forwards the right key bundle.
 
 **Invocation:** `junie run --headless --model <id> --prompt-file <path>`. The prompt lives on disk under `.sdd/runtime/` so multi-line prompts and shell metacharacters round-trip cleanly; `--headless` suppresses the interactive TUI so the process exits when the model finishes the response.
 
@@ -686,11 +724,11 @@ Runs OpenAI Codex inside Cloudflare sandboxes for isolated, scalable execution.
 
 **Install:** `brew install --cask amazon-q` (macOS) or the AWS-hosted `.deb`/`.rpm` packages (Linux). The Linux AppImage works for sandboxed installs.
 
-**Env vars:** none directly — `q` reads its bearer token from the on-disk login cache that `q login` writes. Cache lives under XDG paths on Linux/macOS and `%LOCALAPPDATA%` on Windows. The adapter refuses to spawn when no plausible cache directory is present and surfaces a clear "run `q login`" message rather than letting the CLI dump an authentication stack-trace into the agent log.
+**Env vars:** none directly - `q` reads its bearer token from the on-disk login cache that `q login` writes. Cache lives under XDG paths on Linux/macOS and `%LOCALAPPDATA%` on Windows. The adapter refuses to spawn when no plausible cache directory is present and surfaces a clear "run `q login`" message rather than letting the CLI dump an authentication stack-trace into the agent log.
 
-**Invocation:** `q chat --no-interactive --trust-all-tools "<prompt>"`. Both flags are required for unattended runs — missing either deadlocks the CLI on stdin (upstream issue #1951).
+**Invocation:** `q chat --no-interactive --trust-all-tools "<prompt>"`. Both flags are required for unattended runs - missing either deadlocks the CLI on stdin (upstream issue #1951).
 
-**Auth backends:** AWS Builder ID (free, personal account) or IAM Identity Center (enterprise SSO). When the spawn env carries an Identity Center session, `q`'s tool calls execute with **the user's IAM Identity Center role** — route infra-touching tasks (Terraform plans, AWS resource mutations) through `iac` or scope the role narrowly instead.
+**Auth backends:** AWS Builder ID (free, personal account) or IAM Identity Center (enterprise SSO). When the spawn env carries an Identity Center session, `q`'s tool calls execute with **the user's IAM Identity Center role** - route infra-touching tasks (Terraform plans, AWS resource mutations) through `iac` or scope the role narrowly instead.
 
 **Project status:** the upstream `aws/amazon-q-developer-cli` repo is deprecated and rebranded as Kiro CLI (`kiro-cli`, see [`kiro` adapter](#kiro-aws)). The legacy `q` binary continues to ship for existing installs and the documented `--no-interactive --trust-all-tools` surface is unchanged; this adapter targets that legacy surface so users on the original Builder ID flow keep working without a forced Kiro migration.
 
@@ -706,7 +744,7 @@ Simulates agent behavior for unit and integration tests. Not for production use.
 
 ## Orchestrator Delegation Adapters
 
-The adapters profiled above wrap **CLI coding agents** — tools that execute one task per invocation. The `devin_terminal` and `clm` adapters live alongside them in `registry.py`; their module docstrings carry the full configuration surface, and `clm` has its own [page](clm.md). The two below wrap **other CLI orchestrators** as if each were a single agent. Bernstein hands the wrapped tool a prompt or plan and only sees the final exit code and combined log; sub-agent costs and quality gates *inside* the wrapped orchestrator are not visible to Bernstein. This is leaf-node delegation, not deep meta-orchestration.
+The adapters profiled above wrap **CLI coding agents** - tools that execute one task per invocation. The `devin_terminal` and `clm` adapters live alongside them in `registry.py`; their module docstrings carry the full configuration surface, and `clm` has its own [page](clm.md). The two below wrap **other CLI orchestrators** as if each were a single agent. Bernstein hands the wrapped tool a prompt or plan and only sees the final exit code and combined log; sub-agent costs and quality gates *inside* the wrapped orchestrator are not visible to Bernstein. This is leaf-node delegation, not deep meta-orchestration.
 
 Use these when you have an existing workflow built on Composio or ralphex and want to drop it into one step of a larger Bernstein plan, rather than re-implementing it natively.
 
@@ -714,9 +752,9 @@ Use these when you have an existing workflow built on Composio or ralphex and wa
 
 **Install:** `npm install -g @aoagents/ao`
 
-**Env vars:** `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, plus optional `COMPOSIO_API_KEY` / `AO_PROJECT_ID`. Composio inherits credentials from whichever underlying agent plugin (`codex`, `claude-code`, …) it's configured with — there is no dedicated key.
+**Env vars:** `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, plus optional `COMPOSIO_API_KEY` / `AO_PROJECT_ID`. Composio inherits credentials from whichever underlying agent plugin (`codex`, `claude-code`, …) it's configured with - there is no dedicated key.
 
-**Invocation:** `ao spawn --prompt "<text>"` — the documented non-interactive entry point. The companion `ao start` is interactive (boots a tmux + dashboard) and is unsuitable for headless use. With no `ao start` running, `ao spawn` prints a benign warning that "AO is not running — lifecycle polling is inactive." The session still completes; the warning is expected for leaf-node delegation.
+**Invocation:** `ao spawn --prompt "<text>"` - the documented non-interactive entry point. The companion `ao start` is interactive (boots a tmux + dashboard) and is unsuitable for headless use. With no `ao start` running, `ao spawn` prints a benign warning that "AO is not running - lifecycle polling is inactive." The session still completes; the warning is expected for leaf-node delegation.
 
 **Best for:** Teams already running Composio's TypeScript orchestrator who want to keep that workflow as a step inside a Bernstein plan.
 
@@ -738,11 +776,12 @@ Use these when you have an existing workflow built on Composio or ralphex and wa
 
 ## Support Modules
 
-In addition to the 44 CLI agent adapters above, the adapter package includes
+In addition to the CLI agent adapters above, the adapter package includes
 support modules that provide cross-cutting infrastructure:
 
 | Module | Purpose |
 |--------|---------|
+| `acp_channel` | Binds an ACP-speaking CLI's JSON-RPC lifecycle onto the content-addressed event journal (no stdout parser) |
 | `caching_adapter` | Prompt prefix deduplication and response reuse wrapper |
 | `claude_agents` | Per-task Claude Code subagent definitions for `--agents` flag |
 | `claude_exit_codes` | Maps Claude Code exit codes to Bernstein lifecycle enums |
@@ -753,6 +792,54 @@ support modules that provide cross-cutting infrastructure:
 | `plugin_sdk` | Base classes and utilities for third-party adapter plugins |
 | `registry` | Adapter discovery and registration (entry-point and runtime) |
 | `skills_injector` | Injects per-task Claude Code skills into worktrees before spawn |
+
+---
+
+## Declaring ACP as the event channel
+
+Most adapters read lifecycle signals from stdout: either the newline-delimited
+JSON of a stream-json CLI (`EventChannel.STREAM_JSON`) or the canonical
+`BERNSTEIN:<KIND>` text grammar (`EventChannel.TEXT_SIGNALS`). Both are bespoke
+parsing paths, and when an upstream CLI changes its output format the parser
+drifts. For a CLI that can speak the Agent Client Protocol, that failure class
+is avoidable: declare `EventChannel.ACP` and the adapter consumes typed
+JSON-RPC lifecycle events over the client transport with no text parser at all.
+
+**How to declare it.** Add an `EventChannel.ACP` row for the adapter in
+`STRATEGY_MATRIX` (`src/bernstein/adapters/_contract.py`):
+
+```python
+"my_agent": AdapterStrategy(event_channel=EventChannel.ACP),
+```
+
+`kilo` and `goose`, whose upstream CLIs expose ACP, ship on this channel.
+
+**What the channel does.** The upstream CLI is spawned as an ACP subprocess
+speaking line-delimited JSON-RPC. Every inbound frame is validated at the
+schema boundary (`validate_request` / `validate_response`) and journaled
+content-addressed into the run's Merkle-chained `EventJournal`: each event row
+carries the SHA-256 of its canonical bytes. The lifecycle is driven from the
+structured `stopReason` in the prompt response, never from stdout text, so an
+upstream output-format change cannot drift it.
+
+Because every event is content-addressed:
+
+- Replaying a recorded ACP session yields byte-identical journal payload
+  hashes, so the run's replay identity covers the agent's output.
+- A mutated recorded event surfaces as a hash divergence naming the exact step
+  (`compare_acp_journals`), rather than a silent drift a re-parse would miss.
+
+**Conformance.** For an ACP adapter, lifecycle conformance is an event-schema
+fixture (a recorded JSON-RPC frame sequence under
+`tests/fixtures/acp/lifecycle/*.jsonl`) replayed through the same validated,
+content-addressed transport the adapter uses at runtime, replacing the pinned
+stdout golden transcript. See `replay_acp_event_fixture` in
+`bernstein.adapters.conformance`.
+
+The helper surface lives in `bernstein.adapters.acp_channel`
+(`run_acp_channel`, `adapter_speaks_acp`) and the transport core in
+`bernstein.core.protocols.acp.client`. The client-side ACP role is documented
+next to `acp serve` in [interop/acp.md](../interop/acp.md).
 
 ---
 
@@ -779,8 +866,8 @@ support modules that provide cross-cutting infrastructure:
 
 6. **Do you need air-gapped / self-hosted?**
    - `ollama` (local Ollama via Aider front-end)
-   - `ollama` with `deepseek-v4-flash` (single-GPU) or `deepseek-v4-pro` (vLLM tensor-parallel) for the EU-residency profile — see [DeepSeek V4](deepseek.md)
-   - `clm` for sovereign-AI customer-side gateways behind mTLS — see [CLM (Cyber Language Model)](clm.md)
+   - `ollama` with `deepseek-v4-flash` (single-GPU) or `deepseek-v4-pro` (vLLM tensor-parallel) for the EU-residency profile - see [DeepSeek V4](deepseek.md)
+   - `clm` for sovereign-AI customer-side gateways behind mTLS - see [CLM (Cyber Language Model)](clm.md)
 
 7. **Do you need multi-provider diversity?**
    - Primary: `claude`, Secondary: `codex` or `gemini`, Tertiary: `qwen`

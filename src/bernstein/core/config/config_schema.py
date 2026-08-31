@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -139,8 +139,103 @@ class QualityGatesSchema(BaseModel):
     verify_citations_allowed_hosts: list[str] | None = None
 
 
+class CouncilCandidateConfig(BaseModel):
+    """One candidate (or judge) endpoint in a ``council`` block.
+
+    Mirrors the subset of :class:`RoleModelPolicyEntry`'s endpoint fields
+    a single council member needs: which model, and optionally which
+    OpenAI-compatible endpoint/credential to reach it through. ``base_url``
+    /``api_key_env`` follow the exact same semantics and fail-closed
+    credential-allowlist validation as the top-level role policy fields of
+    the same name (see :class:`RoleModelPolicyEntry`) - ``api_key_env`` is
+    always the NAME of an environment variable, never a literal key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    base_url: str | None = None
+    api_key_env: str | None = None
+
+
+class CouncilConfig(BaseModel):
+    """ "Council of agents" fan-out/judge configuration for one role.
+
+    When set on a :class:`RoleModelPolicyEntry` (or loaded from a
+    ``role_model_policy.<role>.model: "*.yaml"`` council definition file -
+    see ``openai_agents_runner._load_council_config``), the role's ENTIRE
+    task run is driven by a task-level council instead of a single model:
+    every ``candidates`` entry runs the WHOLE task independently in
+    parallel (its own full multi-turn run), then ``judge`` synthesizes one
+    improved answer from whichever candidates survived. See
+    ``src/bernstein/adapters/council_runner.py`` (``run_council``) for the
+    runtime implementation and ``openai_agents_runner._run_session``'s
+    ``manifest.council`` branch for how this config drives a run instead of
+    a single ``Runner.run_sync`` call.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[CouncilCandidateConfig]
+    judge: CouncilCandidateConfig
+    timeout: float = 60.0
+
+
+class LocalEndpointProfileSchema(BaseModel):
+    """A named OpenAI-compatible local endpoint profile (issue #2356).
+
+    Declares once, under ``local_endpoints.<name>``, where a local runtime
+    (for example ollama, LM Studio, or an MLX server) is reachable and which
+    model it serves. Role entries reference the profile by name via
+    ``role_model_policy.<role>.endpoint`` and inherit its ``base_url`` /
+    ``model`` / ``api_key_env`` at validation time, so the fleet wiring
+    lives in one place instead of being copy-pasted per role.
+
+    ``api_key_env`` is the NAME of an environment variable, never a literal
+    key -- the same fail-closed semantics as
+    :class:`RoleModelPolicyEntry.api_key_env`. ``engine`` is a free-form
+    runtime label recorded in the certification receipt for provenance.
+
+    Whether the endpoint may carry a merge-critical role is NOT a field
+    here by design: certification is a signed receipt produced by
+    ``bernstein doctor --endpoint`` (see
+    :mod:`bernstein.core.endpoints.certification`), verified at config load.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    model: str
+    api_key_env: str | None = None
+    engine: str | None = None
+    timeout: float = Field(default=120.0, gt=0)
+
+
 class RoleModelPolicyEntry(BaseModel):
-    """Per-role model/provider policy."""
+    """Per-role model/provider policy.
+
+    ``base_url`` and ``api_key_env`` let a role target an OpenAI-compatible
+    endpoint other than the default: some roles (for example a local
+    reasoning model behind an OpenAI-compatible gateway) must not share the
+    default endpoint's credentials. ``api_key_env`` is the NAME of the
+    environment variable holding that endpoint's key, never a literal key;
+    it is validated against the same fail-closed credential allowlist the
+    ``openai_agents`` runner enforces so a repo-carried config cannot
+    forward arbitrary host secrets to an arbitrary endpoint.
+
+    ``temperature``/``top_p``/``top_k``/``max_tokens``/``extra_params`` mirror
+    the sampling-field shape already proven on the ``ModelCard`` dataclass
+    (see ``feat/model-cards-phase1``): they are per-role sampling overrides
+    that flow into the per-spawn ``mcp_config`` via
+    :meth:`bernstein.core.agents.spawner_core.AgentSpawner._apply_sampling_overrides`,
+    taking precedence over a resolved :class:`ModeProfile`'s sampling
+    defaults for the same role. The spawn-time capability gate
+    (:func:`bernstein.adapters.plugin_sdk.ensure_sampling_params_supported`)
+    still decides whether the target adapter actually honours them -
+    setting these fields for a role pinned to an adapter that does not
+    declare sampling support raises ``SamplingParamsRefusal`` rather than
+    silently dropping the override.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -148,6 +243,57 @@ class RoleModelPolicyEntry(BaseModel):
     provider: str | None = None
     model: str | None = None
     effort: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    # Name of a ``local_endpoints`` profile this role runs on (issue #2356).
+    # Mutually exclusive with inline ``base_url``/``model``/``api_key_env``;
+    # the profile's endpoint fields are materialized onto this entry at
+    # validation time so downstream consumers see one resolved shape.
+    # Merge-critical roles referencing a profile are additionally gated on a
+    # verified certification receipt in :func:`load_and_validate`.
+    endpoint: str | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    max_tokens: int | None = None
+    extra_params: dict[str, Any] = Field(default_factory=dict)
+    # Per-role response-style profile applied at spawn
+    # (``bernstein.core.agents.response_style``). Resolution order is
+    # deterministic and documented there: ``Task.metadata['mode']`` > this
+    # entry > the ``role_model_policy.default`` entry > ``"balanced"``.
+    # ``balanced`` renders an empty style addendum, keeping unset-profile
+    # spawns byte-identical to pre-change spawns.
+    response_style: Literal["verbose", "balanced", "terse"] | None = None
+    # Optional "council of agents" fan-out/judge override (see
+    # ``CouncilConfig``). When set, this role's ENTIRE task run is driven by
+    # a task-level council (``bernstein.adapters.council_runner.run_council``)
+    # instead of a single model; ``model``/``base_url``/``api_key_env`` above
+    # are then ignored in favor of the council's own per-candidate endpoints.
+    council: CouncilConfig | None = None
+    # Opt-in map of task-tier → model id (#4854). When unset, dispatch is
+    # byte-identical to a single ``model`` pin. Keys must be members of the
+    # closed tier set (``light``|``standard``|``heavy``|``critical``); the
+    # reserved classifier error marker is rejected here so a broken
+    # classifier cannot be configured as a cheap-tier verdict.
+    tier_models: dict[str, str] | None = None
+
+    @field_validator("tier_models")
+    @classmethod
+    def _validate_tier_models(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is None:
+            return None
+        allowed = frozenset({"light", "standard", "heavy", "critical"})
+        cleaned: dict[str, str] = {}
+        for tier, model in value.items():
+            if tier not in allowed:
+                raise ValueError(
+                    f"unknown tier {tier!r}; allowed: {', '.join(sorted(allowed))} "
+                    "(reserved marker 'error' is not a configurable tier)"
+                )
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(f"tier_models[{tier!r}] must be a non-empty model id")
+            cleaned[tier] = model.strip()
+        return cleaned
 
 
 class RoleConfigEntry(BaseModel):
@@ -189,6 +335,45 @@ class StorageSchema(BaseModel):
     redis_url: str | None = None
 
 
+class SovereignProfileSchema(BaseModel):
+    """Sovereign deployment profile declaration (issue #2518).
+
+    Declares the residency posture the ``--profile sovereign`` activation
+    pins: the EU regions data may reside in and whether region enforcement is
+    strict. The remaining posture axes (deny-all egress, offline catalog,
+    local storage, compliance pack) are profile constants and need no config
+    surface; the profile composes them. This block only exists so the
+    residency regions are part of the config snapshot an auditor recomputes
+    the posture hash from -- see
+    :mod:`bernstein.core.security.deployment_profile`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description="Marker that the workspace is intended to run under --profile sovereign.",
+    )
+    regions: list[str] = Field(
+        default_factory=lambda: ["eu-central", "eu-west"],
+        description="Residency regions data may reside in; sovereign requires the EU set.",
+    )
+    enforce_strict: bool = Field(
+        default=True,
+        description="When true, a residency region outside the pinned set halts the run.",
+    )
+    allowed_egress: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Egress allow-list under --profile sovereign, as host / host:port / CIDR tokens "
+            "(e.g. a self-hosted EU model server on 10.0.0.5:11434). Empty means deny-all. "
+            "Declared here (not via --allow-network) so the runtime policy and the signed "
+            "posture attestation are sourced from the same config and cannot diverge. Every "
+            "entry must resolve to a self-hosted / EU-region destination."
+        ),
+    )
+
+
 class SessionSchema(BaseModel):
     """Session resume configuration."""
 
@@ -196,6 +381,38 @@ class SessionSchema(BaseModel):
 
     resume: bool = True
     stale_after_minutes: int = Field(default=30, ge=1)
+
+
+class GithubSchema(BaseModel):
+    """GitHub integration configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sync_backlog: bool = Field(
+        default=False,
+        description=(
+            "Pull open GitHub issues into .sdd/backlog/open/ at bootstrap. "
+            "Off by default: syncing every open issue can silently displace a "
+            "seeded goal on a non-empty backlog. Overridable at runtime with "
+            "BERNSTEIN_SYNC_GITHUB_BACKLOG."
+        ),
+    )
+
+
+class OrchestrationSchema(BaseModel):
+    """Orchestrator run-lifecycle behaviour configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    test_followup: bool = Field(
+        default=True,
+        description=(
+            "Schedule one bounded test-authoring follow-up task when a run's "
+            "branch diff touches src/ without touching tests/, instead of "
+            "parking at the merge gate for an operator to notice. On by "
+            "default. Overridable at runtime with BERNSTEIN_TEST_FOLLOWUP."
+        ),
+    )
 
 
 class ClusterSchema(BaseModel):
@@ -210,6 +427,15 @@ class ClusterSchema(BaseModel):
     node_timeout_s: int = Field(default=60, ge=1)
     server_url: str | None = None
     bind_host: str = "127.0.0.1"
+    # MESH-only keys (issue #2558): leaderless coordination through the signed
+    # claim journal. Ignored on the STAR path, which keeps its central server.
+    gossip_peers: list[str] = Field(default_factory=list)
+    claim_lease_ttl_s: int = Field(default=300, ge=1)
+    claim_journal_path: str | None = None
+    # Pinned peer identities (issue #2997): node_id -> Ed25519 public key,
+    # given as SPKI PEM text, an OKP JWK mapping, or the bare base64url 'x'.
+    # A MESH node folds only receipts signed by a pinned key.
+    gossip_peer_keys: dict[str, Any] = Field(default_factory=dict)
 
 
 class RemoteSchema(BaseModel):
@@ -276,6 +502,81 @@ class BatchSchema(BaseModel):
 
     enabled: bool = False
     eligible: list[str] = Field(default_factory=list)
+
+
+class ModelPriceSchema(BaseModel):
+    """USD rate for one model, per 1 million tokens (issue #2354).
+
+    The scheduling price table lives in config so an operator can override the
+    shipped defaults without a code change. Rates are validated non-negative:
+    a negative USD rate is a misconfiguration that would corrupt every
+    downstream budget decision, so it fails at load time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: float = Field(..., ge=0, description="USD per 1M input tokens.")
+    output: float = Field(..., ge=0, description="USD per 1M output tokens.")
+    cache_read: float | None = Field(
+        default=None, ge=0, description="USD per 1M cache-read tokens; omitted inherits the base rate."
+    )
+    cache_write: float | None = Field(
+        default=None, ge=0, description="USD per 1M cache-write tokens; omitted inherits the base rate."
+    )
+
+
+class PricingSchema(BaseModel):
+    """Versioned price-table overrides for cost-aware scheduling (#2354)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    as_of: str = Field(default="", description="ISO date (YYYY-MM-DD) the override rates were captured.")
+    revision: int = Field(default=0, ge=0, description="Monotonic price-table revision counter.")
+    models: dict[str, ModelPriceSchema] = Field(
+        default_factory=dict,
+        description="Per-model USD rates; each row overrides / extends the shipped defaults.",
+    )
+
+
+class CostCapsSchema(BaseModel):
+    """USD ceilings enforced before dispatch (#2354). ``0`` means unlimited."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    per_task_usd: float = Field(default=0.0, ge=0, description="Per-task USD ceiling; 0 = unlimited.")
+    per_run_usd: float = Field(default=0.0, ge=0, description="Per-run USD ceiling; 0 = unlimited.")
+    per_day_usd: float = Field(default=0.0, ge=0, description="Per-day USD ceiling; 0 = unlimited.")
+
+
+class CostPolicySchema(BaseModel):
+    """Cost-aware scheduling policy: pricing, USD caps, pools, cache window.
+
+    Issue #2354. USD ceilings and per-pool caps drive deterministic dispatch
+    decisions from the existing spend ledger; the cache-window fan-out opt-in
+    defaults off (conservative) so priming a shared prompt cache is always a
+    deliberate operator choice.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pricing: PricingSchema | None = Field(default=None, description="Price-table overrides.")
+    caps: CostCapsSchema | None = Field(default=None, description="Per-task / run / day USD ceilings.")
+    pools: dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-pool USD caps keyed by pool name (e.g. api, subscription); 0 = unlimited.",
+    )
+    cache_window: bool = Field(
+        default=False,
+        description="Opt in to cache-window fan-out (one warm-up call primes a shared prefix); default off.",
+    )
+
+    @model_validator(mode="after")
+    def _reject_negative_pool_caps(self) -> CostPolicySchema:
+        for pool, cap in self.pools.items():
+            if cap < 0:
+                msg = f"cost_policy.pools[{pool!r}] cap must be >= 0 (0 means unlimited), got {cap}"
+                raise ValueError(msg)
+        return self
 
 
 class TestAgentSchema(BaseModel):
@@ -372,6 +673,87 @@ class ModelFallbackSchema(BaseModel):
     trigger_codes: list[int] = Field(
         default_factory=lambda: [429, 503, 529],
         description="HTTP status codes that count as fallback-triggering errors.",
+    )
+
+
+class FallbackChainElementSchema(BaseModel):
+    """One (adapter, model) pair in a role's provider fallback chain (#2355)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    adapter: str = Field(..., min_length=1, description="CLI adapter name, e.g. claude, codex, gemini.")
+    model: str = Field(..., min_length=1, description="Model identifier dispatched through that adapter.")
+    conformance: Literal["basic", "advanced", "expert"] = Field(
+        default="basic",
+        description="Declared conformance level, compared against the role's floor.",
+    )
+
+
+class RoleFallbackChainSchema(BaseModel):
+    """Per-role fallback chain plus conformance floor (#2355).
+
+    A chain element whose conformance is below the role's floor is rejected
+    here, at config validation time, so a fallback is never silently less
+    capable than the role requires.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    conformance_floor: Literal["basic", "advanced", "expert"] = Field(
+        default="basic",
+        description="Minimum conformance every chain element must declare.",
+    )
+    chain: list[FallbackChainElementSchema] = Field(
+        ...,
+        min_length=1,
+        description="Ordered fallback chain; the scheduler picks the first healthy element.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_floor(self) -> RoleFallbackChainSchema:
+        """Reject chain elements below the conformance floor."""
+        order = {"basic": 0, "advanced": 1, "expert": 2}
+        floor = order[self.conformance_floor]
+        for idx, element in enumerate(self.chain):
+            if order[element.conformance] < floor:
+                raise ValueError(
+                    f"chain position {idx} ({element.adapter}/{element.model}) declares "
+                    f"conformance {element.conformance!r}, below the role's floor "
+                    f"{self.conformance_floor!r}."
+                )
+        return self
+
+
+class ProviderAvailabilitySchema(BaseModel):
+    """Provider availability policy: per-role fallback chains (#2355).
+
+    Example::
+
+        provider_availability:
+          probe_ttl_minutes: 5
+          probes_enabled: true
+          roles:
+            developer:
+              conformance_floor: advanced
+              chain:
+                - {adapter: claude, model: opus, conformance: expert}
+                - {adapter: codex, model: gpt-5.2, conformance: advanced}
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    probe_ttl_minutes: int = Field(
+        default=5,
+        ge=1,
+        description="How long a provider health-probe result is cached before re-probing.",
+    )
+    probes_enabled: bool = Field(
+        default=True,
+        description="Disable for offline runs; every chain element is then presumed healthy.",
+    )
+    roles: dict[str, RoleFallbackChainSchema] = Field(
+        default_factory=dict,
+        description="Per-role fallback chains keyed by role name.",
     )
 
 
@@ -480,6 +862,14 @@ class BernsteinConfig(BaseModel):
         default="nvidia/nemotron-3-super-120b-a12b",
         description="Model for internal LLM calls.",
     )
+    judge_model: str | None = Field(
+        default=None,
+        description="Model for janitor LLM-judge calls. Falls back to the run's top-level model.",
+    )
+    judge_provider: str | None = Field(
+        default=None,
+        description="Provider for janitor LLM-judge calls. Falls back to the run's adapter provider.",
+    )
 
     # --- Constraints and context ---
     constraints: list[str] = Field(default_factory=list)
@@ -487,23 +877,35 @@ class BernsteinConfig(BaseModel):
 
     # --- Nested configs ---
     quality_gates: QualityGatesSchema | None = None
+    local_endpoints: dict[str, LocalEndpointProfileSchema] | None = Field(
+        default=None,
+        description=(
+            "Named OpenAI-compatible endpoint profiles for local runtimes. "
+            "Referenced from role_model_policy.<role>.endpoint."
+        ),
+    )
     role_model_policy: dict[str, RoleModelPolicyEntry] | None = None
     role_config: dict[str, RoleConfigEntry] | None = None
     model_policy: ModelPolicySchema | None = None
     worktree_setup: WorktreeSetupSchema | None = None
     notify: NotifyConfigSchema | None = None
     storage: StorageSchema | None = None
+    sovereign: SovereignProfileSchema | None = None
     session: SessionSchema | None = None
+    github: GithubSchema | None = None
+    orchestration: OrchestrationSchema | None = None
     cluster: ClusterSchema | None = None
     remote: RemoteSchema | None = None
     agency: AgencySchema | None = None
     catalogs: list[CatalogEntry] | None = None
     formal_verification: FormalVerificationSchema | None = None
     batch: BatchSchema | None = None
+    cost_policy: CostPolicySchema | None = None
     test_agent: TestAgentSchema | None = None
     smtp: SmtpSchema | None = None
     mcp_servers: dict[str, Any] | None = None
     model_fallback: ModelFallbackSchema | None = None
+    provider_availability: ProviderAvailabilitySchema | None = None
     arch_conformance: ArchConformanceSchema | None = None
     metrics: dict[str, CustomMetricSchema] | None = Field(
         default=None,
@@ -549,7 +951,7 @@ class BernsteinConfig(BaseModel):
                 # Auto-disable the defaulted feature so the config validates.
                 object.__setattr__(self, "auto_decompose", False)
                 logger.info(
-                    "internal_llm_provider='%s' — auto_decompose auto-disabled. Set an LLM provider to re-enable.",
+                    "internal_llm_provider='%s' - auto_decompose auto-disabled. Set an LLM provider to re-enable.",
                     self.internal_llm_provider,
                 )
 
@@ -562,7 +964,7 @@ class BernsteinConfig(BaseModel):
             elif self.evolution_enabled:
                 object.__setattr__(self, "evolution_enabled", False)
                 logger.info(
-                    "internal_llm_provider='%s' — evolution_enabled auto-disabled. Set an LLM provider to re-enable.",
+                    "internal_llm_provider='%s' - evolution_enabled auto-disabled. Set an LLM provider to re-enable.",
                     self.internal_llm_provider,
                 )
 
@@ -593,10 +995,49 @@ class BernsteinConfig(BaseModel):
             if self.storage.backend == "redis" and not self.storage.redis_url:
                 errors.append("storage.backend is 'redis' but redis_url is not set.")
 
+        # Local endpoint profile references (issue #2356): resolve
+        # role_model_policy.<role>.endpoint onto the referenced profile's
+        # base_url/model/api_key_env so downstream consumers see one shape.
+        self._resolve_local_endpoint_references(errors)
+
         if errors:
             raise ValueError("Configuration has conflicting settings:\n" + "\n".join(f"  - {e}" for e in errors))
 
         return self
+
+    def _resolve_local_endpoint_references(self, errors: list[str]) -> None:
+        """Materialize ``endpoint`` profile references onto role entries.
+
+        A role entry naming a ``local_endpoints`` profile must not also pin
+        an inline ``base_url``/``model``/``api_key_env``: the profile is the
+        single source of truth for the endpoint, and the certification
+        receipt is keyed on the profile's exact ``(base_url, model)`` pair.
+        """
+        if not self.role_model_policy:
+            return
+        profiles = self.local_endpoints or {}
+        for role, entry in self.role_model_policy.items():
+            if entry.endpoint is None:
+                continue
+            profile = profiles.get(entry.endpoint)
+            if profile is None:
+                known = ", ".join(sorted(profiles)) or "(none defined)"
+                errors.append(
+                    f"role_model_policy.{role}.endpoint references unknown "
+                    f"local_endpoints profile {entry.endpoint!r}. Known profiles: {known}."
+                )
+                continue
+            conflicts = [name for name in ("base_url", "model", "api_key_env") if getattr(entry, name) is not None]
+            if conflicts:
+                errors.append(
+                    f"role_model_policy.{role}: {', '.join(conflicts)} cannot be set inline "
+                    f"together with endpoint={entry.endpoint!r}; the profile pins the "
+                    "certified endpoint. Move overrides into the profile."
+                )
+                continue
+            entry.base_url = profile.base_url
+            entry.model = profile.model
+            entry.api_key_env = profile.api_key_env
 
     def _parse_budget_value(self) -> float | None:
         """Parse the budget field into a numeric value."""
@@ -606,8 +1047,7 @@ class BernsteinConfig(BaseModel):
         if isinstance(raw, (int, float)):
             return float(raw)
         # raw is str at this point
-        s = str(raw).strip()
-        s = s.removeprefix("$")
+        s = str(raw).strip().removeprefix("$")
         try:
             return float(s)
         except ValueError:
@@ -831,6 +1271,16 @@ def load_and_validate(
     # CFG-001 + CFG-002: Validate with Pydantic
     config = BernsteinConfig.model_validate(data)
 
+    # Issue #2356: gate merge-critical roles on a verified endpoint
+    # certification receipt. Local profiles on low-stakes roles pass
+    # without a receipt (best-effort by policy); a gated role requires a
+    # signed receipt certifying that exact role for that exact endpoint.
+    endpoint_errors = _validate_endpoint_certifications(config, project_root=path.parent)
+    if endpoint_errors:
+        raise ValueError(
+            "Configuration failed the endpoint certification gate:\n" + "\n".join(f"  - {e}" for e in endpoint_errors)
+        )
+
     # CFG-005: Check file paths
     if check_paths:
         path_errors = validate_file_paths(config, project_root=path.parent)
@@ -838,6 +1288,26 @@ def load_and_validate(
             raise ConfigPathError("Config references missing paths:\n" + "\n".join(f"  - {e}" for e in path_errors))
 
     return config
+
+
+def _validate_endpoint_certifications(config: BernsteinConfig, *, project_root: Path) -> list[str]:
+    """Collect certification-gate errors for local endpoint assignments."""
+    policy = config.role_model_policy or {}
+    assignments = [
+        (role, entry.endpoint, entry.base_url or "", entry.model or "")
+        for role, entry in policy.items()
+        if entry.endpoint is not None
+    ]
+    if not assignments:
+        return []
+    # Imported lazily: the endpoints package pulls in signing/lineage
+    # machinery most config loads never touch.
+    from bernstein.core.endpoints.certification import validate_endpoint_assignments
+
+    return validate_endpoint_assignments(
+        [(role, name, base_url, model) for role, name, base_url, model in assignments],
+        workdir=project_root,
+    )
 
 
 def export_json_schema(*, indent: int = 2) -> str:

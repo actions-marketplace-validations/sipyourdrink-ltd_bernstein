@@ -15,6 +15,8 @@ Environment overrides (take priority over all file-based config layers):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
@@ -55,7 +57,7 @@ effort: max
 model: null
 """
 
-ConfigSource = Literal["session", "project", "global", "default"]
+ConfigSource = Literal["seed", "session", "project", "context", "global", "default"]
 
 
 class ConfigProvenanceLayer(TypedDict):
@@ -87,9 +89,14 @@ class SourcePolicyViolation(TypedDict):
 # Keys that must only be set at specific sources (policy enforcement).
 # If a key is absent from this map, any source is allowed.
 _ALLOWED_SOURCE_POLICIES: dict[str, tuple[ConfigSource, ...]] = {
-    # Security-sensitive keys must not be set via session/env overrides alone
-    "budget": ("project", "global", "default"),
-    "max_agents": ("project", "global", "default"),
+    # Security-sensitive keys must not be set via session/env overrides alone.
+    # A named operating context (#2550) is an audit-chained, attested source
+    # that sits between project and global, so it joins the allowlist.
+    # The run seed (``bernstein.yaml``, the committed run manifest) is the
+    # value the orchestrator actually enforces at runtime, so it is a
+    # legitimate source on par with the project layer (#2874).
+    "budget": ("seed", "project", "context", "global", "default"),
+    "max_agents": ("seed", "project", "context", "global", "default"),
 }
 
 
@@ -208,8 +215,7 @@ class BernsteinHome:
 
     def load_raw(self) -> dict[str, object]:
         """Return raw persisted global settings without default expansion."""
-        data = self._load()
-        return {key: value for key, value in data.items()}
+        return self._load().copy()
 
     def _save(self, data: dict[str, Any]) -> None:
         """Persist data to config.yaml, creating home dir if needed."""
@@ -320,6 +326,73 @@ def _load_project_config(project_dir: Path) -> dict[str, object]:
     return {str(key): value for key, value in typed_data.items()}
 
 
+#: Directory (relative to a project) holding operating-context documents and
+#: the ``active.json`` activation pointer written by the fleet context store.
+_CONTEXT_DIR = ("fleet", "contexts")
+
+#: Fields the fleet context store hashes into the activated settings identity.
+#: Kept in sync with ``bernstein.core.fleet.context._COMPOSITE_FIELDS`` so this
+#: loader can recompute the identity without importing the fleet package.
+_CONTEXT_COMPOSITE_FIELDS = ("server_url", "store_dsn", "adapter_defaults", "budget_envelope")
+
+
+def _context_settings_hash(doc: dict[str, object]) -> str:
+    """Recompute a context document's canonical settings hash.
+
+    Mirrors ``bernstein.core.fleet.context.settings_hash_of(context.composite())``:
+    canonical JSON (sorted keys, compact separators, ASCII) over the composite
+    fields plus the config layer, digested with SHA-256. Kept dependency-light
+    so the low-level config resolver never imports the fleet package.
+    """
+    composite: dict[str, object] = {f: doc.get(f, "") for f in _CONTEXT_COMPOSITE_FIELDS}
+    layer = doc.get("config_layer")
+    composite["config_layer"] = layer if isinstance(layer, dict) else {}
+    canonical = json.dumps(composite, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _load_context_config(project_dir: Path) -> tuple[dict[str, object], str | None]:
+    """Load the active operating context's config overrides (#2550).
+
+    Returns ``(overrides, context_name)``. When no context is active the
+    overrides are empty and the name is ``None`` - so with no context active
+    the precedence chain is byte-for-byte the original four-layer behaviour.
+
+    The context store writes a self-describing document whose ``config_layer``
+    field is the exact key -> value map the context contributes to the
+    precedence chain; this loader reads only plain JSON and never imports the
+    fleet package, so the low-level config resolver stays dependency-light.
+
+    The layer is applied only when the document still hashes to the settings
+    identity recorded at activation. A document edited on disk after
+    activation (its hash no longer matching ``active.json``) is treated as no
+    active context: the resolver fails closed rather than silently resolving
+    under an unaudited configuration.
+    """
+    context_root = project_dir / ".sdd" / _CONTEXT_DIR[0] / _CONTEXT_DIR[1]
+    active_pointer = context_root / "active.json"
+    if not active_pointer.exists():
+        return {}, None
+    try:
+        active = json.loads(active_pointer.read_text(encoding="utf-8"))
+        name = active.get("name")
+        if not isinstance(name, str) or not name:
+            return {}, None
+        doc = json.loads((context_root / f"{name}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, KeyError):
+        return {}, None
+    if not isinstance(doc, dict):
+        return {}, None
+    recorded_hash = active.get("settings_hash")
+    if isinstance(recorded_hash, str) and recorded_hash and _context_settings_hash(doc) != recorded_hash:
+        # The document drifted from its audited identity; fail closed.
+        return {}, None
+    layer = doc.get("config_layer")
+    if not isinstance(layer, dict):
+        return {}, name
+    return {str(k): v for k, v in layer.items()}, name
+
+
 # ---------------------------------------------------------------------------
 # Config resolution with precedence
 # ---------------------------------------------------------------------------
@@ -331,30 +404,54 @@ def resolve_config(
     home: BernsteinHome,
     project_dir: Path,
     session_overrides: Mapping[str, object] | None = None,
+    seed_overrides: Mapping[str, object] | None = None,
+    seed_overrides_path: str | None = None,
 ) -> ConfigResolution:
     """Resolve the effective value for *key* across all config layers.
 
     Precedence (highest first):
-    1. Session-only overrides (environment or caller-provided)
-    2. ``<project>/.sdd/config.yaml``
-    3. ``~/.bernstein/config.yaml``
-    4. Built-in defaults
+    1. Run seed overrides (``bernstein.yaml``, the value the orchestrator
+       actually enforces at runtime - see ``seed_overrides``)
+    2. Session-only overrides (environment or caller-provided)
+    3. ``<project>/.sdd/config.yaml``
+    4. ``~/.bernstein/config.yaml``
+    5. Built-in defaults
 
     Args:
         key: Config key to look up.
         home: BernsteinHome instance (global config).
         project_dir: Project root for loading ``.sdd/config.yaml``.
         session_overrides: Optional session-only overrides.
+        seed_overrides: Optional run-seed effective values. The seed
+            (``bernstein.yaml``) is not read by the low-level file resolver,
+            yet it is the value the orchestrator caps concurrency and spend
+            with. Threading it here as the top-precedence ``seed`` layer keeps
+            surfaces such as the dashboard capacity denominator honest for
+            seed-configured runs (#2874). A key absent from this mapping is
+            resolved exactly as before.
+        seed_overrides_path: Filesystem path recorded on the injected ``seed``
+            layer (the resolved seed file), or ``None`` when unknown.
 
     Returns:
         Typed mapping with the effective ``value``, winning ``source``, and the
         full ``source_chain`` in descending-precedence order.
     """
     project_config = _load_project_config(project_dir)
+    context_config, context_name = _load_context_config(project_dir)
     global_data = home.load_raw()
     combined_session_overrides = _session_overrides_from_env() | dict(session_overrides or {})
 
     layers: list[ConfigProvenanceLayer] = []
+    if seed_overrides is not None and key in seed_overrides:
+        value = _coerce_config_value(key, seed_overrides[key])
+        layers.append(
+            {
+                "source": "seed",
+                "value": value,
+                "redacted_value": _redact_config_value(key, value),
+                "path": seed_overrides_path,
+            }
+        )
     if key in combined_session_overrides:
         value = _coerce_config_value(key, combined_session_overrides[key])
         layers.append(
@@ -373,6 +470,16 @@ def resolve_config(
                 "value": value,
                 "redacted_value": _redact_config_value(key, value),
                 "path": str(project_dir / ".sdd" / _CONFIG_YAML_FILENAME),
+            }
+        )
+    if key in context_config:
+        value = context_config[key]
+        layers.append(
+            {
+                "source": "context",
+                "value": value,
+                "redacted_value": _redact_config_value(key, value),
+                "path": str(project_dir / ".sdd" / _CONTEXT_DIR[0] / _CONTEXT_DIR[1] / f"{context_name}.json"),
             }
         )
     if key in global_data:
@@ -410,8 +517,15 @@ def resolve_config_bundle(
     project_dir: Path,
     keys: tuple[str, ...] | None = None,
     session_overrides: Mapping[str, object] | None = None,
+    seed_overrides: Mapping[str, object] | None = None,
+    seed_overrides_path: str | None = None,
 ) -> dict[str, ConfigResolution]:
-    """Resolve a stable bundle of config keys with provenance."""
+    """Resolve a stable bundle of config keys with provenance.
+
+    ``seed_overrides`` threads the run seed's effective values (see
+    :func:`resolve_config`) so the bundle reflects what the orchestrator
+    actually enforces for seed-configured runs (#2874).
+    """
     target_keys = keys or tuple(sorted(_DEFAULTS))
     return {
         key: resolve_config(
@@ -419,6 +533,8 @@ def resolve_config_bundle(
             home=home,
             project_dir=project_dir,
             session_overrides=session_overrides,
+            seed_overrides=seed_overrides,
+            seed_overrides_path=seed_overrides_path,
         )
         for key in target_keys
     }

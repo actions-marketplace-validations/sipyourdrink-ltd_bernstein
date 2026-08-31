@@ -1,6 +1,6 @@
 # bernstein-sdk
 
-Python integration SDK for the [Bernstein](https://github.com/sasha-labs/bernstein) multi-agent orchestration system.
+Python integration SDK for [Bernstein](https://github.com/sipyourdrink-ltd/bernstein), the open-source governance layer for AI agents.
 
 Connect CI/CD pipelines, issue trackers (Jira, Linear), and chat tools (Slack, Teams) to Bernstein's task server.
 
@@ -28,11 +28,11 @@ with BernsteinClient("http://127.0.0.1:8052") as client:
 
 ## Adapters
 
-- **Jira** — convert issues to tasks, sync status back via transitions
-- **Linear** — GraphQL-backed issue sync
-- **Slack** — Block Kit notifications on task events
-- **Teams** — Adaptive Card notifications
-- **GitHub Actions** — create fix tasks from CI failures
+- **Jira** - convert issues to tasks, sync status back via transitions
+- **Linear** - GraphQL-backed issue sync
+- **Slack** - Block Kit notifications on task events
+- **Teams** - Adaptive Card notifications
+- **GitHub Actions** - create fix tasks from CI failures
 
 ## State mapping
 
@@ -40,8 +40,8 @@ with BernsteinClient("http://127.0.0.1:8052") as client:
 from bernstein_sdk.state_map import JiraToBernstein, BernsteinToJira
 from bernstein_sdk.models import TaskStatus
 
-status = JiraToBernstein.map("In Progress")   # → TaskStatus.IN_PROGRESS
-label  = BernsteinToJira.map(TaskStatus.DONE) # → "Done"
+status = JiraToBernstein.map("In Progress")  # → TaskStatus.IN_PROGRESS
+label = BernsteinToJira.map(TaskStatus.DONE)  # → "Done"
 ```
 
 ## Async client

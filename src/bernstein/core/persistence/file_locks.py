@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LOCK_TTL_SECONDS = 7_200  # 2 hours — expire stale locks from crashed agents
+LOCK_TTL_SECONDS = 7_200  # 2 hours - expire stale locks from crashed agents
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +70,14 @@ if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
                 # match the blocking POSIX flock.
                 time.sleep(0.05)
 
+    def _os_try_lock(fh: IO[bytes]) -> bool:
+        """Attempt the lock without blocking; return whether it was taken."""
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
     def _os_unlock(fh: IO[bytes]) -> None:
         """Release the OS-level lock on *fh* (Windows)."""
         with suppress(OSError):
@@ -80,6 +88,14 @@ else:
     def _os_lock(fh: IO[bytes]) -> None:
         """Acquire an exclusive OS-level lock on *fh* (POSIX)."""
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+
+    def _os_try_lock(fh: IO[bytes]) -> bool:
+        """Attempt the lock without blocking; return whether it was taken."""
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
 
     def _os_unlock(fh: IO[bytes]) -> None:
         """Release the OS-level lock on *fh* (POSIX)."""
@@ -108,6 +124,56 @@ def _cross_process_lock(lock_path: Path) -> Iterator[None]:
     fh = lock_path.open("a+b")
     try:
         _os_lock(fh)
+        try:
+            yield
+        finally:
+            _os_unlock(fh)
+    finally:
+        fh.close()
+
+
+class LockTimeout(TimeoutError):
+    """Raised when a bounded :func:`cross_process_lock` could not be acquired."""
+
+
+@contextmanager
+def cross_process_lock(lock_path: Path, *, timeout: float | None = None) -> Iterator[None]:
+    """Public alias for :func:`_cross_process_lock`.
+
+    An exclusive OS-level file lock at *lock_path*, usable by any subsystem
+    that needs to serialize a load-modify-save cycle across processes sharing
+    a ``.sdd/`` directory (e.g. the fleet config plane's variable writer). See
+    the module docstring for the cross-process safety contract and the NFS
+    caveat.
+
+    Args:
+        lock_path: Path to the ``.lock`` sentinel file.
+        timeout: Seconds to wait before giving up. ``None`` (the default)
+            blocks indefinitely, preserving the historical behaviour for
+            existing callers. A bounded wait turns the worst failure mode -
+            a same-process second descriptor on a lock this process already
+            holds, which ``flock`` will never grant - from a silent permanent
+            hang into a diagnosable error.
+
+    Raises:
+        LockTimeout: When *timeout* elapses before the lock is acquired.
+    """
+    if timeout is None:
+        with _cross_process_lock(lock_path):
+            yield
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("a+b")
+    try:
+        deadline = time.monotonic() + timeout
+        while not _os_try_lock(fh):
+            if time.monotonic() >= deadline:
+                raise LockTimeout(
+                    f"could not acquire {lock_path} within {timeout}s; another process - or this one, "
+                    "through a second handle on the same lock - is holding it",
+                )
+            time.sleep(0.05)
         try:
             yield
         finally:
@@ -265,7 +331,7 @@ class FileLockManager:
     def check_conflicts(self, files: list[str]) -> list[tuple[str, FileLock]]:
         """Return (path, lock) pairs for each *file* that is currently locked.
 
-        Unlike :meth:`acquire`, this is a read-only probe — it never modifies the
+        Unlike :meth:`acquire`, this is a read-only probe - it never modifies the
         lock table.  Expired locks are evicted before the check.
 
         Args:
@@ -335,7 +401,7 @@ class FileLockManager:
         Callers must hold the cross-process OS lock (via :meth:`_guard`).
         Routes through :func:`write_atomic_json` which does temp-file +
         fsync + ``os.replace`` so readers either see the old payload or the
-        new one — never a truncated mid-write document.
+        new one - never a truncated mid-write document.
         """
         try:
             data = [asdict(lock) for lock in self._locks.values()]
@@ -353,8 +419,8 @@ class ToolConcurrencySafety(Enum):
     """Classification of whether a tool is safe to run concurrently (T576).
 
     Attributes:
-        SAFE: Read-only or idempotent — may run in parallel with other tools.
-        UNSAFE: Mutates shared state — must be serialized.
+        SAFE: Read-only or idempotent - may run in parallel with other tools.
+        UNSAFE: Mutates shared state - must be serialized.
         UNKNOWN: Classification not determined; defaults to conservative UNSAFE.
     """
 
@@ -447,14 +513,14 @@ def partition_tools_by_concurrency(tool_names: list[str]) -> tuple[list[str], li
 #: Built-in tool concurrency classifications.
 #: Tools absent from this map default to UNKNOWN (treated as UNSAFE).
 TOOL_CONCURRENCY_CLASSIFICATIONS: dict[str, ToolConcurrencySafety] = {
-    # Read-only tools — safe to parallelize
+    # Read-only tools - safe to parallelize
     "read_file": ToolConcurrencySafety.SAFE,
     "list_directory": ToolConcurrencySafety.SAFE,
     "search_files": ToolConcurrencySafety.SAFE,
     "grep": ToolConcurrencySafety.SAFE,
     "glob": ToolConcurrencySafety.SAFE,
     "get_file_info": ToolConcurrencySafety.SAFE,
-    # Mutating tools — must be serialized
+    # Mutating tools - must be serialized
     "write_file": ToolConcurrencySafety.UNSAFE,
     "edit_file": ToolConcurrencySafety.UNSAFE,
     "create_file": ToolConcurrencySafety.UNSAFE,

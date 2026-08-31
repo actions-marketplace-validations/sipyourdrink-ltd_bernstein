@@ -12,7 +12,7 @@ Users define custom metrics in bernstein.yaml::
         unit: "ratio"
 
 Formulas reference built-in variables from tick and cumulative metrics.
-Only safe arithmetic is supported — no function calls or attribute access.
+Only safe arithmetic is supported - no function calls or attribute access.
 """
 
 from __future__ import annotations
@@ -91,11 +91,11 @@ def _eval_node(node: ast.AST, variables: dict[str, float]) -> float:
         return float(_BINOP_MAP[op_type](left, right))
 
     if isinstance(node, ast.UnaryOp):
-        op_type = type(node.op)
-        if op_type not in _UNARYOP_MAP:
-            raise FormulaError(f"Unsupported unary operator {op_type.__name__}")
+        unary_op_type = type(node.op)
+        if unary_op_type not in _UNARYOP_MAP:
+            raise FormulaError(f"Unsupported unary operator {unary_op_type.__name__}")
         operand = _eval_node(node.operand, variables)
-        return float(_UNARYOP_MAP[op_type](operand))
+        return float(_UNARYOP_MAP[unary_op_type](operand))
 
     raise FormulaError(
         f"Unsupported AST node type {type(node).__name__}. "
@@ -124,7 +124,7 @@ def evaluate_formula(formula: str, variables: dict[str, float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Variable registry — maps names to metric sources
+# Variable registry - maps names to metric sources
 # ---------------------------------------------------------------------------
 
 

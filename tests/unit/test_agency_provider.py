@@ -1,4 +1,4 @@
-"""Tests for AgencyProvider — parses msitarzewski/agency-agents format."""
+"""Tests for AgencyProvider - parses msitarzewski/agency-agents format."""
 
 from __future__ import annotations
 
@@ -177,6 +177,70 @@ class TestParseFile:
         agents = AgencyProvider._parse_file(f, division="engineering")
         assert all(isinstance(a, CatalogAgent) for a in agents)
 
+    def test_scalar_tools_split_on_comma(self, tmp_path: Path) -> None:
+        md = textwrap.dedent("""\
+            ---
+            name: Scalar Tools Agent
+            tools: WebFetch, WebSearch, Read
+            ---
+
+            Body.
+        """)
+        f = tmp_path / "eng-scalar-tools.md"
+        f.write_text(md, encoding="utf-8")
+        agents = AgencyProvider._parse_file(f, division="engineering")
+        assert agents[0].tools == ["WebFetch", "WebSearch", "Read"]
+
+    def test_scalar_capabilities_split_on_comma(self, tmp_path: Path) -> None:
+        md = textwrap.dedent("""\
+            ---
+            name: Scalar Caps Agent
+            capabilities: code-review, security-analysis
+            ---
+
+            Body.
+        """)
+        f = tmp_path / "eng-scalar-caps.md"
+        f.write_text(md, encoding="utf-8")
+        agents = AgencyProvider._parse_file(f, division="engineering")
+        assert agents[0].capabilities == ["code-review", "security-analysis"]
+
+    def test_scalar_single_tool(self, tmp_path: Path) -> None:
+        md = textwrap.dedent("""\
+            ---
+            name: Single Tool Agent
+            tools: Read
+            ---
+
+            Body.
+        """)
+        f = tmp_path / "eng-single-tool.md"
+        f.write_text(md, encoding="utf-8")
+        agents = AgencyProvider._parse_file(f, division="engineering")
+        assert agents[0].tools == ["Read"]
+
+    def test_scalar_extra_whitespace_stripped(self, tmp_path: Path) -> None:
+        md = textwrap.dedent("""\
+            ---
+            name: Whitespace Agent
+            tools: A , B ,  C
+            capabilities:  x , y
+            ---
+
+            Body.
+        """)
+        f = tmp_path / "eng-whitespace.md"
+        f.write_text(md, encoding="utf-8")
+        agents = AgencyProvider._parse_file(f, division="engineering")
+        assert agents[0].tools == ["A", "B", "C"]
+        assert agents[0].capabilities == ["x", "y"]
+
+    def test_yaml_list_tools_still_works(self, tmp_path: Path) -> None:
+        f = tmp_path / "engineering-code-reviewer.md"
+        f.write_text(FULL_AGENT_MD, encoding="utf-8")
+        agents = AgencyProvider._parse_file(f, division="engineering")
+        assert agents[0].tools == ["ruff", "mypy", "pytest"]
+
 
 # ---------------------------------------------------------------------------
 # provider_id / is_available
@@ -296,11 +360,17 @@ class TestSyncCatalog:
         assert "catalogs" in path.parts
 
     def test_sync_catalog_respects_ttl(self, tmp_path: Path) -> None:
-        """If a fresh marker file exists, sync_catalog returns (True, ...) without git."""
+        """A fresh marker short-circuits the sync only when the lockfile is also present.
+
+        The marker alone is not enough: a catalog with no ``agents.lock`` has
+        nothing for :meth:`fetch_agents` to verify against, so the TTL is
+        treated as stale and the next sync re-writes one.
+        """
         target = tmp_path / "agency"
         target.mkdir()
         # Create a git repo stub so the "pull" path would be taken
         (target / ".git").mkdir()
+        (target / "agents.lock").write_text('{"content_digest": ""}', encoding="utf-8")
         # Create a fresh marker file
         marker = tmp_path / ".agency.synced"
         marker.touch()
@@ -476,7 +546,7 @@ MODEL_PREFS_AGENT_MD = textwrap.dedent("""\
 
 
 class TestModelPreferencesField:
-    """model_preferences frontmatter field is gracefully ignored — not required by Bernstein."""
+    """model_preferences frontmatter field is gracefully ignored - not required by Bernstein."""
 
     def test_model_preferences_field_does_not_cause_error(self, tmp_path: Path) -> None:
         """Agents with model_preferences in frontmatter are parsed without error."""

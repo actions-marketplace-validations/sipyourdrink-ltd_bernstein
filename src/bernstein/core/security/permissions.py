@@ -170,7 +170,16 @@ DEFAULT_ROLE_PERMISSIONS: dict[str, AgentPermissions] = {
         denied_paths=(_PATTERN_SDD, _PATTERN_ROLES),
     ),
     "devops": AgentPermissions(
-        allowed_paths=(_PATTERN_GITHUB, "Dockerfile", "docker-compose.yml", _PATTERN_SCRIPTS, "Makefile"),
+        allowed_paths=(
+            _PATTERN_GITHUB,
+            "Dockerfile",
+            # Both spellings occur in the wild; listed literally rather than as a
+            # glob because fnmatch's ``*`` also crosses ``/``.
+            "docker-compose.yaml",
+            "docker-compose.yml",
+            _PATTERN_SCRIPTS,
+            "Makefile",
+        ),
         denied_paths=(_PATTERN_SDD, _PATTERN_SRC, _PATTERN_ROLES),
     ),
     "docs": AgentPermissions(
@@ -268,7 +277,7 @@ def is_path_allowed(
     """
     # Path traversal quick-check
     if has_path_traversal(filepath):
-        logger.warning("Path traversal detected in %r — denied", filepath)
+        logger.warning("Path traversal detected in %r - denied", filepath)
         return False
 
     # Resolve and validate containment when a project root is available
@@ -338,7 +347,7 @@ def check_file_permissions(
         return [
             PermissionDecision(
                 type=DecisionType.ALLOW,
-                reason=f"No file permission rules defined for role '{role}' — skipping",
+                reason=f"No file permission rules defined for role '{role}' - skipping",
             )
         ]
 
@@ -367,7 +376,7 @@ def check_file_permissions(
 
 
 # ---------------------------------------------------------------------------
-# Diff parsing (shared with guardrails.py — minimal duplication)
+# Diff parsing (shared with guardrails.py - minimal duplication)
 # ---------------------------------------------------------------------------
 
 

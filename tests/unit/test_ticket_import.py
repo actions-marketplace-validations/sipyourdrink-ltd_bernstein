@@ -146,6 +146,20 @@ def test_github_gh_cli_path_parses() -> None:
             "labels": [{"name": "docs"}],
             "assignees": [{"login": "alice"}],
             "url": "https://github.com/acme/widgets/issues/7",
+            "comments": [
+                {
+                    "body": "Nice work.",
+                    "author": {"login": "alice"},
+                    "author_association": "MEMBER",
+                    "created_at": "2024-01-01T00:00:00Z",
+                },
+                {
+                    "body": "LGTM.",
+                    "author": {"login": "bob"},
+                    "author_association": "CONTRIBUTOR",
+                    "created_at": "2024-01-02T00:00:00Z",
+                },
+            ],
         }
     )
 
@@ -163,6 +177,14 @@ def test_github_gh_cli_path_parses() -> None:
     assert payload.labels == ("docs",)
     assert payload.assignee == "alice"
     assert payload.source == "github"
+    assert len(payload.comments) == 2
+    assert payload.comments[0]["body"] == "Nice work."
+    assert payload.comments[0]["author"] == "alice"
+    assert payload.comments[0]["author_association"] == "MEMBER"
+    assert payload.comments[0]["created_at"] == "2024-01-01T00:00:00Z"
+    assert payload.comments[1]["body"] == "LGTM."
+    assert payload.comments[1]["author"] == "bob"
+    assert payload.comments[1]["author_association"] == "CONTRIBUTOR"
 
 
 def test_github_rest_fallback_parses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,21 +200,57 @@ def test_github_rest_fallback_parses(monkeypatch: pytest.MonkeyPatch) -> None:
         "assignee": {"login": "bob"},
         "html_url": "https://github.com/acme/widgets/issues/11",
     }
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = rest_body
+    comments_body = [
+        {
+            "body": "Looks good to me.",
+            "user": {"login": "carol"},
+            "author_association": "CONTRIBUTOR",
+            "created_at": "2024-01-01T00:00:00Z",
+        },
+        {
+            "body": "Needs more tests.",
+            "user": {"login": "dave"},
+            "author_association": "MEMBER",
+            "created_at": "2024-01-02T00:00:00Z",
+        },
+    ]
+
+    call_count = 0
+
+    def mock_get(url: str, headers: dict[str, str], timeout: float) -> MagicMock:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = rest_body
+            resp.headers = {}
+        else:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = comments_body
+            resp.headers = {}
+        return resp
 
     with (
         patch.object(github_issues, "_gh_available", return_value=False),
-        patch("httpx.get", return_value=mock_resp) as mock_get,
+        patch("httpx.get", side_effect=mock_get) as mock_get,
     ):
         payload = github_issues.fetch_github_issue("https://github.com/acme/widgets/issues/11")
 
-    mock_get.assert_called_once()
+    assert mock_get.call_count == 2
     assert payload.id == "acme/widgets#11"
     assert payload.title == "Refactor"
     assert payload.labels == ("backend", "refactor")
     assert payload.assignee == "bob"
+    assert len(payload.comments) == 2
+    assert payload.comments[0]["body"] == "Looks good to me."
+    assert payload.comments[0]["author"] == "carol"
+    assert payload.comments[0]["author_association"] == "CONTRIBUTOR"
+    assert payload.comments[0]["created_at"] == "2024-01-01T00:00:00Z"
+    assert payload.comments[1]["body"] == "Needs more tests."
+    assert payload.comments[1]["author"] == "dave"
+    assert payload.comments[1]["author_association"] == "MEMBER"
 
 
 def test_github_rest_missing_token_raises_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -360,3 +418,277 @@ def test_explicit_role_flag_overrides_inference() -> None:
     payload = build_task_payload(ticket, role="backend", priority="low")
     assert payload["role"] == "backend"
     assert payload["priority"] == 3
+
+
+# ---------------------------------------------------------------------------
+# HTTP helper: retries, rate limits, and circuit breaker (Issue #4534)
+# ---------------------------------------------------------------------------
+
+
+def test_429_with_retry_after_is_retried_and_succeeds() -> None:
+    from bernstein.core.integrations.tickets._http import http_get_json
+    from bernstein.core.observability.provider_circuit_breaker import ProviderCircuitBreaker
+
+    calls = 0
+    slept: list[float] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, headers: dict[str, str], json_data: dict[str, Any] | None = None):
+            self.status_code = status_code
+            self.headers = headers
+            self._json = json_data or {}
+            self.text = "rate limited"
+
+        def json(self) -> dict[str, Any]:
+            return self._json
+
+    def mock_get(url: str, headers: dict[str, str], timeout: float) -> FakeResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return FakeResponse(429, {"Retry-After": "2.5"})
+        return FakeResponse(200, {}, {"title": "Issue title"})
+
+    breaker = ProviderCircuitBreaker("test-provider")
+
+    with patch("httpx.get", side_effect=mock_get):
+        data = http_get_json(
+            url="https://api.github.com/repos/acme/repo/issues/1",
+            headers={"Authorization": "Bearer tok"},
+            provider_label="GitHub",
+            auth_env_var="GITHUB_TOKEN",
+            circuit_breaker=breaker,
+            sleep_fn=slept.append,
+        )
+
+    assert calls == 2
+    assert slept == [2.5]
+    assert data["title"] == "Issue title"
+    assert breaker.state.value == "closed"
+
+
+def test_a_huge_retry_after_is_capped_not_obeyed() -> None:
+    """A provider must not be able to park the calling thread.
+
+    ``Retry-After`` is a server-controlled number and this helper sleeps on it
+    synchronously, so honouring it unbounded hands any tracker the ability to
+    block a ticket sync for as long as it likes. The existing coverage uses
+    2.5s, which is under the cap and so passes either way; this pins the cap.
+    """
+    from bernstein.core.integrations.tickets._http import http_get_json
+    from bernstein.core.observability.provider_circuit_breaker import ProviderCircuitBreaker
+
+    slept: list[float] = []
+    calls = 0
+
+    class FakeResponse:
+        def __init__(self, status_code: int, headers: dict[str, str], json_data: dict[str, Any] | None = None):
+            self.status_code = status_code
+            self.headers = headers
+            self._json = json_data or {}
+            self.text = "rate limited"
+
+        def json(self) -> dict[str, Any]:
+            return self._json
+
+    def mock_get(url: str, headers: dict[str, str], timeout: float) -> FakeResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return FakeResponse(429, {"Retry-After": "3600"})
+        return FakeResponse(200, {}, {"title": "ok"})
+
+    breaker = ProviderCircuitBreaker("cap-httpx")
+    with patch("httpx.get", side_effect=mock_get):
+        http_get_json(
+            url="https://api.github.com/repos/acme/repo/issues/1",
+            headers={"Authorization": "Bearer tok"},
+            provider_label="GitHub",
+            auth_env_var="GITHUB_TOKEN",
+            circuit_breaker=breaker,
+            max_backoff_s=30.0,
+            sleep_fn=slept.append,
+        )
+
+    assert slept == [30.0], f"Retry-After must be capped at max_backoff_s; slept {slept}"
+
+
+def test_the_urllib_fallback_caps_retry_after_the_same_way() -> None:
+    """The two transports must not disagree about how long they will wait.
+
+    ``http_request_json`` falls back to ``urllib`` when ``httpx`` is absent, and
+    that branch is otherwise uncovered. A response that costs 30s through one
+    transport must not cost an hour through the other.
+    """
+    import sys
+    import urllib.error
+
+    from bernstein.core.integrations.tickets._http import http_get_json
+    from bernstein.core.observability.provider_circuit_breaker import ProviderCircuitBreaker
+
+    slept: list[float] = []
+    calls = 0
+
+    class _Headers(dict[str, str]):
+        pass
+
+    def mock_urlopen(req: Any, timeout: float | None = None) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise urllib.error.HTTPError(
+                "https://api.github.com/x", 429, "Too Many Requests", _Headers({"Retry-After": "3600"}), None
+            )
+
+        class _Handle:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b'{"title": "ok"}'
+
+        return _Handle()
+
+    breaker = ProviderCircuitBreaker("cap-urllib")
+    with (
+        patch.dict(sys.modules, {"httpx": None}),
+        patch("urllib.request.urlopen", side_effect=mock_urlopen),
+    ):
+        http_get_json(
+            url="https://api.github.com/repos/acme/repo/issues/1",
+            headers={"Authorization": "Bearer tok"},
+            provider_label="GitHub",
+            auth_env_var="GITHUB_TOKEN",
+            circuit_breaker=breaker,
+            max_backoff_s=30.0,
+            sleep_fn=slept.append,
+        )
+
+    assert calls == 2
+    assert slept == [30.0], f"urllib fallback must cap Retry-After too; slept {slept}"
+
+
+def test_404_fails_immediately_without_retry() -> None:
+    from bernstein.core.integrations.tickets._http import http_get_json
+    from bernstein.core.observability.provider_circuit_breaker import ProviderCircuitBreaker
+
+    slept: list[float] = []
+
+    class FakeResponse:
+        status_code = 404
+        headers: dict[str, str] = {}
+        text = "Not Found"
+
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    breaker = ProviderCircuitBreaker("test-provider")
+
+    with patch("httpx.get", return_value=FakeResponse()):
+        with pytest.raises(TicketParseError) as exc_info:
+            http_get_json(
+                url="https://api.github.com/repos/acme/repo/issues/999",
+                headers={},
+                provider_label="GitHub",
+                auth_env_var="GITHUB_TOKEN",
+                circuit_breaker=breaker,
+                sleep_fn=slept.append,
+            )
+
+    assert "404" in str(exc_info.value)
+    assert len(slept) == 0
+
+
+def test_retry_exhaustion_raises_rate_limited_error_not_parse_error() -> None:
+    from bernstein.core.integrations.tickets import TicketRateLimitError
+    from bernstein.core.integrations.tickets._http import http_get_json
+    from bernstein.core.observability.provider_circuit_breaker import ProviderCircuitBreaker
+
+    calls = 0
+    slept: list[float] = []
+
+    class FakeResponse:
+        status_code = 429
+        headers = {"Retry-After": "1"}
+        text = "Too Many Requests"
+
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    def mock_get(url: str, headers: dict[str, str], timeout: float) -> FakeResponse:
+        nonlocal calls
+        calls += 1
+        return FakeResponse()
+
+    breaker = ProviderCircuitBreaker("test-provider")
+
+    with patch("httpx.get", side_effect=mock_get):
+        with pytest.raises(TicketRateLimitError) as exc_info:
+            http_get_json(
+                url="https://api.github.com/repos/acme/repo/issues/1",
+                headers={},
+                provider_label="GitHub",
+                auth_env_var="GITHUB_TOKEN",
+                max_retries=2,
+                circuit_breaker=breaker,
+                sleep_fn=slept.append,
+            )
+
+    assert calls == 3  # initial + 2 retries
+    assert len(slept) == 2
+    assert "rate limit exceeded" in str(exc_info.value)
+    assert exc_info.value.provider == "GitHub"
+
+
+def test_repeated_provider_failures_open_the_circuit() -> None:
+    from bernstein.core.integrations.tickets import TicketCircuitOpenError
+    from bernstein.core.integrations.tickets._http import http_get_json
+    from bernstein.core.observability.provider_circuit_breaker import CircuitBreakerConfig, ProviderCircuitBreaker
+
+    class FakeResponse:
+        status_code = 500
+        headers: dict[str, str] = {}
+        text = "Internal Server Error"
+
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    config = CircuitBreakerConfig(failure_threshold=2, recovery_timeout_s=60.0)
+    breaker = ProviderCircuitBreaker("jira", config=config)
+
+    with patch("httpx.get", return_value=FakeResponse()):
+        # Attempt 1 -> Failure
+        with pytest.raises(TicketParseError):
+            http_get_json(
+                url="https://jira.example.com/rest/api/2/issue/1",
+                headers={},
+                provider_label="Jira",
+                auth_env_var="JIRA_API_TOKEN",
+                circuit_breaker=breaker,
+            )
+        assert breaker.state.value == "closed"
+
+        # Attempt 2 -> Failure (hits threshold 2) -> Transitions to OPEN
+        with pytest.raises(TicketParseError):
+            http_get_json(
+                url="https://jira.example.com/rest/api/2/issue/1",
+                headers={},
+                provider_label="Jira",
+                auth_env_var="JIRA_API_TOKEN",
+                circuit_breaker=breaker,
+            )
+        assert breaker.state.value == "open"
+
+        # Attempt 3 -> Immediately rejected by open circuit without HTTP call
+        with pytest.raises(TicketCircuitOpenError) as exc_info:
+            http_get_json(
+                url="https://jira.example.com/rest/api/2/issue/1",
+                headers={},
+                provider_label="Jira",
+                auth_env_var="JIRA_API_TOKEN",
+                circuit_breaker=breaker,
+            )
+        assert "circuit breaker is OPEN" in str(exc_info.value)

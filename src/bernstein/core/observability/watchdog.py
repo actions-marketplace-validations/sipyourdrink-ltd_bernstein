@@ -7,6 +7,7 @@ incident to humans via the existing notification and bulletin channels.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import time
@@ -15,7 +16,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from bernstein.core.agent_log_aggregator import AgentLogAggregator
+from bernstein.core.defaults import AGENT
 from bernstein.core.heartbeat import HeartbeatMonitor, compute_stall_profile
+from bernstein.core.tasks.auto_spawn_guard import AutoSpawnGuard
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -31,7 +34,41 @@ WatchdogSource = Literal["heartbeat", "log_growth", "progress_stall"]
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_OBJ = "dict[str, object]"
+type _CAST_DICT_STR_OBJ = dict[str, object]
+
+# Heartbeat phases that mean the agent is still producing its FIRST turn. A
+# non-heartbeat adapter (consumes_heartbeat_dir=False) has only its spawn-time
+# heartbeat on disk during this phase, so heartbeat age == wall-clock since
+# spawn; a slow/free model that deliberates past the normal stale threshold
+# must be judged on log/git liveness, not reaped on heartbeat age (issue #3012).
+_STARTING_PHASES: frozenset[str] = frozenset(
+    {"starting", "start", "init", "initializing", "spawning", "spawn", "boot", "booting"}
+)
+
+
+def _is_starting_phase(phase: str | None) -> bool:
+    return phase is not None and phase.strip().lower() in _STARTING_PHASES
+
+
+def _log_signal_is_fresh(log_age_s: float | None, heartbeat_age_s: float | None = None) -> bool:
+    """Whether a log mtime proves the agent is alive within the grace window.
+
+    A log/git-tree write fresher than ``AGENT.liveness_grace_s`` is a positive
+    liveness signal that SUPPRESSES the heartbeat-staleness incident (issue
+    #3012): the agent is demonstrably alive regardless of heartbeat age.
+
+    The suppression is bounded (issue #3058). Every CLI adapter except claude
+    merges the child's stderr into the same runner log
+    (``stderr=subprocess.STDOUT``), so provider retry chatter, a progress
+    spinner, or a runtime deprecation warning refreshes the mtime with no real
+    progress. Once ``heartbeat_age_s`` passes ``AGENT.liveness_suppression_cap_s``
+    the mtime is treated as output noise rather than proof of work and the
+    incident is raised. ``heartbeat_age_s`` of ``None`` means "unbounded",
+    preserving the caller-side behaviour for callers that have no heartbeat age.
+    """
+    if log_age_s is None or log_age_s >= AGENT.liveness_grace_s:
+        return False
+    return heartbeat_age_s is None or heartbeat_age_s < AGENT.liveness_suppression_cap_s
 
 
 @dataclass(frozen=True)
@@ -46,6 +83,11 @@ class WatchdogFinding:
     summary: str
     detail: str
     role: str = "reviewer"
+    # Title of the task this finding is about. Used by AutoSpawnGuard to
+    # compute ancestry depth (e.g. a finding about a task whose title already
+    # starts with "Watchdog triage:" is itself depth-1, so a new triage task
+    # about it would be depth 2 and gets refused).
+    task_title: str = ""
 
 
 @dataclass
@@ -77,6 +119,9 @@ def _check_session_findings(
     no_growth_ticks: int,
     stall_counts: dict[str, int],
     findings: dict[str, WatchdogFinding],
+    *,
+    log_age_s: float | None = None,
+    starting_timeout_s: float | None = None,
 ) -> None:
     """Check a single session for watchdog-worthy findings."""
     stall_count = int(stall_counts.get(task_id, 0))
@@ -101,10 +146,22 @@ def _check_session_findings(
                     f"Adaptive profile: wakeup={profile.wakeup_threshold}, "
                     f"shutdown={profile.shutdown_threshold}, kill={profile.kill_threshold} ({profile.reason})."
                 ),
+                task_title=str(title),
             )
             return
 
-    _check_heartbeat_findings(session_id, task_id, task, runtime_s, hb_status, timeout_s, current_line, findings)
+    _check_heartbeat_findings(
+        session_id,
+        task_id,
+        task,
+        runtime_s,
+        hb_status,
+        timeout_s,
+        current_line,
+        findings,
+        log_age_s=log_age_s,
+        starting_timeout_s=starting_timeout_s,
+    )
     _check_log_growth_findings(session_id, task_id, task, runtime_s, current_line, no_growth_ticks, findings)
 
 
@@ -117,10 +174,38 @@ def _check_heartbeat_findings(
     timeout_s: float,
     current_line: int,
     findings: dict[str, WatchdogFinding],
+    *,
+    log_age_s: float | None = None,
+    starting_timeout_s: float | None = None,
 ) -> None:
-    """Check heartbeat-related findings for a session."""
+    """Check heartbeat-related findings for a session.
+
+    A log/git mtime fresher than ``AGENT.liveness_grace_s`` is treated as a
+    POSITIVE liveness signal that suppresses the heartbeat-staleness incident:
+    the agent is demonstrably alive even if its heartbeat is stale (issue
+    #3012). That suppression is bounded by ``AGENT.liveness_suppression_cap_s``
+    of continuous heartbeat silence (issue #3058) so stderr noise merged into
+    the runner log cannot hold the incident off indefinitely. While the agent
+    is still in the ``starting`` phase the (larger, configurable)
+    ``starting_timeout_s`` is used so a slow/free model's first turn is not a
+    hard 120s cap.
+    """
+    # Fresh log/git write within the grace window -> the agent is alive; never
+    # raise a heartbeat-staleness incident against a demonstrably-live agent,
+    # up to the suppression cap.
+    _heartbeat_age_s = hb_status.age_seconds if hb_status.last_heartbeat is not None else runtime_s
+    if _log_signal_is_fresh(log_age_s, _heartbeat_age_s):
+        return
+
+    # A `starting` agent (only its spawn-time heartbeat on disk for a
+    # non-heartbeat adapter) is judged against the larger starting-phase
+    # window, not the general stale threshold.
+    effective_timeout = timeout_s
+    if starting_timeout_s is not None and _is_starting_phase(getattr(hb_status, "phase", None)):
+        effective_timeout = max(timeout_s, starting_timeout_s)
+
     if hb_status.last_heartbeat is None:
-        if runtime_s >= max(timeout_s / 2.0, 60.0) and current_line == 0:
+        if runtime_s >= max(effective_timeout / 2.0, 60.0) and current_line == 0:
             title = task.title if task is not None else task_id
             findings[f"heartbeat:{session_id}:{task_id}"] = WatchdogFinding(
                 key=f"heartbeat:{session_id}:{task_id}",
@@ -133,11 +218,12 @@ def _check_heartbeat_findings(
                     f"Tier-1 watchdog found no heartbeat file and no log activity for {runtime_s:.0f}s "
                     f"while task {task_id} remains active."
                 ),
+                task_title=str(title),
             )
         return
 
-    if hb_status.age_seconds >= max(timeout_s / 2.0, 60.0):
-        severity: WatchdogSeverity = "critical" if hb_status.age_seconds >= timeout_s else "high"
+    if hb_status.age_seconds >= max(effective_timeout / 2.0, 60.0):
+        severity: WatchdogSeverity = "critical" if hb_status.age_seconds >= effective_timeout else "high"
         title = task.title if task is not None else task_id
         findings[f"heartbeat:{session_id}:{task_id}"] = WatchdogFinding(
             key=f"heartbeat:{session_id}:{task_id}",
@@ -148,8 +234,9 @@ def _check_heartbeat_findings(
             summary=f"Heartbeat stale for task {title}",
             detail=(
                 f"Tier-1 watchdog observed heartbeat age {hb_status.age_seconds:.0f}s "
-                f"for task {task_id} (timeout={timeout_s:.0f}s, phase={hb_status.phase or 'unknown'})."
+                f"for task {task_id} (timeout={effective_timeout:.0f}s, phase={hb_status.phase or 'unknown'})."
             ),
+            task_title=str(title),
         )
 
 
@@ -178,6 +265,7 @@ def _check_log_growth_findings(
             f"Tier-1 watchdog saw no new log lines for {no_growth_ticks} consecutive ticks "
             f"(current_line={current_line}, runtime={runtime_s:.0f}s) on task {task_id}."
         ),
+        task_title=str(title),
     )
 
 
@@ -194,6 +282,7 @@ def collect_watchdog_findings(orch: Any) -> list[WatchdogFinding]:
 
     config = getattr(orch, "_config", None)
     timeout_s = float(getattr(config, "heartbeat_timeout_s", 120))
+    starting_timeout_s = float(getattr(config, "heartbeat_starting_timeout_s", AGENT.heartbeat_starting_timeout_s))
     monitor = HeartbeatMonitor(workdir, timeout_s=timeout_s)
     logs = AgentLogAggregator(workdir)
     now = time.time()
@@ -232,6 +321,7 @@ def collect_watchdog_findings(orch: Any) -> list[WatchdogFinding]:
         runtime_s = max(now - float(getattr(session, "spawn_ts", now)), 0.0)
         hb_status = monitor.check(session_id)
         log_summary = logs.parse_log(session_id)
+        log_age_s = logs.log_age_s(session_id, now)
         task = latest_tasks.get(task_id)
 
         prev_line, prev_no_growth = _coerce_log_state(log_state.get(session_id))
@@ -250,6 +340,8 @@ def collect_watchdog_findings(orch: Any) -> list[WatchdogFinding]:
             no_growth_ticks,
             stall_counts,
             findings,
+            log_age_s=log_age_s,
+            starting_timeout_s=starting_timeout_s,
         )
 
     for session_id in list(log_state.keys()):
@@ -270,6 +362,7 @@ class WatchdogManager:
         *,
         notify: Callable[..., None] | None = None,
         post_bulletin: Callable[[str, str], None] | None = None,
+        max_auto_spawns_per_run: int = 3,
     ) -> None:
         self._workdir = workdir
         self._client = client
@@ -278,6 +371,7 @@ class WatchdogManager:
         self._post_bulletin = post_bulletin
         self._state_path = workdir / ".sdd" / "runtime" / "watchdog_state.json"
         self._events_path = workdir / ".sdd" / "runtime" / "watchdog_incidents.jsonl"
+        self._auto_spawn_guard = AutoSpawnGuard(workdir, max_auto_spawns_per_run=max_auto_spawns_per_run)
 
     def sync(self, findings: list[WatchdogFinding]) -> None:
         """Sync current findings into persisted incident state."""
@@ -302,6 +396,15 @@ class WatchdogManager:
                     last_seen_ts=now,
                 )
                 self._append_event("detected", incident)
+                logger.warning(
+                    "watchdog TIER1 detected: key=%s source=%s severity=%s task=%s session=%s summary=%s",
+                    incident.key,
+                    incident.source,
+                    incident.severity,
+                    incident.task_id,
+                    incident.session_id,
+                    incident.summary,
+                )
             else:
                 incident.count += 1
                 incident.last_seen_ts = now
@@ -311,12 +414,36 @@ class WatchdogManager:
                 incident.detail = finding.detail
 
             if incident.triage_task_id is None:
-                triage_task_id = self._create_triage_task(finding)
+                # Bug fix (2026-07-04): dedupe must also cover incidents
+                # created EARLIER IN THIS SAME sync() call. Those live only
+                # in ``active`` (not yet persisted to ``state`` - that
+                # happens once, after the loop, via ``self._save_state``),
+                # so scanning ``state.values()`` alone missed same-pass
+                # duplicates and could create two "Watchdog triage: ..."
+                # tasks with the same title in one sync.
+                existing_open_titles = [
+                    f"Watchdog triage: {other.summary}"
+                    for other in itertools.chain(state.values(), active.values())
+                    if other.triage_task_id is not None and other.key != finding.key
+                ]
+                triage_task_id = self._create_triage_task(finding, existing_open_titles)
                 if triage_task_id:
                     incident.triage_task_id = triage_task_id
                     self._append_event("triage_created", incident)
 
             if not incident.escalated and incident.count >= _human_escalation_threshold(incident.severity):
+                threshold = _human_escalation_threshold(incident.severity)
+                logger.warning(
+                    "watchdog TIER3 escalating to human: key=%s count=%d threshold=%d severity=%s "
+                    "task=%s session=%s triage_task_id=%s",
+                    incident.key,
+                    incident.count,
+                    threshold,
+                    incident.severity,
+                    incident.task_id,
+                    incident.session_id,
+                    incident.triage_task_id or "n/a",
+                )
                 self._escalate_human(incident)
                 incident.escalated = True
                 self._append_event("human_escalated", incident)
@@ -325,10 +452,30 @@ class WatchdogManager:
 
         self._save_state(active)
 
-    def _create_triage_task(self, finding: WatchdogFinding) -> str | None:
-        """Create a Tier-2 reviewer task for AI triage."""
+    def _create_triage_task(self, finding: WatchdogFinding, existing_open_titles: list[str]) -> str | None:
+        """Create a Tier-2 reviewer task for AI triage.
+
+        Gated by :class:`AutoSpawnGuard` to prevent the "watchdog triage of
+        watchdog triage" recursion and unbounded triage-task growth observed
+        in production (see module docstring of ``auto_spawn_guard``).
+        """
+        title = f"Watchdog triage: {finding.summary}"
+        decision = self._auto_spawn_guard.evaluate(
+            kind="watchdog_triage",
+            title=title,
+            source_title=finding.task_title,
+            existing_open_titles=existing_open_titles,
+        )
+        if not decision.allowed:
+            logger.info(
+                "watchdog TIER2 triage suppressed by AutoSpawnGuard: key=%s title=%r reason=%s",
+                finding.key,
+                title,
+                getattr(decision, "reason", "<no reason attr>"),
+            )
+            return None
         payload = {
-            "title": f"Watchdog triage: {finding.summary}",
+            "title": title,
             "description": (
                 "Tier-2 watchdog triage.\n\n"
                 "A Tier-1 mechanical watchdog detected a live agent problem before merge.\n"
@@ -418,17 +565,17 @@ class WatchdogManager:
 
 def _coerce_log_state(raw: object) -> tuple[int, int]:
     if isinstance(raw, tuple):
-        values = cast("tuple[object, ...]", raw)
-        if len(values) == 2:
-            first = _safe_int(values[0])
-            second = _safe_int(values[1])
+        tuple_values = cast("tuple[object, ...]", raw)
+        if len(tuple_values) == 2:
+            first = _safe_int(tuple_values[0])
+            second = _safe_int(tuple_values[1])
             if first is not None and second is not None:
                 return first, second
     if isinstance(raw, list):
-        values = cast("list[object]", raw)
-        if len(values) == 2:
-            first = _safe_int(values[0])
-            second = _safe_int(values[1])
+        list_values = cast("list[object]", raw)
+        if len(list_values) == 2:
+            first = _safe_int(list_values[0])
+            second = _safe_int(list_values[1])
             if first is not None and second is not None:
                 return first, second
     return 0, 0

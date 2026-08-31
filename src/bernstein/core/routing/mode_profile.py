@@ -3,9 +3,9 @@
 Bernstein chooses a model via the bandit/cascade routers based purely on
 cost/quality signals. Once a model is selected, the *mode profile* layered
 on top tailors the agent's interaction style to that model's personality:
-- ``smart`` — Claude-family models, rapid feedback, broad tool surface.
-- ``deep`` — GPT-5.2-class models, long autonomous research, narrow tools.
-- ``fast`` — small/fast models, terse output, minimal tool surface.
+- ``smart`` - Claude-family models, rapid feedback, broad tool surface.
+- ``deep`` - GPT-5.2-class models, long autonomous research, narrow tools.
+- ``fast`` - small/fast models, terse output, minimal tool surface.
 
 Profiles are loaded from ``templates/mode_profiles/<name>.yaml`` at startup
 when present and fall back to the in-code defaults below otherwise. The
@@ -16,11 +16,14 @@ are honoured via ``Task.metadata['mode']`` (e.g. ``mode=fast``).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+from bernstein.core.dataclass_helpers import typed_replace as _typed_replace
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,13 @@ class ModeProfile:
         system_prompt_preamble: Text prepended to the agent's system prompt.
         tool_subset: Allowlist of tool names; empty tuple means "all tools".
         temperature: Sampling temperature target for the adapter.
+        top_p: Optional nucleus-sampling target. ``None`` leaves the
+            provider default in place (the profile expresses no preference).
+        top_k: Optional top-k sampling target, forwarded to
+            OpenAI-compatible endpoints that accept it. ``None`` leaves the
+            provider default in place.
+        max_tokens: Optional per-run output-token cap. ``None`` leaves the
+            adapter's own default in place.
         max_turns: Upper bound on conversation turns for this profile.
         expected_runtime_minutes: Wall-clock budget hint for callers.
     """
@@ -42,6 +52,9 @@ class ModeProfile:
     system_prompt_preamble: str
     tool_subset: tuple[str, ...] = ()
     temperature: float = 0.2
+    top_p: float | None = None
+    top_k: int | None = None
+    max_tokens: int | None = None
     max_turns: int = 40
     expected_runtime_minutes: int = 15
 
@@ -173,8 +186,9 @@ def select_mode(
 
     if task is not None:
         metadata = getattr(task, "metadata", None)
-        if isinstance(metadata, dict):
-            override = metadata.get("mode")
+        if isinstance(metadata, Mapping):
+            metadata_map = cast(Mapping[str, object], metadata)
+            override = metadata_map.get("mode")
             if isinstance(override, str) and override in table:
                 return table[override]
 
@@ -186,14 +200,24 @@ def select_mode(
 def _coerce_profile(name: str, raw: dict[str, Any]) -> ModeProfile | None:
     """Build a :class:`ModeProfile` from a YAML-decoded dict; return ``None`` on bad input."""
     try:
-        tool_subset_raw = raw.get("tool_subset", []) or []
-        if not isinstance(tool_subset_raw, list):
-            raise TypeError(f"tool_subset must be a list, got {type(tool_subset_raw).__name__}")
+        tool_subset_value = raw.get("tool_subset", [])
+        if tool_subset_value is None:
+            tool_subset_raw: list[object] = []
+        elif isinstance(tool_subset_value, list):
+            tool_subset_raw = cast(list[object], tool_subset_value)
+        else:
+            raise TypeError(f"tool_subset must be a list, got {type(tool_subset_value).__name__}")
+        top_p_raw = raw.get("top_p")
+        top_k_raw = raw.get("top_k")
+        max_tokens_raw = raw.get("max_tokens")
         return ModeProfile(
             name=str(raw.get("name", name)),
             system_prompt_preamble=str(raw.get("system_prompt_preamble", "")),
             tool_subset=tuple(str(t) for t in tool_subset_raw),
             temperature=float(raw.get("temperature", 0.2)),
+            top_p=None if top_p_raw is None else float(top_p_raw),
+            top_k=None if top_k_raw is None else int(top_k_raw),
+            max_tokens=None if max_tokens_raw is None else int(max_tokens_raw),
             max_turns=int(raw.get("max_turns", 40)),
             expected_runtime_minutes=int(raw.get("expected_runtime_minutes", 15)),
         )
@@ -227,7 +251,7 @@ def load_profiles_from_dir(path: Path) -> dict[str, ModeProfile]:
         if not isinstance(raw, dict):
             logger.warning("Mode profile %s does not contain a mapping; skipped", yaml_file)
             continue
-        profile = _coerce_profile(yaml_file.stem, raw)
+        profile = _coerce_profile(yaml_file.stem, cast(dict[str, Any], raw))
         if profile is not None:
             loaded[profile.name] = profile
     return loaded
@@ -276,7 +300,7 @@ def apply_mode(
 def replace_profile(name: str, **changes: Any) -> ModeProfile:
     """Replace fields on the registry entry *name* and return the new instance."""
     current = MODE_REGISTRY[name]
-    updated = replace(current, **changes)
+    updated = _typed_replace(current, **changes)
     MODE_REGISTRY[name] = updated
     return updated
 

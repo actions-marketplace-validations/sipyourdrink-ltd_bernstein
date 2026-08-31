@@ -11,12 +11,14 @@ Covers:
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from bernstein.core.knowledge.agents_md_generator import (
+    MODULE_MAP_PAGE,
     AgentsMdSection,
     GenerateOptions,
     _first_docstring_line,
@@ -25,6 +27,7 @@ from bernstein.core.knowledge.agents_md_generator import (
     _render_two_column_table,
     generate,
     render_canonical,
+    render_module_map_page,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,7 +61,7 @@ def _make_repo(root: Path, *, with_git: bool = False) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# generate() — top-level behaviour
+# generate() - top-level behaviour
 # ---------------------------------------------------------------------------
 
 
@@ -120,7 +123,7 @@ class TestGenerate:
 
 
 # ---------------------------------------------------------------------------
-# render_canonical() — shape contracts
+# render_canonical() - shape contracts
 # ---------------------------------------------------------------------------
 
 
@@ -129,15 +132,15 @@ class TestRenderCanonical:
         _make_repo(tmp_path)
         sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
         out = render_canonical(sections, repo_name="demo")
-        assert out.splitlines()[0] == "# demo — AGENTS.md"
-        # No YAML frontmatter — agents.md spec is explicitly schema-free.
+        assert out.splitlines()[0] == "# demo - AGENTS.md"
+        # No YAML frontmatter - agents.md spec is explicitly schema-free.
         assert not out.startswith("---")
 
     def test_section_headings_use_h2(self, tmp_path: Path) -> None:
         _make_repo(tmp_path)
         sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
         out = render_canonical(sections, repo_name="demo")
-        # Every section must render as `## Title` — never H3 or H1.
+        # Every section must render as `## Title` - never H3 or H1.
         for sec in sections:
             assert f"\n## {sec.title}\n" in out
 
@@ -152,21 +155,84 @@ class TestRenderCanonical:
         _make_repo(tmp_path)
         sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
         out = render_canonical(sections)
-        assert "Project — AGENTS.md" in out
+        assert "Project - AGENTS.md" in out
 
 
 # ---------------------------------------------------------------------------
-# Section builder edges — module map preserves gen_agents_md.py contract
+# Section builder edges - module map preserves gen_agents_md.py contract
 # ---------------------------------------------------------------------------
 
 
 class TestModuleMap:
-    def test_picks_up_module_docstrings(self, tmp_path: Path) -> None:
+    """The embedded section (#4142): a compact one-row-per-package index.
+
+    Per-file docstrings moved to :func:`render_module_map_page`'s output -
+    see ``TestModuleMapPage`` below - so this class checks the index shape,
+    not file-level content.
+    """
+
+    def test_one_row_per_top_level_package_present(self, tmp_path: Path) -> None:
         _make_repo(tmp_path)
         sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
         mm = next(s for s in sections if s.kind == "module-map")
-        assert "Cost-aware model router" in mm.body
-        assert "Domain model dataclasses" in mm.body
+        # The fixture only populates src/bernstein/core/, so that's the one
+        # package row this repo shape can produce.
+        assert "`core/`" in mm.body
+        assert "orchestration engine" in mm.body
+
+    def test_does_not_embed_per_file_docstrings(self, tmp_path: Path) -> None:
+        """The regression this whole issue exists to fix (#4142)."""
+        _make_repo(tmp_path)
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        mm = next(s for s in sections if s.kind == "module-map")
+        assert "Cost-aware model router" not in mm.body
+        assert "Domain model dataclasses" not in mm.body
+
+    def test_links_to_the_full_page(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        mm = next(s for s in sections if s.kind == "module-map")
+        assert MODULE_MAP_PAGE in mm.body
+
+    def test_package_without_own_agents_md_points_at_directory(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        mm = next(s for s in sections if s.kind == "module-map")
+        assert "`src/bernstein/core/`" in mm.body
+
+    def test_package_with_own_agents_md_points_at_it(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path, with_git=True)
+        core = tmp_path / "src" / "bernstein" / "core"
+        (core / "AGENTS.md").write_text("# core context\n")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "add core AGENTS.md"], cwd=tmp_path, check=True)
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        mm = next(s for s in sections if s.kind == "module-map")
+        assert "`src/bernstein/core/AGENTS.md`" in mm.body
+        # The bare-directory fallback string does not also appear - the
+        # closing backtick lands right after "core/" only in the fallback
+        # form, not inside "...core/AGENTS.md`".
+        assert "`src/bernstein/core/`" not in mm.body
+
+
+class TestModuleMapPage:
+    """:func:`render_module_map_page` - the full per-file table's new home."""
+
+    def test_picks_up_module_docstrings(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        page = render_module_map_page(tmp_path)
+        assert page is not None
+        assert "Cost-aware model router" in page
+        assert "Domain model dataclasses" in page
+
+    def test_none_when_no_src_tree(self, tmp_path: Path) -> None:
+        assert render_module_map_page(tmp_path) is None
+
+    def test_carries_autogen_marker(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        page = render_module_map_page(tmp_path)
+        assert page is not None
+        assert "AUTO-GENERATED by `bernstein agents-md sync`" in page
 
     def test_truncation_when_over_max(self, tmp_path: Path) -> None:
         _make_repo(tmp_path)
@@ -174,16 +240,63 @@ class TestModuleMap:
         core = tmp_path / "src" / "bernstein" / "core"
         for i in range(30):
             (core / f"mod_{i:02d}.py").write_text(f'"""Module {i}."""\n')
-        sections = generate(
-            tmp_path,
-            GenerateOptions(
-                include_git_workflow=False,
-                max_module_map_lines=5,
-            ),
-        )
-        mm = next(s for s in sections if s.kind == "module-map")
+        page = render_module_map_page(tmp_path, GenerateOptions(max_module_map_lines=5))
+        assert page is not None
         # Truncation marker present.
-        assert "more_" in mm.body or "truncated" in mm.body
+        assert "more_" in page or "truncated" in page
+
+
+class TestModuleMapLineBudget:
+    """#4142's own line-budget claim, demonstrated rather than asserted blind.
+
+    A package's row count in the *old* per-file table scaled with its file
+    count; the compact index is always one row per package regardless.
+    Piling files into ``core/`` makes ``render_module_map_page`` (the old
+    table's new home) balloon well past any reasonable line budget while
+    ``render_canonical`` - which now embeds the compact index, not the
+    table - stays flat. That contrast is the property the issue's
+    acceptance criteria call "failing before your change and passing
+    after": these two assertions are what would have disagreed before
+    #4142 and agree now.
+    """
+
+    _FILE_COUNT = 200
+    _LINE_BUDGET = 160
+
+    def _make_oversized_repo(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        core = tmp_path / "src" / "bernstein" / "core"
+        for i in range(self._FILE_COUNT):
+            (core / f"mod_{i:03d}.py").write_text(f'"""Module {i}."""\n')
+
+    def test_full_page_would_blow_the_budget(self, tmp_path: Path) -> None:
+        self._make_oversized_repo(tmp_path)
+        page = render_module_map_page(tmp_path)
+        assert page is not None
+        assert page.count("\n") > self._LINE_BUDGET
+
+    def test_compact_canonical_render_stays_under_budget(self, tmp_path: Path) -> None:
+        self._make_oversized_repo(tmp_path)
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        out = render_canonical(sections, repo_name="demo")
+        assert out.count("\n") <= self._LINE_BUDGET
+
+
+class TestSyncDeterminism:
+    """#4142's other explicit test requirement: two consecutive runs agree."""
+
+    def test_two_consecutive_renders_are_byte_identical(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        opts = GenerateOptions(include_git_workflow=False)
+        first = render_canonical(generate(tmp_path, opts), repo_name="demo")
+        second = render_canonical(generate(tmp_path, opts), repo_name="demo")
+        assert first == second
+
+    def test_two_consecutive_module_map_pages_are_byte_identical(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        first = render_module_map_page(tmp_path)
+        second = render_module_map_page(tmp_path)
+        assert first == second
 
 
 class TestBuildTestSection:
@@ -202,6 +315,35 @@ class TestBuildTestSection:
         bt = next(s for s in sections if s.kind == "build-test")
         assert "uv sync" in bt.body
         assert "uv run pytest" in bt.body
+
+    def test_uv_lock_alone_triggers_uv_branch(self, tmp_path: Path) -> None:
+        # A hatchling-built repo can be uv-managed with no ``[tool.uv]`` table;
+        # the sole signal is ``uv.lock``. It must still render uv commands so
+        # the install/test lines agree with the uv run lint/type-check lines.
+        _make_repo(tmp_path)
+        (tmp_path / "uv.lock").write_text("# minimal\n")
+        pyp = tmp_path / "pyproject.toml"
+        pyp.write_text(pyp.read_text() + "[tool.ruff]\nline-length = 120\n")
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        bt = next(s for s in sections if s.kind == "build-test")
+        assert "uv sync" in bt.body
+        assert "pip install" not in bt.body
+        # Lint line uses the same runner prefix, not a bare ``ruff``.
+        assert "uv run ruff check ." in bt.body
+
+    def test_isolated_test_runner_preferred_over_bare_pytest(self, tmp_path: Path) -> None:
+        # When the repo ships scripts/run_tests.py, the build-test block must
+        # emit that isolated per-file runner rather than a bare ``pytest`` that
+        # would retain the whole suite in memory.
+        _make_repo(tmp_path)
+        (tmp_path / "uv.lock").write_text("# minimal\n")
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.py").write_text("# isolated runner\n")
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        bt = next(s for s in sections if s.kind == "build-test")
+        assert "uv run python scripts/run_tests.py" in bt.body
+        # No standalone bare ``pytest`` command line.
+        assert not re.search(r"(?m)^(uv run )?pytest\b", bt.body)
 
 
 class TestArchitectureSection:
@@ -320,7 +462,7 @@ class TestRenderTwoColumnTable:
 
 
 # ---------------------------------------------------------------------------
-# AgentsMdSection — frozen + minimal
+# AgentsMdSection - frozen + minimal
 # ---------------------------------------------------------------------------
 
 
@@ -336,3 +478,66 @@ class TestAgentsMdSection:
         s = AgentsMdSection(key="k", title="T", body="b", kind="overview")
         assert s.target_globs == ()
         assert s.always_apply is True
+
+
+# ---------------------------------------------------------------------------
+# _build_directory_context - nested AGENTS.md map
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDirectoryContext:
+    def test_absent_when_no_nested_files(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        assert all(s.key != "directory-context" for s in sections)
+
+    def test_lists_nested_file_with_h1_as_description(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        (tmp_path / "src" / "bernstein" / "core" / "AGENTS.md").write_text("# Core engine\n\nInvariants live here.\n")
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        sec = next(s for s in sections if s.key == "directory-context")
+        assert "`src/bernstein/core/AGENTS.md`" in sec.body
+        assert "Core engine" in sec.body
+        assert sec.always_apply is False
+
+    def test_rows_sorted_by_posix_path(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "AGENTS.md").write_text("# Test suite\n")
+        (tmp_path / "src" / "bernstein" / "core" / "AGENTS.md").write_text("# Core\n")
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        sec = next(s for s in sections if s.key == "directory-context")
+        assert sec.body.index("src/bernstein/core/AGENTS.md") < sec.body.index("tests/AGENTS.md")
+
+    def test_missing_h1_falls_back_to_directory_name(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        (tmp_path / "src" / "bernstein" / "core" / "AGENTS.md").write_text("no heading here\n")
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        sec = next(s for s in sections if s.key == "directory-context")
+        assert "core/ context" in sec.body
+
+    def test_appears_between_module_map_and_build_test(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path)
+        (tmp_path / "src" / "bernstein" / "core" / "AGENTS.md").write_text("# Core\n")
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        keys = [s.key for s in sections]
+        assert keys.index("module-map") < keys.index("directory-context") < keys.index("build-test")
+
+    def test_untracked_file_excluded_inside_git_repo(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path, with_git=True)
+        tracked = tmp_path / "src" / "bernstein" / "core" / "AGENTS.md"
+        tracked.write_text("# Core engine\n")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "core context"], cwd=tmp_path, check=True)
+        # Untracked scratch file must not leak into the render.
+        (tmp_path / "src" / "bernstein" / "AGENTS.md").write_text("# Scratch notes\n")
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        sec = next(s for s in sections if s.key == "directory-context")
+        assert "`src/bernstein/core/AGENTS.md`" in sec.body
+        assert "Scratch notes" not in sec.body
+
+    def test_only_untracked_files_omits_section_inside_git_repo(self, tmp_path: Path) -> None:
+        _make_repo(tmp_path, with_git=True)
+        (tmp_path / "src" / "bernstein" / "core" / "AGENTS.md").write_text("# Never committed\n")
+        sections = generate(tmp_path, GenerateOptions(include_git_workflow=False))
+        assert all(s.key != "directory-context" for s in sections)

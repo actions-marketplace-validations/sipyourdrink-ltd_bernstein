@@ -1,4 +1,4 @@
-"""Tests for crash recovery — orphaned agent detection and resume.
+"""Tests for crash recovery - orphaned agent detection and resume.
 
 Tests cover:
 - OrchestratorConfig has recovery fields with defaults
@@ -29,6 +29,7 @@ from bernstein.core.orchestrator import Orchestrator
 from bernstein.core.spawner import AgentSpawner
 
 from bernstein.adapters.base import CLIAdapter, SpawnResult
+from bernstein.core.agents.response_style import render_style_addendum
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -96,6 +97,7 @@ def _make_spawner(tmp_path: Path, adapter: CLIAdapter | None = None) -> AgentSpa
         adapter=adapter,
         templates_dir=tmp_path / "templates",
         workdir=tmp_path,
+        default_model="mock-model",
     )
 
 
@@ -124,7 +126,7 @@ def test_orchestrator_config_recovery_accepts_all_strategies():
 
 
 # ---------------------------------------------------------------------------
-# 2. spawn_for_resume — uses provided worktree path
+# 2. spawn_for_resume - uses provided worktree path
 # ---------------------------------------------------------------------------
 
 
@@ -165,7 +167,7 @@ def test_spawn_for_resume_does_not_create_new_worktree(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 3. spawn_for_resume — prompt includes crash context
+# 3. spawn_for_resume - prompt includes crash context
 # ---------------------------------------------------------------------------
 
 
@@ -199,6 +201,41 @@ def test_spawn_for_resume_prompt_includes_changed_files(tmp_path: Path):
     prompt = adapter.spawn.call_args.kwargs.get("prompt") or adapter.spawn.call_args.args[0]
     for f in changed:
         assert f in prompt
+
+
+# ---------------------------------------------------------------------------
+# 3b. spawn_for_resume - system_addendum (issue #3565)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_for_resume_forwards_system_addendum(tmp_path: Path):
+    """A resumed agent must still receive its completion/heartbeat
+    instructions via ``system_addendum``.
+
+    Before the fix, ``spawn_for_resume`` bypassed the response-style
+    resolution ``_spawn_for_tasks_internal`` performs and called
+    ``adapter.spawn()`` without ``system_addendum`` at all, so it silently
+    defaulted to ``""`` - the crashed-then-resumed agent could run to
+    completion but never be seen to finish.
+    """
+    adapter = _mock_adapter()
+    spawner = AgentSpawner(
+        adapter=adapter,
+        templates_dir=tmp_path / "templates",
+        workdir=tmp_path,
+        default_model="mock-model",
+        role_model_policy={"backend": {"model": "mock-model", "response_style": "terse"}},
+    )
+
+    task = _make_task()
+    worktree_path = tmp_path / ".sdd" / "worktrees" / "resume-addendum"
+    worktree_path.mkdir(parents=True)
+
+    spawner.spawn_for_resume([task], worktree_path=worktree_path, changed_files=[])
+
+    addendum = adapter.spawn.call_args.kwargs["system_addendum"]
+    assert addendum
+    assert render_style_addendum("terse", workdir=tmp_path) == addendum
 
 
 def _find_task_by_id(task_store: list[dict], tid: str) -> dict | None:
@@ -265,7 +302,7 @@ def _route_mock_request(request: httpx.Request, task_store: list[dict]) -> httpx
 
 
 # ---------------------------------------------------------------------------
-# 4. Orchestrator crash tracking — crash count incremented
+# 4. Orchestrator crash tracking - crash count incremented
 # ---------------------------------------------------------------------------
 
 
@@ -325,7 +362,7 @@ def test_orchestrator_increments_crash_count_on_agent_death(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 5. max_crash_retries enforced — task fails after limit
+# 5. max_crash_retries enforced - task fails after limit
 # ---------------------------------------------------------------------------
 
 
@@ -333,7 +370,7 @@ def test_orchestrator_fails_task_after_max_crash_retries(tmp_path: Path):
     """Task should be failed permanently once _crash_counts[task_id] >= max_crash_retries."""
     task = _make_task(id="T-exhaust", status="claimed")
     task_dict = _task_as_dict(task)
-    # audit-017: retry_count is the typed source of truth — no markers.
+    # audit-017: retry_count is the typed source of truth - no markers.
     task_dict["retry_count"] = 2
     task_dict["max_retries"] = 2
 
@@ -361,7 +398,7 @@ def test_orchestrator_fails_task_after_max_crash_retries(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 6. resume strategy — spawn_for_resume called with preserved worktree
+# 6. resume strategy - spawn_for_resume called with preserved worktree
 # ---------------------------------------------------------------------------
 
 
@@ -400,7 +437,7 @@ def test_orchestrator_calls_spawn_for_resume_when_worktree_preserved(tmp_path: P
 
 
 # ---------------------------------------------------------------------------
-# 7. restart strategy — no worktree preserved
+# 7. restart strategy - no worktree preserved
 # ---------------------------------------------------------------------------
 
 
@@ -433,7 +470,7 @@ def test_orchestrator_does_not_preserve_worktree_on_restart(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 8. escalate strategy — marks task BLOCKED after max_crash_retries exceeded
+# 8. escalate strategy - marks task BLOCKED after max_crash_retries exceeded
 # ---------------------------------------------------------------------------
 
 

@@ -12,12 +12,22 @@ branch, Bernstein will attempt to fix it automatically.
 
 | Input            | Required | Default   | Description                                             |
 |------------------|----------|-----------|---------------------------------------------------------|
-| `task`           | no       | —         | Task description, or `"fix-ci"` for auto-fix mode       |
+| `task`           | no       | -         | Task description, or `"fix-ci"` for auto-fix mode. Mutually exclusive with `plan` |
+| `plan`           | no       | -         | Path to a Bernstein plan YAML file; runs `bernstein run <plan>` instead of a free-text goal. Mutually exclusive with `task` |
 | `budget`         | no       | `"5.00"`  | Dollar cap for the run                                  |
 | `cli`            | no       | `"claude"`| Agent CLI to use (`claude`, `codex`, `gemini`, `qwen`)  |
 | `max-retries`    | no       | `"3"`     | Retry count in fix-ci mode                              |
 | `python-version` | no       | `"3.12"`  | Python version to install                               |
 | `post-comment`   | no       | `"true"`  | Post PR comment with orchestration summary              |
+
+## Outputs
+
+| Output                 | Description                                                          |
+|------------------------|----------------------------------------------------------------------|
+| `tasks-completed`      | Number of tasks Bernstein completed in this run                      |
+| `total-cost`           | Total API cost in USD for this run                                   |
+| `pr-url`               | URL of a pull request created or updated by the run (if any)         |
+| `evidence-bundle-path` | Workspace-relative path to the evidence bundle (tests, logs, cost)   |
 
 ## Modes
 
@@ -33,6 +43,26 @@ When `task` is the literal string `"fix-ci"`, the action:
 This mode is designed for `workflow_run` triggers so it can react to CI
 failures from another workflow.
 
+### Plan mode (`plan: <path>`)
+
+When `plan` is set instead of `task`, the action runs:
+
+```
+bernstein run <plan> --budget <budget> --quiet
+```
+
+`--quiet` is what makes this mode usable in CI. The `run` subcommand renders
+a dashboard on a TTY and otherwise detaches, leaving the run going in the
+background; `--quiet` instead waits for the run to reach a terminal state and
+prints only the final summary. The step therefore blocks until the run really
+finishes, its exit code reflects the run's outcome rather than whether the
+launch succeeded, and `.sdd/run-summary.json` exists by the time the step
+reads it for the `tasks-completed` and `total-cost` outputs.
+
+Note that `--headless` is an option of the root `bernstein` group, not of
+`bernstein run`. Passing it after the `run` subcommand makes the CLI exit 2
+at option parsing without starting anything.
+
 ### Normal mode
 
 When `task` is anything other than `"fix-ci"`, the action runs:
@@ -44,7 +74,7 @@ bernstein -g "<task>" --budget <budget> --headless
 Use this for ad-hoc tasks like generating tests, refactoring, or applying
 a migration.
 
-**Example — run a task on push:**
+**Example - run a task on push:**
 
 ```yaml
 on:

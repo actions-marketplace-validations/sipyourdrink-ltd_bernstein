@@ -1,4 +1,4 @@
-"""Pydantic v2 schema for Archon-style YAML workflow manifests.
+"""Pydantic v2 schema for declarative YAML workflow manifests.
 
 This module defines the data model that backs ``bernstein workflow run``.
 The format is intentionally small and orthogonal to the existing
@@ -59,7 +59,7 @@ _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_\-]*$")
 # Permissive semver-ish: ``MAJOR.MINOR[.PATCH]`` plus optional pre-release.
 _VERSION_PATTERN = re.compile(r"^\d+\.\d+(?:\.\d+)?(?:-[A-Za-z0-9.-]+)?$")
 
-# Default node timeout — an hour matches the orchestrator's default
+# Default node timeout - an hour matches the orchestrator's default
 # per-agent wall clock for medium-scope tasks.
 DEFAULT_NODE_TIMEOUT_SECONDS: int = 1800
 
@@ -93,10 +93,10 @@ class WorkflowNode(BaseModel):
 
     Each node is one of:
 
-    * **command** — runs ``command`` via ``subprocess.run`` with timeout.
-    * **agent** — dispatches a task with ``agent`` (role) and ``prompt``
+    * **command** - runs ``command`` via ``subprocess.run`` with timeout.
+    * **agent** - dispatches a task with ``agent`` (role) and ``prompt``
       through :meth:`AgentSpawner.spawn_for_tasks`.
-    * **loop** — wraps a command-typed node and re-fires it until the
+    * **loop** - wraps a command-typed node and re-fires it until the
       :attr:`LoopSpec.until` predicate exits 0 or
       :attr:`LoopSpec.max_iterations` is reached.
 
@@ -111,12 +111,28 @@ class WorkflowNode(BaseModel):
         prompt: Prompt body for agent-typed nodes.  May contain the
             ``{goal}`` placeholder which the runner substitutes from
             ``WorkflowRunner.run(goal=...)``.
+        cli: Optional adapter override for this node.
+        model: Optional provider-specific model identifier for this node.
+        effort: Optional reasoning-effort override for this node.
         loop: Optional loop predicate.  When set the node re-fires.
+        when: Optional bash predicate gating whether this node runs at
+            all, evaluated once its ``depends_on`` are satisfied.  Exit
+            0 runs the node normally; non-zero marks it ``SKIPPED``
+            without failing the run, and - unlike a dependency-failure
+            skip - does not block nodes that depend on this one.  Lets a
+            manifest express "run this node only if an earlier one asked
+            for it" (e.g. revise-on-request-changes) without the DSL's
+            conditional-DAG machinery.
         fresh_context: When ``True``, agent-typed nodes get a fresh
             session per iteration (no carryover).  Ignored for command-
             typed nodes.
-        interactive: Stub for human-approval gates.  When ``True`` the
-            runner raises ``NotImplementedError`` referencing #1110.
+        interactive: Stub for human-approval gates.  Manifests with this
+            set to ``True`` are rejected at load time with a ``ValueError``
+            referencing #1110 so the failure surfaces before any upstream
+            node runs.  The runner keeps a defence-in-depth
+            ``NotImplementedError`` for out-of-band loaders.  Once the
+            approval gate ships in #1110 this validator relaxes to a
+            permissive pass-through.
         timeout_seconds: Per-iteration wall clock cap.
     """
 
@@ -127,7 +143,11 @@ class WorkflowNode(BaseModel):
     command: str | None = None
     agent: str | None = None
     prompt: str | None = None
+    cli: str | None = Field(default=None, min_length=1, max_length=128)
+    model: str | None = Field(default=None, min_length=1, max_length=256)
+    effort: str | None = Field(default=None, min_length=1, max_length=32)
     loop: LoopSpec | None = None
+    when: str | None = Field(default=None, min_length=1, description="Bash predicate gating whether this node runs.")
     fresh_context: bool = False
     interactive: bool = False
     timeout_seconds: int = Field(default=DEFAULT_NODE_TIMEOUT_SECONDS, ge=1, le=86_400)
@@ -164,10 +184,36 @@ class WorkflowNode(BaseModel):
             )
         if has_command and self.prompt is not None:
             raise ValueError(f"node {self.id!r} sets 'command'; 'prompt' is not allowed")
+        if has_command:
+            routing_fields = [
+                name for name, value in (("cli", self.cli), ("model", self.model), ("effort", self.effort)) if value
+            ]
+            if routing_fields:
+                fields = ", ".join(repr(name) for name in routing_fields)
+                raise ValueError(
+                    f"node {self.id!r} sets 'command'; routing fields {fields} require an agent node",
+                )
         if has_agent and (self.prompt is None or self.prompt.strip() == ""):
             raise ValueError(f"node {self.id!r} sets 'agent'; 'prompt' is required")
         if self.id in set(self.depends_on):
             raise ValueError(f"node {self.id!r} cannot depend on itself")
+        return self
+
+    @model_validator(mode="after")
+    def _check_interactive_unsupported(self) -> WorkflowNode:
+        """Reject ``interactive: true`` until #1110 ships the approval gate.
+
+        Without this guard, manifests with an interactive node parse cleanly,
+        the DAG validates, and the runner aborts mid-run only after upstream
+        nodes have already produced state (filesystem side-effects, agent
+        spawns).  Failing at load time means manifest authors learn at lint
+        time instead of after partial execution.  This validator relaxes to
+        a permissive pass-through once #1110 lands.
+        """
+        if self.interactive:
+            raise ValueError(
+                f"node {self.id!r} sets unsupported field 'interactive: true'; approval gates ship in #1110",
+            )
         return self
 
     @property
@@ -231,7 +277,7 @@ class WorkflowSpec(BaseModel):
                         f"node {node.id!r} depends on unknown node {dep!r}",
                     )
 
-        # Kahn's algorithm — if the topological queue drains before all
+        # Kahn's algorithm - if the topological queue drains before all
         # nodes are visited, there's a cycle somewhere in depends_on.
         indegree: dict[str, int] = {node.id: len(node.depends_on) for node in self.nodes}
         children: dict[str, list[str]] = defaultdict(list)
@@ -264,7 +310,7 @@ class WorkflowSpec(BaseModel):
     def topological_order(self) -> list[list[WorkflowNode]]:
         """Return nodes in topologically sorted layers.
 
-        Each inner list is a "layer" — a set of nodes whose dependencies
+        Each inner list is a "layer" - a set of nodes whose dependencies
         are all satisfied by previous layers.  The runner schedules every
         node in a layer in parallel before advancing.
         """
@@ -383,7 +429,7 @@ def discover_workflows(
 
     Yields:
         ``(name, path)`` tuples ordered as above.  Names are deduplicated
-        across sources — the first occurrence wins.
+        across sources - the first occurrence wins.
     """
     seen: set[str] = set()
     dirs: list[Path] = []

@@ -31,6 +31,10 @@ if TYPE_CHECKING:
 
 _TRUNCATED_SUFFIX = "\n... (truncated)"
 
+# A command that never reached a process - killed on timeout, or refused by
+# the OS - has no exit code to report. Distinct from 0 and from 127.
+NO_EXIT_CODE = -1
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -89,7 +93,7 @@ class IntentVerificationConfig:
     and blocks merge when the verdict is "no" (and optionally "partially").
 
     Attributes:
-        enabled: Master switch — when False, the gate does not run.
+        enabled: Master switch - when False, the gate does not run.
         model: OpenRouter model for verification (cheap model recommended).
         provider: LLM provider key passed to call_llm.
         max_diff_chars: Truncate diff at this length for cost control.
@@ -137,7 +141,7 @@ class QualityGatesConfig:
     """Configuration for automated quality gates.
 
     Attributes:
-        enabled: Master switch — when False, no gates run.
+        enabled: Master switch - when False, no gates run.
         lint: Run lint gate (ruff check by default).
         lint_command: Shell command for linting.
         type_check: Run type-check gate (pyright by default).
@@ -172,6 +176,10 @@ class QualityGatesConfig:
             via AST pattern matching.
         comment_quality_check: Run comment quality gate on changed Python files.
             Checks docstring accuracy, completeness, redundancy, and style.
+        run_config: Block a change that contains one of the run-configuration
+            paths (``bernstein.yaml``, ``.claude/mcp.json``, ...). On by
+            default: run overrides belong in the untracked overlay, so a
+            configuration file inside a change is always a leak, never work.
         comment_quality_docstyle: Expected docstring style for the comment-quality
             gate. One of ``"google"``, ``"numpy"``, ``"rest"``, or ``"auto"``
             (auto-detect per docstring).
@@ -200,6 +208,7 @@ class QualityGatesConfig:
     pii_allowlist_prefixes: list[str] = field(
         default_factory=lambda: ["FAKE", "TEST", "EXAMPLE", "DUMMY", "PLACEHOLDER", "LOCALHOST"]
     )
+    run_config: bool = True
     security_scan: bool = False
     security_scan_command: str | None = None
     coverage_delta: bool = False
@@ -367,10 +376,10 @@ def _parse_intent_response(raw: str, model: str) -> IntentVerdict:
                 data = json.loads(text[start:end])
 
     if not data:
-        logger.warning("intent_verification: unparseable response — defaulting to yes: %.200s", text)
+        logger.warning("intent_verification: unparseable response - defaulting to yes: %.200s", text)
         return IntentVerdict(
             verdict="yes",
-            reason="Verifier returned unparseable response — defaulting to yes",
+            reason="Verifier returned unparseable response - defaulting to yes",
             model=model,
         )
 
@@ -391,7 +400,7 @@ def _parse_intent_response(raw: str, model: str) -> IntentVerdict:
 
 
 async def _verify_intent_async(task: Task, worktree_path: Path, config: IntentVerificationConfig) -> IntentVerdict:
-    """Async core for intent verification — call the LLM and return a verdict."""
+    """Async core for intent verification - call the LLM and return a verdict."""
     from bernstein.core.llm import call_llm
 
     diff = _get_intent_diff(worktree_path, task.owned_files)
@@ -434,13 +443,13 @@ async def _verify_intent_async(task: Task, worktree_path: Path, config: IntentVe
         )
     except RuntimeError as exc:
         logger.warning(
-            "intent_verification: LLM call failed for task %s: %s — defaulting to yes",
+            "intent_verification: LLM call failed for task %s: %s - defaulting to yes",
             task.id,
             exc,
         )
         return IntentVerdict(
             verdict="yes",
-            reason=f"Verifier call failed: {exc} — defaulting to yes",
+            reason=f"Verifier call failed: {exc} - defaulting to yes",
             model=config.model,
         )
 
@@ -485,8 +494,8 @@ def run_intent_gate_sync(
 # ---------------------------------------------------------------------------
 
 
-def _run_command(command: str, cwd: Path, timeout_s: int) -> tuple[bool, str]:
-    """Run a shell command and return (success, output).
+def _run_command(command: str, cwd: Path, timeout_s: int) -> tuple[bool, str, int]:
+    """Run a shell command and return (success, output, exit_code).
 
     Args:
         command: Shell command to run.
@@ -494,7 +503,11 @@ def _run_command(command: str, cwd: Path, timeout_s: int) -> tuple[bool, str]:
         timeout_s: Timeout in seconds before the process is killed.
 
     Returns:
-        Tuple of (exit_code_zero, combined_stdout_stderr_output).
+        ``(exit_code_zero, combined_stdout_stderr_output, exit_code)``. The exit
+        code is always present so a caller can tell 127 (command not found) from
+        an ordinary non-zero exit without re-deriving the tuple shape.
+        ``NO_EXIT_CODE`` stands in when the process never reported one - a
+        timeout kill or an OS-level spawn failure.
     """
     try:
         # SECURITY: shell=True required because quality gate commands are admin-configured
@@ -512,14 +525,15 @@ def _run_command(command: str, cwd: Path, timeout_s: int) -> tuple[bool, str]:
         output = (proc.stdout + proc.stderr).strip()
         if len(output) > 2000:
             output = output[:2000] + _TRUNCATED_SUFFIX
-        return proc.returncode == 0, output or "(no output)"
+
+        return proc.returncode == 0, output or "(no output)", proc.returncode
     except subprocess.TimeoutExpired:
-        return False, f"Timed out after {timeout_s}s"
+        return False, f"Timed out after {timeout_s}s", NO_EXIT_CODE
     except OSError as exc:
-        return False, f"Command error: {exc}"
+        return False, f"Command error: {exc}", NO_EXIT_CODE
 
 
-def run_command_sync(command: str, cwd: Path, timeout_s: int) -> tuple[bool, str]:
+def run_command_sync(command: str, cwd: Path, timeout_s: int) -> tuple[bool, str, int]:
     """Public sync wrapper used by the async gate runner."""
     return _run_command(command, cwd, timeout_s)
 
@@ -548,7 +562,7 @@ def _parse_mutation_score(output: str) -> float | None:
         killed, total = int(m.group(1)), int(m.group(2))
         if total > 0:
             return killed / total
-        return None  # zero mutants — can't produce a meaningful score
+        return None  # zero mutants - can't produce a meaningful score
 
     # mutatest / generic:
     #   "Killed: 42\nSurvived: 58"   (keyword before number)
@@ -568,7 +582,7 @@ def _parse_mutation_score(output: str) -> float | None:
     return None
 
 
-def _run_mutation_gate(config: QualityGatesConfig, run_dir: Path) -> tuple[bool, str, float | None]:
+def _run_mutation_gate(config: QualityGatesConfig, run_dir: Path) -> tuple[bool, str, float | None, str | None]:
     """Run mutation testing and compare score against the configured threshold.
 
     Args:
@@ -576,11 +590,14 @@ def _run_mutation_gate(config: QualityGatesConfig, run_dir: Path) -> tuple[bool,
         run_dir: Directory to run the mutation command in.
 
     Returns:
-        Tuple of (passed, detail_message, score_or_None).
+        Tuple of (passed, detail_message, score_or_None, evidence_status).
         ``passed`` is True when the mutation score meets the threshold.
         ``score_or_None`` is the parsed float score, or None when unparseable.
+        ``evidence_status`` is None when evidence exists, or a reason string
+        like ``evidence-missing`` when the gate cannot run.
     """
-    _ok, output = _run_command(config.mutation_command, run_dir, config.mutation_timeout_s)
+    result = _run_command(config.mutation_command, run_dir, config.mutation_timeout_s)
+    _ok, output, exit_code = result
 
     score = _parse_mutation_score(output)
 
@@ -588,19 +605,42 @@ def _run_mutation_gate(config: QualityGatesConfig, run_dir: Path) -> tuple[bool,
         passed = score >= config.mutation_threshold
         status = "\u2265" if passed else "<"
         detail = f"Mutation score: {score:.1%} ({status} threshold {config.mutation_threshold:.1%})\n{output}"
-        return passed, detail, score
+        return passed, detail, score, None
 
-    # Could not parse a numeric score — treat non-zero exit as failure.
-    passed = _ok
+    # Could not parse a numeric score - check for missing evidence.
+    # Exit code 127 (command not found) indicates missing tool/evidence.
+    if exit_code == 127:
+        detail = (
+            f"Could not parse mutation score (threshold {config.mutation_threshold:.1%}). "
+            f"Tool missing (exit 127)\n{output}"
+        )
+        return False, detail, None, "evidence-missing"
+
+    # Subprocess died before producing output (timeout or other error).
+    if exit_code == NO_EXIT_CODE or not _ok:
+        detail = (
+            f"Could not parse mutation score (threshold {config.mutation_threshold:.1%}). "
+            f"Runner died before output\n{output}"
+        )
+        return False, detail, None, "runner-died-before-output"
+
+    # Could not parse a numeric score - treat non-zero exit as failure.
+    passed = _ok and exit_code != 127
     detail = (
         f"Could not parse mutation score (threshold {config.mutation_threshold:.1%}). "
         f"Exit: {'0' if _ok else 'non-zero'}\n{output}"
     )
-    return passed, detail, None
+    return passed, detail, None, None
 
 
-def run_mutation_gate_sync(config: QualityGatesConfig, run_dir: Path) -> tuple[bool, str, float | None]:
-    """Public sync wrapper used by the async gate runner."""
+def run_mutation_gate_sync(config: QualityGatesConfig, run_dir: Path) -> tuple[bool, str, float | None, str | None]:
+    """Public sync wrapper used by the async gate runner.
+
+    Returns:
+        Tuple of (passed, detail_message, score_or_None, evidence_status).
+        ``evidence_status`` is None when evidence exists, or a reason string
+        like ``evidence-missing`` when the gate cannot run.
+    """
     return _run_mutation_gate(config, run_dir)
 
 
@@ -679,7 +719,7 @@ def run_agent_test_mutation_gate_sync(
     config: QualityGatesConfig,
     task: Task,
     run_dir: Path,
-) -> tuple[bool, str, float | None]:
+) -> tuple[bool, str, float | None, str | None]:
     """Verify that agent-written tests actually catch bugs via targeted mutation testing.
 
     Extracts test files from the agent's git diff, infers the corresponding
@@ -697,23 +737,27 @@ def run_agent_test_mutation_gate_sync(
         run_dir: Repository root for running commands.
 
     Returns:
-        Tuple of (passed, detail_message, score_or_None).
+        Tuple of (passed, detail_message, score_or_None, evidence_status).
+        ``evidence_status`` is None when evidence exists, or a reason string
+        like ``evidence-missing`` when the gate cannot run.
     """
     diff = _get_intent_diff(run_dir, task.owned_files or [])
     test_files = _extract_agent_test_files(diff)
     if not test_files:
-        return True, "No agent-written test files detected in diff — skipping agent mutation gate.", None
+        return True, "No agent-written test files detected in diff - skipping agent mutation gate.", None, None
 
     source_files = _infer_source_files(test_files, run_dir)
     if not source_files:
         return (
             True,
-            f"Could not infer source files for tests: {test_files} — skipping agent mutation gate.",
+            f"Could not infer source files for tests: {test_files} - skipping agent mutation gate.",
+            None,
             None,
         )
 
     command = _build_agent_mutation_command(source_files, test_files)
-    _ok, output = _run_command(command, run_dir, config.agent_test_mutation_timeout_s)
+    result = _run_command(command, run_dir, config.agent_test_mutation_timeout_s)
+    _ok, output, exit_code = result
 
     score = _parse_mutation_score(output)
     threshold = config.agent_test_mutation_threshold
@@ -726,17 +770,39 @@ def run_agent_test_mutation_gate_sync(
             f"Test files: {', '.join(test_files)}\n"
             f"Source files: {', '.join(source_files)}\n{output}"
         )
-        return passed, detail, score
+        return passed, detail, score, None
 
-    # Could not parse — fall back to exit code
+    # Could not parse - check for missing evidence.
+    # Exit code 127 (command not found) indicates missing tool/evidence.
+    if exit_code == 127:
+        detail = (
+            f"Could not parse agent mutation score (threshold {threshold:.1%}). "
+            f"Tool missing (exit 127)\n"
+            f"Test files: {', '.join(test_files)}\n"
+            f"Source files: {', '.join(source_files)}\n{output}"
+        )
+        return False, detail, None, "evidence-missing"
+
+    # Subprocess died before producing output (timeout or other error).
+    if exit_code == NO_EXIT_CODE or not _ok:
+        detail = (
+            f"Could not parse agent mutation score (threshold {threshold:.1%}). "
+            f"Runner died before output\n"
+            f"Test files: {', '.join(test_files)}\n"
+            f"Source files: {', '.join(source_files)}\n{output}"
+        )
+        return False, detail, None, "runner-died-before-output"
+
+    # Could not parse - fall back to exit code.
     passed = _ok
+    exit_detail = "command not found (127)" if exit_code == 127 else ("0" if _ok else "non-zero")
     detail = (
         f"Could not parse agent mutation score (threshold {threshold:.1%}). "
-        f"Exit: {'0' if _ok else 'non-zero'}\n"
+        f"Exit: {exit_detail}\n"
         f"Test files: {', '.join(test_files)}\n"
         f"Source files: {', '.join(source_files)}\n{output}"
     )
-    return passed, detail, None
+    return passed, detail, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -976,12 +1042,12 @@ def _run_dlp_gate(
 
     has_blocks = any(f.block_merge for _, f in all_findings)
     categories = sorted({f.category for _, f in all_findings})
-    lines = [f"DLP scan: {len(all_findings)} finding(s) — categories: {', '.join(categories)}"]
+    lines = [f"DLP scan: {len(all_findings)} finding(s) - categories: {', '.join(categories)}"]
     for fpath_str, f in all_findings:
         block_label = "[BLOCK]" if f.block_merge else "[WARN]"
         lines.append(
             f"  {block_label} [{f.severity.upper()}] {fpath_str}"
-            f" (line {f.line_number}): {f.description} — {f.redacted_match}"
+            f" (line {f.line_number}): {f.description} - {f.redacted_match}"
         )
     detail = "\n".join(lines)
     if len(detail) > 2000:
@@ -1035,6 +1101,15 @@ def run_quality_gates(
 
     if not config.enabled:
         return QualityGatesResult(task_id=task.id, passed=True)
+
+    # Agent worktrees carry a session-specific CLAUDE.md override marked
+    # skip-worktree (worktree_claude_md.write_claude_md). Restore the tracked
+    # one before gates run so checks that read repo-root docs (e.g.
+    # test_claude_md_shim_doc) grade the real tree, not the session file.
+    if run_dir != workdir:
+        from bernstein.core.git.worktree_claude_md import restore_claude_md
+
+        restore_claude_md(run_dir)
 
     explicit_skip_gates = skip_gates if skip_gates is not None else _env_skip_gates()
     explicit_bypass_reason = bypass_reason if bypass_reason is not None else _env_bypass_reason()

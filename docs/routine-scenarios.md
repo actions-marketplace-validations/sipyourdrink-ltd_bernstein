@@ -7,11 +7,16 @@ events. The bridge wires them together so a team lead can author one
 scenario in the repo and an operator can stand up the matching Routine in
 about five minutes.
 
+The subcommands live under `bernstein schedule routine`. The older top-level
+`bernstein routine <sub>` spelling remains registered as a deprecated alias for
+the whole 3.x line — same subcommands, same flags, a warning on stderr — and is
+unregistered in 4.0.0.
+
 ## Two directions
 
-### Direction A — Scenario to Routine (export)
+### Direction A - Scenario to Routine (export)
 
-`bernstein routine export <scenario-id> --repo owner/name --output ./out` writes:
+`bernstein schedule routine export <scenario-id> --repo owner/name --output ./out` writes:
 
 ```
 out/
@@ -26,18 +31,18 @@ The prompt instructs the Routine session to call `bernstein_scenario`,
 poll status, and summarise outcomes (including PR comments when a GitHub
 trigger supplied a pull request number).
 
-`bernstein routine provision` is an interactive wrapper around the same
+`bernstein schedule routine provision` is an interactive wrapper around the same
 flow that also registers the trigger id once the operator pastes it back.
 
-### Direction B — Routine to Scenario (invoke)
+### Direction B - Routine to Scenario (invoke)
 
 The MCP server exposes three tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `bernstein_scenarios()` | List scenarios known to the local library. |
-| `bernstein_scenario(scenario_id, context, pr_number, branch)` | Spawn one task per scenario template. |
-| `bernstein_scenario_status(orchestration_id)` | Aggregate status of a running scenario. |
+| `bernstein_scenario(action="list")` | List scenarios known to the local library. |
+| `bernstein_scenario(action="run", scenario_id, context, pr_number, branch)` | Spawn one task per scenario template; returns the same pollable handle shape as `bernstein_run`. |
+| `bernstein_scenario(action="status", orchestration_id=...)` | Aggregate status of a running scenario. |
 
 Each spawned task carries `metadata.scenario_id` and
 `metadata.orchestration_id` so the status tool can group them.
@@ -71,18 +76,18 @@ ready-to-use templates covering:
 
 ## Auto-provisioning
 
-Trigger ids resolved through `bernstein routine register --scenario <id>
+Trigger ids resolved through `bernstein schedule routine register --scenario <id>
 --trigger-id <tid> --repo owner/name` are persisted under
 `.sdd/routines/registry.json`. When the Routine webhook arrives at the
 Bernstein server with the matching trigger id, the bridge looks up the
 binding and invokes the scenario without operator intervention.
 
-`bernstein routine bindings` lists all registered bindings.
+`bernstein schedule routine bindings` lists all registered bindings.
 
 ## See also
 
-- `src/bernstein/core/planning/scenario_library.py` — scenario data model.
-- `src/bernstein/core/planning/routine_provisioner.py` — Direction A export.
-- `src/bernstein/core/planning/routine_bridge.py` — bidirectional bridge.
-- `src/bernstein/mcp/routine_tools.py` — MCP tool registration.
-- `src/bernstein/cli/commands/routine_cmd.py` — CLI surface.
+- `src/bernstein/core/planning/scenario_library.py` - scenario data model.
+- `src/bernstein/core/planning/routine_provisioner.py` - Direction A export.
+- `src/bernstein/core/planning/routine_bridge.py` - bidirectional bridge.
+- `src/bernstein/mcp/routine_tools.py` - MCP tool registration.
+- `src/bernstein/cli/commands/routine_cmd.py` - CLI surface.

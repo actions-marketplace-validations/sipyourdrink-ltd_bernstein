@@ -97,6 +97,24 @@ async def _post_task_to_server(
     # Include upgrade_details if present
     if task.upgrade_details:
         body["upgrade_details"] = asdict(task.upgrade_details)
+    # Forward the declared artifact contract (issue #3110). Dropping it here
+    # would silently turn a declared report/dataset/action_log/ops_result task
+    # back into a code_diff task at the server boundary.
+    from bernstein.core.tasks.artifacts import ArtifactKind
+
+    if task.artifact_spec.kind is not ArtifactKind.CODE_DIFF:
+        body["artifact_spec"] = task.artifact_spec.to_dict()
+
+    # Forward declared context files (issue #3375). The plan loader stamps
+    # plan-level ``context_files`` onto ``task.metadata``, and the spawner
+    # reads the same key off the stored task at dispatch; this body is built
+    # field-by-field, so without an explicit forward the declaration dies at
+    # the server boundary. Scoped to the one key this wire carries rather
+    # than forwarding all metadata, so unrelated loader-internal metadata
+    # keys keep their current (server-absent) behaviour.
+    context_files = task.metadata.get("context_files") if isinstance(task.metadata, dict) else None
+    if isinstance(context_files, list) and context_files:
+        body["metadata"] = {"context_files": [str(p) for p in context_files]}
 
     # Plan mode: tasks start as PLANNED instead of OPEN
     if plan_mode:
@@ -175,7 +193,7 @@ async def _run_shape_check_with_retry(
     The retry is best-effort: if the second LLM call fails to parse, or
     still produces an invalid plan, we fall back to the original tasks
     and log the violations as warnings.  This keeps existing plans from
-    breaking hard when the LLM cannot satisfy the new constraints —
+    breaking hard when the LLM cannot satisfy the new constraints -
     operators still have the ``--no-enforce-vertical`` escape valve.
     """
     violations = check_plan(tasks, shape_config)
@@ -284,7 +302,7 @@ async def plan(
             max_files=shape_config.max_files,
             max_modules=shape_config.max_modules,
         )
-    # 0. Semantic cache — skip LLM if we've planned a similar goal before
+    # 0. Semantic cache - skip LLM if we've planned a similar goal before
     sem_cache = SemanticCacheManager(workdir)
 
     # 1. Gather context
@@ -298,7 +316,7 @@ async def plan(
         try:
             existing = await _fetch_existing_tasks(client, server_url)
         except httpx.HTTPError:
-            logger.warning("Could not fetch existing tasks — planning from scratch")
+            logger.warning("Could not fetch existing tasks - planning from scratch")
             existing = []
 
         # Record metrics start
@@ -335,7 +353,7 @@ async def plan(
         cached_response, similarity = sem_cache.lookup(goal, model=model)
         if cached_response is not None:
             logger.info(
-                "Semantic cache hit (similarity=%.3f) — skipping LLM call for goal: %r",
+                "Semantic cache hit (similarity=%.3f) - skipping LLM call for goal: %r",
                 similarity,
                 goal[:80],
             )

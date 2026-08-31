@@ -1,66 +1,55 @@
+# Dependabot configuration. Without this file only ad-hoc security PRs can
+# appear; version updates never run, which left dependabot-auto-merge.yml
+# with nothing to act on. Updates are weekly and grouped so the maintainer
+# sees one PR per ecosystem, not one per package; patch/minor groups are
+# auto-enqueued by .github/workflows/dependabot-auto-merge.yml and gated by
+# the same merge-queue CI as any other change.
 version: 2
 updates:
-  - package-ecosystem: pip
-    directory: /
+  - package-ecosystem: "github-actions"
+    directory: "/"
     schedule:
-      interval: weekly
-    # Wait a few days after upstream release before opening a bump PR
-    # so a fast-follow patch can catch up — and longer for majors
-    # (zizmor dependabot-cooldown).
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    # A week's cooldown before proposing a new release: a compromised
+    # package is usually yanked within days, so not tracking the bleeding
+    # edge is itself a supply-chain control (zizmor: dependabot-cooldown).
     cooldown:
       default-days: 7
-      semver-major-days: 14
-    labels:
-      - "dependencies"
     groups:
-      # Security-critical deps get a dedicated group so a CVE patch
-      # doesn't hide inside a bundle of feature bumps. Each entry must
-      # also appear in pyproject.toml :: dependencies (production) or
-      # dev (CI hardening).
-      security:
-        applies-to: security-updates
-        patterns:
-          - "cryptography"
-          - "signxml"
-          - "defusedxml"
-          - "fastapi"
-          - "starlette"
-          - "uvicorn"
-          - "httpx"
-          - "pyjwt"
-          - "pyyaml"
-          - "lxml"
-          - "requests"
-          - "urllib3"
-          - "bandit"
-          - "pip-audit"
-        # semgrep is installed out-of-tree via `uv tool install semgrep`
-        # (see .github/workflows/ci.yml + docs/contributing/testing.md);
-        # not a pip dep so dependabot can't manage it from here.
-      minor-and-patch:
-        update-types:
-          - minor
-          - patch
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
-
-  - package-ecosystem: github-actions
-    directory: /
-    schedule:
-      interval: weekly
-      day: tuesday
-    # Same cooldown rationale as the pip ecosystem above
-    # (zizmor dependabot-cooldown).
-    cooldown:
-      default-days: 7
-      semver-major-days: 14
-    open-pull-requests-limit: 5
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
     labels:
       - "dependencies"
       - "ci"
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    cooldown:
+      default-days: 7
     groups:
-      actions-minor-patch:
-        update-types:
-          - minor
-          - patch
+      python-minor-and-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+    labels:
+      - "dependencies"
+    ignore:
+      # mkdocs-redirects 1.2.3 swapped its `mkdocs` dependency for
+      # `properdocs`, a third-party fork of mkdocs 1.x. The docs build targets
+      # upstream mkdocs, so the cap in docs/requirements.in is a decision
+      # rather than a stale pin - a grouped version update lifted it once
+      # already, which is how the fork nearly arrived as a transitive
+      # dependency of the docs toolchain. Revisit by editing the cap, not by
+      # letting a bump edit it.
+      - dependency-name: "mkdocs-redirects"
+        versions: [">=1.2.3"]
+    # Majors stay individual PRs for a human decision.
+    open-pull-requests-limit: 10

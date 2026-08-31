@@ -1,14 +1,19 @@
-# Bug Bounty Program
+# Coordinated Disclosure
 
-Full details of the Bernstein vulnerability disclosure and bug bounty program.
+Full details of the Bernstein vulnerability disclosure process and researcher sandbox. For the policy summary, severity classification, and recognition, see [`SECURITY.md`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/SECURITY.md).
 
 ## Program overview
 
-Bernstein orchestrates AI coding agents that run directly on a user's machine. The attack surface is meaningful: agents read/write files, execute CLI commands, and communicate via a local HTTP task server. We treat security seriously and compensate researchers who find real issues.
+Bernstein orchestrates AI coding agents that run directly on a user's machine. The attack surface is meaningful: agents read/write files, execute CLI commands, and communicate via a local HTTP task server. We treat security seriously and recognize researchers who find real issues.
 
-Reports go through **HackerOne**: https://hackerone.com/bernstein
+Report a vulnerability by email to **forte@bernstein.run**, or open a private
+security advisory on GitHub:
+https://github.com/sipyourdrink-ltd/bernstein/security/advisories/new
 
-Email fallback: security@bernstein.dev (see `SECURITY.md` for PGP key).
+The project publishes no PGP key, so email to that address is not
+end-to-end encrypted. Use the GitHub private advisory for anything whose
+contents matter before a fix ships - a working exploit, a credential, a
+customer-identifying detail. Email is fine for everything else.
 
 ---
 
@@ -86,9 +91,9 @@ High-value targets in approximate priority order:
 
 ### 1. Task server authentication (Critical / High)
 
-- `POST /tasks` — can an unauthenticated caller inject tasks?
-- Token replay / forgery — are tokens validated correctly?
-- Privilege escalation — can a `research-token-2` caller access admin endpoints?
+- `POST /tasks` - can an unauthenticated caller inject tasks?
+- Token replay / forgery - are tokens validated correctly?
+- Privilege escalation - can a `research-token-2` caller access admin endpoints?
 
 Relevant code: `src/bernstein/core/routes/`
 
@@ -98,21 +103,21 @@ Relevant code: `src/bernstein/core/routes/`
 - Path traversal: does `scope` or `goal` field sanitize `../` sequences?
 - Shell injection in `spawn_prompt` template expansion
 
-Relevant code: `src/bernstein/core/spawner.py`, `src/bernstein/core/spawn_prompt.py`
+Relevant code: `src/bernstein/core/agents/spawner.py`, `src/bernstein/core/agents/spawn_prompt.py`
 
 ### 3. Worktree isolation (High / Medium)
 
 - Does the `EnterWorktree` / `ExitWorktree` flow prevent escaping the assigned worktree?
 - Can one agent read another agent's worktree?
 
-Relevant code: `src/bernstein/core/orchestrator.py`
+Relevant code: `src/bernstein/core/orchestration/orchestrator.py`
 
 ### 4. Bulletin board (Medium)
 
 - Can a bulletin post cause XSS in the web dashboard?
 - Can a malicious agent post bulletins that influence other agents' behavior (prompt injection via bulletin)?
 
-Relevant code: `src/bernstein/core/bulletin.py`
+Relevant code: `src/bernstein/core/communication/bulletin.py`
 
 ### 5. Docker sandbox itself (Medium / Low)
 
@@ -123,35 +128,37 @@ Relevant code: `src/bernstein/core/bulletin.py`
 
 ## Submission guidelines
 
-1. Use the HackerOne form at https://hackerone.com/bernstein
+1. Email **forte@bernstein.run** or open a private GitHub security advisory
 2. Include:
    - Description of the vulnerability
    - Steps to reproduce (curl commands, scripts, or a PoC)
    - Impact assessment (what an attacker could achieve)
    - Affected file(s) and line numbers if known
 3. Attach screenshots or screen recordings for complex PoCs
-4. Do not include production credentials — use the sandbox tokens
+4. Do not include production credentials - use the sandbox tokens
 
 ---
 
 ## Disclosure policy
 
-We target coordinated disclosure: fix ships first, then you may publish. Timeline:
+A first substantive response can take up to 90 days, and no fix date is
+promised - severity sets the order work happens in, not a deadline. Bernstein
+has one unpaid maintainer, and that is the whole reason.
 
-| Severity | Fix deadline | Disclosure after fix |
-|----------|-------------|----------------------|
-| Critical | 7 days | 7 days |
-| High | 14 days | 7 days |
-| Medium | 30 days | 14 days |
-| Low | 90 days | 30 days |
+You may disclose 90 days after your report, whether or not a fix has shipped,
+without asking. Earlier is fine if we agree on it.
 
-If we miss a deadline we communicate proactively and you retain the right to disclose with 7 days' notice.
+The terms that govern are in [`SECURITY.md`](../../SECURITY.md); this page is
+the sandbox guide.
 
 ---
 
-## Acknowledgments
+## Credit
 
-Researchers who discover and responsibly disclose valid vulnerabilities are listed in
-[`docs/security/security-acknowledgments.md`](security-acknowledgments.md).
+An advisory is published when a fix ships, crediting the reporter by the name,
+handle, or link they choose, and a CVE can be requested on it. The reporter is
+also named in the release notes of the release carrying the fix.
 
-We also issue CVEs for confirmed vulnerabilities of Medium severity and above.
+Credit lives on those two artefacts rather than in a separate roll of honour, so
+that it is produced by shipping the fix rather than by remembering to update a
+page.

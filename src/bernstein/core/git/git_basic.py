@@ -14,10 +14,36 @@ logger = logging.getLogger(__name__)
 _CONVENTIONAL_COMMIT_RE = re.compile(r"^(feat|fix|chore|docs|test|refactor)(\([a-z0-9._/-]+\))?: .+")
 
 # Paths that must NEVER be staged, even via explicit add.
+#
+# Extended (defect 28 - decoy commit / secret leak): the previous list
+# only excluded ``.sdd/runtime/`` and ``.sdd/metrics/``.  The decoy commit
+# ``7e2364e`` on ``main`` (see
+# ``work/bernstein/proofs/d2/minimax/attempt-83808a8a/DIAGNOSIS.md``)
+# swept 83 ``.sdd/*`` files including ``.sdd/attestations/ed25519-signing-key.pem``,
+# ``.sdd/auth/agent_identity_jwt_secret``, ``.sdd/runtime/agent_tokens/``,
+# and ``bernstein.yaml`` into a single commit on a default branch.  The
+# merge-preflight safety guard in :mod:`bernstein.core.git.git_pr` blocks
+# the COMMIT, but to close the gap at the staging layer too we extend the
+# deny list with every prefix that must never reach a default branch.
+#
+# NOTE: entries here are matched as bare substrings against candidate paths
+# (see ``stage_files``/``stage_task_files`` below), so every entry MUST be
+# scoped with enough of a path prefix to avoid matching unrelated legitimate
+# paths.  A bare ``"attestations/"`` or ``"auth/"`` entry would also match
+# any legitimate path that happens to contain that substring anywhere (e.g.
+# ``src/myapp/auth/handler.py``), silently excluding real work from staging
+# -- the inverse of the leak this list exists to prevent.  Keep only the
+# ``.sdd/``-scoped forms.
 _NEVER_STAGE: frozenset[str] = frozenset(
     {
+        ".sdd/",
         ".sdd/runtime/",
         ".sdd/metrics/",
+        ".sdd/attestations/",
+        ".sdd/auth/",
+        ".sdd/traces/",
+        "bernstein.yaml",
+        ".claude/mcp.json",
         ".env",
         "*.pid",
         "*.log",
@@ -206,13 +232,15 @@ def stage_all_except(cwd: Path, exclude: list[str] | None = None) -> None:
         exclude: Paths/globs to unstage after the bulk add.
     """
     run_git(["add", "-A"], cwd)
-    to_unstage = list(exclude or [])
-    # Always unstage never-stage paths that are directories
-    for pat in _NEVER_STAGE:
-        if pat.endswith("/"):
-            to_unstage.append(pat)
-    if to_unstage:
-        run_git(["reset", "HEAD", "--", *to_unstage], cwd)
+    # Every never-stage entry is unstaged, not only the directory prefixes.
+    # The earlier version appended a pattern only when it ended in "/", so
+    # ``bernstein.yaml``, ``.claude/mcp.json`` and ``.env`` survived the bulk
+    # ``git add -A`` and were committed - and this helper's only caller
+    # commits and pushes to the default branch (issue #4485). Git reads the
+    # bare names and the ``*.pid`` / ``*.log`` forms as pathspecs, and a
+    # pathspec that matches nothing is a no-op.
+    to_unstage = list(exclude or []) + sorted(_NEVER_STAGE)
+    run_git(["reset", "HEAD", "--", *to_unstage], cwd)
 
 
 # ------------------------------------------------------------------
@@ -259,7 +287,7 @@ def conventional_commit(
     """Generate a conventional commit message from the staged diff and commit.
 
     Parses ``git diff --cached`` to determine change type and scope.
-    No LLM call — purely deterministic.
+    No LLM call - purely deterministic.
 
     Args:
         cwd: Repository root.
@@ -385,7 +413,7 @@ def _rebase_or_merge(cwd: Path, remote: str, branch: str) -> GitResult | None:
 
 _TRANSIENT_MARKERS = (
     "unable to access",
-    "could not read",
+    "could not read from remote",
     "connection",
     "timed out",
     "timeout",
@@ -393,6 +421,13 @@ _TRANSIENT_MARKERS = (
     "non-fast-forward",
     "fetch first",
     "cannot lock ref",
+)
+
+_TERMINAL_MARKERS = (
+    "could not read username",
+    "authentication failed",
+    "permission denied",
+    "fatal: could not read",
 )
 
 
@@ -409,6 +444,22 @@ def _is_transient_push_error(stderr: str) -> bool:
     return any(marker in lower for marker in _TRANSIENT_MARKERS)
 
 
+def _is_terminal_push_error(stderr: str) -> bool:
+    """Check if a push failure is terminal and should not be retried.
+
+    Terminal errors indicate configuration problems (missing credentials,
+    auth failures) that will not resolve with retries.
+
+    Args:
+        stderr: Stderr output from the failed push.
+
+    Returns:
+        True if the error matches a known terminal pattern.
+    """
+    lower = stderr.lower()
+    return any(marker in lower for marker in _TERMINAL_MARKERS)
+
+
 def remote_exists(cwd: Path, remote: str = "origin") -> bool:
     """Return True when *remote* is configured for the repo at *cwd*.
 
@@ -419,6 +470,135 @@ def remote_exists(cwd: Path, remote: str = "origin") -> bool:
     """
     result = run_git(["remote", "get-url", remote], cwd, timeout=5)
     return result.ok
+
+
+def _run_git_quiet(args: list[str], cwd: Path) -> GitResult:
+    """Run a read-only git query, converting OS-level errors into a failed
+    :class:`GitResult` instead of raising.
+
+    Used by the branch resolvers below so they honour their "never raises"
+    contract even when *cwd* does not exist, git is not installed, or the
+    command times out.
+    """
+    try:
+        return run_git(args, cwd, timeout=5)
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        logger.debug("git %s failed at %s: %s", args[0] if args else "?", cwd, exc)
+        return GitResult(returncode=1, stdout="", stderr=str(exc))
+
+
+def current_branch(cwd: Path) -> str | None:
+    """Return the branch currently checked out at *cwd*, or ``None``.
+
+    ``None`` covers detached-HEAD and any git failure. Never raises.
+    """
+    result = _run_git_quiet(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    if not result.ok:
+        return None
+    name = result.stdout.strip()
+    if not name or name == "HEAD":  # detached HEAD
+        return None
+    return name
+
+
+def _resolve_default_branch_from_remote_head(cwd: Path, remote: str) -> str | None:
+    """Return the default branch named by ``<remote>/HEAD``, or ``None``.
+
+    ``None`` means ``<remote>/HEAD`` is unset (common in ``git worktree``
+    checkouts and partial clones where ``git remote set-head`` was never run),
+    so callers must fall back to a heuristic and treat the result as ambiguous.
+    """
+    head = _run_git_quiet(["symbolic-ref", f"refs/remotes/{remote}/HEAD"], cwd)
+    if head.ok:
+        ref = head.stdout.strip()
+        prefix = f"refs/remotes/{remote}/"
+        if ref.startswith(prefix):
+            return ref.removeprefix(prefix)
+
+    abbrev = _run_git_quiet(["rev-parse", "--abbrev-ref", f"{remote}/HEAD"], cwd)
+    if abbrev.ok:
+        ref = abbrev.stdout.strip()
+        if ref and ref != f"{remote}/HEAD":
+            return ref.removeprefix(f"{remote}/")
+
+    return None
+
+
+def _branch_exists(cwd: Path, branch: str) -> bool:
+    """Return ``True`` if a local ``branch`` ref exists at *cwd*."""
+    probe = _run_git_quiet(["rev-parse", "--verify", "--quiet", branch], cwd)
+    return probe.ok
+
+
+def resolve_default_branch(cwd: Path, remote: str = "origin") -> str:
+    """Resolve the repository's default branch (the protected trunk).
+
+    Resolution order: ``<remote>/HEAD`` first (the authoritative signal), then
+    ``init.defaultBranch`` from git config, then the ``<remote>/master``
+    remote-tracking ref, then the conventional ``main``/``master`` local probe,
+    and finally ``"main"`` as a last resort. Consulting ``init.defaultBranch``
+    and ``<remote>/master`` BEFORE the hard-coded ``main``-first local probe
+    means a repo whose real trunk is ``master`` is not mis-resolved to a stray
+    local ``main`` when ``<remote>/HEAD`` is unavailable. Never raises.
+
+    Args:
+        cwd: Repository root.
+        remote: Remote whose ``HEAD`` symbolic ref names the default branch.
+
+    Returns:
+        The default branch short name (e.g. ``"main"`` or ``"master"``).
+    """
+    from_head = _resolve_default_branch_from_remote_head(cwd, remote)
+    if from_head is not None:
+        return from_head
+
+    cfg = _run_git_quiet(["config", "--get", "init.defaultBranch"], cwd)
+    if cfg.ok and cfg.stdout.strip():
+        configured = cfg.stdout.strip()
+        if _branch_exists(cwd, configured):
+            return configured
+
+    master_tracking = _run_git_quiet(["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/master"], cwd)
+    if master_tracking.ok:
+        return "master"
+
+    for candidate in ("main", "master"):
+        if _branch_exists(cwd, candidate):
+            return candidate
+
+    if cfg.ok and cfg.stdout.strip():
+        return cfg.stdout.strip()
+
+    return "main"
+
+
+def protected_default_branches(cwd: Path, remote: str = "origin") -> frozenset[str]:
+    """Return the set of branch names that must be treated as protected trunks.
+
+    Normally this is the single :func:`resolve_default_branch` result. But when
+    ``<remote>/HEAD`` is unavailable (unset ``set-head``, partial clone, some
+    ``git worktree`` checkouts) AND both a local ``main`` and a local ``master``
+    exist, the true trunk is genuinely ambiguous: neither the local probe order
+    nor the remote-tracking heuristic can be trusted to pick correctly. In that
+    ambiguous state this returns BOTH names so a merge guard fails closed and
+    refuses to land unreviewed commits on either candidate. Never raises.
+
+    Args:
+        cwd: Repository root.
+        remote: Remote whose ``HEAD`` symbolic ref names the default branch.
+
+    Returns:
+        A frozenset of protected branch short names (usually one, two when the
+        default is ambiguous).
+    """
+    from_head = _resolve_default_branch_from_remote_head(cwd, remote)
+    if from_head is not None:
+        return frozenset({from_head})
+
+    if _branch_exists(cwd, "main") and _branch_exists(cwd, "master"):
+        return frozenset({"main", "master"})
+
+    return frozenset({resolve_default_branch(cwd, remote)})
 
 
 def safe_push(
@@ -436,7 +616,7 @@ def safe_push(
     unavailable) are retried; persistent failures like rejected non-fast-
     forward pushes fail immediately.
 
-    No-ops cleanly when ``remote`` is not configured — local-only repos
+    No-ops cleanly when ``remote`` is not configured - local-only repos
     (the GUI-smoke playground, ephemeral test fixtures) used to log a noisy
     ``fatal: 'origin' does not appear to be a git repository`` per agent
     reap.  We now detect the missing remote and return a successful
@@ -453,7 +633,7 @@ def safe_push(
         GitResult from the push command.
     """
 
-    # Guardrail: never push to "master" — auto-correct to "main".
+    # Guardrail: never push to "master" - auto-correct to "main".
     if branch == "master":
         logger.info("safe_push: correcting branch 'master' -> 'main'")
         branch = "main"
@@ -499,6 +679,15 @@ def _push_with_retry(
             _rebase_or_merge(cwd, remote, branch)
         push_result = run_git(["push", remote, branch], cwd, timeout=60)
         if push_result.ok:
+            return push_result
+        # Terminal errors (missing credentials, auth failures) will not
+        # resolve with retries — fail immediately with a clear message.
+        if _is_terminal_push_error(push_result.stderr):
+            logger.error(
+                "git push to %s failed (configuration error, not retried): %s",
+                remote,
+                push_result.stderr.strip(),
+            )
             return push_result
         if not _is_transient_push_error(push_result.stderr) or attempt >= max_retries:
             if attempt > 0:
@@ -592,7 +781,7 @@ def _parse_latest_version(tags: list[str], tag_prefix: str) -> tuple[int, int, i
         tag_prefix: Prefix to strip (e.g. ``"v"``).
 
     Returns:
-        (major, minor, patch, latest_tag) — tag is None if no valid tag found.
+        (major, minor, patch, latest_tag) - tag is None if no valid tag found.
     """
     for t in tags:
         stripped = t.lstrip(tag_prefix)

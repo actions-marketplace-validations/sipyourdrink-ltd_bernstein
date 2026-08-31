@@ -26,8 +26,10 @@ from typing import TYPE_CHECKING, cast
 
 import httpx
 
+from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 from bernstein.core.metrics import get_collector
 from bernstein.core.models import Complexity, ModelConfig, Scope, Task
+from bernstein.core.security.path_containment import PathContainmentError, contained_subpath
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -36,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_OBJ = "dict[str, object]"
+type _CAST_DICT_STR_OBJ = dict[str, object]
 
 
 class TaskLevel(Enum):
@@ -101,7 +103,7 @@ class FastPathStats:
 # Classification rules
 # ---------------------------------------------------------------------------
 
-# Regex patterns for L0 (trivial) tasks — matched against lowercased title+description
+# Regex patterns for L0 (trivial) tasks - matched against lowercased title+description
 # These are lowercase because they are reassigned by load_fast_path_config().
 _l0_patterns: list[tuple[re.Pattern[str], FastPathAction, str]] = [
     (re.compile(r"\b(format|formatting|auto-?format|black|prettier)\b"), FastPathAction.RUFF_FORMAT, "formatting"),
@@ -118,7 +120,7 @@ _l0_patterns: list[tuple[re.Pattern[str], FastPathAction, str]] = [
     ),
 ]
 
-# Regex patterns for L1 (simple) tasks — route to cheapest model
+# Regex patterns for L1 (simple) tasks - route to cheapest model
 # These are lowercase because they are reassigned by load_fast_path_config().
 _l1_patterns: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(add docstring|update docstring|missing docstring)\b"), "docstring"),
@@ -182,7 +184,7 @@ def classify_task(task: Task) -> ClassificationResult:
             )
 
     # Low-complexity + small-scope tasks that didn't match L0/L1 patterns
-    # still benefit from the cheapest model — they're simple by metadata.
+    # still benefit from the cheapest model - they're simple by metadata.
     if task.complexity == Complexity.LOW and task.scope == Scope.SMALL:
         return ClassificationResult(
             level=TaskLevel.L1,
@@ -196,7 +198,7 @@ def classify_task(task: Task) -> ClassificationResult:
 
 
 # ---------------------------------------------------------------------------
-# L0 executors — deterministic, no LLM
+# L0 executors - deterministic, no LLM
 # ---------------------------------------------------------------------------
 
 
@@ -361,7 +363,18 @@ def _run_rename(workdir: Path, owned_files: list[str], task: Task | None = None)
 
     modified = 0
     for rel_path in targets:
-        fpath = workdir / rel_path
+        # ``owned_files`` entries are caller-supplied strings, and
+        # ``workdir / rel_path`` is not by itself a path under ``workdir``:
+        # ``Path.__truediv__`` discards the left side when the right side is
+        # absolute and never collapses ``..``.  ``contained_subpath`` returns
+        # the normalised path only when it is proven to stay under the
+        # working directory; an entry that is not is skipped and logged, the
+        # same way an unreadable entry already is.
+        try:
+            fpath = contained_subpath(workdir, rel_path, label="owned file")
+        except PathContainmentError as exc:
+            logger.warning("Rename skipped for %s: %s", rel_path, exc)
+            continue
         if not fpath.is_file():
             continue
         try:
@@ -426,16 +439,43 @@ def execute_fast_path(
 
 
 # ---------------------------------------------------------------------------
-# L1 model override — cheapest model for simple tasks
+# L1 model override - cheapest model for simple tasks
 # ---------------------------------------------------------------------------
 
-# Default L1 model: sonnet (not haiku — on Max plan sonnet is unlimited
-# and produces much better results for the same cost).
-_l1_model_config = ModelConfig(model="sonnet", effort="normal", max_tokens=50_000)
+# L1 model config comes ONLY from routing.yaml's `fast_path.l1_model` /
+# `fast_path.l1_effort` keys, loaded via load_fast_path_config() below.
+# Bernstein never hardcodes a fallback model (previously "sonnet") - if no
+# config has been loaded, get_l1_model_config() raises ModelNotConfiguredError
+# instead of silently defaulting.
+_l1_model_config: ModelConfig | None = None
 
 
 def get_l1_model_config() -> ModelConfig:
-    """Return the cheapest model config for L1 (simple) tasks."""
+    """Return the config-supplied model config for L1 (simple) tasks.
+
+    Raises:
+        ModelNotConfiguredError: if ``fast_path.l1_model`` has not been set
+            via ``load_fast_path_config()`` (i.e. no routing.yaml, or the
+            YAML omits ``fast_path.l1_model``). Bernstein never falls back
+            to a hardcoded default model.
+    """
+    if _l1_model_config is None:
+        logger.error(
+            "get_l1_model_config: no L1 model configured (fast_path.l1_model "
+            "missing from routing.yaml) - raising instead of defaulting to a "
+            "hardcoded model"
+        )
+        raise ModelNotConfiguredError(
+            "No L1 model configured for fast-path routing. Set "
+            "fast_path.l1_model (and optionally fast_path.l1_effort) in "
+            ".sdd/config/routing.yaml - Bernstein does not hardcode a "
+            "default model for L1 tasks."
+        )
+    logger.debug(
+        "get_l1_model_config: returning config-supplied model=%s effort=%s",
+        _l1_model_config.model,
+        _l1_model_config.effort,
+    )
     return _l1_model_config
 
 
@@ -520,7 +560,7 @@ def load_fast_path_config(routing_yaml: Path) -> bool:
     global _l0_patterns, _l1_patterns, _l1_model_config
 
     try:
-        import yaml  # lazy import — only needed if routing.yaml is present
+        import yaml  # lazy import - only needed if routing.yaml is present
     except ImportError:
         logger.debug("PyYAML not available; using default fast-path patterns")
         return False
@@ -528,11 +568,16 @@ def load_fast_path_config(routing_yaml: Path) -> bool:
     try:
         data: object = yaml.safe_load(routing_yaml.read_text(encoding="utf-8"))
     except Exception as exc:
-        logger.warning("Could not read %s: %s — using default fast-path patterns", routing_yaml, exc)
+        logger.warning("Could not read %s: %s - using default fast-path patterns", routing_yaml, exc)
         return False
 
     if not isinstance(data, dict):
         return False
+
+    # Remove pending_upgrades if present
+    if "pending_upgrades" in data:
+        data.pop("pending_upgrades")
+        logger.warning("Ignoring leftover pending_upgrades in %s", routing_yaml)
 
     data_dict: dict[str, object] = cast(_CAST_DICT_STR_OBJ, data)
     fp_cfg_raw: object = data_dict.get("fast_path")
@@ -555,16 +600,30 @@ def load_fast_path_config(routing_yaml: Path) -> bool:
     if parsed_l1 is not None:
         _l1_patterns = parsed_l1
 
-    # Load L1 model override
+    # Load L1 model override. l1_model is required - Bernstein does not
+    # hardcode a fallback model (previously "haiku") when the operator sets
+    # l1_effort without also pinning l1_model.
     l1_model: object = fp_cfg.get("l1_model")
     l1_effort: object = fp_cfg.get("l1_effort")
-    if l1_model or l1_effort:
+    if l1_model:
         _l1_model_config = ModelConfig(
-            model=str(l1_model) if l1_model else "haiku",
-            effort=str(l1_effort) if l1_effort else "low",
+            model=str(l1_model),
+            effort=str(l1_effort) if l1_effort else "normal",
             max_tokens=50_000,
         )
-        logger.debug("L1 model config from routing.yaml: %s/%s", _l1_model_config.model, _l1_model_config.effort)
+        logger.info(
+            "L1 model config loaded from routing.yaml (config-supplied): model=%s effort=%s",
+            _l1_model_config.model,
+            _l1_model_config.effort,
+        )
+    elif l1_effort:
+        logger.warning(
+            "routing.yaml fast_path.l1_effort=%r set without fast_path.l1_model - "
+            "ignoring l1_effort (no hardcoded model fallback available); "
+            "L1 model config remains %s",
+            l1_effort,
+            "unset (will raise on use)" if _l1_model_config is None else "unchanged",
+        )
 
     return True
 
@@ -700,9 +759,9 @@ def try_fast_path_batch(
             result.summary,
         )
     else:
-        # Mark task failed — it will be retried via normal LLM path
+        # Mark task failed - it will be retried via normal LLM path
         logger.warning(
-            "Fast-path failed for task %s: %s — will retry via LLM",
+            "Fast-path failed for task %s: %s - will retry via LLM",
             task.id,
             result.error,
         )

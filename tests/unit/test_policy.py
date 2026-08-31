@@ -1,4 +1,4 @@
-"""Tests for the policy engine — policy loading, evaluation, and management."""
+"""Tests for the policy engine - policy loading, evaluation, and management."""
 
 from __future__ import annotations
 
@@ -827,6 +827,37 @@ policies:
             (config_dir / "policies.yaml").write_text(yaml_content)
 
             engine = PolicyEngine.default(state_dir=Path(tmpdir))
+
+            assert len(engine.policies) == 1
+            assert engine.policies[0].id == "from-file"
+
+    def test_default_ignores_leftover_pending_upgrades(self, caplog: pytest.LogCaptureFixture) -> None:
+        """PolicyEngine.default() should ignore pending_upgrades key and log a warning."""
+        import logging
+
+        yaml_content = """
+policies:
+  - id: "from-file"
+    name: "From File Policy"
+    description: "Loaded from sdd config"
+    priority: 55
+    enabled: true
+    conditions: []
+    actions: []
+pending_upgrades:
+  - id: "old-upgrade"
+    title: "Legacy pending upgrade"
+    change: "This should be ignored"
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = Path(tmpdir) / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "policies.yaml").write_text(yaml_content)
+
+            with caplog.at_level(logging.WARNING):
+                engine = PolicyEngine.default(state_dir=Path(tmpdir))
+                # Check that a warning was logged
+                assert any("pending_upgrades" in record.message for record in caplog.records)
 
             assert len(engine.policies) == 1
             assert engine.policies[0].id == "from-file"

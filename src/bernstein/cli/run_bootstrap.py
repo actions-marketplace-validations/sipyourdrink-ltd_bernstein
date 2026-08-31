@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import sys
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import click
 import httpx
@@ -19,12 +20,20 @@ import httpx
 from bernstein.cli.first_run_guard import handle_first_run_exception
 from bernstein.cli.helpers import (
     SDD_DIRS,
+    SDD_PID_SPAWNER,
+    SERVER_URL,
+    adapter_cli_choice,
+    auth_headers,
     console,
     find_seed_file,
+    persist_server_port,
     print_banner,
+    print_startup_banner,
     server_get,
 )
 from bernstein.cli.run_preflight import (
+    _CLI_RUN_EPOCH,
+    _abort_if_default_branch_merge_target,
     _configure_quality_gate_bypass,
     _emit_preflight_runtime_warnings,
     _estimate_run_preview,
@@ -32,10 +41,23 @@ from bernstein.cli.run_preflight import (
     _make_profile_ctx,
     _quiet_bootstrap_console,
     _show_run_summary,
+    validate_seed_or_exit,
 )
 from bernstein.core.cost import estimate_run_cost
+from bernstein.core.errors import BernsteinFirstRunError
 from bernstein.core.manager_parsing import _resolve_depends_on  # pyright: ignore[reportPrivateUsage]
+from bernstein.core.orchestration.process_utils import (
+    LIVENESS_ALIVE,
+    LIVENESS_GONE,
+    LIVENESS_UNKNOWN,
+    ORCHESTRATOR_PROCESS_MARKERS,
+    WATCHDOG_POLL_S,
+    Liveness,
+    classify_pidfile_liveness,
+)
 from bernstein.core.plan_loader import PlanLoadError, load_plan, load_plan_from_yaml
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Plan helpers
@@ -70,6 +92,47 @@ def _build_synthetic_plan(goal: str, team: list[str] | None = None) -> tuple[Any
     ]
     plan = create_plan(goal, tasks)
     return plan, tasks
+
+
+def _resolve_goal_and_team(workdir: Path, goal: str | None, seed_file: str | None) -> tuple[str, list[str] | None]:
+    """Resolve the effective goal and team from an inline goal or a seed.
+
+    Shared by ``--plan-only`` and ``--dry-run`` so both preview the same plan
+    from the same source and reject the same seeds. When ``goal`` is given it
+    wins; otherwise the seed file is parsed (``parse_seed``), which enforces the
+    exact validation a real run enforces - so a seed the run would reject (for
+    example an unselectable ``cli:``) is rejected during preview too, instead of
+    being previewed and then crashing at spawn time (issues #2800, #2807).
+
+    Raises:
+        SystemExit: On a missing goal/seed or a seed that fails validation.
+    """
+    if goal is not None:
+        return goal, None
+
+    from bernstein.core.seed import SeedError, parse_seed
+
+    if seed_file is not None:
+        seed_path = Path(seed_file)
+    else:
+        found = find_seed_file()
+        if found is None:
+            from bernstein.cli.errors import no_seed_or_goal
+
+            no_seed_or_goal().print()
+            raise SystemExit(1)
+        seed_path = found
+
+    try:
+        seed = parse_seed(seed_path)
+    except SeedError as exc:
+        from bernstein.cli.errors import seed_parse_error
+
+        seed_parse_error(exc).print()
+        raise SystemExit(1) from exc
+
+    team = list(seed.team) if seed.team != "auto" else None
+    return seed.goal, team
 
 
 def _load_plan_goal(plan_path: Path) -> str:
@@ -115,7 +178,10 @@ def _save_plan_markdown(md: str, workdir: Path) -> Path:
     plans_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     plan_file = plans_dir / f"plan-{ts}.md"
-    plan_file.write_text(md)
+    # The rendered plan always carries the status glyphs the builder emits, so
+    # writing at the platform default encoding raises UnicodeEncodeError on a
+    # cp1252 locale.
+    plan_file.write_text(md, encoding="utf-8")
     return plan_file
 
 
@@ -154,7 +220,7 @@ def _load_dry_run_tasks(plan_file: Path | None) -> list[Any]:
         resp.raise_for_status()
         tasks_data = resp.json()
     except httpx.ConnectError as err:
-        console.print("[red]Task server not running. Start with `bernstein conduct` first,[/red]")
+        console.print("[red]Task server not running. Start with `bernstein run` first,[/red]")
         console.print("[red]or pass a plan file: `bernstein run --dry-run plan.yaml`[/red]")
         raise SystemExit(1) from err
     except Exception as exc:
@@ -164,23 +230,35 @@ def _load_dry_run_tasks(plan_file: Path | None) -> list[Any]:
     return [Task.from_dict(td) for td in tasks_data]
 
 
-def _confirm_run(*, goal: str | None, seed_file: str | None) -> bool:
+def _confirm_run(
+    *,
+    goal: str | None,
+    seed_file: str | None,
+    model_override: str | None = None,
+    cli_override: str | None = None,
+) -> bool:
     """Show confirmation prompt before execution. Returns True to proceed."""
     effective_goal = goal
     team: list[str] | None = None
 
-    if effective_goal is None:
-        _peek_path: Path | None = Path(seed_file) if seed_file is not None else find_seed_file()
-        if _peek_path is not None:
-            with suppress(Exception):
-                from bernstein.core.seed import parse_seed as _parse_seed
+    _peek_path: Path | None = Path(seed_file) if seed_file is not None else find_seed_file()
+    _seed = None
+    if _peek_path is not None:
+        with suppress(Exception):
+            from bernstein.core.seed import parse_seed as _parse_seed
 
-                _seed = _parse_seed(_peek_path)
+            _seed = _parse_seed(_peek_path)
+            if effective_goal is None:
                 effective_goal = _seed.goal
-                team = list(_seed.team) if _seed.team != "auto" else None
-                from bernstein.core.plan_approval import configure_plan_models
+            team = list(_seed.team) if _seed.team != "auto" else None
 
-                configure_plan_models(_seed.role_model_policy)
+    from bernstein.core.plan_approval import configure_plan_models
+
+    configure_plan_models(
+        _seed.role_model_policy if _seed else None,
+        default_model=model_override or (_seed.model if _seed else None),
+        default_cli=cli_override or (_seed.cli if _seed and _seed.cli != "auto" else None),
+    )
 
     if effective_goal:
         plan_obj, plan_tasks = _build_synthetic_plan(effective_goal, team)
@@ -208,6 +286,10 @@ SANDBOX_CHOICES: tuple[str, ...] = (
     "blaxel",
     "runloop",
     "vercel",
+    # Opt-in, never auto-selected: mirrors its trailing position in
+    # DEFAULT_PRECEDENCE, and it is deliberately absent from
+    # SANDBOX_FREE_CHOICES so only an explicit flag reaches it.
+    "microvm",
 )
 
 
@@ -316,8 +398,12 @@ def _propagate_env_flags(
         normalized = sandbox.lower()
         # Only the kernel-isolation backends imply ``--container=1``; cloud
         # and worktree backends manage their own environment so we leave
-        # the legacy flag alone for them.
-        if normalized in {"docker", "podman"}:
+        # the legacy flag alone for them. Issue #3039: the membership test
+        # derives from the single runtime declaration instead of repeating
+        # the literals, so a newly supported runtime sets this flag too.
+        from bernstein.core.security.sandbox import CONTAINER_RUNTIME_NAMES
+
+        if normalized in CONTAINER_RUNTIME_NAMES:
             os.environ["BERNSTEIN_CONTAINER"] = "1"
         os.environ["BERNSTEIN_SANDBOX_RUNTIME"] = normalized
         # Surface the paid-allowed bit so downstream callers (selector,
@@ -353,36 +439,241 @@ def _install_network_policy(
     """
     from bernstein.core.security.network_policy import (
         PROFILE_AIRGAP,
+        PROFILE_SOVEREIGN,
         NetworkPolicy,
         NetworkPolicyConfigError,
         install_policy,
     )
 
     profile_norm = (run_profile or "").strip().lower() or None
-    if profile_norm == PROFILE_AIRGAP:
+    # Sovereign composes the airgap network posture: the same deny-all default
+    # and runtime socket guard, plus the residency posture wired up separately
+    # in ``_activate_sovereign_profile``. So a network-locked profile is either
+    # airgap or sovereign.
+    network_locked = profile_norm in {PROFILE_AIRGAP, PROFILE_SOVEREIGN}
+    if network_locked:
         for spec in allow_network:
             if spec.strip().lower() == "any":
                 raise NetworkPolicyConfigError(
-                    "--profile airgap is incompatible with --allow-network any: "
+                    f"--profile {profile_norm} is incompatible with --allow-network any: "
                     "explicit allow-list entries (host, host:port, or CIDR) are required, "
                     "or omit --allow-network to keep the deny-all default.",
                 )
     if allow_network:
         policy = NetworkPolicy.from_specs(allow_network)
-    elif profile_norm == PROFILE_AIRGAP:
+    elif network_locked:
         policy = NetworkPolicy.deny_all()
     else:
         policy = NetworkPolicy.allow_all()
-    install_policy(policy, profile=profile_norm)
+    # Under sovereign, install the airgap network profile mode so every airgap
+    # network behaviour (deny-all default, doctor airgap, socket guard) fires;
+    # the dedicated sovereign marker distinguishes the superset. Both markers go
+    # in through one call so the process never observes a half-set pair.
+    is_sovereign = profile_norm == PROFILE_SOVEREIGN
+    network_profile = PROFILE_AIRGAP if is_sovereign else profile_norm
+    install_policy(policy, profile=network_profile, sovereign=is_sovereign)
 
-    # Under airgap profile, also patch socket.socket.connect so an
+    # Under a network-locked profile, also patch socket.socket.connect so an
     # un-declared outbound dial cannot bypass the per-adapter check.
-    # Outside airgap the guard self-disables (returns False) so the
+    # Outside these profiles the guard self-disables (returns False) so the
     # call is safe to issue unconditionally.
-    if profile_norm == PROFILE_AIRGAP:
+    if network_locked:
         from bernstein.core.security.socket_guard import install_runtime_socket_guard
 
         install_runtime_socket_guard()
+
+
+def _sovereign_config_snapshot(*, run_profile: str | None, workdir: Path) -> dict[str, Any] | None:
+    """Load the sovereign config snapshot once, failing closed if unreadable.
+
+    Returning a single snapshot that both the network-policy install and the
+    attestation consume removes the window where the file could change between
+    two independent reads and leave the attestation describing a posture the
+    runtime never installed.
+
+    Returns:
+        The parsed snapshot under ``--profile sovereign``, else ``None``.
+
+    Raises:
+        SystemExit: When the sovereign config is missing or unreadable.
+    """
+    from bernstein.core.security.network_policy import PROFILE_SOVEREIGN
+
+    if (run_profile or "").strip().lower() != PROFILE_SOVEREIGN:
+        return None
+
+    from bernstein.core.security.deployment_profile import SovereignConfigError, load_config_snapshot
+
+    try:
+        return load_config_snapshot(workdir, require=True)
+    except SovereignConfigError as exc:
+        from bernstein.cli.errors import BernsteinError
+
+        BernsteinError(
+            what="Sovereign profile cannot resolve its source configuration",
+            why=(
+                f"{exc}. The residency posture is a projection of bernstein.yaml; an unreadable "
+                "config would resolve to a permissive default posture and be attested as though "
+                "the operator had declared it."
+            ),
+            fix="Restore a readable bernstein.yaml in the project root, then re-run with --profile sovereign",
+        ).print()
+        raise SystemExit(2) from exc
+
+
+def _install_profile_network_policy(
+    *,
+    run_profile: str | None,
+    allow_network: tuple[str, ...],
+    workdir: Path,
+    config_snapshot: dict[str, Any] | None = None,
+) -> None:
+    """Install the egress policy, sourcing sovereign egress from config (#2518).
+
+    Under ``--profile sovereign`` the egress allow-list comes from
+    ``bernstein.yaml`` (``sovereign.allowed_egress``), not ``--allow-network``,
+    so the runtime network policy and the signed posture attestation are
+    computed from the same config and cannot diverge (a deny-all attestation
+    can never coexist with a runtime that quietly allows a destination).
+    Everything else keeps the existing ``--allow-network`` behaviour.
+
+    Args:
+        config_snapshot: Pre-loaded snapshot shared with the attestation step.
+            ``None`` loads it here, failing closed if it cannot be read.
+
+    Raises:
+        click.UsageError: When ``--allow-network`` is combined with
+            ``--profile sovereign``.
+        SystemExit: When the sovereign config is missing or unreadable.
+    """
+    if (run_profile or "").strip().lower() == "sovereign":
+        from bernstein.core.security.deployment_profile import sovereign_egress_allowlist
+
+        if allow_network:
+            raise click.UsageError(
+                "--allow-network is not accepted under --profile sovereign. Declare egress "
+                "destinations in bernstein.yaml under sovereign.allowed_egress so the runtime "
+                "network policy and the signed posture attestation stay in sync."
+            )
+        snapshot = (
+            config_snapshot
+            if config_snapshot is not None
+            else _sovereign_config_snapshot(run_profile=run_profile, workdir=workdir)
+        )
+        egress = sovereign_egress_allowlist(snapshot)
+        _install_network_policy(run_profile=run_profile, allow_network=egress)
+    else:
+        _install_network_policy(run_profile=run_profile, allow_network=allow_network)
+
+
+def _refuse_sovereign_activation(*, workdir: Path, violations: tuple[str, ...], policy: Any) -> None:
+    """Anchor a signed refusal record and abort the run.
+
+    The refusal is evidence, not a console message: the same signed drift
+    record the spawn gate emits is anchored in the HMAC audit chain, so an
+    auditor sees why the profile refused to activate and can re-verify it under
+    ``bernstein audit verify``. Nothing is attested - a posture that violates
+    the profile must never be sealed as this install's sovereign posture.
+
+    Raises:
+        SystemExit: Always.
+    """
+    import time as _time
+
+    from bernstein.cli.errors import BernsteinError
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.security.deployment_profile import DriftEvaluation, record_and_sign_drift
+
+    evaluation = DriftEvaluation(
+        drifted=False,
+        reason="sovereign posture violates the profile; activation refused before attestation",
+        attested_hash="",
+        observed_hash=policy.posture_hash(),
+        diverging_keys=(),
+        observed_policy=policy,
+        violations=violations,
+    )
+    _, record_sha256 = record_and_sign_drift(
+        workdir=workdir,
+        evaluation=evaluation,
+        timestamp=int(_time.time()),
+        chain=AuditChainStore(workdir / ".sdd" / "audit"),
+    )
+    BernsteinError(
+        what="Sovereign profile activation refused: the live posture violates the profile",
+        why="; ".join(violations),
+        fix=(
+            "Fix the settings above, then re-run with --profile sovereign. "
+            "Inspect the full report with 'bernstein doctor sovereign'. "
+            f"Signed refusal record: {record_sha256}"
+        ),
+    ).print()
+    raise SystemExit(2)
+
+
+def _activate_sovereign_profile(
+    *,
+    run_profile: str | None,
+    workdir: Path,
+    config_snapshot: dict[str, Any] | None = None,
+) -> None:
+    """Attest the sovereign residency posture at run start (issue #2518).
+
+    No-op unless ``--profile sovereign`` was selected. When active, resolves
+    the effective policy from the workspace config snapshot, **enforces the
+    profile before sealing anything**, then signs the policy with the install's
+    Ed25519 sovereign identity and anchors the attestation in the HMAC audit
+    chain.
+
+    Enforcement before attestation is the point: the checks run here are the
+    same ones the spawn gate applies (config projection, endpoint certification,
+    and the attested-equals-enforced egress invariant against the network policy
+    installed moments earlier). Warning and attesting anyway would put a signed
+    claim of a sovereign posture on the chain for a deployment that does not
+    have one - and a signature is exactly what stops an auditor looking further.
+
+    Raises:
+        SystemExit: When the config is unreadable or the posture violates the
+            profile. Nothing is attested in either case.
+    """
+    from bernstein.core.security.network_policy import PROFILE_SOVEREIGN
+
+    if (run_profile or "").strip().lower() != PROFILE_SOVEREIGN:
+        return
+
+    import time as _time
+
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.security.deployment_profile import (
+        SOVEREIGN_PROFILE,
+        build_posture_attestation,
+        resolve_effective_policy,
+        sovereign_posture_violations,
+    )
+    from bernstein.core.security.network_policy import policy_from_env
+
+    snapshot = (
+        config_snapshot
+        if config_snapshot is not None
+        else _sovereign_config_snapshot(run_profile=run_profile, workdir=workdir)
+    )
+    policy = resolve_effective_policy(SOVEREIGN_PROFILE, snapshot)
+    violations = sovereign_posture_violations(policy, workdir=workdir, runtime_policy=policy_from_env())
+    if violations:
+        _refuse_sovereign_activation(workdir=workdir, violations=violations, policy=policy)
+
+    chain = AuditChainStore(workdir / ".sdd" / "audit")
+    attestation = build_posture_attestation(
+        workdir=workdir,
+        policy=policy,
+        timestamp=int(_time.time()),
+        chain=chain,
+    )
+    console.print(f"[dim]Sovereign posture attested:[/dim] {attestation.posture_hash}")
+    console.print(
+        f"[dim]Egress posture:[/dim] {policy.network_egress}"
+        + (f" {list(policy.egress_allowlist)}" if policy.egress_allowlist else "")
+    )
 
 
 def _show_dry_run_plan(
@@ -407,14 +698,23 @@ def _show_dry_run_plan(
         model_override: Optional model override.
         _cli: Optional CLI override.
     """
-    _ = workdir  # Part of interface
-    _ = seed_file  # Part of interface
-    _ = cli  # Part of interface
+    _ = cli  # Part of interface: --cli is validated by its click.Choice
     from rich.table import Table
 
     console.print("\n[bold]Dry-run mode: no agents will be spawned.[/bold]\n")
 
-    tasks = _load_dry_run_tasks(plan_file)
+    if plan_file is not None:
+        tasks = _load_dry_run_tasks(plan_file)
+    elif goal is not None or seed_file is not None or find_seed_file() is not None:
+        # Synthesize the plan from the seed/goal exactly as --plan-only does, so
+        # a seed preview needs no running task server and a seed the real run
+        # would reject is rejected here too (issues #2800, #2807), instead of
+        # querying a server that --dry-run never started.
+        effective_goal, team = _resolve_goal_and_team(workdir, goal, seed_file)
+        _plan_obj, tasks = _build_synthetic_plan(effective_goal, team)
+    else:
+        # No seed/goal/plan: fall back to previewing a running server's backlog.
+        tasks = _load_dry_run_tasks(None)
 
     if not tasks:
         console.print("[yellow]No tasks to schedule.[/yellow]")
@@ -577,14 +877,54 @@ def is_codespace_runtime() -> bool:
         "Skips local-binary checks that would fail in a fresh container."
     ),
 )
+@click.option(
+    "--wizard",
+    "-w",
+    "wizard",
+    is_flag=True,
+    default=False,
+    help="Run interactive setup wizard to configure the workspace.",
+)
+@click.option(
+    "--non-interactive",
+    "non_interactive",
+    is_flag=True,
+    default=False,
+    help="With --wizard: take the wizard's defaults without prompting. Plain init never prompts.",
+)
 def init(
     target_dir: str,
     *,
     add_badge: bool = False,
     badge_variant: str = "signed",
     remote: bool = False,
+    wizard: bool = False,
+    non_interactive: bool = False,
 ) -> None:
-    """Init workspace -- create .sdd/ structure."""
+    """Init workspace -- create .sdd/ structure.
+
+    Raises:
+        click.UsageError: When --wizard is combined with a flag the wizard
+            path does not implement.
+    """
+    if wizard:
+        # The wizard is a separate implementation, not a mode of _init_impl:
+        # it writes its own bernstein.yaml and never reaches the badge or
+        # remote-container code below. Accepting those flags here would drop
+        # them silently, which reads to the operator as the flag not working.
+        unhonoured = [name for name, used in (("--add-badge", add_badge), ("--remote", remote)) if used]
+        if unhonoured:
+            raise click.UsageError(
+                f"{' and '.join(unhonoured)} cannot be combined with --wizard: the wizard does not run "
+                "that path. Run `bernstein init --wizard` first, then `bernstein init` with those flags."
+            )
+
+        from bernstein.cli.commands.init_wizard_cmd import init_wizard_cmd
+
+        ctx = click.get_current_context()
+        ctx.invoke(init_wizard_cmd, target_dir=target_dir, non_interactive=non_interactive)
+        return
+
     try:
         _init_impl(
             target_dir,
@@ -708,7 +1048,7 @@ def _init_impl(
                 if changed:
                     console.print(f"[green]Updated[/green] README.md (added '{variant.name}' badge)")
                 else:
-                    console.print("[dim]README.md already has a bernstein badge — skipped.[/dim]")
+                    console.print("[dim]README.md already has a bernstein badge - skipped.[/dim]")
 
     # Print clear next steps
     console.print("")
@@ -716,53 +1056,750 @@ def _init_impl(
     console.print("  1. Edit [bold]bernstein.yaml[/bold]: set a goal")
     console.print("  2. Run [bold]bernstein[/bold] to start the orchestra")
     console.print("")
+    # ``examples/`` is a repo directory and is not part of the wheel, so an
+    # operator who installed from PyPI has no such path to look at. The
+    # scenario behind ``demo --flask-todo`` carries its own inline copy of the
+    # sample project and works from any install.
     console.print(
-        "  See [link=https://chernistry.github.io/bernstein/]docs[/link] "
-        "or [bold]examples/quickstart/[/bold] for a working example."
+        "  See [link=https://bernstein.readthedocs.io/en/latest/]docs[/link] "
+        "or run [bold]bernstein demo --flask-todo[/bold] for a working example."
     )
+
+
+def _signal_orchestrator_shutdown(*, reason: str = "cli detected run completion") -> None:
+    """Best-effort belt-and-braces graceful-shutdown signal to the orchestrator.
+
+    The orchestrator has its own quiescence self-stop (see
+    ``core/orchestration/orchestrator.py`` tick-quiescence handling) that
+    should already have terminated the run by the time the CLI observes
+    completion. This call exists purely as a backstop: if the self-stop
+    ever fails to fire, the CLI still nudges the server's ``POST /shutdown``
+    route (see ``core/routes/status_lifecycle.py::shutdown_server``) so the
+    run does not hang forever.
+
+    This call is idempotent and never raises: a connection error or 404
+    almost always means the orchestrator already stopped itself, which is
+    treated as success (not a failure of this signal).
+    """
+    target = f"{SERVER_URL}/shutdown"
+    try:
+        resp = httpx.post(
+            target,
+            json={"reason": reason},
+            timeout=3.0,
+            headers=auth_headers(),
+        )
+        if resp.status_code == 404:
+            logger.info(
+                "cli_shutdown_signal: sent target=%s result=already_stopped "
+                "(404 - server likely self-stopped and torn down its routes)",
+                target,
+            )
+            return
+        resp.raise_for_status()
+        logger.info(
+            "cli_shutdown_signal: sent target=%s result=acknowledged response=%s",
+            target,
+            resp.json() if resp.content else None,
+        )
+    except httpx.ConnectError:
+        logger.info(
+            "cli_shutdown_signal: sent target=%s result=already_stopped "
+            "(connection refused - orchestrator process already exited via self-stop)",
+            target,
+        )
+    except Exception as exc:
+        logger.info(
+            "cli_shutdown_signal: sent target=%s result=error error=%s "
+            "(non-fatal - orchestrator quiescence self-stop is the primary path)",
+            target,
+            exc,
+        )
+
+
+def _spawner_liveness_from_health(health_payload: Any) -> Liveness | None:
+    """Read the task server's opinion of the orchestrator, or ``None``.
+
+    ``GET /health`` reports ``components.spawner.status``
+    (``core/routes/status_dashboard.py::_health_components``). The server runs
+    that check from inside its own process, which matters because the server
+    and the orchestrator are started together by
+    ``core/orchestration/bootstrap.py`` and therefore share a pid namespace,
+    while the CLI may not: the shipped container image runs the orchestrator in
+    a container, so a CLI outside it cannot see the orchestrator's pid at all.
+
+    This is NOT an independent second opinion, and callers must not treat it as
+    one. The server reads the SAME ``spawner.pid`` file and runs a plain
+    ``os.kill(pid, 0)`` on it, with none of the guards
+    :func:`classify_pidfile_liveness` applies: no mtime attribution, no
+    command-line identity, no zombie rejection. It is a strictly weaker read of
+    the same evidence. Treating its ``down`` as corroboration would let the
+    cruder observer override every guard the stricter one applies, and only in
+    the destructive direction. Hence :func:`_orchestrator_liveness` uses it as a
+    veto and never as a source of a verdict.
+
+    Returns ``None`` when the server expresses no opinion (older server, no
+    ``sdd_dir`` configured, or no pidfile yet).
+    """
+    if not isinstance(health_payload, dict):
+        return None
+    components = health_payload.get("components")
+    if not isinstance(components, dict):
+        return None
+    spawner = components.get("spawner")
+    if not isinstance(spawner, dict):
+        return None
+    status = str(spawner.get("status") or "").strip().lower()
+    if status == "ok":
+        return LIVENESS_ALIVE
+    if status == "down":
+        return LIVENESS_GONE
+    return None
+
+
+def _orchestrator_liveness(
+    health_payload: Any = None,
+    *,
+    pidfile_not_before: float | None = None,
+) -> tuple[Liveness, int | None]:
+    """Classify the orchestrator as ``alive``, ``gone``, or ``unknown``.
+
+    Returns ``(liveness, pid)``. The pid is returned so a caller tracking a
+    streak of observations can tell "still the same dead process" from "a
+    different process, so something restarted it".
+
+    Every answer other than ``unknown`` requires positive LOCAL evidence, and
+    the task server can only veto it:
+
+    * **The local pidfile probe** (:func:`classify_pidfile_liveness` over
+       ``.sdd/runtime/spawner.pid``) is the sole source of a verdict. It is the
+       same classifier the recovery supervisor in
+       ``core/orchestration/bootstrap.py`` uses, so the two subsystems cannot
+       hold different definitions of "gone", and it is the only observer that
+       applies mtime attribution, command-line identity and zombie rejection.
+    * **The task server** (``/health`` -> ``components.spawner``) can veto, and
+       nothing else. It is not an independent witness: it reads the same pidfile
+       with a bare ``os.kill``, with none of those guards (see
+       :func:`_spawner_liveness_from_health`). Letting its ``down`` stand in for
+       local evidence would make every guard above overridable by the cruder
+       read of the same file, and only in the direction that reaps. What it CAN
+       do is see the orchestrator's pid namespace when this CLI cannot, so its
+       ``ok`` is allowed to overrule a local ``gone``.
+
+    ==============  ==============  =========
+    local probe     server says     result
+    ==============  ==============  =========
+    ``gone``        ``down``        ``gone``
+    ``gone``        no opinion      ``gone``
+    ``gone``        ``ok``          ``unknown``  (veto)
+    ``alive``       ``ok``          ``alive``
+    ``alive``       no opinion      ``alive``
+    ``alive``       ``down``        ``unknown``  (veto)
+    ``unknown``     anything        ``unknown``
+    ==============  ==============  =========
+
+    The bottom row is the one the earlier revision got wrong: a missing,
+    unreadable, or previous-run pidfile used to become ``gone`` on the server's
+    say-so, contradicting the classifier's own contract and leaving ``pid`` as
+    ``None`` so a restart could not even be detected as a pid change.
+
+    ``pidfile_not_before`` is forwarded to the local probe so a pidfile left
+    behind by a previous run cannot be read as this run's death. Pass ``None``
+    once the orchestrator has actually been observed alive during this wait --
+    at that point the pidfile is known to describe a process of this run
+    regardless of its mtime.
+    """
+    server_view = _spawner_liveness_from_health(health_payload)
+    local_view, pid = classify_pidfile_liveness(
+        Path(SDD_PID_SPAWNER),
+        not_before=pidfile_not_before,
+        expect_cmdline=ORCHESTRATOR_PROCESS_MARKERS,
+    )
+    if local_view == LIVENESS_UNKNOWN:
+        return LIVENESS_UNKNOWN, pid
+    if server_view is not None and server_view != local_view:
+        return LIVENESS_UNKNOWN, pid
+    return local_view, pid
+
+
+#: Consecutive SUCCESSFUL OBSERVATIONS that must all find the orchestrator gone
+#: before the run is declared over. A poll that could not reach the server is
+#: not an observation and resets the count: see
+#: ``_ORCHESTRATOR_GONE_CONFIRM_WINDOW_S``.
+_ORCHESTRATOR_GONE_CONFIRMATIONS = 3
+#: Monotonic seconds the confirming observations must span, derived from the
+#: recovery supervisor's poll period rather than picked: ``run_watchdog`` in
+#: ``core/orchestration/bootstrap.py`` restarts a dead orchestrator, so a dead
+#: pid is a RECOVERABLE state for up to one of its poll periods plus the
+#: restart itself. Three periods leaves the supervisor at least two full
+#: chances to act; if it did, the restarted process is observed alive (or under
+#: a new pid) and the streak resets, so the verdict cannot win that race.
+#:
+#: Measured on ``time.monotonic()``, the same clock the supervisor sleeps on.
+#: On the wall clock an ordinary forward step -- an NTP correction, a container
+#: clock sync, a laptop resume -- satisfies the window without any real time
+#: passing, and a suspend-resume is the worst case: the supervisor's monotonic
+#: clock does not advance while suspended, so it wakes with zero extra restart
+#: attempts made while a wall-clock window would already read as satisfied.
+_ORCHESTRATOR_GONE_CONFIRM_WINDOW_S = 3.0 * WATCHDOG_POLL_S
+#: Monotonic slack allowed between two consecutive confirming observations
+#: before the streak is restarted. Without it, elapsed time in which this loop
+#: was not actually observing -- a hung request, a stopped process, a long GC
+#: pause -- would count towards the window just as if it had been.
+_ORCHESTRATOR_GONE_MAX_OBSERVATION_GAP_S = 2.0 * WATCHDOG_POLL_S
+
+
+def _looks_like_status_histogram(payload: dict[str, Any]) -> bool:
+    """Whether *payload* is recognisably a per-status task histogram.
+
+    ``GET /tasks/counts`` returns integer counts keyed by task status plus
+    ``total``. An error body is also a dict, and every status key is simply
+    absent from it, so counting one yields a confident zero for a run that may
+    have any amount of work outstanding. Requires ``total`` plus at least one
+    known status bucket, all integral.
+    """
+    if not isinstance(payload.get("total"), int):
+        return False
+    known = ("open", "claimed", "in_progress", "orphaned", "done", "failed")
+    return any(isinstance(payload.get(key), int) for key in known)
+
+
+def _incomplete_declared_counts(status_payload: dict[str, Any]) -> tuple[int, dict[str, Any] | None]:
+    """Return ``(n_incomplete_declared, full_histogram_or_None)`` for the run.
+
+    ``GET /status`` reports only ``open``/``claimed``/``done``/``failed``/
+    ``refused``. Two of the four statuses that mean "declared but never
+    finished" -- ``in_progress`` and ``orphaned`` -- have no bucket in that
+    payload at all, so counting them from it always yields zero no matter how
+    many tasks are stuck in them. ``GET /tasks/counts`` is the full per-status
+    histogram and is the only source that can answer this question.
+
+    The second element is ``None`` when the full histogram was unavailable and
+    the ``/status`` payload had to be used instead. Callers must treat that as
+    "this count may be an undercount" and must not conclude anything terminal
+    from a zero.
+
+    A dict that is not a histogram -- an error body such as
+    ``{"detail": "Not Found"}`` from a server that does not serve the route --
+    is rejected rather than accepted as an all-zero histogram. Counting it as
+    complete would report "nothing outstanding" for every run.
+    """
+    from bernstein.core.quality.retrospective import count_incomplete_declared
+
+    full_counts = server_get("/tasks/counts")
+    if isinstance(full_counts, dict) and _looks_like_status_histogram(full_counts):
+        return count_incomplete_declared(full_counts), full_counts
+    return count_incomplete_declared(status_payload), None
+
+
+def _is_quiescent(
+    *,
+    total: int,
+    open_count: int,
+    claimed_count: int,
+    agent_count: int,
+    n_incomplete: int,
+    counts_are_complete: bool,
+) -> bool:
+    """Whether every declared task has reached a terminal outcome, right now.
+
+    One definition, shared by the waiting path and the single-poll path, so the
+    two cannot drift into disagreeing about whether a run has finished.
+
+    The ``open``/``claimed`` test alone calls a run finished while a task sits
+    in ``in_progress`` or ``orphaned``, because ``/status`` has no bucket for
+    either, so the full histogram gets a veto whenever it is available. That
+    only ever tightens the test.
+
+    Unlike the "orchestrator gone" verdict this is a POSITIVE observation --
+    every task is accounted for in a terminal bucket -- rather than an inference
+    from a process's absence, so it needs no confirmation window and is safe to
+    conclude from a single poll.
+    """
+    quiescent = total > 0 and open_count == claimed_count == 0 and agent_count == 0
+    if quiescent and counts_are_complete and n_incomplete > 0:
+        return False
+    return quiescent
+
+
+def _poll_quiescent_status() -> dict[str, Any] | None:
+    """One poll: the ``/status`` payload iff the run is observably quiescent.
+
+    For the CLI paths that do NOT wait for completion (the dashboard, the Rich
+    fallback, and the non-interactive detach). Those paths still have to map an
+    already-finished run onto an exit code, or ``bernstein run && deploy``
+    deploys on a run whose tasks all failed just because the operator did not
+    pass ``--quiet`` (issue #3010).
+
+    Returns ``None`` for every other state, including "still running" and
+    "server unreachable". Only quiescence is reported here: the "orchestrator
+    gone" verdict is an inference from absence that requires a confirmation
+    window spanning several observations, which a single poll cannot supply, so
+    it stays on the waiting path alone.
+    """
+    status_payload = server_get("/status")
+    health_payload = server_get("/health")
+    if not (isinstance(status_payload, dict) and isinstance(health_payload, dict)):
+        return None
+    n_incomplete, full_counts = _incomplete_declared_counts(status_payload)
+    if full_counts is not None:
+        status_payload["task_counts"] = full_counts
+    if not _is_quiescent(
+        total=int(status_payload.get("total", 0) or 0),
+        open_count=int(status_payload.get("open", 0) or 0),
+        claimed_count=int(status_payload.get("claimed", 0) or 0),
+        agent_count=int(health_payload.get("agent_count", 0) or 0),
+        n_incomplete=n_incomplete,
+        counts_are_complete=full_counts is not None,
+    ):
+        return None
+    return status_payload
+
+
+#: Statuses that mean a task was actually picked up by an agent at some
+#: point. Deliberately excludes ``open``: an unclaimed task with no live
+#: agent is the ordinary gap before the next agent spawns for it, not
+#: evidence that anything died.
+_CLAIMED_BUT_STUCK_STATUSES: Final[frozenset[str]] = frozenset({"claimed", "in_progress", "orphaned"})
+
+
+def _poll_no_plan_after_spawn() -> dict[str, Any] | None:
+    """One poll: the ``/status`` payload iff a spawned agent died before any plan formed.
+
+    Covers a shape neither :func:`_poll_quiescent_status` nor
+    :func:`_wait_for_run_completion`'s "orchestrator gone" verdict catches: the
+    orchestrator subprocess is still alive and ticking, but the agent it spawned
+    died almost immediately, the goal was never decomposed, and the single root
+    task it left behind never advances past a declared-but-unfinished status.
+    That shape reads as ``open == claimed == 0`` at the top level whenever the
+    task is stuck ``in_progress``/``orphaned`` rather than ``claimed``, so it is
+    NOT quiescent, and the orchestrator process itself never exits, so it is not
+    "gone" either -- both existing checks correctly report "still running" and
+    the CLI would otherwise detach silently (issue #3528).
+
+    Unlike the "orchestrator gone" verdict, ``agent_count`` here is a live
+    figure the task server reports directly rather than an inference from a
+    pidfile, so a single reading of "no agent registered" needs no confirmation
+    window. The false-positive this must avoid is the ordinary startup window,
+    where the same ``agent_count == 0`` reading means "hasn't spawned yet" --
+    callers must only invoke this once :func:`_await_first_spawn_outcome` has
+    already confirmed an agent was alive at some point in this run.
+
+    Returns ``None`` for every other state, including "still running
+    normally", "at least one task has ever reached a terminal state" (a real
+    plan produced real output, whatever is stuck now is a different failure),
+    and "server unreachable".
+    """
+    status_payload = server_get("/status")
+    health_payload = server_get("/health")
+    if not (isinstance(status_payload, dict) and isinstance(health_payload, dict)):
+        return None
+    if int(health_payload.get("agent_count", 0) or 0) != 0:
+        return None
+    n_incomplete, full_counts = _incomplete_declared_counts(status_payload)
+    if full_counts is not None:
+        status_payload["task_counts"] = full_counts
+    total = int(status_payload.get("total", 0) or 0)
+    # Exactly one declared task (the manager's own decompose task) and it is
+    # still the only thing in the graph: decomposition never happened, so no
+    # plan was ever produced. A run that got as far as declaring child tasks
+    # has a plan, even if something else about it later goes wrong -- that is
+    # a different failure with its own diagnosis, not this one.
+    if total != 1 or n_incomplete != 1:
+        return None
+    # "open" alone is not evidence of a death: an unclaimed task with no
+    # live agent is the ordinary gap before the next agent picks it up, and
+    # that gap is exactly as wide whether an agent died or one simply
+    # hasn't spawned for it yet. What is only explained by a death is a task
+    # that WAS claimed -- ``claimed``, ``in_progress``, or ``orphaned`` --
+    # with nobody left holding it.
+    counts = full_counts if full_counts is not None else status_payload
+    was_claimed = sum(int(counts.get(status, 0) or 0) for status in _CLAIMED_BUT_STUCK_STATUSES)
+    if was_claimed != 1:
+        return None
+    return status_payload
+
+
+#: Ceiling for the terminal-state wait when the caller names no other.
+_RUN_WAIT_DEFAULT_S = 3600.0
 
 
 def _wait_for_run_completion(
     *,
     poll_interval_s: float = 2.0,
-    timeout_s: float = 3600.0,
+    timeout_s: float = _RUN_WAIT_DEFAULT_S,
 ) -> dict[str, Any] | None:
-    """Poll the server until the run becomes quiescent.
+    """Poll the server until the run reaches a terminal state.
 
     Args:
         poll_interval_s: Delay between status polls.
         timeout_s: Maximum total time to wait.
 
     Returns:
-        Final ``/status`` payload when quiescent, else the last observed payload.
+        The ``/status`` payload IF AND ONLY IF the run actually reached a
+        terminal state, else ``None``.
+
+        There are two terminal states, and both return a payload:
+
+        * **Quiescent** -- no declared task is still open/claimed/in-progress/
+          orphaned and no agent is live: every declared task reached a terminal
+          outcome.
+        * **Orchestrator gone with unfinished tasks** -- the spawner process
+          has been observed gone across a confirmation window while declared
+          tasks are still non-terminal, so the run is over and its goal was not
+          met (issue #3010).
+
+        A ``None`` return means "no verdict": the deadline expired (or the
+        server stayed unreachable) while the run was still genuinely in
+        flight. It must NOT be read as a failed run -- callers deriving an
+        exit code have to treat it as unknown and stay at 0, because the
+        orchestrator may still be working and may complete every task.
+
+        Returning the last observed (non-quiescent) payload for that case
+        instead would hand callers a mid-flight snapshot that by definition
+        still has work outstanding -- exactly why quiescence was never
+        detected -- so a run that merely outlived the wait deadline would be
+        misreported as unhealthy. Multi-hour goals are designed for (see the
+        scope timeouts in ``core/defaults.py``, up to 7200s against this 3600s
+        default deadline), which makes that misread the common case rather
+        than an edge one.
+
+    What the "orchestrator gone" verdict actually requires, and why:
+
+    This verdict is the input to a non-zero exit code on a run an operator may
+    still be watching, so it is built to be wrong in one direction only. Every
+    condition below must hold on the SAME poll, and all of them must hold on
+    ``_ORCHESTRATOR_GONE_CONFIRMATIONS`` consecutive SUCCESSFUL OBSERVATIONS
+    spanning at least ``_ORCHESTRATOR_GONE_CONFIRM_WINDOW_S`` of monotonic time:
+
+    * :func:`_orchestrator_liveness` returns ``gone`` -- which needs positive
+      local evidence of death from a pidfile attributable to this run, and needs
+      the task server (which shares the orchestrator's pid namespace, unlike
+      this CLI) not to contradict it.
+    * the pid has not changed since the streak began. A different pid means
+      something restarted the orchestrator, which resets the streak.
+    * no agent is reported live.
+    * at least one declared task is still non-terminal, counted from the FULL
+      per-status histogram. A partial histogram cannot support this verdict at
+      all, because its zero is indistinguishable from an undercount.
+
+    "Consecutive successful observations" is the load-bearing phrase, and
+    elapsed time is not a substitute for it. The window exists to give the
+    recovery supervisor room to restart the orchestrator, so it may only be
+    satisfied by time in which a restart was actually possible AND would have
+    been seen. A poll that could not reach ``/status`` or ``/health`` is not an
+    observation: it resets the streak. That case is not hypothetical -- when the
+    task server is down, ``bootstrap._restart_spawner`` returns ``-1`` and
+    refuses to restart the orchestrator at all, so a server outage is precisely
+    the period during which recovery is impossible, and counting it as
+    confirmation would fire the verdict just as the recovery sequence reaches
+    the orchestrator. Two consecutive confirming observations more than
+    ``_ORCHESTRATOR_GONE_MAX_OBSERVATION_GAP_S`` apart also restart the streak,
+    so time this loop spent not observing cannot be credited either.
+
+    Anything short of all that -- a single dead-pid reading, a server that
+    contradicts the local probe, a pidfile predating this run, an unreachable
+    server, an expired deadline -- yields no verdict and lets the run continue.
+    The cost of that is a healthy run's CLI waiting longer than it had to. The
+    cost of the opposite bias is telling an operator that a run which is still
+    working has failed.
     """
-    deadline = time.time() + timeout_s
-    last_status: dict[str, Any] | None = None
-    while time.time() < deadline:
+    start = time.time()
+    deadline = start + timeout_s
+    orchestrator_seen_alive = False
+    # Streak state. All timing here is monotonic: see
+    # _ORCHESTRATOR_GONE_CONFIRM_WINDOW_S for why the wall clock cannot be used.
+    gone_since: float | None = None
+    gone_last_seen: float | None = None
+    gone_polls = 0
+    gone_pid: int | None = None
+
+    def _reset_streak(reason: str, **fields: Any) -> None:
+        nonlocal gone_since, gone_last_seen, gone_polls, gone_pid
+        if gone_polls:
+            logger.info(
+                "orchestrator_gone_streak_reset after %d observation(s): reason=%s %s",
+                gone_polls,
+                reason,
+                fields,
+            )
+        gone_since = None
+        gone_last_seen = None
+        gone_polls = 0
+        gone_pid = None
+
+    while True:
+        now = time.time()
+        if now >= deadline:
+            break
+        mono = time.monotonic()
         status_payload = server_get("/status")
         health_payload = server_get("/health")
-        if isinstance(status_payload, dict):
-            last_status = status_payload
+        if not (isinstance(status_payload, dict) and isinstance(health_payload, dict)):
+            # Not an observation. The window may only be satisfied by time in
+            # which a recovery restart was possible and would have been seen,
+            # and a server this CLI cannot reach is exactly the state in which
+            # bootstrap._restart_spawner refuses to restart the orchestrator.
+            _reset_streak("server_unreachable")
         if isinstance(status_payload, dict) and isinstance(health_payload, dict):
             total = int(status_payload.get("total", 0) or 0)
             open_count = int(status_payload.get("open", 0) or 0)
             claimed_count = int(status_payload.get("claimed", 0) or 0)
             agent_count = int(health_payload.get("agent_count", 0) or 0)
-            if total > 0 and open_count == claimed_count == 0 and (agent_count == 0):
+            n_incomplete, full_counts = _incomplete_declared_counts(status_payload)
+            counts_are_complete = full_counts is not None
+            if full_counts is not None:
+                # Carry the full histogram with the payload so the caller's
+                # health verdict sees in_progress/orphaned too.
+                status_payload["task_counts"] = full_counts
+
+            quiescent = _is_quiescent(
+                total=total,
+                open_count=open_count,
+                claimed_count=claimed_count,
+                agent_count=agent_count,
+                n_incomplete=n_incomplete,
+                counts_are_complete=counts_are_complete,
+            )
+            if not quiescent and open_count == claimed_count == 0 and counts_are_complete and n_incomplete > 0:
+                logger.info(
+                    "run_not_quiescent: open=0 claimed=0 but %d declared task(s) are still "
+                    "non-terminal in the full histogram (in_progress/orphaned are invisible to "
+                    "/status) - continuing to wait",
+                    n_incomplete,
+                )
+            if quiescent:
+                logger.info(
+                    "run_completion_detected: total=%d open=%d claimed=%d agent_count=%d "
+                    "- sending belt-and-braces shutdown signal",
+                    total,
+                    open_count,
+                    claimed_count,
+                    agent_count,
+                )
+                _signal_orchestrator_shutdown(reason="cli detected run completion (quiescent)")
                 return status_payload
+
+            # Second terminal state: the orchestrator is gone while declared
+            # tasks are still non-terminal (issue #3010: the agent produced no
+            # output, its task stayed non-terminal, the orchestrator stopped,
+            # and the run reported success).
+            #
+            # Quiescence cannot cover this: it requires nothing outstanding,
+            # which a stuck task never satisfies. Orchestrator liveness is the
+            # discriminator that separates it from the STARTUP window, where
+            # tasks are also outstanding but the orchestrator is alive (or not
+            # yet started) and about to drive them.
+            #
+            # Once the orchestrator has been seen alive in THIS wait, its
+            # pidfile is known to belong to this run, so the mtime guard that
+            # protects the startup window is no longer needed.
+            liveness, pid = _orchestrator_liveness(
+                health_payload,
+                pidfile_not_before=None if orchestrator_seen_alive else _CLI_RUN_EPOCH,
+            )
+            if liveness == LIVENESS_ALIVE:
+                orchestrator_seen_alive = True
+
+            terminal_shape = liveness == LIVENESS_GONE and agent_count == 0 and counts_are_complete and n_incomplete > 0
+            if not terminal_shape:
+                _reset_streak(
+                    "not_terminal_shape",
+                    liveness=liveness,
+                    agent_count=agent_count,
+                    incomplete=n_incomplete,
+                    complete_counts=counts_are_complete,
+                )
+            elif gone_since is not None and pid != gone_pid:
+                # A different pid means something restarted the orchestrator.
+                _reset_streak("pid_changed", was=gone_pid, now=pid)
+            elif gone_last_seen is not None and (mono - gone_last_seen) > _ORCHESTRATOR_GONE_MAX_OBSERVATION_GAP_S:
+                # Time passed in which this loop was not observing. It cannot
+                # count towards a window that exists to bound recovery.
+                _reset_streak("observation_gap", gap_s=round(mono - gone_last_seen, 1))
+
+            if terminal_shape:
+                if gone_since is None:
+                    gone_since = mono
+                    gone_pid = pid
+                gone_last_seen = mono
+                gone_polls += 1
+                confirmed_for = mono - gone_since
+                if gone_polls >= _ORCHESTRATOR_GONE_CONFIRMATIONS and (
+                    confirmed_for >= _ORCHESTRATOR_GONE_CONFIRM_WINDOW_S
+                ):
+                    logger.warning(
+                        "run_ended_with_unfinished_tasks: orchestrator pid=%s observed gone on "
+                        "%d consecutive reachable polls over %.0fs monotonic (> the %.0fs "
+                        "recovery-supervisor window, so no restart is coming) while %d declared "
+                        "task(s) are still non-terminal (total=%d open=%d claimed=%d "
+                        "agent_count=%d). Treating this as a terminal, non-healthy verdict "
+                        "(issue #3010).",
+                        pid,
+                        gone_polls,
+                        confirmed_for,
+                        _ORCHESTRATOR_GONE_CONFIRM_WINDOW_S,
+                        n_incomplete,
+                        total,
+                        open_count,
+                        claimed_count,
+                        agent_count,
+                    )
+                    return status_payload
+                logger.info(
+                    "orchestrator_gone_unconfirmed: pid=%s seen gone on observation %d/%d after "
+                    "%.0fs of the %.0fs confirmation window - a recovery restart would still "
+                    "pre-empt this",
+                    pid,
+                    gone_polls,
+                    _ORCHESTRATOR_GONE_CONFIRMATIONS,
+                    confirmed_for,
+                    _ORCHESTRATOR_GONE_CONFIRM_WINDOW_S,
+                )
         time.sleep(poll_interval_s)
-    return last_status
+    logger.info(
+        "run_completion_wait_timed_out after %.0fs: no terminal state observed -- the run is "
+        "still in flight in the background. Returning no verdict; callers must not treat this "
+        "as a failed run.",
+        timeout_s,
+    )
+    return None
+
+
+#: How long the exiting CLI waits for the first spawn outcome (roughly one
+#: spawner tick plus slack) before detaching without a verdict.
+_FIRST_SPAWN_WAIT_S = 10.0
+#: Delay between first-spawn outcome polls.
+_FIRST_SPAWN_POLL_S = 0.5
+#: Consecutive unreachable-server polls before giving up early.
+_FIRST_SPAWN_MAX_UNREACHABLE = 3
+#: Failed tasks older than this are attributed to a previous run and ignored.
+_FIRST_SPAWN_FRESHNESS_S = 300.0
+
+
+def _await_first_spawn_outcome(
+    *,
+    timeout_s: float = _FIRST_SPAWN_WAIT_S,
+    poll_interval_s: float = _FIRST_SPAWN_POLL_S,
+    narrate_wait: bool = False,
+) -> tuple[str, str | None]:
+    """Briefly poll the task server for the outcome of the first agent spawn.
+
+    The CLI detaches right after bootstrap, so a spawn refusal in the
+    background orchestrator would otherwise never reach the terminal and
+    ``bernstein run`` would exit 0 with an empty summary (gh-2744).
+
+    A failed task counts only when its failure reason is a spawn failure and
+    it completed recently; failed tasks reloaded from a previous run are
+    ignored.  Transient spawn failures are given the rest of the window to
+    recover before being reported.
+
+    Args:
+        timeout_s: Maximum total time to wait for a verdict.
+        poll_interval_s: Delay between polls.
+        narrate_wait: When True and the first poll does not already produce a
+            verdict, show a transient Rich status ("waiting for the first
+            agent") while the remaining polls run, clearing it before the
+            caller renders its own surface. A fast start -- the first poll
+            already reports an agent -- stays silent. Off by default so the
+            non-interactive detach branch and ``--quiet`` keep today's
+            chatter-free behaviour.
+
+    Returns:
+        ``("spawned", None)`` once at least one agent is live,
+        ``("refused", reason)`` when the first spawn attempt failed before
+        any agent did work, or ``("unknown", None)`` when no verdict arrived
+        within ``timeout_s`` (including an unreachable server).
+    """
+    deadline = time.time() + timeout_s
+    transient_reason: str | None = None
+    unreachable_polls = 0
+
+    def _poll_once() -> tuple[str, str | None] | None:
+        nonlocal unreachable_polls, transient_reason
+        health = server_get("/health")
+        if not isinstance(health, dict):
+            unreachable_polls += 1
+            if unreachable_polls >= _FIRST_SPAWN_MAX_UNREACHABLE:
+                return "unknown", None
+            return None
+        unreachable_polls = 0
+        if int(health.get("agent_count", 0) or 0) > 0:
+            return "spawned", None
+        failed_page: Any = server_get("/tasks?status=failed&limit=50")
+        entries = failed_page.get("tasks", []) if isinstance(failed_page, dict) else []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            reason = str(entry.get("result_summary") or "")
+            if not reason.startswith("Spawn failed"):
+                continue
+            completed_at = float(entry.get("completed_at") or 0.0)
+            if completed_at < time.time() - _FIRST_SPAWN_FRESHNESS_S:
+                continue
+            if "(transient" in reason:
+                # A retry may still succeed - keep polling until deadline.
+                transient_reason = reason
+                continue
+            return "refused", reason
+        return None
+
+    # The first poll runs before any narration, so a fast start (the first
+    # poll already reports an agent) stays exactly as quiet as it is today.
+    first = _poll_once()
+    if first is not None:
+        return first
+    if time.time() >= deadline:
+        if transient_reason is not None:
+            return "refused", transient_reason
+        return "unknown", None
+
+    def _finish_waiting() -> tuple[str, str | None]:
+        while True:
+            time.sleep(poll_interval_s)
+            result = _poll_once()
+            if result is not None:
+                return result
+            if time.time() >= deadline:
+                break
+        if transient_reason is not None:
+            return "refused", transient_reason
+        return "unknown", None
+
+    if narrate_wait:
+        # Only now is the wait real: tell the operator we are still waiting
+        # for the first agent, and clear the indicator before returning.
+        with console.status("Waiting for the first agent to register..."):
+            return _finish_waiting()
+    return _finish_waiting()
 
 
 def exec_restart() -> None:
     """Re-exec the current process as ``bernstein run`` (full stack restart).
 
     On macOS/Linux, uses ``os.execv`` which replaces the current process
-    image entirely — no orphan.  On Windows, ``os.execv`` does not truly
+    image entirely - no orphan.  On Windows, ``os.execv`` does not truly
     replace the process (it spawns a child), so we use ``subprocess.Popen``
     and ``sys.exit`` instead.
+
+    Refuses to run inside a pytest process. A test that hands the dashboard a
+    bare ``MagicMock`` gets a truthy ``_restart_on_exit`` - every attribute of
+    a bare MagicMock is truthy - so the caller reaches this function and the
+    ``os.execv`` below replaces the running pytest process. The run then
+    prints no test results and exits 0, which is indistinguishable from a
+    pass, and the whole file silently stops protecting anything. Raising here
+    turns that into a loud failure in the offending test.
     """
     import subprocess
+
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raise RuntimeError(
+            "exec_restart() refuses to re-exec inside a pytest process "
+            "(PYTEST_CURRENT_TEST is set): replacing the process would end the "
+            "test run with no results and a zero exit code. Patch "
+            "bernstein.cli.run_bootstrap.exec_restart, or give the dashboard "
+            "double an explicit falsy _restart_on_exit."
+        )
 
     argv = [sys.executable, "-m", "bernstein.cli.main", "run"]
     if sys.platform == "win32":
@@ -771,7 +1808,7 @@ def exec_restart() -> None:
         subprocess.Popen(argv, close_fds=True)
         raise SystemExit(0)
     else:
-        # Unix: execv replaces the process image — clean restart.
+        # Unix: execv replaces the process image - clean restart.
         os.execv(sys.executable, argv)
 
 
@@ -819,7 +1856,7 @@ def exec_restart() -> None:
 @click.option(
     "--cli",
     default=None,
-    type=click.Choice(["auto", "claude", "codex", "gemini", "aider", "qwen"], case_sensitive=False),
+    type=adapter_cli_choice(),
     help="Force specific CLI agent (overrides auto-detection and config file).",
 )
 @click.option(
@@ -897,6 +1934,15 @@ def exec_restart() -> None:
     ),
 )
 @click.option(
+    "--worker",
+    "worker_role",
+    default=None,
+    help=(
+        "Skip manager decomposition and spawn a single agent with this role "
+        "(e.g. backend, qa, frontend) directly against the seed goal."
+    ),
+)
+@click.option(
     "--plan-only",
     is_flag=True,
     default=False,
@@ -960,12 +2006,10 @@ def exec_restart() -> None:
     help=(
         "GUI-dev mode: force every adapter to ``mock`` and have each spawned "
         "agent sleep for $BERNSTEIN_MOCK_IDLE_MIN_S..MAX_S seconds (defaults: "
-        "min=15, max=120) instead of calling an LLM. Zero token spend — used "
-        "to populate the web GUI with live state. NOTE: the orchestrator "
-        "subprocess otherwise defaults to ``--adapter claude``; pin "
-        "``cli: mock`` at the top of bernstein.yaml in your workdir so the "
-        "orchestrator picks the mock backend too. Mutually exclusive with "
-        "--dry-run."
+        "min=15, max=120) instead of calling an LLM. Zero token spend - used "
+        "to populate the web GUI with live state. --idle forces the mock "
+        "backend internally (it exports BERNSTEIN_ADAPTER=mock), so no "
+        "bernstein.yaml edit is needed. Mutually exclusive with --dry-run."
     ),
 )
 @click.option(
@@ -981,11 +2025,13 @@ def exec_restart() -> None:
     "--profile",
     "run_profile",
     default=None,
-    type=click.Choice(["airgap"], case_sensitive=False),
+    type=click.Choice(["airgap", "sovereign"], case_sensitive=False),
     help=(
         "Run profile. 'airgap' = no network egress by default, MCP catalog disabled, "
-        "memo store pinned to .sdd/runtime/memo/. Combine with --allow-network to open "
-        "specific destinations."
+        "memo store pinned to .sdd/runtime/memo/. 'sovereign' = airgap network posture "
+        "plus a signed, chain-anchored residency posture (local storage, offline catalog, "
+        "strict EU residency, certified endpoints) that refuses spawns on drift. Combine "
+        "with --allow-network to open specific destinations."
     ),
 )
 @click.option(
@@ -1012,6 +2058,21 @@ def exec_restart() -> None:
         "agents only; 'builder' = write + shell on an allowlist; 'reviewer' = "
         "read + diff only; 'custom' = honour [permissions.custom] in "
         "bernstein.yaml/bernstein.toml. Off by default to preserve existing behaviour."
+    ),
+)
+@click.option(
+    "--wait",
+    is_flag=False,
+    flag_value=str(_RUN_WAIT_DEFAULT_S),
+    default=None,
+    type=float,
+    metavar="[SECONDS]",
+    help=(
+        "Block until the run reaches a terminal state and exit with its "
+        "outcome, keeping the progress output. Takes an optional ceiling in "
+        f"seconds (default {_RUN_WAIT_DEFAULT_S:.0f}); a fleet that allows a "
+        "run longer than that has to say so. Without it a non-interactive "
+        "run detaches once the first agent is up."
     ),
 )
 @click.option(
@@ -1124,6 +2185,43 @@ def exec_restart() -> None:
         "score 1.0. Off by default; existing runs are unaffected."
     ),
 )
+@click.option(
+    "--attach",
+    "attach",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    default=(),
+    help=(
+        "Attach an image / diagram to the run (issue #1797). May be repeated "
+        "for multiple files. The orchestrator builds a MultiModalContext at "
+        "spawn time, records a multimodal.attach event in the audit chain, "
+        "and refuses adapters that do not advertise multimodal capability. "
+        "Capable adapters: claude, gemini."
+    ),
+)
+@click.option(
+    "--fresh",
+    "force_fresh",
+    is_flag=True,
+    default=False,
+    help=(
+        "Ignore any saved session (.sdd/runtime/session.json) and start from "
+        "scratch instead of resuming. Use after a stopped run to force a full "
+        "re-plan rather than resuming the prior session (issue #2798)."
+    ),
+)
+@click.option(
+    "--refresh-cache",
+    "refresh_cache",
+    is_flag=True,
+    default=False,
+    help=(
+        "Cache policy bypass (issue #2551): ignore every policy cache hit for "
+        "this run, then repopulate the cache with the fresh outputs. Exports "
+        "BERNSTEIN_REFRESH_CACHE=1 for the orchestrator; tasks with no declared "
+        "cache policy are unaffected."
+    ),
+)
 def run(
     plan_file: Path | None,
     goal: str | None,
@@ -1139,13 +2237,15 @@ def run(
     container: bool,
     container_image: str | None,
     two_phase_sandbox: bool,
-    plan_only: bool,
-    from_plan: Path | None,
-    auto_approve: bool,
-    quiet: bool,
-    skip_gate: tuple[str, ...],
-    skip_gate_reason: str | None,
-    audit: bool,
+    worker_role: str | None = None,
+    plan_only: bool = False,
+    from_plan: Path | None = None,
+    auto_approve: bool = False,
+    quiet: bool = False,
+    wait: float | None = None,
+    skip_gate: tuple[str, ...] = (),
+    skip_gate_reason: str | None = None,
+    audit: bool = False,
     sandbox: str | None = None,
     allow_paid: bool = False,
     ab_test: bool = False,
@@ -1165,6 +2265,9 @@ def run(
     retry_budget_spec: str | None = None,
     criterion_profile: str | None = None,
     max_blast_radius: float | None = None,
+    attach: tuple[Path, ...] = (),
+    refresh_cache: bool = False,
+    force_fresh: bool = False,
 ) -> None:
     """Parse seed, init workspace, start server, launch agents.
 
@@ -1188,10 +2291,12 @@ def run(
             container=container,
             container_image=container_image,
             two_phase_sandbox=two_phase_sandbox,
+            worker_role=worker_role,
             plan_only=plan_only,
             from_plan=from_plan,
             auto_approve=auto_approve,
             quiet=quiet,
+            wait=wait,
             skip_gate=skip_gate,
             skip_gate_reason=skip_gate_reason,
             audit=audit,
@@ -1214,6 +2319,9 @@ def run(
             retry_budget_spec=retry_budget_spec,
             criterion_profile=criterion_profile,
             max_blast_radius=max_blast_radius,
+            attach=attach,
+            refresh_cache=refresh_cache,
+            force_fresh=force_fresh,
         )
     except (click.UsageError, SystemExit):
         raise
@@ -1237,9 +2345,11 @@ def _run_impl(
     container: bool,
     container_image: str | None,
     two_phase_sandbox: bool,
+    worker_role: str | None = None,
     plan_only: bool,
     from_plan: Path | None,
     auto_approve: bool,
+    wait: float | None = None,
     quiet: bool,
     skip_gate: tuple[str, ...],
     skip_gate_reason: str | None,
@@ -1263,32 +2373,35 @@ def _run_impl(
     retry_budget_spec: str | None,
     criterion_profile: str | None,
     max_blast_radius: float | None,
+    attach: tuple[Path, ...] = (),
+    refresh_cache: bool = False,
+    force_fresh: bool = False,
 ) -> None:
     """Concrete ``run`` implementation; wrapped by :func:`run` for hinting.
 
     \b
       bernstein run plan.yaml                  # loadable YAML plan (stages + steps)
-      bernstein conduct                        # reads bernstein.yaml
-      bernstein conduct --goal "Build X"       # inline goal
-      bernstein conduct --seed custom.yaml     # custom seed file
-      bernstein conduct --plan-only            # show plan without executing
-      bernstein conduct --from-plan plan.md    # execute a saved plan
-      bernstein conduct --auto-approve         # skip confirmation prompt
-      bernstein conduct --cells 3              # 3 parallel cells (multi-cell mode)
-      bernstein conduct --remote               # bind to 0.0.0.0 for cluster access
-      bernstein conduct --cli claude           # force Claude Code agent
-      bernstein conduct --model opus           # force Opus model
-      bernstein conduct --workflow governed    # governed workflow mode
-      bernstein conduct --routing bandit       # contextual bandit routing (learns over time)
-      bernstein conduct --routing bandit-shadow  # log bandit decisions without changing live routing
-      bernstein conduct --compliance standard  # compliance mode (development/standard/regulated)
-      bernstein conduct --container            # run agents in containers
-      bernstein conduct --sandbox docker       # run agents in Docker sandbox
-      bernstein conduct --container --two-phase-sandbox  # two-phase sandboxed execution
-      bernstein conduct --audit                # SOC 2 audit mode (HMAC-chained log + Merkle seal)
-      bernstein conduct --max-cost-usd 1.50    # hard cap total run spend at $1.50
+      bernstein run                            # reads bernstein.yaml
+      bernstein run --goal "Build X"           # inline goal
+      bernstein run --seed custom.yaml         # custom seed file
+      bernstein run --plan-only                # show plan without executing
+      bernstein run --from-plan plan.md        # execute a saved plan
+      bernstein run --auto-approve             # skip confirmation prompt
+      bernstein run --cells 3                  # 3 parallel cells (multi-cell mode)
+      bernstein run --remote                   # bind to 0.0.0.0 for cluster access
+      bernstein run --cli claude               # force Claude Code agent
+      bernstein run --model opus               # force Opus model
+      bernstein run --workflow governed        # governed workflow mode
+      bernstein run --routing bandit           # contextual bandit routing (learns over time)
+      bernstein run --routing bandit-shadow    # log bandit decisions without changing live routing
+      bernstein run --compliance standard      # compliance mode (development/standard/regulated)
+      bernstein run --container                # run agents in containers
+      bernstein run --sandbox docker           # run agents in Docker sandbox
+      bernstein run --container --two-phase-sandbox  # two-phase sandboxed execution
+      bernstein run --audit                    # SOC 2 audit mode (HMAC-chained log + Merkle seal)
+      bernstein run --max-cost-usd 1.50        # hard cap total run spend at $1.50
       bernstein run plan.yaml --budget 5usd --hard-budget 10usd  # soft + hard caps (#1320)
-      bernstein conduct --budget-cap 5.00      # abort spawn if preflight p90 > $5
+      bernstein run --budget-cap 5.00          # abort spawn if preflight p90 > $5
     """
     # Opt-in operator observability (spec 2026-05-17).  Defaults to off.
     # Prints the one-time notice and emits first_run_* events around the
@@ -1324,6 +2437,35 @@ def _run_impl(
             raise click.UsageError(f"--criterion-profile {criterion_profile!r}: {exc}") from None
         os.environ["BERNSTEIN_RUN_CRITERION_PROFILE"] = criterion_profile
 
+    # Issue #1797: capability-gate ``--attach`` BEFORE any process is
+    # launched. When the operator selected an adapter that does not
+    # advertise multimodal capability, surface a structured error that
+    # names capable adapters instead of spawning the run and failing
+    # mid-flight.
+    if attach:
+        from bernstein.core.agents.multimodal_attestation import (
+            CapabilityRefusal,
+            refuse_when_incapable,
+        )
+
+        # ``cli`` may be ``None`` (auto-detect) or "auto". When the
+        # operator has not pinned an adapter, only refuse if every
+        # candidate is incapable; with "claude" / "gemini" auto-detect
+        # is allowed.
+        explicit_adapter = (cli or "").strip().lower()
+        if explicit_adapter and explicit_adapter not in {"", "auto"}:
+            try:
+                refuse_when_incapable(
+                    adapter_name=explicit_adapter,
+                    attachments=[str(p) for p in attach],
+                )
+            except CapabilityRefusal as exc:
+                raise click.UsageError(f"--attach requires a multimodal-capable adapter. {exc!s}") from None
+        # Stash the attachments for downstream consumers via env var so
+        # the orchestrator subprocess can pick them up without
+        # additional argument threading.
+        os.environ["BERNSTEIN_RUN_ATTACHMENTS"] = os.pathsep.join(str(p) for p in attach)
+
     # Issue #1320: ``--budget`` is the friendlier alias of ``--max-cost-usd``
     # and shares the same env var. When both are set, the operator's
     # explicit ``--max-cost-usd`` wins for backward compat.
@@ -1346,6 +2488,12 @@ def _run_impl(
         except (RetryBudgetError, ValueError) as exc:
             raise click.UsageError(f"invalid --retry-budget value: {exc}") from exc
         os.environ["BERNSTEIN_RETRY_BUDGET_SPEC"] = retry_budget_spec
+    # Issue #2551: --refresh-cache bypasses policy cache hits for this run and
+    # repopulates. Exported so the orchestrator's cache boundary reads it via
+    # ``bernstein.core.persistence.cache_policy.refresh_requested``. Tasks with
+    # no declared policy are unaffected.
+    if refresh_cache:
+        os.environ["BERNSTEIN_REFRESH_CACHE"] = "1"
     # Print the startup banner unless the parent ``cli()`` group already
     # rendered the premium splash for this invocation. Regressed by commit
     # 1e5c13013 ("fix: ... double banner ..."), which mistakenly removed the
@@ -1353,7 +2501,7 @@ def _run_impl(
     # for subcommand invocations, so `bernstein run` lost the banner entirely.
     ctx = click.get_current_context(silent=True)
     if ctx is None or not (ctx.obj and ctx.obj.get("_BANNER_PRINTED")):
-        print_banner()
+        print_startup_banner()
 
     # Set process title so orchestrator is visible in Activity Monitor / ps
     with suppress(ImportError):
@@ -1388,7 +2536,21 @@ def _run_impl(
         max_blast_radius=max_blast_radius,
     )
 
-    _install_network_policy(run_profile=run_profile, allow_network=allow_network)
+    # One config read feeds both the enforced network policy and the attested
+    # posture, so the two cannot describe different versions of the file.
+    _run_workdir = Path.cwd()
+    _sovereign_snapshot = _sovereign_config_snapshot(run_profile=run_profile, workdir=_run_workdir)
+    _install_profile_network_policy(
+        run_profile=run_profile,
+        allow_network=allow_network,
+        workdir=_run_workdir,
+        config_snapshot=_sovereign_snapshot,
+    )
+    _activate_sovereign_profile(
+        run_profile=run_profile,
+        workdir=_run_workdir,
+        config_snapshot=_sovereign_snapshot,
+    )
 
     _configure_quality_gate_bypass(
         goal=goal,
@@ -1397,7 +2559,7 @@ def _run_impl(
         skip_gate_reason=skip_gate_reason,
     )
 
-    # --idle: GUI-development mode — force mock adapter + idle behavior on every spawn.
+    # --idle: GUI-development mode - force mock adapter + idle behavior on every spawn.
     if idle:
         if dry_run:
             raise click.UsageError("--idle and --dry-run are mutually exclusive.")
@@ -1431,12 +2593,28 @@ def _run_impl(
 
     workdir = Path.cwd()
     if not plan_only:
+        # Fail fast when agent merges would target the repository default
+        # branch (gh-2756): without this every agent does its work and the
+        # spawner merge guard then silently discards it at reap time.
+        # Applies only to modes that merge agent work back -- --dry-run
+        # returned above and --plan-only skips this block.
+        _abort_if_default_branch_merge_target(workdir)
+        # Validate the seed before estimating cost (issue #2785): a seed the
+        # run would reject must not first print an estimate "at sonnet
+        # pricing", and the estimate must reflect the validated seed's
+        # effective default model rather than the sonnet fallback. Only seed
+        # mode is validated here; inline-goal, --plan-file and --from-plan
+        # runs carry no seed to validate at this point.
+        validated_seed = None
+        if goal is None and plan_file is None and from_plan is None:
+            validated_seed = validate_seed_or_exit(seed_file)
         estimate = _estimate_run_preview(
             workdir=workdir,
             plan_file=plan_file,
             goal=goal,
             seed_file=seed_file,
             model_override=model,
+            seed=validated_seed,
         )
         _emit_preflight_runtime_warnings(
             workdir=workdir,
@@ -1447,6 +2625,80 @@ def _run_impl(
             budget_cap=budget_cap,
         )
 
+    # --plan-only: render the plan this run would execute, then exit.
+    #
+    # This block runs ahead of the --plan-file / --from-plan dispatch below.
+    # The flag is a property of the run, not of how the plan was supplied: with
+    # a positional plan file the dispatch called bootstrap_from_goal and
+    # returned before the flag was ever consulted, so ``bernstein run plan.yaml
+    # --plan-only`` started a server, spawned an agent, created a worktree and
+    # reached the merge path (gh-3255).
+    if plan_only:
+        from bernstein.core.plan_approval import configure_plan_models, create_plan
+        from bernstein.core.plan_builder import PlanBuilder
+
+        # --plan-only previews the run without reading a seed here, so there
+        # is no role policy to apply; the explicit None keeps the required
+        # positional honest rather than letting the panel fall back to the
+        # complexity default for the model.
+        configure_plan_models(
+            None,
+            default_model=model,
+            default_cli=cli,
+        )
+
+        rerun_hint: str | None = None
+
+        if plan_file is not None:
+            if worker_role:
+                # The same refusal the executing path raises: --worker bypasses
+                # manager decomposition, so there is nothing here to preview.
+                raise click.UsageError("--worker requires a seed file; it is not supported with --plan-file.")
+            try:
+                tasks = load_plan_from_yaml(plan_file)
+                _resolve_depends_on(tasks)
+                try:
+                    import yaml as _yaml
+
+                    plan_data = _yaml.safe_load(plan_file.read_text(encoding="utf-8"))
+                    loaded_goal = plan_data.get("name", str(plan_file))
+                except Exception:
+                    loaded_goal = str(plan_file)
+            except Exception as exc:
+                console.print(f"[red]Failed to load plan file:[/red] {exc}")
+                raise SystemExit(1) from exc
+
+            console.print(f"[dim]Loaded plan from:[/dim] {plan_file}")
+            console.print(f"[dim]Plan name:[/dim] {loaded_goal}")
+            plan_obj = create_plan(loaded_goal, tasks)
+            # Not --from-plan: that path reads only the ``**Goal:**`` line out
+            # of the saved markdown and re-decomposes from the plan name, which
+            # silently drops every task just previewed.
+            rerun_hint = f"bernstein run {plan_file}"
+        else:
+            if from_plan is not None:
+                try:
+                    goal = _load_plan_goal(from_plan)
+                    console.print(f"[dim]Loaded plan from:[/dim] {from_plan}")
+                    console.print(f"[dim]Goal:[/dim] {goal[:100]}")
+                except (ValueError, OSError) as exc:
+                    console.print(f"[red]Failed to load plan:[/red] {exc}")
+                    raise SystemExit(1) from exc
+            effective_goal, team = _resolve_goal_and_team(workdir, goal, seed_file)
+            plan_obj, tasks = _build_synthetic_plan(effective_goal, team)
+
+        builder = PlanBuilder(plan_obj, tasks)
+        md = builder.render_to_markdown()
+
+        from rich.markdown import Markdown
+
+        console.print(Markdown(md))
+
+        saved_plan = _save_plan_markdown(md, workdir)
+        console.print(f"\n[dim]Plan saved to:[/dim] {saved_plan}")
+        console.print(f"[dim]Execute with:[/dim] {rerun_hint or f'bernstein run --from-plan {saved_plan}'}")
+        return
+
     # --plan_file: loadable YAML plan (stages + steps)
     if plan_file is not None:
         try:
@@ -1456,7 +2708,7 @@ def _run_impl(
             try:
                 import yaml as _yaml
 
-                plan_data = _yaml.safe_load(plan_file.read_text())
+                plan_data = _yaml.safe_load(plan_file.read_text(encoding="utf-8"))
                 goal = plan_data.get("name", str(plan_file))
             except Exception:
                 goal = str(plan_file)
@@ -1464,6 +2716,12 @@ def _run_impl(
             console.print(f"[dim]Loaded plan from:[/dim] {plan_file}")
             console.print(f"[dim]Plan name:[/dim] {goal}")
             loaded_goal = goal or str(plan_file)
+
+            if worker_role:
+                # Fail loudly instead of silently running full manager
+                # decomposition, which is exactly what the flag exists
+                # to bypass.
+                raise click.UsageError("--worker requires a seed file; it is not supported with --plan-file.")
 
             with _make_profile_ctx(cprofile, workdir), _quiet_bootstrap_console(quiet):
                 bootstrap_from_goal(
@@ -1475,10 +2733,17 @@ def _run_impl(
                     model=model,
                     tasks=tasks,
                     ab_test=ab_test,
+                    force_fresh=force_fresh,
                 )
+                persist_server_port(port, workdir)
 
-            _finalize_run_output(quiet=quiet)
+            _finalize_run_output(quiet=quiet, wait=wait)
             return
+        except BernsteinFirstRunError:
+            # Already carries a structured category and exit code; let the
+            # outer first-run guard render its hint instead of flattening it
+            # into a generic "failed to load plan file" message.
+            raise
         except Exception as exc:
             console.print(f"[red]Failed to load plan file:[/red] {exc}")
             raise SystemExit(1) from exc
@@ -1493,58 +2758,17 @@ def _run_impl(
             console.print(f"[red]Failed to load plan:[/red] {exc}")
             raise SystemExit(1) from exc
 
-    # --plan-only: build a synthetic plan, render to markdown, save, and exit
-    if plan_only:
-        from bernstein.core.plan_builder import PlanBuilder
-        from bernstein.core.seed import SeedError, parse_seed
-
-        effective_goal = goal
-        team: list[str] | None = None
-
-        if effective_goal is None:
-            # Resolve seed file
-            if seed_file is not None:
-                seed_path = Path(seed_file)
-            else:
-                found = find_seed_file()
-                if found is not None:
-                    seed_path = found
-                else:
-                    from bernstein.cli.errors import no_seed_or_goal
-
-                    no_seed_or_goal().print()
-                    raise SystemExit(1)
-            try:
-                seed = parse_seed(seed_path)
-                effective_goal = seed.goal
-                team = list(seed.team) if seed.team != "auto" else None
-            except SeedError as exc:
-                from bernstein.cli.errors import seed_parse_error
-
-                seed_parse_error(exc).print()
-                raise SystemExit(1) from exc
-
-        plan_obj, tasks = _build_synthetic_plan(effective_goal, team)
-        builder = PlanBuilder(plan_obj, tasks)
-        md = builder.render_to_markdown()
-
-        # Render to terminal
-        from rich.markdown import Markdown
-
-        console.print(Markdown(md))
-
-        # Save to file
-        plan_file = _save_plan_markdown(md, workdir)
-        console.print(f"\n[dim]Plan saved to:[/dim] {plan_file}")
-        console.print(f"[dim]Execute with:[/dim] bernstein run --from-plan {plan_file}")
-        return
-
     # Confirmation prompt before execution (skip with --auto-approve)
-    if not auto_approve and not _confirm_run(goal=goal, seed_file=seed_file):
+    if not auto_approve and not _confirm_run(goal=goal, seed_file=seed_file, model_override=model, cli_override=cli):
         return
 
     if goal is not None:
         # Inline goal mode -- no YAML needed
+        if worker_role:
+            # Fail loudly instead of silently running full manager
+            # decomposition, which is exactly what the flag exists to
+            # bypass.
+            raise click.UsageError("--worker requires a seed file; it is not supported with an inline goal.")
         try:
             with _make_profile_ctx(cprofile, workdir), _quiet_bootstrap_console(quiet):
                 bootstrap_from_goal(
@@ -1554,13 +2778,15 @@ def _run_impl(
                     cells=cells,
                     cli=cli or "auto",  # Default to "auto" if not specified
                     model=model,
+                    force_fresh=force_fresh,
                 )
+                persist_server_port(port, workdir)
         except RuntimeError as exc:
             from bernstein.cli.errors import bootstrap_failed
 
             bootstrap_failed(exc).print()
             raise SystemExit(1) from exc
-        _finalize_run_output(quiet=quiet)
+        _finalize_run_output(quiet=quiet, wait=wait)
         return
 
     # Seed file mode
@@ -1590,7 +2816,10 @@ def _run_impl(
                 remote=remote,
                 cli=cli,
                 model=model,
+                worker_role=worker_role,
+                force_fresh=force_fresh,
             )
+            persist_server_port(port, workdir)
     except SeedError as exc:
         from bernstein.cli.errors import seed_parse_error
 
@@ -1602,7 +2831,7 @@ def _run_impl(
         bootstrap_failed(exc).print()
         raise SystemExit(1) from exc
 
-    _finalize_run_output(quiet=quiet)
+    _finalize_run_output(quiet=quiet, wait=wait)
 
     # Close the first-run timer (spec 2026-05-17).  Fail-closed.
     if _telemetry_first_run_timer is not None:
@@ -1632,7 +2861,7 @@ def _run_impl(
     help="Port for the task server.",
 )
 def start(goal: str | None, seed_file: str, port: int) -> None:
-    """Start server and spawn manager (legacy, use 'conduct')."""
+    """Start server and spawn manager (legacy alias of 'run')."""
     try:
         _start_impl(goal, seed_file, port)
     except (click.UsageError, SystemExit):
@@ -1686,3 +2915,57 @@ def _start_impl(goal: str | None, seed_file: str, port: int) -> None:
             bootstrap_failed(exc).print()
             raise SystemExit(1) from exc
     _show_run_summary()
+
+
+@click.command("serve")
+@click.option(
+    "--host",
+    "bind_host",
+    default=None,
+    help=(
+        "Interface to bind. Defaults to $BERNSTEIN_BIND_HOST, else 127.0.0.1. "
+        "Use 0.0.0.0 to expose a central/coordinator node to other cluster hosts."
+    ),
+)
+@click.option(
+    "--port",
+    default=8052,
+    show_default=True,
+    type=int,
+    help="Port for the task server.",
+)
+@click.option(
+    "--log-level",
+    "log_level",
+    default="info",
+    show_default=True,
+    help="Uvicorn log level.",
+)
+def serve(bind_host: str | None, port: int, log_level: str) -> None:
+    """Run the task server in the foreground until stopped.
+
+    Unlike ``bernstein run`` / ``bernstein start`` - which detach the task
+    server as a background process and return - ``serve`` runs the server
+    in-process and blocks until it receives SIGINT/SIGTERM. This keeps the
+    process alive as PID 1 inside a container, so the published image can host a
+    long-lived central/coordinator node whose ``/health`` endpoint stays
+    reachable for the lifetime of the container.
+
+    Set ``BERNSTEIN_BIND_HOST=0.0.0.0`` (or pass ``--host 0.0.0.0``) and
+    ``BERNSTEIN_CLUSTER_ENABLED=1`` before start to bind all interfaces and
+    expose cluster endpoints to other nodes.
+    """
+    import uvicorn
+
+    host = bind_host or os.environ.get("BERNSTEIN_BIND_HOST", "127.0.0.1")
+    # Keep the cluster config's advertised bind host aligned with the socket we
+    # actually bind, and pin single-worker mode - the TaskStore is
+    # single-process and multi-worker mode corrupts JSONL / double-claims tasks.
+    os.environ["BERNSTEIN_BIND_HOST"] = host
+    os.environ.setdefault("BERNSTEIN_WORKERS", "1")
+
+    console.print(f"[green]Task server (foreground):[/green] http://{host}:{port}/  (Ctrl-C or SIGTERM to stop)")
+    # In-process, blocking run against the same ASGI app the detached path
+    # launches (server_launch._start_server). No start_new_session detach here:
+    # the CLI process stays in the foreground so a container's PID 1 lives.
+    uvicorn.run("bernstein.core.server:app", host=host, port=port, log_level=log_level)

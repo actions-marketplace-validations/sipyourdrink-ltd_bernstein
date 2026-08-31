@@ -1,7 +1,7 @@
 # Cluster 2-node end-to-end harness
 
 The single-process cluster tests prove the algorithm. The 2-node
-harness proves the **system** — real HTTP between two interpreters,
+harness proves the **system** - real HTTP between two interpreters,
 real process kills, real network partitions, real token expiry. Six
 chaos scenarios run in CI on a dedicated workflow.
 
@@ -32,7 +32,7 @@ yields a `ClusterHandle`:
 def test_worker_crash_mid_task(two_node_cluster):
     handle = two_node_cluster
     task_id = handle.submit_task(role="backend", goal="...")
-    handle.kill_worker()                         # SIGKILL
+    handle.kill_worker()  # SIGKILL
     handle.wait_for_node_status("offline", timeout=15)
     handle.restart_worker()
     handle.wait_for_task_completion(task_id, timeout=60)
@@ -41,11 +41,11 @@ def test_worker_crash_mid_task(two_node_cluster):
 
 Helper methods on `ClusterHandle`:
 
-- `kill_worker()` / `restart_worker()` — process control
-- `restart_central()` — central server restart from the JSON registry
-- `block_traffic_for(seconds)` — Linux uses `iptables`; macOS uses a
+- `kill_worker()` / `restart_worker()` - process control
+- `restart_central()` - central server restart from the JSON registry
+- `block_traffic_for(seconds)` - Linux uses `iptables`; macOS uses a
   Python proxy
-- `current_status()` — snapshot of the registry
+- `current_status()` - snapshot of the registry
 
 ## The six chaos scenarios
 
@@ -78,7 +78,7 @@ In CI, `.github/workflows/cluster-e2e.yml` runs them on PRs touching
 `core/protocols/cluster/**` and on a nightly schedule.
 
 When the mTLS fixture is parameterised (`tls=on`), the same six
-scenarios run with TLS enabled — no test rewrites required.
+scenarios run with TLS enabled - no test rewrites required.
 
 ## Diagnostics on failure
 
@@ -86,7 +86,7 @@ When a scenario fails, the harness collects:
 
 - Process logs from both nodes
 - Last 100 audit-log lines
-- The `bernstein cluster status` snapshot
+- The `current_status()` registry snapshot
 
 These are written to `tests/_artifacts/cluster_e2e/<test_name>/`.
 

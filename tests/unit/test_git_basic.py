@@ -9,7 +9,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from bernstein.core.git_basic import GitResult, run_git, safe_push, stage_all_except, stage_task_files
+from bernstein.core.git_basic import (
+    GitResult,
+    _is_terminal_push_error,
+    _is_transient_push_error,
+    run_git,
+    safe_push,
+    stage_all_except,
+    stage_files,
+    stage_task_files,
+)
 
 
 def test_run_git_raises_called_process_error_when_check_is_true(tmp_path: Path) -> None:
@@ -51,6 +60,30 @@ def test_stage_all_except_unstages_explicit_and_never_stage_paths(tmp_path: Path
     assert ".sdd/metrics/" in reset_args
 
 
+def test_stage_files_does_not_exclude_legitimate_paths_that_merely_contain_auth_or_attestations(
+    tmp_path: Path,
+) -> None:
+    """``_NEVER_STAGE`` entries are matched as bare substrings, so a legitimate
+    path that happens to contain ``auth/`` or ``attestations/`` anywhere in
+    it (not under ``.sdd/``) must still be staged -- only the ``.sdd/``-scoped
+    forms are forbidden."""
+    with patch("bernstein.core.git_basic.run_git") as mock_run_git:
+        stage_files(
+            tmp_path,
+            [
+                "src/myapp/auth/handler.py",
+                "src/myapp/attestations/verifier.py",
+                ".sdd/auth/agent_identity_jwt_secret",
+                ".sdd/attestations/ed25519-signing-key.pem",
+            ],
+        )
+
+    mock_run_git.assert_called_once_with(
+        ["add", "--", "src/myapp/auth/handler.py", "src/myapp/attestations/verifier.py"],
+        tmp_path,
+    )
+
+
 def test_safe_push_corrects_master_and_rebases_when_remote_is_ahead(tmp_path: Path) -> None:
     """safe_push rewrites master to main and rebases before pushing when behind the remote."""
     with (
@@ -58,7 +91,7 @@ def test_safe_push_corrects_master_and_rebases_when_remote_is_ahead(tmp_path: Pa
         patch(
             "bernstein.core.git_basic.run_git",
             side_effect=[
-                # remote_exists() preflight: `git remote get-url origin` —
+                # remote_exists() preflight: `git remote get-url origin` -
                 # added 2026-05-15 so safe_push no-ops on local-only repos.
                 GitResult(0, "git@github.com:x/y.git", ""),
                 GitResult(0, "2", ""),  # rev-list count
@@ -74,3 +107,42 @@ def test_safe_push_corrects_master_and_rebases_when_remote_is_ahead(tmp_path: Pa
     assert mock_run_git.call_args_list[1].args[0] == ["rev-list", "--count", "HEAD..origin/main"]
     assert mock_run_git.call_args_list[2].args[0] == ["rebase", "origin/main"]
     assert mock_run_git.call_args_list[3].args[0] == ["push", "origin", "main"]
+
+
+# --- Transient vs terminal push error classification ---
+
+
+class TestTransientPushError:
+    """Tests for _is_transient_push_error marker matching."""
+
+    def test_network_errors_are_transient(self) -> None:
+        assert _is_transient_push_error("could not read from remote repository")
+        assert _is_transient_push_error("unable to access 'https://github.com/repo.git'")
+        assert _is_transient_push_error("Connection refused")
+        assert _is_transient_push_error("timed out")
+        assert _is_transient_push_error("timeout")
+        assert _is_transient_push_error("reset by peer")
+
+    def test_credential_errors_are_not_transient(self) -> None:
+        # The old marker "could not read" matched both — now it shouldn't
+        assert not _is_transient_push_error(
+            "could not read Username for 'https://github.com': No such device or address"
+        )
+
+    def test_non_fast_forward_is_transient(self) -> None:
+        assert _is_transient_push_error("rejected (non-fast-forward)")
+        assert _is_transient_push_error("fetch first")
+
+
+class TestTerminalPushError:
+    """Tests for _is_terminal_push_error marker matching."""
+
+    def test_credential_errors_are_terminal(self) -> None:
+        assert _is_terminal_push_error("could not read Username for 'https://github.com': No such device or address")
+        assert _is_terminal_push_error("Authentication failed")
+        assert _is_terminal_push_error("Permission denied (publickey)")
+
+    def test_network_errors_are_not_terminal(self) -> None:
+        assert not _is_terminal_push_error("could not read from remote repository")
+        assert not _is_terminal_push_error("Connection refused")
+        assert not _is_terminal_push_error("timed out")

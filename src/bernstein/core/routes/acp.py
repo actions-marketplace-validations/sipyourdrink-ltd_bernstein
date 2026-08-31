@@ -4,12 +4,12 @@ Exposes Bernstein as an ACP-compatible agent so it is auto-discoverable
 in editors that support the protocol (JetBrains Air, Zed, Neovim, Emacs).
 
 Endpoints:
-  GET  /.well-known/acp.json          — discovery (public, no auth)
-  GET  /acp/v0/agents                 — list agents
-  GET  /acp/v0/agents/{agent_id}      — agent metadata
-  POST /acp/v0/runs                   — create run → Bernstein task
-  GET  /acp/v0/runs/{run_id}          — run status
-  DELETE /acp/v0/runs/{run_id}        — cancel run
+  GET  /.well-known/acp.json          - discovery (public, no auth)
+  GET  /acp/v0/agents                 - list agents
+  GET  /acp/v0/agents/{agent_id}      - agent metadata
+  POST /acp/v0/runs                   - create run → Bernstein task
+  GET  /acp/v0/runs/{run_id}          - run status
+  DELETE /acp/v0/runs/{run_id}        - cancel run
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
 from bernstein.core.server import TaskCreate, TaskStore
 from bernstein.core.tenanting import request_tenant_id
 
@@ -109,7 +110,7 @@ def _get_acp_handler(request: Request) -> ACPHandler:
 
 @router.get("/.well-known/acp.json")
 def acp_discovery(request: Request) -> ACPDiscoveryResponse:
-    """ACP discovery document — editors poll this to find ACP-compatible agents."""
+    """ACP discovery document - editors poll this to find ACP-compatible agents."""
     doc = _get_acp_handler(request).discovery_doc()
     return ACPDiscoveryResponse(
         protocol=doc["protocol"],
@@ -167,7 +168,7 @@ def get_acp_agent(agent_id: str, request: Request) -> ACPAgentResponse:
     responses={400: {"description": "Unknown ACP agent"}},
 )
 async def create_acp_run(body: ACPRunCreateRequest, request: Request) -> ACPRunResponse:
-    """Create an ACP run — creates a Bernstein task and links it.
+    """Create an ACP run - creates a Bernstein task and links it.
 
     Editors call this when the user submits a goal via the ACP sidebar.
     """
@@ -225,6 +226,12 @@ async def cancel_acp_run(run_id: str, request: Request) -> ACPRunResponse:
 
     # Cancel the underlying Bernstein task if it's still active
     if run.bernstein_task_id is not None:
+        # The run id is the only task identifier in the path, and it resolves
+        # to a Bernstein task this handler then cancels - the same mutation
+        # ``POST /tasks/{id}/cancel`` performs under the path-level scope
+        # gate. Check the id the handler resolved, not the one the caller
+        # supplied, so the lookup cannot carry a task past the check.
+        enforce_agent_task_scope_for_ids(request, [run.bernstein_task_id])
         task = store.get_task(run.bernstein_task_id)
         if task is not None and task.status.value in ("open", "claimed", "in_progress"):
             with contextlib.suppress(KeyError, ValueError):

@@ -32,6 +32,7 @@ from bernstein.adapters._contract import (
     StrategyView,
     _capability_failures,  # pyright: ignore[reportPrivateUsage]
     _strip_ansi,  # pyright: ignore[reportPrivateUsage]
+    probe_failure_reason,
     strategy_for,
 )
 
@@ -49,7 +50,7 @@ _BINARY_OVERRIDES: dict[str, str] = {
     "q_dev": "q",
     "open_interpreter": "interpreter",
     "openai_agents": "python",
-    "cloudflare": "wrangler",
+    "python_runtime": "python",
     "letta_code": "letta",
     "continue": "continue",
     "openhands": "openhands",
@@ -169,8 +170,20 @@ class AdapterReport:
 
 
 def _binary_for_adapter(name: str) -> str:
-    """Map a registry key to its expected CLI binary name."""
-    return _BINARY_OVERRIDES.get(name, name)
+    """Map a registry key to its expected CLI binary name.
+
+    Explicit overrides win, then the adapter's capability profile (which
+    already declares its binary), then the registry key itself. Sourcing
+    the binary from the declaration keeps profiled adapters out of the
+    hand-maintained override table, where a second copy of the same fact
+    could drift from the adapter it describes.
+    """
+    override = _BINARY_OVERRIDES.get(name)
+    if override is not None:
+        return override
+    from bernstein.adapters.capability_profile import profile_binary_for
+
+    return profile_binary_for(name) or name
 
 
 def _resolve_module_path(adapter: type[CLIAdapter] | CLIAdapter) -> str:
@@ -352,6 +365,26 @@ def check_adapter_in_process(
         )
 
     help_text = (proc.stdout or "") + (proc.stderr or "")
+
+    # A binary that is installed and answers --help but advertises none of
+    # its required tokens (or nothing at all) is a broken/redesigned probe
+    # surface, not genuine per-flag drift: an installed adapter cannot
+    # legitimately drop its entire required surface in one release. Record it
+    # as an inconclusive skip so the canary flags it for investigation
+    # instead of paging with a misleading "every flag removed" regression
+    # (issue #2488). Partial misses still fall through to a fail below.
+    probe_reason = probe_failure_reason(spec, help_text)
+    if probe_reason is not None:
+        total_required = len(spec.required_flags) + len(spec.required_subcommands)
+        return ConformanceVerdictPayload(
+            verdict=CONFORMANCE_SKIP,
+            detail=(
+                f"probe inconclusive ({probe_reason}): `{' '.join(help_cmd)}` advertised none of "
+                f"the {total_required} required tokens; not treated as drift"
+            ),
+            capabilities=capabilities,
+        )
+
     failures = _capability_failures(spec, help_text)
     if failures:
         return ConformanceVerdictPayload(

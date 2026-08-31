@@ -41,7 +41,7 @@ def _make_spawner(tmp_path: Path, adapter: MagicMock) -> AgentSpawner:
     backend_dir.mkdir(parents=True)
     (backend_dir / "system_prompt.md").write_text("You are a backend agent.")
 
-    spawner = AgentSpawner(adapter, templates_dir, tmp_path)
+    spawner = AgentSpawner(adapter, templates_dir, tmp_path, default_model="mock-model")
     spawner._get_adapter_by_name = MagicMock(return_value=adapter)
     spawner._infer_adapter_name_for_provider = MagicMock(return_value="test-adapter")
     spawner._router = MagicMock()
@@ -50,7 +50,7 @@ def _make_spawner(tmp_path: Path, adapter: MagicMock) -> AgentSpawner:
 
 
 def test_auth_error_is_non_retryable(tmp_path: Path) -> None:
-    """Auth failures are classified NO_RETRY — spawn_for_tasks raises immediately."""
+    """Auth failures are classified NO_RETRY - spawn_for_tasks raises immediately."""
     adapter = MagicMock()
     adapter.name.return_value = "test-adapter"
     adapter.spawn.side_effect = SpawnError("Auth failed")
@@ -61,5 +61,5 @@ def test_auth_error_is_non_retryable(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="All spawn attempts failed"):
         spawner.spawn_for_tasks(tasks)
 
-    # Auth error is fail-fast — only 1 attempt, no retry
+    # Auth error is fail-fast - only 1 attempt, no retry
     assert adapter.spawn.call_count == 1

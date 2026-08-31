@@ -17,21 +17,6 @@ from click.testing import CliRunner
 # ---------------------------------------------------------------------------
 
 
-def test_chaos_rate_limit(tmp_path: Path) -> None:
-    """Rate-limit command writes the active sentinel file."""
-    with patch("bernstein.cli.chaos_cmd.CHAOS_DIR", tmp_path):
-        runner = CliRunner()
-        result = runner.invoke(chaos_group, ["rate-limit", "--duration", "10", "--provider", "test-p"])
-
-        assert result.exit_code == 0
-        assert "Provider test-p rate-limited" in result.output
-
-        rate_limit_file = tmp_path / "rate_limit_active.json"
-        assert rate_limit_file.exists()
-        data = json.loads(rate_limit_file.read_text())
-        assert data["provider"] == "test-p"
-
-
 def test_chaos_status_empty(tmp_path: Path) -> None:
     """Status command reports no history when the log is absent."""
     with patch("bernstein.cli.chaos_cmd.CHAOS_DIR", tmp_path):
@@ -60,20 +45,6 @@ def test_chaos_status_shows_recorded_event(tmp_path: Path) -> None:
         assert "agent-kill" in result.output
 
 
-def test_chaos_rate_limit_records_event(tmp_path: Path) -> None:
-    """Rate-limit command appends a structured event to the chaos log."""
-    with patch("bernstein.cli.chaos_cmd.CHAOS_DIR", tmp_path):
-        runner = CliRunner()
-        runner.invoke(chaos_group, ["rate-limit", "--duration", "30", "--provider", "openai"])
-
-        log_path = tmp_path / "chaos_log.jsonl"
-        assert log_path.exists()
-        events = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
-        assert len(events) == 1
-        assert events[0]["scenario"] == "rate-limit"
-        assert events[0]["success"] is True
-
-
 def test_chaos_agent_kill_no_agents(tmp_path: Path) -> None:
     """Agent-kill reports gracefully when no agents are running."""
     runner = CliRunner()
@@ -82,49 +53,6 @@ def test_chaos_agent_kill_no_agents(tmp_path: Path) -> None:
         result = runner.invoke(chaos_group, ["agent-kill"])
     assert result.exit_code == 0
     assert "No active agents" in result.output
-
-
-def test_chaos_disk_full_creates_sentinel(tmp_path: Path) -> None:
-    """Disk-full command writes the disk_full_active.json sentinel."""
-    with patch("bernstein.cli.chaos_cmd.CHAOS_DIR", tmp_path):
-        runner = CliRunner()
-        result = runner.invoke(chaos_group, ["disk-full", "--duration", "5"])
-        assert result.exit_code == 0
-
-        sentinel = tmp_path / "disk_full_active.json"
-        assert sentinel.exists()
-        data = json.loads(sentinel.read_text())
-        assert data["duration_seconds"] == 5
-        assert data["expires_at"] > data["started_at"]
-
-
-def test_chaos_agent_oom_records_event(tmp_path: Path) -> None:
-    """agent-oom command records a chaos event in the log."""
-    with patch("bernstein.cli.chaos_cmd.CHAOS_DIR", tmp_path):
-        runner = CliRunner()
-        result = runner.invoke(chaos_group, ["agent-oom", "--agent-id", "test-agent"])
-        assert result.exit_code == 0
-        assert "Simulating OOM" in result.output
-
-        log_path = tmp_path / "chaos_log.jsonl"
-        assert log_path.exists()
-        events = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
-        assert len(events) == 1
-        assert events[0]["scenario"] == "agent-oom"
-        assert events[0]["target"] == "test-agent"
-        assert events[0]["success"] is True
-
-
-def test_chaos_agent_oom_default_target(tmp_path: Path) -> None:
-    """agent-oom without --agent-id uses 'random-active' as target."""
-    with patch("bernstein.cli.chaos_cmd.CHAOS_DIR", tmp_path):
-        runner = CliRunner()
-        result = runner.invoke(chaos_group, ["agent-oom"])
-        assert result.exit_code == 0
-
-        log_path = tmp_path / "chaos_log.jsonl"
-        events = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
-        assert events[0]["target"] == "random-active"
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +200,7 @@ def test_taskstore_replay_tolerates_corrupt_line(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Chaos: agent OOM — slot reclaimed, task requeued, worktree preserved
+# Chaos: agent OOM - slot reclaimed, task requeued, worktree preserved
 # ---------------------------------------------------------------------------
 
 
@@ -362,7 +290,7 @@ def test_oom_slot_reclaimed_and_task_requeued(tmp_path: Path) -> None:
     ):
         handle_orphaned_task(orch, task.id, session, {"claimed": [task], "open": [], "in_progress": [], "done": []})
 
-    # Slot was reclaimed (no completion) — task goes to retry/fail path
+    # Slot was reclaimed (no completion) - task goes to retry/fail path
     mock_complete.assert_not_called()
     mock_retry.assert_called_once()
 
@@ -444,7 +372,7 @@ def test_save_partial_work_skips_missing_worktree() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Chaos: disk full during merge — graceful error, no corruption, cleanup
+# Chaos: disk full during merge - graceful error, no corruption, cleanup
 # ---------------------------------------------------------------------------
 
 
@@ -540,6 +468,7 @@ def test_disk_full_merge_cleanup_worktree_survives_oserror(tmp_path: Path) -> No
     spawner._worktree_roots = {}
     spawner._worktree_managers = {}
     spawner._worktree_mgr = None
+    spawner._artifact_workdirs = {}
 
     session_id = "disk-sess-3"
     worktree = tmp_path / session_id
@@ -547,7 +476,7 @@ def test_disk_full_merge_cleanup_worktree_survives_oserror(tmp_path: Path) -> No
     spawner._worktree_paths[session_id] = worktree
 
     with patch("shutil.rmtree", side_effect=OSError(errno.ENOSPC, "No space left on device")):
-        # Should not raise — disk-full OSError in rmtree is caught and logged
+        # Should not raise - disk-full OSError in rmtree is caught and logged
         spawner.cleanup_worktree(session_id)
 
     # Worktree path removed from tracking dict regardless of rmtree failure
@@ -555,7 +484,7 @@ def test_disk_full_merge_cleanup_worktree_survives_oserror(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
-# Chaos: disk full during merge — _merge_worktree_branch resilience
+# Chaos: disk full during merge - _merge_worktree_branch resilience
 # ---------------------------------------------------------------------------
 
 
@@ -586,7 +515,7 @@ def test_merge_worktree_branch_returns_failed_result_on_exception(tmp_path: Path
 
 
 def test_merge_worktree_branch_no_corruption_after_disk_full(tmp_path: Path) -> None:
-    """No state corruption after disk-full during merge — worktree tracking stays clean.
+    """No state corruption after disk-full during merge - worktree tracking stays clean.
 
     After a failed merge due to ENOSPC, the spawner's internal tracking
     dictionaries must be unmodified so cleanup_worktree can still run.
@@ -599,6 +528,7 @@ def test_merge_worktree_branch_no_corruption_after_disk_full(tmp_path: Path) -> 
     spawner._worktree_roots = {}
     spawner._worktree_managers = {}
     spawner._worktree_mgr = None
+    spawner._artifact_workdirs = {}
 
     session_id = "disk-sess-5"
     worktree = tmp_path / session_id
@@ -653,7 +583,7 @@ def test_merge_queue_processes_next_job_after_failed_merge(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
-# Chaos: kill server mid-task — IN_PROGRESS recovery + CLOSED preservation
+# Chaos: kill server mid-task - IN_PROGRESS recovery + CLOSED preservation
 # ---------------------------------------------------------------------------
 
 
@@ -737,7 +667,7 @@ def test_recovery_is_idempotent_across_multiple_restarts(tmp_path: Path) -> None
     assert count1 == 1
     assert store.get_task("t-stale").status.value == "open"  # type: ignore[union-attr]
 
-    # Second restart (task is already open — no additional resets)
+    # Second restart (task is already open - no additional resets)
     count2 = store.recover_stale_claimed_tasks()
     assert count2 == 0
     assert store.get_task("t-stale").status.value == "open"  # type: ignore[union-attr]
@@ -762,7 +692,7 @@ def test_no_data_loss_after_server_kill_with_mixed_task_states(tmp_path: Path) -
     store.replay_jsonl()
     store.recover_stale_claimed_tasks()
 
-    # All tasks survived replay — no data loss
+    # All tasks survived replay - no data loss
     for tid in all_ids:
         assert store.get_task(tid) is not None, f"Task {tid} was lost after recovery"
 

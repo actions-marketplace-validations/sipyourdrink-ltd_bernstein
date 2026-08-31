@@ -16,11 +16,11 @@ fake without rewriting the script:
 ``BERNSTEIN_FAKE_CLI_MODE``
     Behaviour mode.  Recognised values:
 
-    * ``success`` (default) — emit profile-shaped stdout and exit 0.
-    * ``error`` — print an error line to stderr and exit ``EXIT_CODE``.
-    * ``stream_then_die`` — emit a few stream chunks then exit non-zero.
-    * ``hang`` — sleep forever (hits the adapter's timeout watchdog).
-    * ``no_output`` — exit 0 without printing anything.
+    * ``success`` (default) - emit profile-shaped stdout and exit 0.
+    * ``error`` - print an error line to stderr and exit ``EXIT_CODE``.
+    * ``stream_then_die`` - emit a few stream chunks then exit non-zero.
+    * ``hang`` - sleep forever (hits the adapter's timeout watchdog).
+    * ``no_output`` - exit 0 without printing anything.
 
 ``BERNSTEIN_FAKE_CLI_EXIT_CODE``
     Override the exit code in error/stream_then_die modes.  Default ``2``.
@@ -173,7 +173,7 @@ _DEVIN_LINES: tuple[str, ...] = (
     "[devin] session.complete run_id=fake-devin-run",
 )
 
-# Mistral / vibe prints conversational text — no JSON envelope. Tests
+# Mistral / vibe prints conversational text - no JSON envelope. Tests
 # only assert one tagged line is captured so the upstream parser just
 # needs to forward stdout intact.
 _MISTRAL_LINES: tuple[str, ...] = (
@@ -289,7 +289,7 @@ def _emit_mistral() -> None:
 def _validate_argv(profile: str, argv: list[str]) -> None:
     """Sanity-check the argv shape produced by each adapter.
 
-    The check is loose on purpose — we just confirm a few mandatory flags
+    The check is loose on purpose - we just confirm a few mandatory flags
     survive argv assembly so an adapter regression that drops a flag
     reaches the assertion.
     """
@@ -338,7 +338,7 @@ def _resolve_profile(argv0: str) -> str:
     Resolution order:
 
     1. ``BERNSTEIN_FAKE_CLI_PROFILE`` env var (explicit override).
-    2. ``argv[0]`` basename — first checked against the profile-handler
+    2. ``argv[0]`` basename - first checked against the profile-handler
        table, then against the binary-alias table for cases where the
        upstream CLI name (e.g. ``cursor-agent``, ``vibe``) does not
        match the profile slug (``cursor``, ``mistral``).
@@ -346,7 +346,7 @@ def _resolve_profile(argv0: str) -> str:
        physical path).
 
     Falls back to ``"claude"`` so the harness behaves like a Claude
-    CLI by default — matches the original top-5 contract.
+    CLI by default - matches the original top-5 contract.
     """
     env_profile = os.environ.get("BERNSTEIN_FAKE_CLI_PROFILE", "").strip()
     if env_profile:
@@ -446,14 +446,54 @@ def _run_stream_then_die(profile: str, exit_code: int) -> int:
 
 
 def _run_hang() -> int:
-    """Sleep forever — the adapter's timeout watchdog must intervene."""
+    """Sleep forever - the adapter's timeout watchdog must intervene."""
     while True:
         time.sleep(60)
+
+
+#: Config keys the harness may set, mapped to their ``BERNSTEIN_FAKE_CLI_*``
+#: environment variable. Loading the config in Python (rather than sourcing a
+#: shell file) keeps the wrapper trivial and identical on POSIX and Windows.
+_CONFIG_ENV_KEYS: dict[str, str] = {
+    "mode": "BERNSTEIN_FAKE_CLI_MODE",
+    "exit_code": "BERNSTEIN_FAKE_CLI_EXIT_CODE",
+    "delay_s": "BERNSTEIN_FAKE_CLI_DELAY_S",
+    "argv_dump": "BERNSTEIN_FAKE_CLI_ARGV_DUMP",
+    "env_dump": "BERNSTEIN_FAKE_CLI_ENV_DUMP",
+    "stdout": "BERNSTEIN_FAKE_CLI_STDOUT",
+    "profile": "BERNSTEIN_FAKE_CLI_PROFILE",
+    "stderr": "BERNSTEIN_FAKE_CLI_STDERR",
+}
+
+
+def _load_config_file() -> None:
+    """Populate ``BERNSTEIN_FAKE_CLI_*`` env vars from the JSON config file.
+
+    The wrapper only exports ``BERNSTEIN_FAKE_CLI_CONFIG`` (a path) and
+    ``BERNSTEIN_FAKE_CLI_PROFILE``. Everything else is read here so a single
+    Python config loader works identically under a POSIX ``sh`` wrapper and a
+    Windows ``.cmd`` wrapper -- no shell ``source``/``.`` semantics required.
+    An env var already present in the process takes precedence over the file so
+    a test can still override a single key inline.
+    """
+    config_path = os.environ.get("BERNSTEIN_FAKE_CLI_CONFIG")
+    if not config_path or not Path(config_path).is_file():
+        return
+    try:
+        data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    for key, env_name in _CONFIG_ENV_KEYS.items():
+        if key in data and os.environ.get(env_name) is None:
+            os.environ[env_name] = str(data[key])
 
 
 def main(argv: list[str] | None = None) -> int:
     """Parse env config, dispatch to the requested mode."""
     argv = list(sys.argv if argv is None else argv)
+    _load_config_file()
     profile = _resolve_profile(argv[0] if argv else "")
 
     _maybe_dump_argv(argv)

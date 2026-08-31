@@ -68,14 +68,24 @@ class _FakeProvider(TunnelProvider):
 
 
 @pytest.fixture
-def fake_registry(monkeypatch: pytest.MonkeyPatch) -> _FakeProvider:
+def tunnel_state_path(tmp_path: Path) -> Path:
+    """Tmp-scoped tunnel registry state file.
+
+    The registry persists via a plain ``Path``, so a relative state path
+    would resolve against the CWD and dirty the repo root on every run.
+    """
+    return tmp_path / "tunnels.json"
+
+
+@pytest.fixture
+def fake_registry(monkeypatch: pytest.MonkeyPatch, tunnel_state_path: Path) -> _FakeProvider:
     """Replace ``_build_tunnel_registry`` with one wired to a fake provider."""
     fake = _FakeProvider()
 
     def _build() -> Any:
         from bernstein.core.tunnels.registry import TunnelRegistry
 
-        reg = TunnelRegistry(state_path=Path("tunnels-test.json"))
+        reg = TunnelRegistry(state_path=tunnel_state_path)
         reg.register(fake)
         return reg
 
@@ -333,14 +343,14 @@ def test_cli_serve_with_tunnel_prints_onboarding(
 
 
 def test_cli_serve_with_tunnel_handles_provider_unavailable(
-    monkeypatch: pytest.MonkeyPatch, tmp_passphrase_file: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_passphrase_file: Path, tmp_path: Path
 ) -> None:
     _patch_uvicorn_noop(monkeypatch)
 
     def _build_empty() -> Any:
         from bernstein.core.tunnels.registry import TunnelRegistry
 
-        return TunnelRegistry(state_path=Path("empty.json"))
+        return TunnelRegistry(state_path=tmp_path / "empty.json")
 
     monkeypatch.setattr(gui_cli, "_build_tunnel_registry", _build_empty)
     runner = CliRunner()
@@ -354,6 +364,17 @@ def test_start_tunnel_helper_creates_handle(fake_registry: _FakeProvider) -> Non
     assert handle.port == 8052
     assert handle.provider == "cloudflared"
     assert handle.public_url == "https://fake-cloudflared.example.com"
+
+
+def test_start_tunnel_persists_outside_the_repo(fake_registry: _FakeProvider, tunnel_state_path: Path) -> None:
+    """A relative state path resolves against the CWD and dirties the repo."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert tunnel_state_path.is_absolute(), f"state path must be absolute, got {tunnel_state_path}"
+    assert not tunnel_state_path.resolve().is_relative_to(repo_root), (
+        f"tunnel state {tunnel_state_path} would be written inside {repo_root}"
+    )
+    gui_cli._start_tunnel(port=8052, provider="cloudflared")
+    assert tunnel_state_path.exists(), "state was not persisted to the tmp path"
 
 
 def test_stop_tunnel_helper_idempotent(fake_registry: _FakeProvider, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -393,6 +414,83 @@ def test_stop_tunnel_helper_survives_oserror(fake_registry: _FakeProvider, monke
     monkeypatch.setattr(os, "kill", fake_kill)
     # Should not raise - _stop_tunnel swallows OSError.
     gui_cli._stop_tunnel(handle.name)
+
+
+# ---------------------------------------------------------------------------
+# Local (no-tunnel) browser seed: authenticate the SPA on loopback
+# ---------------------------------------------------------------------------
+#
+# The SPA's data panels call the SSO-gated general API (``/api/v1/agents``,
+# ``/api/v1/tasks``, ...). That surface accepts the process ``BERNSTEIN_AUTH_TOKEN``
+# bearer - a #2366 dashboard scoped token only unlocks ``/api/v1/dashboard/*``.
+# Without seeding, a bare local ``serve`` opens ``/ui/`` with no token, so every
+# panel 401s. These tests pin the seed decision at the helper and CLI level.
+
+
+def test_resolve_local_open_url_seeds_configured_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BERNSTEIN_AUTH_TOKEN", "legacy-secret-xyz")
+    url = gui_cli._resolve_local_open_url(host="127.0.0.1", port=8052, echo=lambda *_a: None)
+    # The token rides the onboarding fragment the SPA parses on boot.
+    assert url == "http://127.0.0.1:8052/ui/#t=legacy-secret-xyz"
+
+
+def test_resolve_local_open_url_reuses_token_verbatim_no_mint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BERNSTEIN_AUTH_TOKEN", "  spaced-token  ")
+    url = gui_cli._resolve_local_open_url(host="localhost", port=9000, echo=lambda *_a: None)
+    # Whitespace is trimmed (matches create_app's resolution) but the token
+    # itself is reused, never regenerated per serve.
+    assert url == "http://localhost:9000/ui/#t=spaced-token"
+
+
+def test_resolve_local_open_url_bare_and_hint_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BERNSTEIN_AUTH_TOKEN", raising=False)
+    notes: list[str] = []
+    url = gui_cli._resolve_local_open_url(host="127.0.0.1", port=8052, echo=notes.append)
+    assert url == "http://127.0.0.1:8052/ui/"
+    assert "#t=" not in url
+    assert any("BERNSTEIN_AUTH_TOKEN" in n for n in notes), notes
+
+
+def test_resolve_local_open_url_never_seeds_non_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A configured token must not be baked into a browser-open URL for a
+    # routable bind - posture stays at bind-time, and the token never rides a
+    # non-loopback URL.
+    monkeypatch.setenv("BERNSTEIN_AUTH_TOKEN", "legacy-secret-xyz")
+    url = gui_cli._resolve_local_open_url(host="0.0.0.0", port=8052, echo=lambda *_a: None)
+    assert url == "http://0.0.0.0:8052/ui/"
+    assert "#t=" not in url
+
+
+def test_cli_serve_local_open_seeds_browser_with_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_uvicorn_noop(monkeypatch)
+    import webbrowser
+
+    opened: list[str] = []
+    monkeypatch.setattr(webbrowser, "open", lambda u, *a, **k: opened.append(u) or True)
+    monkeypatch.setenv("BERNSTEIN_AUTH_TOKEN", "legacy-secret-xyz")
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(gui_cli.gui_group, ["serve", "--minimal"])
+    assert result.exit_code == 0, result.output
+    assert opened, "browser was never opened"
+    assert opened[0] == "http://127.0.0.1:8052/ui/#t=legacy-secret-xyz"
+    # The token travels only in the opened browser URL fragment, never in the
+    # console/log output.
+    assert "legacy-secret-xyz" not in result.output
+
+
+def test_cli_serve_local_open_bare_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_uvicorn_noop(monkeypatch)
+    import webbrowser
+
+    opened: list[str] = []
+    monkeypatch.setattr(webbrowser, "open", lambda u, *a, **k: opened.append(u) or True)
+    monkeypatch.delenv("BERNSTEIN_AUTH_TOKEN", raising=False)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(gui_cli.gui_group, ["serve", "--minimal"])
+    assert result.exit_code == 0, result.output
+    assert opened == ["http://127.0.0.1:8052/ui/"]
 
 
 # ---------------------------------------------------------------------------

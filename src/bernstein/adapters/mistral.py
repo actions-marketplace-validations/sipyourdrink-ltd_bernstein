@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from typing import TYPE_CHECKING, Any
 
@@ -12,6 +13,9 @@ if TYPE_CHECKING:
 
 from bernstein.adapters.base import DEFAULT_TIMEOUT_SECONDS, CLIAdapter, SpawnResult, build_worker_cmd
 from bernstein.adapters.env_isolation import build_filtered_env
+from bernstein.adapters.plugin_sdk import AdapterCapability, AdapterPluginInfo
+
+logger = logging.getLogger(__name__)
 
 
 class MistralAdapter(CLIAdapter):
@@ -21,6 +25,24 @@ class MistralAdapter(CLIAdapter):
     ``--auto-approve`` for non-interactive execution and accepts the task
     prompt via the ``--prompt`` flag.
     """
+
+    def plugin_info(self) -> AdapterPluginInfo:
+        """Declare the sampling surface MistralAdapter genuinely wires.
+
+        ``vibe`` accepts a ``--temperature`` flag. It has no documented
+        ``--top-p``/``--top-k``/``--max-tokens`` flag, so only the narrow
+        temperature capability is declared -
+        :func:`bernstein.adapters.plugin_sdk.ensure_sampling_params_supported`
+        refuses a spawn requesting the others rather than silently
+        dropping them.
+        """
+        return AdapterPluginInfo(
+            name="mistral",
+            version="0.1.0",
+            author="bernstein",
+            description="Mistral Vibe CLI adapter",
+            capabilities=(AdapterCapability.SUPPORTS_TEMPERATURE,),
+        )
 
     def spawn(
         self,
@@ -34,6 +56,7 @@ class MistralAdapter(CLIAdapter):
         task_scope: str = "medium",
         budget_multiplier: float = 1.0,
         system_addendum: str = "",
+        multimodal_context: Any | None = None,
     ) -> SpawnResult:
         """Spawn a Mistral Vibe session.
 
@@ -54,6 +77,7 @@ class MistralAdapter(CLIAdapter):
         Raises:
             RuntimeError: If the ``vibe`` binary cannot be found or executed.
         """
+        self.refuse_multimodal_if_needed(multimodal_context)
         log_path = workdir / ".sdd" / "runtime" / f"{session_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -63,6 +87,21 @@ class MistralAdapter(CLIAdapter):
             "--prompt",
             prompt,
         ]
+
+        if mcp_config:
+            temperature = mcp_config.get("temperature")
+            if isinstance(temperature, (int, float)) and not isinstance(temperature, bool):
+                logger.debug("mistral adapter: wiring --temperature=%s onto argv", temperature)
+                cmd.extend(["--temperature", str(float(temperature))])
+            for dropped_key in ("top_p", "top_k", "max_tokens"):
+                if mcp_config.get(dropped_key) is not None:
+                    logger.warning(
+                        "mistral adapter: %s=%r requested but not wired (vibe CLI has no "
+                        "matching flag) - ensure_sampling_params_supported should have refused "
+                        "this spawn before reaching here",
+                        dropped_key,
+                        mcp_config.get(dropped_key),
+                    )
 
         pid_dir = workdir / ".sdd" / "runtime" / "pids"
         wrapped_cmd = build_worker_cmd(
@@ -92,7 +131,7 @@ class MistralAdapter(CLIAdapter):
             except PermissionError as exc:
                 raise RuntimeError(f"Permission denied executing vibe: {exc}") from exc
 
-        # ``proc`` MUST be threaded into SpawnResult — see cursor.py header
+        # ``proc`` MUST be threaded into SpawnResult - see cursor.py header
         # comment for the regression context (downstream needs poll/wait).
         result = SpawnResult(pid=proc.pid, log_path=log_path, proc=proc)
         if timeout_seconds > 0:

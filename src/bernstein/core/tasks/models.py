@@ -5,14 +5,16 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
 from bernstein.core import defaults as _defaults
 from bernstein.core.defaults import AGENT
+from bernstein.core.tasks.artifacts import ArtifactSpec
 
 if TYPE_CHECKING:
+    from bernstein.core.persistence.cache_policy import CachePolicy
     from bernstein.core.protocols.cluster.cluster_tls import TLSConfig
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,39 @@ def _default_poll_interval_s() -> int:
     ``ORCHESTRATOR`` at module scope) are honoured.
     """
     return int(_defaults.ORCHESTRATOR.tick_interval_s)
+
+
+def _default_stalled_manager_threshold_s() -> float:
+    """Return the current canonical stalled-manager deadline.
+
+    Reads from :mod:`bernstein.core.defaults` each call (same pattern as
+    :func:`_default_poll_interval_s`) so that ``tuning.orchestrator.
+    stalled_manager_threshold_s`` overrides from ``bernstein.yaml`` are
+    honoured. See ``core.orchestration.stalled_manager`` for the consumer.
+    """
+    return float(_defaults.ORCHESTRATOR.stalled_manager_threshold_s)
+
+
+def _default_planning_window_s() -> float:
+    """Return the current canonical planning window.
+
+    Reads from :mod:`bernstein.core.defaults` each call (same pattern as
+    :func:`_default_poll_interval_s`) so that ``tuning.orchestrator.
+    planning_window_s`` overrides from ``bernstein.yaml`` are honoured. The
+    ``BERNSTEIN_PLANNING_WINDOW_S`` env var is applied at the use site by
+    ``core.orchestration.run_stall.resolve_planning_window_s``.
+    """
+    return float(_defaults.ORCHESTRATOR.planning_window_s)
+
+
+def _default_max_agent_runtime_s() -> int:
+    """Return the current canonical agent wall-clock kill starting value.
+
+    Reads from :mod:`bernstein.core.defaults` each call (same pattern as
+    :func:`_default_poll_interval_s`) so that ``tuning.orchestrator.
+    max_agent_runtime_s`` overrides are honoured.
+    """
+    return int(_defaults.ORCHESTRATOR.max_agent_runtime_s)
 
 
 class TaskStoreUnavailable(Exception):
@@ -89,6 +124,7 @@ class ProviderType(Enum):
     QWEN = "qwen"
     KIRO = "kiro"
     KILO = "kilo"
+    KIMCHI = "kimchi"
     OLLAMA = "ollama"
     OPENCODE = "opencode"
 
@@ -161,9 +197,12 @@ class TaskStatus(Enum):
     WAITING_FOR_SUBTASKS = "waiting_for_subtasks"
     CANCELLED = "cancelled"
     ORPHANED = "orphaned"  # Agent crashed mid-task; pending crash recovery
+    SUSPENDED = "suspended"  # Operator-parked mid-session; infra released, resumable from an attested receipt (#2552)
     PENDING_APPROVAL = "pending_approval"  # Completed; awaiting human approval before taking effect
     ABANDONED = "abandoned"  # Agent voluntarily abandoned with a structured reason (#1350)
     BLOCKED_BY_ABANDON = "blocked_by_abandon"  # Downstream task waiting on an abandoned dependency (#1350)
+    BLOCKED_BY_FAILED_DEP = "blocked_by_failed_dep"  # Downstream task whose dependency ended unsuccessfully (#3452)
+    REFUSED = "refused"  # Worker reported a typed refusal via the completion contract (#2244)
 
 
 class TaskType(Enum):
@@ -234,10 +273,37 @@ class UpgradeProposalDetails:
 
 @dataclass(frozen=True)
 class CompletionSignal:
-    """Janitor signal for automatic task verification."""
+    """Janitor signal for automatic task verification.
 
-    type: Literal["path_exists", "glob_exists", "test_passes", "file_contains", "llm_review", "llm_judge"]
-    value: str  # path, glob pattern, test command, search string, or review instruction
+    The first six types verify against the filesystem or a test command (the
+    coding path). The next three (issue #2608) operate on an artifact's
+    canonical bytes instead: ``schema_valid`` validates the artifact against a
+    declared JSON Schema, ``criteria_match`` evaluates a closed predicate set,
+    and ``hash_stable`` re-derives the canonical content hash. Their closed
+    evaluators live in :mod:`bernstein.core.tasks.artifacts`; the janitor
+    dispatches them via :func:`bernstein.core.quality.janitor.evaluate_artifact_signals`
+    when the produced artifact is in scope.
+
+    ``figures_grounded`` (issue #2888) is the tenth type: on a report bundle it
+    requires every declared figure's anchor to resolve to a verifying lineage
+    record and every material number in the body to be declared in the sidecar.
+    Its ``value`` is the severity - ``""``/``"strict"`` (an unanchored figure
+    fails completion) or ``"warn"`` (downgrade for exploratory work).
+    """
+
+    type: Literal[
+        "path_exists",
+        "glob_exists",
+        "test_passes",
+        "file_contains",
+        "llm_review",
+        "llm_judge",
+        "schema_valid",
+        "criteria_match",
+        "hash_stable",
+        "figures_grounded",
+    ]
+    value: str  # path, glob pattern, test command, search string, review instruction, criterion payload, or severity
 
 
 @dataclass(frozen=True)
@@ -316,6 +382,104 @@ class ApprovalSpec:
         )
 
 
+def _normalize_attachments(raw: object) -> list[str]:
+    """Coerce an ``attachments`` payload into a ``list[str]``.
+
+    Rejects scalar values (e.g. ``"diagram.png"``) so a malformed
+    payload does not silently turn into one-character paths via
+    iteration. Accepts ``None`` (empty list) and any list-like
+    sequence whose elements coerce to strings.
+    (bot-ack: 3284182800 -- CodeRabbit minor.)
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str | bytes):
+        raise TypeError(
+            "Task.attachments must be a list of paths, got a "
+            f"{type(raw).__name__}; pass [path] for a single attachment."
+        )
+    if not isinstance(raw, list | tuple):
+        raise TypeError(f"Task.attachments must be a list of paths, got {type(raw).__name__}")
+    return [str(a) for a in raw]
+
+
+def _parse_cache_policy(raw: object) -> CachePolicy | None:
+    """Coerce a ``cache_policy`` payload into a :class:`CachePolicy` or ``None``.
+
+    Accepts a JSON mapping (parsed via ``CachePolicy.from_dict``) or an existing
+    ``CachePolicy``. ``None`` (the default) means the task declares no policy and
+    runs byte-identically to the pre-policy spawn path. Imported lazily so the
+    task model has no runtime dependency on the cache subsystem when no policy is
+    declared. (issue #2551)
+    """
+    if raw is None:
+        return None
+    from bernstein.core.persistence.cache_policy import CachePolicy
+
+    if isinstance(raw, CachePolicy):
+        return raw
+    if isinstance(raw, dict):
+        return CachePolicy.from_dict(raw)
+    raise TypeError(f"Task.cache_policy must be a mapping or CachePolicy, got {type(raw).__name__}")
+
+
+def _normalize_evidence_producers(raw: object) -> list[dict[str, Any]]:
+    """Coerce an ``evidence_producers`` payload into a ``list[dict]``.
+
+    Each entry declares one verification-evidence producer (issue #2362):
+    ``{name, kind, command, required}``. Full field validation lives in
+    :func:`bernstein.core.evidence.bundle.parse_producers`; this normaliser only
+    guarantees the field is a list of mappings so a malformed payload fails
+    loudly at task construction rather than at gate time.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        raise TypeError("Task.evidence_producers must be a list of producer specs, got a single mapping")
+    if not isinstance(raw, list | tuple):
+        raise TypeError(f"Task.evidence_producers must be a list, got {type(raw).__name__}")
+    producers: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise TypeError(f"each evidence producer must be a mapping, got {type(entry).__name__}")
+        producers.append({str(k): v for k, v in entry.items()})
+    return producers
+
+
+def _normalize_declared_outputs(raw: object) -> list[str]:
+    """Coerce a ``declared_outputs`` payload into canonical artifact keys.
+
+    Each entry is an artifact URI or a repo-relative path, optionally carrying
+    ``*`` / ``**`` / ``?`` to declare a set (``dist/*.whl``). Entries are
+    canonicalised through
+    :func:`bernstein.core.lineage.artifact_uri.canonical_artifact_pattern`, then
+    deduplicated and sorted so the field is a pure function of the *set* the
+    operator declared: two spellings of one artifact, or the same artifacts
+    listed in a different order, produce the identical stored value and
+    therefore the identical completion diff (issue #2559).
+
+    A malformed entry raises at task construction rather than silently
+    degrading into "declared nothing" at completion time -- a declaration that
+    quietly disappears is worse than no declaration, because the missing-output
+    finding it was supposed to produce also disappears.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str | bytes):
+        raise TypeError("Task.declared_outputs must be a list of artifact keys, got a single string")
+    if not isinstance(raw, list | tuple):
+        raise TypeError(f"Task.declared_outputs must be a list, got {type(raw).__name__}")
+
+    from bernstein.core.lineage.artifact_uri import canonical_artifact_pattern
+
+    canonical: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise TypeError(f"each declared output must be a string, got {type(entry).__name__}")
+        canonical.add(canonical_artifact_pattern(entry))
+    return sorted(canonical)
+
+
 @dataclass
 class Task:
     """A unit of work for an agent."""
@@ -334,6 +498,12 @@ class Task:
     depends_on: list[str] = field(default_factory=list[str])
     parent_task_id: str | None = None
     completion_signals: list[CompletionSignal] = field(default_factory=list[CompletionSignal])
+    # Issue #2608: the typed artifact contract this task produces. Declares the
+    # expected ArtifactKind, its canonicalisation rule, and typed verification
+    # criteria over the artifact bytes. Defaults to ``code_diff`` so an existing
+    # coding task is unchanged (the git-diff path). Round-trips through
+    # ``Task.to_dict`` / ``Task.from_dict``.
+    artifact_spec: ArtifactSpec = field(default_factory=ArtifactSpec)
     owned_files: list[str] = field(default_factory=list[str])
     assigned_agent: str | None = None
     result_summary: str | None = None
@@ -358,6 +528,12 @@ class Task:
     # above continues to govern the *post-completion* review gate so that
     # legacy approve/reject/pending tests stay intact.
     approval_spec: ApprovalSpec | None = None
+    # Issue #2551: opt-in cache policy declared on the task spec. When set, the
+    # cache boundary composes keys over the policy's ingredient recipe, applies
+    # the drift verdict, and routes fleet-key contention through a claim. When
+    # None (the default) the task runs byte-identically to the pre-policy spawn
+    # path. Parsed by ``bernstein.core.persistence.cache_policy.CachePolicy``.
+    cache_policy: CachePolicy | None = None
     risk_level: Literal["low", "medium", "high", "critical"] = "low"  # Risk for approval workflow routing
     sensitivity: Literal["public", "internal", "confidential"] = "internal"  # Data classification level
     max_output_tokens: int | None = None  # Escalated limit for model output
@@ -381,6 +557,11 @@ class Task:
     subtask_wait_started_at: float | None = None  # Epoch when task entered WAITING_FOR_SUBTASKS
     parent_context: str | None = None  # Parent agent's context summary (key decisions, files explored) for subtasks
     requires: list[str] = field(default_factory=list[str])  # Capability-based addressing: e.g. ["python", "testing"]
+    # Issue #2544: free-form admission tags. Declared tags gate the claim
+    # deterministically (AND-of-all under their pool/tag limits) and are sealed
+    # into a post-hoc tag-conformance receipt after completion. Empty = the
+    # task makes no admission-tag claim. See bernstein.core.admission.
+    tags: list[str] = field(default_factory=list[str])
     best_of_n: int | None = (
         None  # Opt-in best-of-N candidate fan-out (K in [2, BEST_OF_N.max_candidates]); None/<=1 = single agent
     )
@@ -404,6 +585,108 @@ class Task:
     # All tasks sharing a ``story_id`` form a rollback grouping ("deliver the
     # whole MVP slice or none of it"). Parsed from the ``[USn]`` marker.
     story_id: str | None = None
+    # Issue #1797: operator-supplied attachments (image / diagram paths)
+    # that the orchestrator encodes into a MultiModalContext at spawn time
+    # and passes to the adapter. Empty list = no attachments. Adapters
+    # that report ``is_multimodal_capable() == False`` MUST refuse spawns
+    # carrying a non-empty list before any process is launched.
+    attachments: list[str] = field(default_factory=list[str])
+    # Issue #2362: declared verification-evidence producers. Each is a mapping
+    # ``{name, kind, command, required}`` describing a proof-of-done producer
+    # (test command, coverage, lint, optional screenshot/recording) run at gate
+    # time. Required producers gate completion; advisory ones only attach. Empty
+    # list = no evidence bundle is sealed for this task. Parsed by
+    # ``bernstein.core.evidence.bundle.parse_producers``.
+    evidence_producers: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    # Issue #2559: the artifacts this task intends to produce, as canonical
+    # artifact keys or patterns (``dist/*.whl``, ``pkg://pypi/bernstein/3.9.0``,
+    # ``pr://github.com/acme/widget/2559``). Where ``evidence_producers``
+    # declares how the work is *verified*, this declares what the work is
+    # supposed to *leave behind*, which is what makes "attempted and failed"
+    # distinguishable from "nothing was scheduled" at completion. Normalised by
+    # ``_normalize_declared_outputs`` into a sorted, deduplicated list. Empty
+    # list = the task declares no outputs and the completion diff is skipped.
+    declared_outputs: list[str] = field(default_factory=list[str])
+    # Explicit override for compute_max_turns()'s complexity-based auto-computation
+    # (see bernstein.core.agents.claude_max_turns.compute_max_turns). When set,
+    # this value is used verbatim for the Claude adapter's --max-turns flag,
+    # bypassing all scope/complexity-derived math. None = auto-compute as before.
+    max_turns: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise a Task into a JSON-safe mapping that ``from_dict`` reads back.
+
+        The mapping mirrors every field :meth:`from_dict` consumes, so
+        ``Task.from_dict(task.to_dict())`` reconstructs the task faithfully
+        (including the :class:`ArtifactSpec`). Enums serialise to their string
+        values and nested specs to their own ``to_dict`` form.
+        """
+        return {
+            "id": self.id,
+            "title": self.title,
+            "description": self.description,
+            "role": self.role,
+            "priority": self.priority,
+            "scope": self.scope.value,
+            "complexity": self.complexity.value,
+            "estimated_minutes": self.estimated_minutes,
+            "status": self.status.value,
+            "task_type": self.task_type.value,
+            "upgrade_details": (asdict(self.upgrade_details) if self.upgrade_details is not None else None),
+            "depends_on": list(self.depends_on),
+            "parent_task_id": self.parent_task_id,
+            "completion_signals": [{"type": s.type, "value": s.value} for s in self.completion_signals],
+            "artifact_spec": self.artifact_spec.to_dict(),
+            "owned_files": list(self.owned_files),
+            "assigned_agent": self.assigned_agent,
+            "result_summary": self.result_summary,
+            "tenant_id": self.tenant_id,
+            "cell_id": self.cell_id,
+            "repo": self.repo,
+            "depends_on_repo": self.depends_on_repo,
+            "model": self.model,
+            "effort": self.effort,
+            "cli": self.cli,
+            "mcp_servers": list(self.mcp_servers),
+            "metadata": dict(self.metadata),
+            "batch_eligible": self.batch_eligible,
+            "eu_ai_act_risk": self.eu_ai_act_risk,
+            "approval_required": self.approval_required,
+            "approval_spec": (self.approval_spec.to_dict() if self.approval_spec is not None else None),
+            "cache_policy": (self.cache_policy.to_dict() if self.cache_policy is not None else None),
+            "risk_level": self.risk_level,
+            "max_output_tokens": self.max_output_tokens,
+            "meta_messages": list(self.meta_messages),
+            "created_at": self.created_at,
+            "claimed_at": self.claimed_at,
+            "completed_at": self.completed_at,
+            "closed_at": self.closed_at,
+            "deadline": self.deadline,
+            "progress_log": list(self.progress_log),
+            "version": self.version,
+            "claimed_by_session": self.claimed_by_session,
+            "parent_session_id": self.parent_session_id,
+            "execution_mode": self.execution_mode,
+            "verification_count": self.verification_count,
+            "flagged_unverified": self.flagged_unverified,
+            "retry_count": self.retry_count,
+            "max_retries": self.max_retries,
+            "retry_delay_s": self.retry_delay_s,
+            "terminal_reason": self.terminal_reason,
+            "subtask_wait_started_at": self.subtask_wait_started_at,
+            "parent_context": self.parent_context,
+            "requires": list(self.requires),
+            "tags": list(self.tags),
+            "best_of_n": self.best_of_n,
+            "refinement_rounds": self.refinement_rounds,
+            "agent_restart_between_retries": self.agent_restart_between_retries,
+            "parallel_safe": self.parallel_safe,
+            "story_id": self.story_id,
+            "attachments": list(self.attachments),
+            "evidence_producers": [dict(p) for p in self.evidence_producers],
+            "declared_outputs": list(self.declared_outputs),
+            "max_turns": self.max_turns,
+        }
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Task:
@@ -428,6 +711,33 @@ class Task:
                 signals.append(CompletionSignal(type=sig["type"], value=sig["value"]))
             except (KeyError, TypeError):
                 logger.warning("Invalid completion_signal entry: %r", sig)
+
+        # Rehydration boundary, deliberately lenient (#3110): every operator
+        # input surface (plan schema/loader, backlog frontmatter, CLI flags,
+        # POST /tasks) now refuses a malformed declaration at load via
+        # ``bernstein.core.tasks.artifacts.parse_artifact_spec``, so a bad
+        # block cannot *newly* enter a store. What reaches this path is a
+        # previously persisted record or a server response; raising here would
+        # brick store rehydration over one historic record, so the entry is
+        # logged as an error (loudly - this used to be the silent-downgrade
+        # hole) and the task falls back to the code_diff contract.
+        raw_spec = raw.get("artifact_spec")
+        if isinstance(raw_spec, ArtifactSpec):
+            artifact_spec = raw_spec
+        elif isinstance(raw_spec, dict):
+            try:
+                artifact_spec = ArtifactSpec.from_dict(raw_spec)
+            except (KeyError, TypeError, ValueError):
+                logger.error(
+                    "Invalid artifact_spec entry on stored task %r: %r - falling back to code_diff. "
+                    "New declarations are refused at load; this record predates that boundary or was "
+                    "hand-edited.",
+                    raw.get("id"),
+                    raw_spec,
+                )
+                artifact_spec = ArtifactSpec()
+        else:
+            artifact_spec = ArtifactSpec()
 
         upgrade_details: UpgradeProposalDetails | None = None
         raw_upgrade = raw.get("upgrade_details")
@@ -459,6 +769,7 @@ class Task:
             depends_on=raw.get("depends_on", []),
             parent_task_id=raw.get("parent_task_id"),
             completion_signals=signals,
+            artifact_spec=artifact_spec,
             owned_files=raw.get("owned_files", []),
             assigned_agent=raw.get("assigned_agent"),
             result_summary=raw.get("result_summary"),
@@ -470,12 +781,14 @@ class Task:
             effort=raw.get("effort"),
             cli=raw.get("cli"),
             mcp_servers=list(raw.get("mcp_servers", [])),
+            metadata=dict(raw.get("metadata") or {}),
             batch_eligible=(lambda v: None if v is None else bool(v))(raw.get("batch_eligible")),
             eu_ai_act_risk=raw.get("eu_ai_act_risk", "minimal"),
             approval_required=bool(raw.get("approval_required", False)),
             approval_spec=(
                 ApprovalSpec.from_dict(raw["approval_spec"]) if isinstance(raw.get("approval_spec"), dict) else None
             ),
+            cache_policy=_parse_cache_policy(raw.get("cache_policy")),
             risk_level=raw.get("risk_level", "low"),
             max_output_tokens=raw.get("max_output_tokens"),
             meta_messages=list(raw.get("meta_messages", [])),
@@ -498,11 +811,16 @@ class Task:
             subtask_wait_started_at=raw.get("subtask_wait_started_at"),
             parent_context=raw.get("parent_context"),
             requires=list(raw.get("requires", [])),
+            tags=[str(t) for t in raw.get("tags", [])],
             best_of_n=(lambda v: None if v is None else int(v))(raw.get("best_of_n")),
             refinement_rounds=(lambda v: None if v is None else int(v))(raw.get("refinement_rounds")),
             agent_restart_between_retries=bool(raw.get("agent_restart_between_retries", False)),
             parallel_safe=bool(raw.get("parallel_safe", False)),
             story_id=(str(raw["story_id"]) if raw.get("story_id") else None),
+            attachments=_normalize_attachments(raw.get("attachments")),
+            evidence_producers=_normalize_evidence_producers(raw.get("evidence_producers")),
+            declared_outputs=_normalize_declared_outputs(raw.get("declared_outputs")),
+            max_turns=(lambda v: None if v is None else int(v))(raw.get("max_turns")),
         )
 
 
@@ -548,6 +866,9 @@ class JanitorResult:
     guardrail_results: list[GuardrailResult] = field(
         default_factory=list[GuardrailResult]
     )  # Pre-merge guardrail checks
+    # Composite verifier-ladder receipt hash (#2927). Set only when the
+    # janitor ran with a VerifierLadderContext; None when the ladder is off.
+    ladder_receipt_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -860,6 +1181,7 @@ class AgentSession:
     provider: str | None = None  # Provider selected by TierAwareRouter
     agent_source: str = "built-in"  # "catalog", "agency", or "built-in"
     timeout_s: int | None = None  # Per-agent wall-clock timeout; None = use OrchestratorConfig default
+    timeout_timer: Any | None = None  # Armed watchdog timer, stashed at spawn for re-arm on extension (#4571)
     log_path: str = ""  # Path to agent log file for live streaming
     tokens_used: int = 0  # Running total of input+output tokens consumed by this agent
     token_budget: int = 0  # Per-task token budget computed from scope (0 = unlimited)
@@ -877,6 +1199,61 @@ class AgentSession:
     abort_detail: str = ""
     finish_reason: str = ""
     meta_messages: list[str] = field(default_factory=list[str])  # Operational nudges/hints (T423)
+    # Response-style profile applied at spawn. The profile name and the
+    # SHA-256 of the rendered style addendum are stamped here so the cost
+    # ledger entry written at task completion can attribute spend per
+    # profile without re-resolving config.
+    response_profile: str = ""
+    profile_content_sha256: str = ""
+    # Consecutive reap ticks where heartbeat_ts was refreshed only from the
+    # agent log's mtime, not a live PID or the heartbeat JSON (issue #3058).
+    # Reset whenever a stronger signal confirms real activity.
+    log_only_heartbeat_ticks: int = 0
+    # Declared context files resolved at dispatch (issue #3375). Each entry
+    # is ``{"path", "order", "sha256", "reason_code"}`` in declared order -
+    # an unresolvable path keeps its position with a reason code instead of
+    # being skipped. Stamped by the spawner so the run journal can record
+    # the attachment set next to the ``agent_spawned`` event. Empty when the
+    # session's tasks declare nothing.
+    context_attachments: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+    # Skill templates injected into the worktree at spawn time (issue #3382).
+    # Each entry is ``{"template_name", "version", "pre_render_digest",
+    # "rendered_digest", "trigger_source", "status"}`` in injection order -
+    # a revoked skill keeps its position with status="refused" instead of
+    # being skipped. Stamped by the spawner so the run journal can record
+    # the injected set next to the ``agent_spawned`` event, independent of
+    # whether the human-readable activation log is enabled. Empty when
+    # nothing was injected (not absent).
+    injected_skills: list[dict[str, str]] = field(default_factory=list)
+    # Operator attachments resolved at spawn (issue #1797). Each entry is
+    # ``{"sha256", "mime", "worktree_id", "source_path", "modality"}`` in
+    # declared order. Stamped by the spawner from the same dispatch that
+    # stored the bytes in CAS and appended the ``multimodal.attach`` chain
+    # event, so the session record names exactly the digests the chain
+    # attests. Empty when the session's tasks declare no attachments.
+    multimodal_attachments: list[dict[str, str]] = field(default_factory=list)
+    # Per-section context receipt captured at spawn time (issue #4405). Each
+    # entry is ``{"label", "content_sha256", "token_estimate", "char_count"}``
+    # in prompt order - a deterministic fingerprint of the context actually
+    # sent to the model. Empty when no receipt was captured.
+    context_receipt: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+
+    # Spawn-time prompt budget measurement (#4377). Stamped before the
+    # adapter is invoked so the cost is queryable without waiting for the
+    # session to end.
+    spawn_prompt_tokens: int = 0  # estimated token count of assembled prompt at spawn
+    spawn_prompt_utilization_pct: float = 0.0  # percentage of context window consumed by prompt
+    spawn_prompt_over_budget: bool = False  # True when prompt exceeded the budget threshold
+
+    # Endpoint identity resolved at spawn time (issue #4908):
+    # - adapter: the adapter name that actually served this spawn
+    # - model: the model that actually served this spawn
+    # - base_url: the normalized endpoint base URL (api_key_env value excluded)
+    # - endpoint_profile_name: the local_endpoints profile name when one applied
+    endpoint_adapter_name: str = ""  # adapter name
+    endpoint_model: str = ""  # model served
+    endpoint_base_url: str = ""  # normalized base_url (no secrets)
+    endpoint_profile_name: str = ""  # local_endpoints profile name
 
 
 class IsolationMode(StrEnum):
@@ -887,13 +1264,49 @@ class IsolationMode(StrEnum):
     CONTAINER = "container"
 
 
+@dataclass(frozen=True, slots=True)
+class IsolationDowngrade:
+    """A requested isolation boundary that could not be provided.
+
+    Issue #3014: when a spawn is routed to container isolation - via the
+    ``sandbox:`` config, ``--sandbox docker``, or ``BERNSTEIN_SANDBOX_RUNTIME``
+    - but no container runtime is available, the spawn falls back to a weaker
+    boundary (worktree, or none). Left as a bare log WARNING, that downgrade is
+    invisible to the operator who asked for the stronger boundary. Recording it
+    as a typed value lets the run summary and the HMAC-chained audit log both
+    surface requested-vs-actual isolation, so the weaker posture is an auditable
+    decision rather than a silent substitution.
+
+    Attributes:
+        session_id: Agent session whose isolation was downgraded.
+        requested: The isolation mode that was requested (an
+            :class:`IsolationMode` value, e.g. ``"container"``).
+        actual: The isolation mode actually provided (e.g. ``"worktree"``).
+        reason: Human-readable cause (typically the container-runtime error).
+    """
+
+    session_id: str
+    requested: str
+    actual: str
+    reason: str
+
+    def as_dict(self) -> dict[str, str]:
+        """Return a JSON-serialisable mapping for run-summary rendering."""
+        return {
+            "session_id": self.session_id,
+            "requested": self.requested,
+            "actual": self.actual,
+            "reason": self.reason,
+        }
+
+
 class AgentBackend(StrEnum):
     """Agent execution backend.
 
     SUBPROCESS (default) launches each agent as a separate OS process.
     TMUX runs the agent in a tmux session for manual inspection.
     IN_PROCESS runs the agent as a Python thread in the same process
-    for lightweight, fast tasks — use with caution, crashes can take
+    for lightweight, fast tasks - use with caution, crashes can take
     down the task server.
     SSH runs the agent on a remote machine via SSH; requires a ``remote:``
     section in bernstein.yaml.
@@ -1124,6 +1537,8 @@ class ConvergenceGuardConfig:
         max_spawn_rate: Maximum spawns per minute before blocking spawns.
         error_rate_window_seconds: Look-back window for computing error rate.
         spawn_rate_window_seconds: Look-back window for computing spawn rate.
+        min_error_rate_samples: Observations the error-rate window must hold
+            before that gate may block a wave.
     """
 
     max_pending_merges: int = 10
@@ -1132,6 +1547,7 @@ class ConvergenceGuardConfig:
     max_spawn_rate: float = 12.0
     error_rate_window_seconds: int = 300  # 5 minutes
     spawn_rate_window_seconds: int = 60  # 1 minute
+    min_error_rate_samples: int = 3
 
 
 @dataclass(frozen=True)
@@ -1195,8 +1611,27 @@ class OrchestratorConfig:
     # Unified with AGENT.heartbeat_stale_s. Previously 900s; now defaults to 120s.
     # Deployments that explicitly relied on the 900s value must set this field explicitly.
     heartbeat_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_stale_s))
+    # Time-to-first-turn cap for agents still in the `starting` phase. Kept
+    # separate from (and larger than) ``heartbeat_timeout_s`` so a slow/free
+    # model that takes >120s to its first turn is not reaped mid-work while a
+    # non-heartbeat adapter has only its spawn-time heartbeat on disk (issue
+    # #3012). Overridable via ``tuning.agent.heartbeat_starting_timeout_s``.
+    heartbeat_starting_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_starting_timeout_s))
     heartbeat_enabled: bool = True
-    max_agent_runtime_s: int = 1800  # 30 min wall-clock kill (agents need time for complex tasks)
+    # Derived from ORCHESTRATOR.max_agent_runtime_s (canonical) so
+    # ``tuning.orchestrator.max_agent_runtime_s`` overrides the starting
+    # wall-clock kill deadline (agents need time for complex tasks; this
+    # self-extends up to a 5400s hard cap while heartbeating, see
+    # core/agents/agent_lifecycle.py - this is only the starting value).
+    max_agent_runtime_s: int = field(default_factory=_default_max_agent_runtime_s)
+    # Derived from ORCHESTRATOR.stalled_manager_threshold_s (canonical) so
+    # ``tuning.orchestrator.stalled_manager_threshold_s`` overrides actually
+    # change the manager-stall deadline. See core.orchestration.stalled_manager.
+    stalled_manager_threshold_s: float = field(default_factory=_default_stalled_manager_threshold_s)
+    # Derived from ORCHESTRATOR.planning_window_s (canonical). Bounds how long
+    # the run may sit on an empty ledger after planning has already produced
+    # tasks at least once; see core.orchestration.orchestrator.
+    planning_window_s: float = field(default_factory=_default_planning_window_s)
     max_tasks_per_agent: int = 2  # batch 2 same-role tasks per agent to reduce context overhead
     server_url: str = "http://localhost:8052"
     evolution_enabled: bool = True
@@ -1209,22 +1644,26 @@ class OrchestratorConfig:
     budget_aware_routing_enabled: bool = True  # downgrade opus→sonnet near budget cap
     dry_run: bool = False  # Preview planned spawns without actually spawning agents
     auth_token: str | None = None  # Bearer token for authenticated API calls
-    merge_strategy: str = "pr"  # "pr" | "direct" — how agent work reaches the main branch
+    merge_strategy: str = "pr"  # "pr" | "direct" - how agent work reaches the main branch
     auto_merge: bool = True  # Auto-merge PR after code review passes (requires gh CLI)
     pr_labels: list[str] = field(default_factory=lambda: ["bernstein", "auto-generated"])
     approval: Any = "auto"  # "auto" | "review" | "pr" or dict for workflow
     approval_workflow: ApprovalWorkflowConfig | None = field(default=None, repr=False)
-    recovery: str = "resume"  # "resume" | "restart" | "escalate" — crash recovery strategy
+    recovery: str = "resume"  # "resume" | "restart" | "escalate" - crash recovery strategy
     max_crash_retries: int = 2  # Max times to resume in same worktree before escalating
     cross_model_verify: Any | None = None  # CrossModelVerifierConfig | None
-    context_degradation: Any | None = None  # ContextDegradationConfig | None — restart agents on quality drop
-    force_parallel: bool = False  # Skip complexity advisor — always decompose/parallelize
+    context_degradation: Any | None = None  # ContextDegradationConfig | None - restart agents on quality drop
+    # Proactive compaction lane: {proactive, threshold, max_per_task}.
+    # Resolved by orchestration.proactive_compaction.resolve_compaction_settings;
+    # None keeps the lane off so existing runs are unchanged.
+    compaction: Any | None = None
+    force_parallel: bool = False  # Skip complexity advisor - always decompose/parallelize
     plan_mode: bool = False  # When True, tasks start as PLANNED and require approval before execution
     workflow: str | None = None  # "governed" activates governed workflow mode; None = adaptive (default)
     container_isolation: ContainerIsolationConfig = field(
         default_factory=ContainerIsolationConfig,
     )  # Container-based agent isolation settings
-    compliance: Any | None = None  # ComplianceConfig | None — compliance preset configuration
+    compliance: Any | None = None  # ComplianceConfig | None - compliance preset configuration
     max_tokens_per_task: dict[str, int] = field(
         default_factory=lambda: {"small": 10_000, "medium": 50_000, "large": 200_000},
     )  # Per-task token budget by scope; agents warned at 80%, hard-killed at 2x
@@ -1234,11 +1673,16 @@ class OrchestratorConfig:
     cost_anomaly: CostAnomalyConfig = field(default_factory=CostAnomalyConfig)
     batch: BatchConfig = field(default_factory=BatchConfig)
     max_cost_per_agent: float = 0.0  # Hard per-agent spend cap (0 = unlimited)
+    # Cost-aware scheduling policy (issue #2354): USD caps + price-table
+    # overrides consulted before each dispatch. ``None`` (the default) leaves
+    # the deterministic USD dispatch gate a no-op (fail-open). Typed ``Any`` to
+    # avoid importing the pydantic config schema into the task models module.
+    cost_policy: Any | None = None
     test_agent: TestAgentConfig = field(default_factory=TestAgentConfig)
     convergence: ConvergenceGuardConfig = field(default_factory=ConvergenceGuardConfig)
     ci_autofix: CIAutofixConfig = field(default_factory=CIAutofixConfig)
-    permission_mode: str | None = None  # "bypass" | "plan" | "auto" | "default" — see permission_mode.py
-    agent_resource_limits: Any | None = None  # ResourceLimits | None — OS-level limits for non-sandboxed spawns
+    permission_mode: str | None = None  # "bypass" | "plan" | "auto" | "default" - see permission_mode.py
+    agent_resource_limits: Any | None = None  # ResourceLimits | None - OS-level limits for non-sandboxed spawns
     shutdown_stagger_delay_s: float = 5.0  # Seconds between SHUTDOWN signals during drain
     # Single source of truth lives in ``defaults.ORCHESTRATOR``; using ``default_factory`` with a
     # module-attribute lookup (not a captured reference) ensures ``override()`` and ``reset()``
@@ -1250,6 +1694,15 @@ class OrchestratorConfig:
     drain_timeout_s: float = field(
         default_factory=lambda: _defaults.ORCHESTRATOR.drain_timeout_s,
     )  # Seconds to wait for agents during drain before cleanup
+    # Terminal state for a quiescent run that produced zero terminal tasks
+    # (issue #3010). See ``core.orchestration.run_stall`` for the criterion
+    # and ``defaults.OrchestratorDefaults`` for why the grace is 1800s.
+    stalled_run_grace_s: float = field(
+        default_factory=lambda: _defaults.ORCHESTRATOR.stalled_run_grace_s,
+    )  # Seconds of unchanged task state before a zero-terminal run is stopped
+    stalled_run_ticks: int = field(
+        default_factory=lambda: _defaults.ORCHESTRATOR.stalled_run_ticks,
+    )  # Consecutive no-progress quiescent ticks required alongside the grace
     # Priority-aging janitor: boost long-waiting low-priority tasks
     # so they do not starve behind a steady stream of P1 work.  Default off
     # until run data confirms behaviour; interval is measured in orchestrator ticks.
@@ -1261,6 +1714,26 @@ class OrchestratorConfig:
     # Default off; enable once multi-tenant workloads exist.
     fair_scheduling_enabled: bool = False
     cost_autopilot: bool = False  # Wire CostAutopilot when True
+    # Scheduled dependency vulnerability scan. Off by default so a scoped run
+    # is never given unrequested background maintenance tasks; enable only when
+    # the target repo declares Python dependencies that should be audited.
+    dependency_scan_enabled: bool = False
+    # Whether a run whose branch diff touches src/ without tests/ gets one
+    # bounded test-authoring follow-up task at run completion (issue #4462).
+    # On by default; threaded from the seed's ``orchestration.test_followup``
+    # (bernstein.yaml). See core.orchestration.test_followup.
+    test_followup_enabled: bool = True
+    # Issue #4463: on a merge-gate (lint/tests) failure in the reap-and-merge
+    # path, seed one bounded repair task carrying the real gate output before
+    # falling through to the existing reopen/permanent-fail handling. Default
+    # on. Env override ``BERNSTEIN_GATE_REPAIR`` takes precedence when set
+    # (see ``task_lifecycle._gate_repair_enabled``).
+    gate_repair_enabled: bool = True
+    # Janitor LLM-judge model/provider override, threaded from the seed's
+    # ``judge_model``/``judge_provider`` (bernstein.yaml). None = fall back
+    # to the janitor's hardcoded JUDGE_MODEL/JUDGE_PROVIDER defaults.
+    judge_model: str | None = None
+    judge_provider: str | None = None
 
     def __post_init__(self) -> None:
         """Parse nested workflow config if dict provided."""
@@ -1292,7 +1765,7 @@ class TaskCostEstimate:
     task_id: str
     title: str
     role: str
-    model: str = "sonnet"
+    model: str = "unresolved"
     estimated_tokens: int = 0
     estimated_cost_usd: float = 0.0
     risk_level: Literal["low", "medium", "high", "critical"] = "low"
@@ -1326,6 +1799,9 @@ class TaskPlan:
         created_at: Unix timestamp when the plan was created.
         decided_at: Unix timestamp when the plan was approved/rejected.
         decision_reason: Optional reason provided by the human.
+        rendering_hash: SHA-256 digest of the canonical plan rendering, bound
+            into the approval decision so a plan modified after review is
+            detected at decision time.
     """
 
     id: str
@@ -1338,6 +1814,7 @@ class TaskPlan:
     created_at: float = field(default_factory=time.time)
     decided_at: float | None = None
     decision_reason: str = ""
+    rendering_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-safe dict."""
@@ -1364,6 +1841,7 @@ class TaskPlan:
             "created_at": self.created_at,
             "decided_at": self.decided_at,
             "decision_reason": self.decision_reason,
+            "rendering_hash": self.rendering_hash,
         }
 
     @classmethod
@@ -1374,7 +1852,7 @@ class TaskPlan:
                 task_id=e["task_id"],
                 title=e["title"],
                 role=e["role"],
-                model=e.get("model", "sonnet"),
+                model=e.get("model", "unresolved"),
                 estimated_tokens=int(e.get("estimated_tokens", 0)),
                 estimated_cost_usd=float(e.get("estimated_cost_usd", 0.0)),
                 risk_level=e.get("risk_level", "low"),
@@ -1393,6 +1871,7 @@ class TaskPlan:
             created_at=float(d.get("created_at", 0.0)),
             decided_at=d.get("decided_at"),
             decision_reason=d.get("decision_reason", ""),
+            rendering_hash=d.get("rendering_hash", ""),
         )
 
 
@@ -1451,6 +1930,117 @@ class NodeInfo:
 
 
 @dataclass(frozen=True)
+class MeshPeerKey:
+    """A gossip peer's pinned identity: its ``node_id`` and its public key.
+
+    A MESH ``node_id`` is not an operator-chosen label -- it is the RFC 7638
+    thumbprint of the node's Ed25519 claim-signing key, so the identity and the
+    key are the same fact. Pinning therefore has a checkable form: the
+    thumbprint of ``public_key_x`` must reproduce ``node_id``, which is what
+    :meth:`node_id_from_key` computes and the seed loader asserts. A pin that
+    does not verify is a typo, not a policy, and is rejected before a node
+    boots with it.
+
+    Attributes:
+        node_id: The peer's install identity id, as it appears in the
+            ``node_id`` field of every receipt that peer signs.
+        public_key_x: Base64url (unpadded) encoding of the peer's raw 32-byte
+            Ed25519 public key -- the JWK ``x`` member per RFC 8037.
+    """
+
+    node_id: str
+    public_key_x: str
+
+    def to_jwk(self) -> dict[str, str]:
+        """Return this key as an RFC 8037 OKP JWK."""
+        return {"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "x": self.public_key_x}
+
+    def node_id_from_key(self) -> str:
+        """Return the RFC 7638 thumbprint of :attr:`public_key_x`.
+
+        Equals :attr:`node_id` for a correctly pinned peer; the seed loader
+        compares the two so a pin cannot name a node whose key it does not
+        carry.
+        """
+        import base64
+        import hashlib
+        import json
+
+        canonical = json.dumps(
+            {"crv": "Ed25519", "kty": "OKP", "x": self.public_key_x},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        digest = hashlib.sha256(canonical).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    @classmethod
+    def from_material(cls, node_id: str, material: object) -> MeshPeerKey:
+        """Build a pin from the key material an operator can paste into YAML.
+
+        Three forms are accepted, all normalising to the same JWK ``x``:
+
+        * The SPKI PEM a peer publishes at
+          ``.sdd/cluster/identity/claim_signing.pub``.
+        * A JWK mapping (``kty``/``crv`` must be ``OKP``/``Ed25519``).
+        * The bare base64url ``x`` member.
+
+        Args:
+            node_id: The peer's install identity id.
+            material: The key material in one of the three forms above.
+
+        Returns:
+            The normalised :class:`MeshPeerKey`.
+
+        Raises:
+            ValueError: When the material is not a usable Ed25519 public key.
+                The message names the accepted forms so a bad paste is
+                actionable at seed load.
+        """
+        import base64
+
+        if isinstance(material, dict):
+            jwk: dict[str, object] = material
+            if jwk.get("kty") != "OKP" or jwk.get("crv") != "Ed25519":
+                raise ValueError("JWK must have kty='OKP' and crv='Ed25519'")
+            x_member = jwk.get("x")
+            if not isinstance(x_member, str) or not x_member.strip():
+                raise ValueError("JWK is missing a non-empty 'x' member")
+            x = x_member.strip()
+        elif isinstance(material, str) and material.strip():
+            text = material.strip()
+            if "-----BEGIN" in text:
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+                try:
+                    loaded = serialization.load_pem_public_key(text.encode("ascii"))
+                except Exception as exc:
+                    raise ValueError(f"not a readable PEM public key: {exc}") from exc
+                if not isinstance(loaded, Ed25519PublicKey):
+                    raise ValueError("PEM public key is not Ed25519")
+                raw = loaded.public_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw,
+                )
+                x = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+            else:
+                x = text
+        else:
+            raise ValueError(
+                "must be an Ed25519 public key: SPKI PEM text, an OKP JWK mapping, or the base64url 'x' member",
+            )
+
+        try:
+            raw_key = base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
+        except Exception as exc:
+            raise ValueError(f"public key is not valid base64url: {exc}") from exc
+        if len(raw_key) != 32:
+            raise ValueError(f"Ed25519 public key must decode to 32 bytes, got {len(raw_key)}")
+        return cls(node_id=node_id, public_key_x=x)
+
+
+@dataclass(frozen=True)
 class ClusterConfig:
     """Configuration for distributed cluster mode.
 
@@ -1466,6 +2056,18 @@ class ClusterConfig:
             When set, the central server serves over HTTPS with the supplied
             cert chain and worker httpx clients present a client cert.
             See :mod:`bernstein.core.protocols.cluster.cluster_tls`.
+        gossip_peers: MESH only. Peer base URLs this node gossips claim
+            receipts to. Empty on STAR, where coordination is central.
+        claim_lease_ttl_s: MESH only. Lease duration granted to a self-claim
+            in the signed claim journal.
+        claim_journal_path: MESH only. Explicit path to the signed claim
+            journal. ``None`` uses the conventional
+            ``.sdd/cluster/claim_journal.jsonl``.
+        gossip_peer_keys: MESH only. The peers whose gossiped receipts this
+            node will fold, each pinned to the Ed25519 key that must have
+            signed them. Empty means no peer is trusted: a MESH node folds
+            only receipts signed by a pinned key, so gossip is closed until
+            the operator opens it deliberately (#2997).
     """
 
     enabled: bool = False
@@ -1476,6 +2078,17 @@ class ClusterConfig:
     server_url: str | None = None  # Central server URL (worker nodes connect here)
     bind_host: str = "127.0.0.1"  # Default: localhost only
     tls: TLSConfig | None = None
+    # MESH-only keys (issue #2558). Unused on STAR, whose behaviour is
+    # unchanged by their presence.
+    gossip_peers: tuple[str, ...] = ()
+    claim_lease_ttl_s: int = 300
+    claim_journal_path: str | None = None
+    gossip_peer_keys: tuple[MeshPeerKey, ...] = ()
+
+    @property
+    def is_mesh(self) -> bool:
+        """``True`` when this config selects the leaderless MESH topology."""
+        return self.topology is ClusterTopology.MESH
 
     @property
     def cluster_url_scheme(self) -> str:
@@ -1549,7 +2162,7 @@ class LifecycleEvent:
     """Typed event emitted on every task or agent status transition.
 
     This is the single source of truth for replay, audit, and metrics.
-    Every status change — task or agent — produces exactly one event.
+    Every status change - task or agent - produces exactly one event.
 
     Attributes:
         timestamp: Unix epoch when the transition occurred.

@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich import box
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 @dataclass
@@ -32,6 +37,12 @@ class RunSummaryData:
     sequential_time_seconds: float | None = None
     cost_per_task_usd: float = 0.0
     routing_savings_usd: float = 0.0
+    # Issue #3014: spawns whose requested container isolation could not be
+    # honoured and fell back to a weaker boundary. Each item carries
+    # ``session_id``/``requested``/``actual``/``reason`` so the run outcome
+    # shows requested-vs-actual isolation instead of hiding the downgrade in a
+    # log WARNING.
+    isolation_downgrades: list[dict[str, str]] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
     @property
@@ -74,6 +85,67 @@ def _fmt_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
+
+
+#: Rendered when an entry does not carry the field, matching the historical
+#: positional read. A downgrade record is written by the spawner and always
+#: carries both, so this is a defensive default rather than a live path.
+_DEFAULT_REQUESTED = "container"
+_DEFAULT_ACTUAL = "worktree"
+
+
+def _representative_downgrade(entries: Sequence[dict[str, str]]) -> tuple[str, str, int, int]:
+    """Return ``(requested, actual, pair_count, distinct_kinds)`` for a run.
+
+    The card names one requested-vs-actual pair, and which one it names must not
+    depend on the order the spawner happened to append in. Downgrades are
+    recorded from whichever spawn thread hit the fallback (see
+    ``SpawnerCore._record_isolation_downgrade``), so index ``0`` is whichever
+    thread won a race; with two downgrade kinds reachable in one run (#3028)
+    that made the same run render two different lines.
+
+    The pair is therefore chosen by a total order over the entries rather than
+    by position: most frequent first, ties broken on the pair itself. Any
+    permutation of the same downgrades yields the same answer.
+
+    ``pair_count`` counts only the entries that carry the chosen pair, and is
+    reported separately from the run total: attributing every downgrade in a
+    heterogeneous run to one pair overstates what happened to the boundary the
+    card names.
+
+    Args:
+        entries: Downgrade records, each with ``requested`` and ``actual``.
+
+    Returns:
+        The chosen pair, how many entries carry it, and how many distinct pairs
+        the run holds. ``(default, default, 0, 0)`` for an empty sequence.
+    """
+    counts: Counter[tuple[str, str]] = Counter(
+        (
+            str(entry.get("requested", _DEFAULT_REQUESTED)),
+            str(entry.get("actual", _DEFAULT_ACTUAL)),
+        )
+        for entry in entries
+    )
+    if not counts:
+        return _DEFAULT_REQUESTED, _DEFAULT_ACTUAL, 0, 0
+    (requested, actual), pair_count = min(counts.items(), key=lambda item: (-item[1], item[0]))
+    return requested, actual, pair_count, len(counts)
+
+
+def _downgrade_summary(entries: Sequence[dict[str, str]]) -> str:
+    """Render the isolation-downgrade cell for *entries*.
+
+    A run whose downgrades all share one pair keeps the original wording. A run
+    that holds more than one pair says so, and says how much of the run the
+    named pair accounts for, so the line cannot be read as covering downgrades
+    it does not describe.
+    """
+    requested, actual, pair_count, kinds = _representative_downgrade(entries)
+    total = len(entries)
+    if kinds <= 1:
+        return f"{requested} -> {actual} (x{total})"
+    return f"{requested} -> {actual} (x{pair_count} of {total} across {kinds} kinds)"
 
 
 def build_summary_card(data: RunSummaryData) -> Table:
@@ -146,6 +218,15 @@ def build_summary_card(data: RunSummaryData) -> Table:
         else:
             q_color = "red"
         table.add_row("Quality score", f"[{q_color}]{pct:.0f}%[/{q_color}]")
+
+    # Issue #3014: surface any isolation downgrade so an operator who requested
+    # a stronger boundary (``sandbox:`` config or ``--sandbox docker``) sees at
+    # run level that a weaker one was used.
+    if data.isolation_downgrades:
+        table.add_row(
+            "[yellow]Isolation downgrade[/yellow]",
+            f"[yellow]{_downgrade_summary(data.isolation_downgrades)}[/yellow]",
+        )
 
     return table
 

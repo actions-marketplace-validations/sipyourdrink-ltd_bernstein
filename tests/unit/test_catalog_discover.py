@@ -262,14 +262,19 @@ class TestLoadGenericEntry:
         assert result["security"]["model"] == "sonnet"
         assert result["security"]["effort"] == "high"
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="chmod 0o000 has no effect on Windows")
     def test_skips_unreadable_file(self, tmp_path, caplog):
-        """Unreadable files are logged as warnings and skipped."""
+        """An unreadable file is skipped; a readable one loads (platform-keyed).
+
+        Runs on every OS. ``chmod 0o000`` denies read on POSIX (the file is
+        skipped) but is a no-op on Windows (the file stays readable and loads),
+        so the expectation is keyed off the platform rather than skipping the
+        Windows lane.
+        """
         import logging
 
         bad_file = tmp_path / "bad.yaml"
         bad_file.write_text("role: something")
-        bad_file.chmod(0o000)  # make unreadable
+        bad_file.chmod(0o000)  # denies read on POSIX; no-op on Windows
 
         registry = CatalogRegistry()
         entry = _make_entry(name="generic", type_="generic", path=str(tmp_path))
@@ -277,8 +282,13 @@ class TestLoadGenericEntry:
         try:
             with caplog.at_level(logging.WARNING):
                 result = registry._load_generic_entry(entry)
-            # Should not raise; unreadable file skipped
-            assert "something" not in result
+            if sys.platform == "win32":
+                # Windows cannot make the file unreadable via mode bits, so the
+                # loader reads it like any other entry.
+                assert "role" in result or "something" in str(result)
+            else:
+                # Should not raise; the unreadable file is skipped.
+                assert "something" not in result
         finally:
             bad_file.chmod(0o644)  # restore for cleanup
 
@@ -370,6 +380,7 @@ class TestParseCatalogEntry:
         assert entry.source is None
         assert entry.path is None
         assert entry.field_map == {}
+        assert entry.source_kind is None
 
     def test_missing_name_raises_value_error(self):
         with pytest.raises(ValueError, match="missing required string 'name'"):
@@ -384,12 +395,19 @@ class TestParseCatalogEntry:
             _parse_catalog_entry({"name": 42, "type": "agency"})
 
     def test_invalid_type_raises_value_error(self):
-        with pytest.raises(ValueError, match="type must be 'agency' or 'generic'"):
+        with pytest.raises(ValueError, match="type must be 'agency', 'generic', or 'plugin'"):
             _parse_catalog_entry({"name": "test", "type": "invalid"})
 
     def test_missing_type_raises_value_error(self):
-        with pytest.raises(ValueError, match="type must be 'agency' or 'generic'"):
+        with pytest.raises(ValueError, match="type must be 'agency', 'generic', or 'plugin'"):
             _parse_catalog_entry({"name": "test"})
+
+    def test_valid_plugin_entry(self):
+        """The plugin-layout catalog type (issue #3972) parses like generic."""
+        raw = {"name": "my-plugins", "type": "plugin", "path": "/some/plugin-root"}
+        entry = _parse_catalog_entry(raw)
+        assert entry.type == "plugin"
+        assert entry.path == "/some/plugin-root"
 
     def test_non_bool_enabled_raises_value_error(self):
         with pytest.raises(ValueError, match="enabled must be a bool"):
@@ -427,6 +445,35 @@ class TestParseCatalogEntry:
         raw = {"name": "disabled", "type": "agency", "enabled": False}
         entry = _parse_catalog_entry(raw)
         assert entry.enabled is False
+
+    def test_valid_source_kind_directory_is_accepted(self):
+        raw = {"name": "test", "type": "plugin", "path": "/p", "source_kind": "directory"}
+        entry = _parse_catalog_entry(raw)
+        assert entry.source_kind == "directory"
+
+    def test_valid_source_kind_file_is_accepted(self):
+        raw = {"name": "test", "type": "plugin", "path": "/p/a.md", "source_kind": "file"}
+        entry = _parse_catalog_entry(raw)
+        assert entry.source_kind == "file"
+
+    def test_valid_source_kind_remote_values_are_accepted_at_parse_time(self):
+        """github/git/npm are valid configuration even though resolution isn't
+        implemented yet (#3973) - the parser's job is schema validation, not
+        resolution; NotImplementedError is raised later, at load time."""
+        for kind in ("github", "git", "npm"):
+            raw = {"name": "test", "type": "plugin", "source": "example/repo", "source_kind": kind}
+            entry = _parse_catalog_entry(raw)
+            assert entry.source_kind == kind
+
+    def test_invalid_source_kind_raises_value_error(self):
+        raw = {"name": "test", "type": "plugin", "path": "/p", "source_kind": "ftp"}
+        with pytest.raises(ValueError, match="source_kind must be one of"):
+            _parse_catalog_entry(raw)
+
+    def test_non_string_source_kind_raises_value_error(self):
+        raw = {"name": "test", "type": "plugin", "path": "/p", "source_kind": 7}
+        with pytest.raises(ValueError, match="source_kind must be one of"):
+            _parse_catalog_entry(raw)
 
     def test_from_config_skips_disabled_entries(self):
         """CatalogRegistry.from_config should skip disabled catalog entries."""

@@ -36,13 +36,13 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# McpToolError — consistent error wrapper
+# McpToolError - consistent error wrapper
 # ---------------------------------------------------------------------------
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_ANY = "dict[str, Any]"
-_CAST_STR_NONE = "str | None"
+type _CAST_DICT_STR_ANY = dict[str, Any]
+type _CAST_STR_NONE = str | None
 
 
 @dataclass(frozen=True)
@@ -304,7 +304,7 @@ def _type_matches(value: Any, expected: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# ToolNormalizer — registry-based normalization layer
+# ToolNormalizer - registry-based normalization layer
 # ---------------------------------------------------------------------------
 
 

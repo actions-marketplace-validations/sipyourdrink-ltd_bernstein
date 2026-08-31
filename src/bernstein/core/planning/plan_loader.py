@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from enum import Enum
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
 from bernstein.core.models import CompletionSignal, Complexity, Scope, Task, TaskStatus, TaskType
+from bernstein.core.tasks.artifacts import ArtifactSpec, ArtifactSpecError, parse_artifact_spec
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -18,6 +20,17 @@ logger = logging.getLogger(__name__)
 
 class PlanLoadError(Exception):
     """Raised when a plan file cannot be loaded or parsed."""
+
+
+# Top-level keys that identify a seed config (``bernstein.yaml`` shape) rather
+# than a staged plan. ``goal`` is the required seed field; ``model`` is a
+# common companion. Deliberately excludes ``cli``, which is also a valid
+# top-level ``PlanConfig`` key (a staged plan may set a default CLI for all
+# its steps) -- keying off it would mislabel a genuine plan with a missing or
+# typo'd ``stages`` list as a seed. Presence of a key from this set on a file
+# that is missing ``stages`` is a reliable signal that the file was meant to
+# be a seed, not a plan (issue #3009).
+_SEED_SHAPED_KEYS = ("goal", "model")
 
 
 @dataclass
@@ -82,16 +95,16 @@ def _parse_completion_signals(raw_signals: list[object]) -> list[CompletionSigna
     signals: list[CompletionSignal] = []
     for i, raw in enumerate(raw_signals):
         if not isinstance(raw, dict):
-            logger.warning("completion_signals[%d] is not a mapping — skipping", i)
+            logger.warning("completion_signals[%d] is not a mapping - skipping", i)
             continue
         sig_type = raw.get("type", "")
         # Support 'value' or 'path'/'command'/'contains' as the signal value
         sig_value = raw.get("value") or raw.get("path") or raw.get("command") or raw.get("contains") or ""
         if sig_type not in valid_types:
-            logger.warning("completion_signals[%d] has invalid type %r — skipping", i, sig_type)
+            logger.warning("completion_signals[%d] has invalid type %r - skipping", i, sig_type)
             continue
         if not sig_value:
-            logger.warning("completion_signals[%d] has empty value — skipping", i)
+            logger.warning("completion_signals[%d] has empty value - skipping", i)
             continue
         signals.append(CompletionSignal(type=sig_type, value=str(sig_value)))  # type: ignore[arg-type]
     return signals
@@ -117,6 +130,122 @@ def _step_title(step: dict[object, object], stage_name: str, step_idx: int) -> s
     return str(title)
 
 
+def _parse_enum_field[EnumT: Enum](
+    enum_cls: type[EnumT],
+    raw: object,
+    field_name: str,
+    stage_name: str,
+    step_idx: int,
+) -> EnumT:
+    """Convert a raw YAML value to *enum_cls*, guarding the conversion.
+
+    A bare ``ValueError`` out of an enum constructor escapes ``load_plan``'s
+    documented failure contract -- callers catch ``PlanLoadError`` alone, so an
+    enum typo in a plan surfaced as an unhandled traceback (issue #3515).
+
+    Args:
+        enum_cls: The target enum class (e.g. ``Scope``, ``Complexity``).
+        raw: Raw value from the step dict.
+        field_name: Step field name, for error context.
+        stage_name: Stage name for error context.
+        step_idx: Zero-based step index for error context.
+
+    Returns:
+        The matching enum member.
+
+    Raises:
+        PlanLoadError: If *raw* is not one of the enum's values, naming the
+            field, the offending value, and the accepted values.
+    """
+    try:
+        return enum_cls(raw)
+    except ValueError as exc:
+        accepted = ", ".join(str(member.value) for member in enum_cls)
+        raise PlanLoadError(
+            f"Step {step_idx} in stage {stage_name!r}: invalid {field_name!r} value {raw!r}; accepted: {accepted}"
+        ) from exc
+
+
+def _parse_int_field(
+    step: dict[str, Any],
+    field_name: str,
+    stage_name: str,
+    step_idx: int,
+    *,
+    default: int,
+) -> int:
+    """Parse an integer step field, sharing validate_plan's boundary contract.
+
+    ``int(...)`` coercion silently accepted string values the schema types as
+    integers and let a non-numeric string escape as a bare ``ValueError``
+    instead of the documented ``PlanLoadError`` (#3516). Booleans are rejected
+    too: JSON Schema's ``integer`` excludes them even though Python's ``bool``
+    subclasses ``int``. Presence is checked on the step dict itself so an
+    explicit ``null`` is rejected like any other non-integer instead of
+    silently receiving the default reserved for an absent key.
+
+    Args:
+        step: The step dict the field is read from.
+        field_name: Step field name, for error context.
+        stage_name: Stage name for error context.
+        step_idx: Zero-based step index for error context.
+        default: Value returned when the key is absent.
+
+    Returns:
+        The integer value.
+
+    Raises:
+        PlanLoadError: If the key is present but its value is not an integer
+            (including an explicit ``null``).
+    """
+    if field_name not in step:
+        return default
+    raw = step[field_name]
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise PlanLoadError(
+            f"Step {step_idx} in stage {stage_name!r}: {field_name!r} must be an integer, got {type(raw).__name__}"
+        )
+    return raw
+
+
+def _step_context(stage_name: str, step_idx: int) -> str:
+    """Error-message prefix naming a step by its stage and position."""
+    return f"Step {step_idx} in stage {stage_name!r}"
+
+
+def _parse_string_list_field(raw: object, field_name: str, context: str) -> list[str]:
+    """Parse an optional list-of-strings field.
+
+    Args:
+        raw: Raw field value from the YAML document.
+        field_name: Field name, for error context.
+        context: Where in the document the field was found, used verbatim as
+            the error-message prefix -- ``"Plan"``, ``"Stage 'build'"``, or
+            ``_step_context(...)``. The same list fields exist at three levels
+            of a plan file, so the message has to name the level the reader
+            must go and edit; a step-shaped prefix on a plan-level field would
+            send them to a step that does not exist.
+
+    Returns:
+        The string items, or an empty list when the field is absent or ``null``.
+
+    Raises:
+        PlanLoadError: If the field is present but not a list, or if any list
+            item is not a string.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise PlanLoadError(f"{context}: {field_name!r} must be a list of strings, got {type(raw).__name__}")
+    items = cast(list[object], raw)
+    parsed: list[str] = []
+    for item_idx, item in enumerate(items):
+        if not isinstance(item, str):
+            raise PlanLoadError(f"{context}: {field_name}[{item_idx}] must be a string, got {type(item).__name__}")
+        parsed.append(item)
+    return parsed
+
+
 def load_plan(path: Path) -> tuple[PlanConfig, list[Task]]:
     """Load a YAML plan file and return plan-level config plus a list of Task objects.
 
@@ -137,7 +266,9 @@ def load_plan(path: Path) -> tuple[PlanConfig, list[Task]]:
         generated task IDs before submitting to the task server.
 
     Raises:
-        PlanLoadError: If the file is missing, invalid YAML, or missing required fields.
+        PlanLoadError: If the file is missing, invalid YAML, missing required
+            fields, or a step's enum-typed field (``scope``, ``complexity``)
+            carries a value outside the enum.
     """
     if not path.exists():
         raise PlanLoadError(f"Plan file not found: {path}")
@@ -152,6 +283,15 @@ def load_plan(path: Path) -> tuple[PlanConfig, list[Task]]:
 
     stages = data.get("stages")
     if not stages:
+        found_seed_keys = [key for key in _SEED_SHAPED_KEYS if key in data]
+        if found_seed_keys:
+            found = ", ".join(repr(key) for key in found_seed_keys)
+            raise PlanLoadError(
+                f"{path} looks like a seed config, not a staged plan (found "
+                f"{found} but no 'stages' list). Name it 'bernstein.yaml' so "
+                f"it is auto-discovered, pass it with '--seed {path}', or add "
+                "a 'stages:' list to make it a plan."
+            )
         raise PlanLoadError("Plan file must contain a 'stages' list")
 
     # Extract plan-level config
@@ -162,11 +302,11 @@ def load_plan(path: Path) -> tuple[PlanConfig, list[Task]]:
     repos: list[RepoRef] = []
     for raw_repo in data.get("repos") or []:
         if not isinstance(raw_repo, dict):
-            logger.warning("repos entry is not a mapping — skipping")
+            logger.warning("repos entry is not a mapping - skipping")
             continue
         repo_path = raw_repo.get("path")
         if not repo_path:
-            logger.warning("repos entry missing 'path' — skipping")
+            logger.warning("repos entry missing 'path' - skipping")
             continue
         repos.append(
             RepoRef(
@@ -179,8 +319,8 @@ def load_plan(path: Path) -> tuple[PlanConfig, list[Task]]:
     config = PlanConfig(
         name=str(data.get("name", "")),
         description=str(data.get("description", "")),
-        constraints=list(data.get("constraints") or []),
-        context_files=list(data.get("context_files") or []),
+        constraints=_parse_string_list_field(data.get("constraints"), "constraints", "Plan"),
+        context_files=_parse_string_list_field(data.get("context_files"), "context_files", "Plan"),
         cli=str(data["cli"]) if data.get("cli") else None,
         budget=str(budget_raw) if budget_raw is not None else None,
         max_agents=int(max_agents_raw) if max_agents_raw is not None else None,
@@ -192,6 +332,15 @@ def load_plan(path: Path) -> tuple[PlanConfig, list[Task]]:
 
     for i, stage in enumerate(stages):
         _parse_stage(stage, i, stage_tasks, tasks)
+
+    # Issue #3375: plan-level ``context_files`` must reach the workers, but
+    # every caller that needs only the task list discards the config half of
+    # this return value. Stamping the declaration onto each task's metadata
+    # here - the key the spawner reads at dispatch - closes that gap at the
+    # source instead of relying on callers to carry the config through.
+    if config.context_files:
+        for task in tasks:
+            task.metadata["context_files"] = list(config.context_files)
 
     return config, tasks
 
@@ -217,7 +366,7 @@ def _parse_stage(
         return
 
     stage_tasks[str(stage_name)] = []
-    stage_deps: list[str] = [str(d) for d in (stage.get("depends_on") or [])]
+    stage_deps: list[str] = _parse_string_list_field(stage.get("depends_on"), "depends_on", f"Stage {stage_name!r}")
     stage_repo: str | None = str(stage["repo"]) if stage.get("repo") else None
 
     for j, step in enumerate(steps):
@@ -250,18 +399,45 @@ def _parse_step(
 
     raw_signals: list[object] = list(step.get("completion_signals") or [])
     signals = _parse_completion_signals(raw_signals)
-    owned_files: list[str] = [str(f) for f in (step.get("files") or [])]
+    # Reject scalar / non-list shapes and non-string items so direct loads
+    # match the CLI pre-check (validate_plan) boundary for list[string] fields.
+    raw_files: object = step.get("files")
+    owned_files = _parse_string_list_field(raw_files, "files", _step_context(stage_name, step_index))
+    # Issue #1797: operator-supplied image attachments. The orchestrator
+    # builds a MultiModalContext at spawn time from these paths.
+    # Reject scalar / non-list shapes so a YAML typo like
+    # ``attachments: ./shot.png`` does not silently iterate the string
+    # character-by-character. (bot-ack: 3284182784 -- CodeRabbit major.)
+    # Items are checked too: this field becomes a filesystem path at spawn, so
+    # ``str()`` on a mapping produced "{'a': 'b'}" and handed the adapter a
+    # path that cannot exist and never named the plan line that wrote it.
+    attachments: list[str] = _parse_string_list_field(
+        step.get("attachments"), "attachments", _step_context(stage_name, step_index)
+    )
 
     model_raw = step.get("model")
     effort_raw = step.get("effort")
     cli_raw = step.get("cli")
-    estimated_minutes_raw = step.get("estimated_minutes")
     mode_raw = step.get("mode")
     execution_mode: str | None = str(mode_raw) if mode_raw else None
     step_repo_raw = step.get("repo")
     task_repo: str | None = str(step_repo_raw) if step_repo_raw else stage_repo
     depends_on_repo_raw = step.get("depends_on_repo")
     task_depends_on_repo: str | None = str(depends_on_repo_raw) if depends_on_repo_raw else None
+
+    # Issue #3110: the declared artifact contract. Parsed by the one strict
+    # parser every declaration surface shares. Fail-closed: a malformed block
+    # aborts the plan load naming the offending field - it must never fall
+    # back to the default code_diff contract, because a task that silently
+    # completes on a git SHA is the wrong completion identity for the
+    # artifact the operator declared.
+    raw_artifact = step.get("artifact_spec")
+    artifact_spec = ArtifactSpec.default()
+    if raw_artifact is not None:
+        try:
+            artifact_spec = parse_artifact_spec(raw_artifact)
+        except ArtifactSpecError as exc:
+            raise PlanLoadError(f"Step {step_index} in stage {stage_name!r}: {exc}") from exc
 
     metadata: dict[str, object] = {}
     phases_raw = step.get("phases")
@@ -271,7 +447,7 @@ def _parse_step(
         try:
             parsed = parse_phases(phases_raw)
         except ValueError as exc:
-            raise PlanLoadError(f"Step {step_index} in stage {stage_name!r}: invalid 'phases' field — {exc}") from exc
+            raise PlanLoadError(f"Step {step_index} in stage {stage_name!r}: invalid 'phases' field - {exc}") from exc
         if parsed:
             metadata["phases"] = [p.value for p in parsed]
 
@@ -280,15 +456,18 @@ def _parse_step(
         title=title,
         description=str(step.get("description", title)),
         role=str(step.get("role", "backend")),
-        priority=int(step.get("priority", 2)),
-        scope=Scope(step.get("scope", "medium")),
-        complexity=Complexity(step.get("complexity", "medium")),
-        estimated_minutes=int(estimated_minutes_raw) if estimated_minutes_raw is not None else 30,
+        priority=_parse_int_field(step, "priority", stage_name, step_index, default=2),
+        scope=_parse_enum_field(Scope, step.get("scope", "medium"), "scope", stage_name, step_index),
+        complexity=_parse_enum_field(
+            Complexity, step.get("complexity", "medium"), "complexity", stage_name, step_index
+        ),
+        estimated_minutes=_parse_int_field(step, "estimated_minutes", stage_name, step_index, default=30),
         status=TaskStatus.OPEN,
         task_type=TaskType.STANDARD,
         depends_on=depends_on,
         owned_files=owned_files,
         completion_signals=signals,
+        artifact_spec=artifact_spec,
         model=str(model_raw) if model_raw else None,
         effort=str(effort_raw) if effort_raw else None,
         cli=str(cli_raw) if cli_raw else None,
@@ -296,6 +475,7 @@ def _parse_step(
         repo=task_repo,
         depends_on_repo=task_depends_on_repo,
         metadata=metadata,
+        attachments=attachments,
     )
 
 
@@ -312,7 +492,9 @@ def load_plan_from_yaml(path: Path) -> list[Task]:
         List of Task objects with dependencies mapped by title.
 
     Raises:
-        PlanLoadError: If the file is missing, invalid YAML, or missing required fields.
+        PlanLoadError: If the file is missing, invalid YAML, missing required
+            fields, or a step's enum-typed field (``scope``, ``complexity``)
+            carries a value outside the enum.
     """
     _config, tasks = load_plan(path)
     return tasks

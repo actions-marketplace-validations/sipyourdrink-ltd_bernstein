@@ -11,7 +11,7 @@ override path is exercised without bandit interference.
 
 The CLI surface tests (``bernstein criterion-profile show``,
 ``bernstein add-task --criterion-profile``, etc.) hit the Click runner
-in-process to avoid spinning up the full task server — the CLI
+in-process to avoid spinning up the full task server - the CLI
 performs early validation locally, which is what the integration
 contract guarantees.
 """
@@ -61,7 +61,9 @@ class TestRouteTaskHonoursCriterionProfile:
     def test_safety_first_routes_to_opus(self) -> None:
         baseline = _make_task()
         with_profile = _make_task(metadata={"criterion_profile": "safety-first"})
-        baseline_cfg = route_task(baseline)
+        # The unbiased baseline needs a configured default; routing no longer
+        # guesses a model for unconfigured tasks.
+        baseline_cfg = route_task(baseline, default_model="sonnet")
         biased_cfg = route_task(with_profile)
         assert baseline_cfg.model != biased_cfg.model or baseline_cfg.effort != biased_cfg.effort, (
             "expected criterion-profile to change at least one of model/effort"
@@ -103,9 +105,12 @@ class TestRouteTaskHonoursCriterionProfile:
 class TestFeatureFlagDisablesPath:
     def test_disabled_flag_reverts_to_default_routing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(ENV_FLAG, "0")
-        cfg = route_task(_make_task(metadata={"criterion_profile": "safety-first"}))
+        cfg = route_task(
+            _make_task(metadata={"criterion_profile": "safety-first"}),
+            default_model="sonnet",
+        )
         # Without the bias, the small/low backend task lands on the
-        # default sonnet/high path, not opus.
+        # configured default sonnet/high path, not opus.
         assert cfg.model != "opus"
 
     def test_enabled_flag_picks_up_profile(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,7 +181,7 @@ class TestProfileValidationGuardsAtCLI:
         # ``extract_from_task`` is the wire-side path; integration check
         # confirms it doesn't crash the router for malformed input.
         task = _make_task(metadata={"criterion_profile": "made-up-preset"})
-        cfg = route_task(task)
+        cfg = route_task(task, default_model="sonnet")
         # Falls through to the default heuristic path.
         assert cfg.model in {"sonnet", "haiku", "opus"}
 
@@ -244,12 +249,12 @@ def test_env_var_propagated_to_router_path(
     """Setting ``BERNSTEIN_RUN_CRITERION_PROFILE`` doesn't crash the router.
 
     The env var is set by the ``bernstein run`` bootstrap; the router
-    itself does not read it directly — tasks carry the metadata.  This
+    itself does not read it directly - tasks carry the metadata.  This
     test pins the contract: the env var presence alone never alters
     routing for tasks that lack the metadata key.
     """
     monkeypatch.setenv("BERNSTEIN_RUN_CRITERION_PROFILE", "safety-first")
-    cfg = route_task(_make_task())
+    cfg = route_task(_make_task(), default_model="sonnet")
     # No metadata on the task -> no bias, default routing applies.
     assert cfg.model in {"sonnet", "haiku", "opus"}
     # Specifically, it must NOT be auto-pinned to opus just because the

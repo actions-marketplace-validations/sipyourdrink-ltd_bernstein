@@ -12,8 +12,8 @@ agent-specific consumers that stay in sync via one command.
 ## What it generates
 
 The canonical IR is the
-[`AGENTS.md`](https://agents.md/) document — AAIF-aligned, plain
-markdown, no frontmatter — derived from the repository:
+[`AGENTS.md`](https://agents.md/) document - AAIF-aligned, plain
+markdown, no frontmatter - derived from the repository:
 
 | Source                       | Drives                                  |
 | ---------------------------- | --------------------------------------- |
@@ -36,7 +36,7 @@ reads on disk in 2026:
 | Aider       | `CONVENTIONS.md` + `.aider.conf.yml` (`read:` entry) |
 | Goose       | `.goosehints` at repo root                          |
 
-The legacy `.cursorrules` is intentionally not emitted — Cursor's docs
+The legacy `.cursorrules` is intentionally not emitted - Cursor's docs
 no longer document it; `.cursor/rules/*.mdc` is the supported surface.
 Devin's `.devin.yaml` is deferred until the schema stabilises.
 
@@ -53,6 +53,26 @@ bernstein agents-md diff                # human-readable unified diff
 `--target T` accepts `canonical | cursor | claude | aider | goose`
 (plus `all` for `verify`/`diff`). All commands take `--workdir PATH`
 to operate on another repo.
+
+### Default branch resolution
+
+The "Git workflow" section names the repository's default branch, which
+is a property of the repository - not of the checkout you happen to be
+on. The generator resolves it in this order:
+
+1. `--default-branch NAME` (explicit pin, wins over everything;
+   also available as `GenerateOptions.default_branch` for library use).
+2. `origin/HEAD`'s symbolic target (`git remote set-head origin -a`
+   creates it).
+3. Conventional `main` / `master` refs, local or remote-tracking.
+4. The `gh-readonly-queue/<base>/pr-<n>-<sha>` merge-queue ref shape.
+
+The checked-out branch name is never used: on a feature branch, a
+detached HEAD, or a single-branch CI clone it is guaranteed wrong, and
+writing it silently corrupts the committed mirrors. When nothing
+resolves, `sync` (and every other verb) fails with exit code 3 and a
+message naming the escape hatches (`--default-branch`, `set-head`, or
+fetching the default ref) instead of writing a guess.
 
 ## Drift-and-reconcile demo
 
@@ -111,7 +131,7 @@ $ bernstein agents-md diff --target claude
 +| Tests | `uv run pytest` |
 ```
 
-`diff` exits 0 either way — it is informational.
+`diff` exits 0 either way - it is informational.
 
 ### 4. `sync` rewrites every target from the canonical source
 
@@ -137,9 +157,9 @@ loop is one command.
 
 ## Authoring overlays
 
-Auto-derivation handles ~80% of any real repo. The remaining 20% —
+Auto-derivation handles ~80% of any real repo. The remaining 20% -
 team-specific gotchas, project conventions that aren't pulled from
-`pyproject.toml` — lives under `.sdd/agents-md/`:
+`pyproject.toml` - lives under `.sdd/agents-md/`:
 
 ```
 .sdd/agents-md/
@@ -177,18 +197,18 @@ section's existing fields, never invented.
 
 Modules:
 
-- `src/bernstein/core/knowledge/agents_md_generator.py` — section
+- `src/bernstein/core/knowledge/agents_md_generator.py` - section
   builders + canonical render.
-- `src/bernstein/core/knowledge/agents_md_bridge.py` — per-target
+- `src/bernstein/core/knowledge/agents_md_bridge.py` - per-target
   translators.
-- `src/bernstein/cli/commands/agents_md_cmd.py` — Click group with
+- `src/bernstein/cli/commands/agents_md_cmd.py` - Click group with
   `generate`, `write`, `sync`, `verify`, `diff`.
 
 References:
 
-- AGENTS.md canonical site — <https://agents.md/>
-- AAIF AGENTS.md project page — <https://aaif.io/projects/agents-md/>
-- Cursor rules — <https://cursor.com/docs/context/rules>
-- Claude Code memory — <https://code.claude.com/docs/en/memory>
-- Aider conventions — <https://aider.chat/docs/usage/conventions.html>
-- Goose hints — <https://github.com/block/goose>
+- AGENTS.md canonical site - <https://agents.md/>
+- AAIF AGENTS.md project page - <https://aaif.io/projects/agents-md/>
+- Cursor rules - <https://cursor.com/docs/context/rules>
+- Claude Code memory - <https://code.claude.com/docs/en/memory>
+- Aider conventions - <https://aider.chat/docs/usage/conventions.html>
+- Goose hints - <https://github.com/block/goose>

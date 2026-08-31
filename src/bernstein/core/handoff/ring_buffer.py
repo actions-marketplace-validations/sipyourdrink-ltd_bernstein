@@ -14,7 +14,7 @@ Each line is a JSON object with ``ts`` (epoch seconds), ``surface``
 (``terminal``/``chat``/``dashboard``), and ``text`` (the raw line that
 was streamed to the user). Writers call :meth:`StreamTailBuffer.append`
 which trims older lines once the file crosses
-``max_entries`` records — this keeps replay cheap and bounds the on-disk
+``max_entries`` records - this keeps replay cheap and bounds the on-disk
 footprint regardless of run length.
 """
 
@@ -43,7 +43,7 @@ class TailEntry:
 
     Attributes:
         ts: Epoch seconds when the line was emitted.
-        surface: Origin surface — ``"terminal"``, ``"chat"`` or
+        surface: Origin surface - ``"terminal"``, ``"chat"`` or
             ``"dashboard"``.
         text: Raw line as it was rendered to the operator. Trailing
             newlines are stripped on append so the wire format stays
@@ -86,7 +86,7 @@ class TailEntry:
 class StreamTailBuffer:
     """File-backed ring buffer for one session's recent stream output.
 
-    The buffer is intentionally simple — append-only JSONL with a hard
+    The buffer is intentionally simple - append-only JSONL with a hard
     cap on the line count. We trim by rewriting the tail when the line
     count would exceed ``max_entries``; this is O(N) on trim but the
     cap keeps N small (default 500 lines).
@@ -116,7 +116,14 @@ class StreamTailBuffer:
         self._workdir = workdir
         self._session_id = session_id
         self._max_entries = max_entries
-        self._path = workdir / _TAIL_DIR / f"{session_id}.jsonl"
+        # The session id becomes a filename component; normalise the
+        # candidate and require it to stay inside the tail directory so a
+        # hostile id ("../", absolute path) cannot address other files.
+        tail_dir = os.path.realpath(workdir / _TAIL_DIR)
+        candidate = os.path.realpath(os.path.join(tail_dir, f"{session_id}.jsonl"))
+        if not candidate.startswith(tail_dir + os.sep):
+            raise ValueError("session_id must resolve inside the handoff tail directory")
+        self._path = Path(candidate)
 
     @property
     def path(self) -> Path:

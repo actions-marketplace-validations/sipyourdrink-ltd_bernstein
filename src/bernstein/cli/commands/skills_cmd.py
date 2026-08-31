@@ -29,7 +29,10 @@ from bernstein.core.skills.lifecycle import (
     InstallScope,
     SkillLifecycleError,
     SkillsTomlError,
+    init_skill,
     install_local,
+    install_plugin_local,
+    is_agent_plugins_layout,
     remove_skill,
     sync_skills,
 )
@@ -102,12 +105,20 @@ def skills_list(no_plugins: bool, layered: bool) -> None:
         description = skill.description.strip().replace("\n", " ")
         if len(description) > 100:
             description = description[:97] + "..."
+
+        # Format SOURCE column to include the pack name if from a plugin
+        source_display = skill.source_name
+        if source_display.startswith("plugin:"):
+            # Format as "plugin <packname>"
+            pack_name = source_display.replace("plugin:", "", 1)
+            source_display = f"plugin {pack_name}"
+
         table.add_row(
             skill.name,
             description,
             str(len(skill.references)),
             str(len(skill.scripts)),
-            skill.source_name,
+            source_display,
         )
 
     console.print(table)
@@ -244,6 +255,37 @@ def _parse_scope(scope_str: str) -> InstallScope:
         raise click.BadParameter(f"unknown scope {scope_str!r}; expected project or user") from exc
 
 
+@skills_group.command("init")
+@click.argument("name")
+@click.option(
+    "--scope",
+    "scope",
+    type=click.Choice(["project", "user"]),
+    default="project",
+    help="Scaffold under the project or user skill directory.",
+)
+@click.option(
+    "--description",
+    "description",
+    default=None,
+    help="Description to write into SKILL.md.",
+)
+def skills_init(name: str, scope: str, description: str | None) -> None:
+    """Create a deterministic local skill scaffold."""
+    install_scope = _parse_scope(scope)
+    try:
+        result = init_skill(
+            name,
+            scope=install_scope,
+            workdir=Path.cwd(),
+            description=description,
+        )
+    except SkillLifecycleError as exc:
+        console.print(f"[red]init failed:[/red] {exc}")
+        raise SystemExit(1) from exc
+    console.print(f"[green]initialized[/green] {result.name} -> {result.install_dir}")
+
+
 @skills_group.command("install")
 @click.argument("source", type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -259,7 +301,30 @@ def _parse_scope(scope_str: str) -> InstallScope:
     default=None,
     help="Override the auto-detected skill name (uses source filename otherwise).",
 )
-def skills_install(source: Path, scope: str, override_name: str | None) -> None:
+@click.option(
+    "--strict",
+    "strict",
+    is_flag=True,
+    default=False,
+    help="Fail install when skill lint reports ERROR findings.",
+)
+@click.option(
+    "--accept-risk",
+    "accept_risk",
+    is_flag=True,
+    default=False,
+    help="Allow installs that require explicit risk acceptance.",
+)
+@click.option(
+    "--force",
+    "force",
+    is_flag=True,
+    default=False,
+    help="Replace a same-named skill that was installed from a different source.",
+)
+def skills_install(
+    source: Path, scope: str, override_name: str | None, strict: bool, accept_risk: bool, force: bool
+) -> None:
     """Install a skill from a local path.
 
     \b
@@ -268,11 +333,41 @@ def skills_install(source: Path, scope: str, override_name: str | None) -> None:
     """
     install_scope = _parse_scope(scope)
     try:
+        resolved = source.resolve()
+        if is_agent_plugins_layout(resolved):
+            if override_name is not None:
+                console.print(
+                    "[red]install failed:[/red] --name does not apply to a plugin "
+                    "directory (a pack installs every skill under skills/ under "
+                    "its own name)"
+                )
+                raise SystemExit(1)
+            plugin_result = install_plugin_local(
+                resolved,
+                scope=install_scope,
+                workdir=Path.cwd(),
+                strict_lint=strict,
+                accept_risk=accept_risk,
+                force=force,
+            )
+            for result in plugin_result.installed:
+                console.print(
+                    f"[green]installed[/green] {result.name} -> {result.install_dir} "
+                    f"(digest {result.digest.digest[:12]}...)",
+                )
+            for skipped in plugin_result.skipped:
+                console.print(f"[yellow]skipped[/yellow] {skipped.name}: {skipped.reason}")
+            if not plugin_result.installed:
+                console.print("[red]plugin install failed:[/red] no skills could be installed")
+                raise SystemExit(1)
+            return
         result = install_local(
-            source.resolve(),
+            resolved,
             scope=install_scope,
             workdir=Path.cwd(),
             override_name=override_name,
+            strict_lint=strict,
+            accept_risk=accept_risk,
         )
     except SkillLifecycleError as exc:
         console.print(f"[red]install failed:[/red] {exc}")
@@ -317,7 +412,21 @@ def skills_remove(name: str, scope: str) -> None:
     default="project",
     help="Where to install declared skills.",
 )
-def skills_sync(manifest: Path | None, scope: str) -> None:
+@click.option(
+    "--strict",
+    "strict",
+    is_flag=True,
+    default=False,
+    help="Fail sync when skill lint reports ERROR findings.",
+)
+@click.option(
+    "--accept-risk",
+    "accept_risk",
+    is_flag=True,
+    default=False,
+    help="Allow installs that require explicit risk acceptance.",
+)
+def skills_sync(manifest: Path | None, scope: str, strict: bool, accept_risk: bool) -> None:
     """Install every skill declared in ``bernstein-skills.toml``.
 
     Re-runs are idempotent: skills whose digest already matches are
@@ -331,6 +440,8 @@ def skills_sync(manifest: Path | None, scope: str) -> None:
             toml_path.resolve(),
             scope=install_scope,
             workdir=Path.cwd(),
+            strict_lint=strict,
+            accept_risk=accept_risk,
         )
     except (SkillsTomlError, SkillLifecycleError) as exc:
         console.print(f"[red]sync failed:[/red] {exc}")
@@ -393,6 +504,158 @@ def skills_lint(names: tuple[str, ...], scope: str) -> None:
         console.print(f"\n[dim]{all_findings} finding(s) total (advisory only)[/dim]")
 
 
+@skills_group.command("test")
+@click.argument("suite", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--skills-root",
+    "skills_root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Skill root to test. Defaults to <cwd>/.bernstein/skills.",
+)
+def skills_test(suite: Path, skills_root: Path | None) -> None:
+    """Run a deterministic trigger-set suite without model calls."""
+    from bernstein.core.skills.authoring import SkillAuthoringError, run_trigger_suite
+
+    root = skills_root if skills_root is not None else Path.cwd() / ".bernstein" / "skills"
+    try:
+        result = run_trigger_suite(root.resolve(), suite.resolve())
+    except SkillAuthoringError as exc:
+        console.print(f"[red]test failed:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    for case_result in result.cases:
+        if case_result.passed:
+            console.print(f"[green]ok[/green] {case_result.case.name}")
+            continue
+        details: list[str] = []
+        if case_result.missing:
+            details.append("missing: " + ", ".join(case_result.missing))
+        if case_result.unexpected:
+            details.append("unexpected: " + ", ".join(case_result.unexpected))
+        console.print(f"[red]fail[/red] {case_result.case.name} ({'; '.join(details)})")
+
+    total = len(result.cases)
+    console.print(f"\n{result.passed_count} passed / {total} case(s)")
+    if not result.passed:
+        raise SystemExit(1)
+
+
+@skills_group.command("diff")
+@click.argument("left", type=click.Path(exists=True, path_type=Path))
+@click.argument("right", type=click.Path(exists=True, path_type=Path))
+def skills_diff(left: Path, right: Path) -> None:
+    """Compare two skill directories using canonical manifest/body digests."""
+    from bernstein.core.skills.authoring import diff_skill_dirs
+    from bernstein.core.skills.lifecycle import SkillLifecycleError
+
+    try:
+        result = diff_skill_dirs(left.resolve(), right.resolve())
+    except SkillLifecycleError as exc:
+        console.print(f"[red]diff failed:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    if not result.changed:
+        console.print(f"[green]unchanged[/green] digest {result.left_digest.digest}")
+        return
+
+    console.print("[yellow]changed[/yellow] " + ", ".join(result.changed_sections))
+    console.print(f"left:  {result.left_digest.digest}")
+    console.print(f"right: {result.right_digest.digest}")
+    raise SystemExit(1)
+
+
+@skills_group.command("bench")
+@click.argument("suite", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--skills-root",
+    "skills_root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Skill root to bench. Defaults to <cwd>/.bernstein/skills.",
+)
+@click.option(
+    "--iterations",
+    "iterations",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Number of deterministic trigger-set iterations.",
+)
+def skills_bench(suite: Path, skills_root: Path | None, iterations: int) -> None:
+    """Benchmark a deterministic trigger-set suite without model calls."""
+    from bernstein.core.skills.authoring import SkillAuthoringError, bench_trigger_suite
+
+    root = skills_root if skills_root is not None else Path.cwd() / ".bernstein" / "skills"
+    try:
+        result = bench_trigger_suite(root.resolve(), suite.resolve(), iterations=iterations)
+    except SkillAuthoringError as exc:
+        console.print(f"[red]bench failed:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    console.print(
+        f"{result.iterations} iteration(s), {result.elapsed_seconds:.6f}s, "
+        f"{result.suite.passed_count}/{len(result.suite.cases)} case(s) passing"
+    )
+    if not result.suite.passed:
+        raise SystemExit(1)
+
+
+@skills_group.command("helpfulness")
+def skills_helpfulness() -> None:
+    """Rebuild the local skill helpfulness report."""
+    from bernstein.core.skills.helpfulness import build_helpfulness_report, write_helpfulness_report
+
+    report = build_helpfulness_report(Path.cwd())
+    path = write_helpfulness_report(Path.cwd(), report=report)
+    console.print(f"[green]wrote[/green] {path}")
+    if not report.skills:
+        console.print("[dim]no matched skill activations[/dim]")
+        return
+    ranked = sorted(report.skills.values(), key=lambda item: (-item.posterior_mean, item.skill))
+    for item in ranked[:10]:
+        console.print(
+            f"{item.skill}: {item.posterior_mean:.2f} "
+            f"({item.successes}/{item.observations} successful, {item.failures} failed)"
+        )
+    if report.unmatched_activations:
+        console.print(f"[dim]{report.unmatched_activations} activation(s) had no task outcome yet[/dim]")
+
+
+@skills_group.command("bisect")
+@click.argument("task_id")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Print the bisect plan as JSON.",
+)
+def skills_bisect(task_id: str, json_output: bool) -> None:
+    """Build a local skill-activation bisect plan for a task."""
+    from bernstein.core.skills.bisect import SkillBisectError, build_skill_bisect_plan
+
+    try:
+        plan = build_skill_bisect_plan(Path.cwd(), task_id)
+    except SkillBisectError as exc:
+        console.print(f"[red]bisect failed:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    payload = plan.as_payload()
+    if json_output:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    console.print(f"[bold]task[/bold] {plan.task_id}: {plan.outcome}; {plan.candidate_count} candidate skill(s)")
+    console.print("[bold]next probe[/bold]")
+    console.print("disable: " + (", ".join(plan.next_probe.disable) or "(none)"))
+    console.print("keep: " + (", ".join(plan.next_probe.keep) or "(none)"))
+    for candidate in plan.candidates:
+        console.print(
+            f"- {candidate.skill} ({candidate.trigger_source or 'unknown'}, role={candidate.role or 'unknown'})"
+        )
+
+
 @skills_group.command("watch")
 @click.argument(
     "path",
@@ -413,8 +676,9 @@ def skills_watch(path: Path | None) -> None:
 
     reload_count = 0
 
-    def on_reload(_loader: SkillLoader) -> None:
+    def on_reload(loader: SkillLoader) -> None:
         nonlocal reload_count
+        del loader
         reload_count += 1
         console.print(f"[green]reloaded[/green] index (event #{reload_count})")
 
@@ -441,3 +705,9 @@ def skills_watch(path: Path | None) -> None:
             signal.signal(signal.SIGINT, previous_sigint)
         handle.stop()
         console.print("[dim]watcher stopped[/dim]")
+
+
+from bernstein.cli.commands.skill_cmd import skill_provenance_cmd, skill_verify_cmd  # noqa: E402
+
+skills_group.add_command(skill_provenance_cmd, "provenance")
+skills_group.add_command(skill_verify_cmd, "verify")

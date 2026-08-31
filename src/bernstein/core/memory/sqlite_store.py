@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    import builtins
+    from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,14 @@ MemoryType = Literal[
 
 @dataclass(frozen=True)
 class MemoryEntry:
-    """A single memory entry."""
+    """A single memory entry.
+
+    The optional ``source_adapter`` field records which CLI adapter (claude
+    code, codex, gemini-cli, ...) produced the row. It is ``None`` for
+    pre-migration rows and for writers that do not opt in to provenance.
+    Operators that need cross-adapter read isolation pass
+    ``read_only_from_adapters=`` on :meth:`SQLiteMemoryStore.query`.
+    """
 
     id: int
     type: MemoryType
@@ -41,6 +50,7 @@ class MemoryEntry:
     task_id: str | None = None
     source_agent: str = ""
     source_model: str = ""
+    source_adapter: str | None = None
 
 
 class SQLiteMemoryStore:
@@ -65,7 +75,8 @@ class SQLiteMemoryStore:
                     task_id TEXT,
                     created_at REAL NOT NULL,
                     source_agent TEXT DEFAULT '',
-                    source_model TEXT DEFAULT ''
+                    source_model TEXT DEFAULT '',
+                    source_adapter TEXT
                 )
                 """
             )
@@ -76,12 +87,20 @@ class SQLiteMemoryStore:
 
     @staticmethod
     def _migrate_columns(conn: sqlite3.Connection) -> None:
-        """Add new columns to existing databases (backward compat)."""
+        """Add new columns to existing databases (backward compat).
+
+        Additive-only: new columns default to NULL or the empty string so
+        rows written by older versions remain readable and surface through
+        the default :meth:`list` / :meth:`query` paths unchanged.
+        """
         existing = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
         if "source_agent" not in existing:
             conn.execute("ALTER TABLE memory ADD COLUMN source_agent TEXT DEFAULT ''")
         if "source_model" not in existing:
             conn.execute("ALTER TABLE memory ADD COLUMN source_model TEXT DEFAULT ''")
+        if "source_adapter" not in existing:
+            # NULL default lets old rows backfill as "unknown adapter".
+            conn.execute("ALTER TABLE memory ADD COLUMN source_adapter TEXT")
 
     def add(
         self,
@@ -92,23 +111,101 @@ class SQLiteMemoryStore:
         task_id: str | None = None,
         source_agent: str = "",
         source_model: str = "",
+        source_adapter: str | None = None,
     ) -> int:
-        """Add a new memory entry."""
+        """Add a new memory entry.
+
+        ``source_adapter`` records which CLI adapter produced the write. The
+        default is ``None`` so callers that have not adopted provenance see
+        no behavioural change. Pair with
+        :meth:`query` ``read_only_from_adapters=`` when an adapter-level read
+        boundary is required.
+        """
         tags_str = ",".join(tags) if tags else ""
         now = time.time()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO memory (type, content, tags, importance, task_id, created_at, source_agent, source_model)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO memory (
+                    type, content, tags, importance, task_id, created_at,
+                    source_agent, source_model, source_adapter
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (type, content, tags_str, importance, task_id, now, source_agent, source_model),
+                (
+                    type,
+                    content,
+                    tags_str,
+                    importance,
+                    task_id,
+                    now,
+                    source_agent,
+                    source_model,
+                    source_adapter,
+                ),
             )
             rowid = cursor.lastrowid
             if rowid is None:
                 raise sqlite3.DatabaseError("SQLite did not return a row id for inserted memory entry")
             return rowid
 
+    def add_many(self, entries: Iterable[Mapping[str, Any]]) -> list[int]:
+        """Bulk-insert memory entries, returning the new row ids in order.
+
+        Each mapping accepts the same keyword set as :meth:`add` (``type``
+        and ``content`` are required). The whole batch shares one SQLite
+        transaction so a partial write cannot leak provenance.
+        """
+        now = time.time()
+        rows: list[tuple[Any, ...]] = []
+        for raw in entries:
+            entry_type: str = raw["type"]
+            content: str = raw["content"]
+            raw_tags = raw.get("tags") or []
+            tag_list: list[str] = list(raw_tags) if raw_tags else []
+            tags_str = ",".join(tag_list) if tag_list else ""
+            importance = float(raw.get("importance", 1.0))
+            task_id = raw.get("task_id")
+            source_agent: str = raw.get("source_agent", "")
+            source_model: str = raw.get("source_model", "")
+            source_adapter: str | None = raw.get("source_adapter")
+            rows.append(
+                (
+                    entry_type,
+                    content,
+                    tags_str,
+                    importance,
+                    task_id,
+                    now,
+                    source_agent,
+                    source_model,
+                    source_adapter,
+                )
+            )
+        if not rows:
+            return []
+        ids: list[int] = []
+        with sqlite3.connect(self.db_path) as conn:
+            for row in rows:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO memory (
+                        type, content, tags, importance, task_id, created_at,
+                        source_agent, source_model, source_adapter
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    row,
+                )
+                rowid = cursor.lastrowid
+                if rowid is None:
+                    raise sqlite3.DatabaseError("SQLite did not return a row id for inserted memory entry")
+                ids.append(rowid)
+        return ids
+
+    # NOTE: this method binds the name ``list`` in the class body, which
+    # shadows the builtin for every annotation that follows it. Signatures
+    # below therefore spell the builtin as ``builtins.list``.
     def list(
         self,
         type: MemoryType | None = None,
@@ -117,7 +214,8 @@ class SQLiteMemoryStore:
     ) -> list[MemoryEntry]:
         """List memory entries, optionally filtered by type or tags."""
         query = (
-            "SELECT id, type, content, tags, importance, task_id, created_at, source_agent, source_model FROM memory"
+            "SELECT id, type, content, tags, importance, task_id, created_at, "
+            "source_agent, source_model, source_adapter FROM memory"
         )
         params: list[Any] = []
         where: list[str] = []
@@ -143,6 +241,61 @@ class SQLiteMemoryStore:
             for row in conn.execute(query, params):
                 entries.append(self._row_to_entry(row))
         return entries
+
+    def query(
+        self,
+        type: MemoryType | None = None,
+        tags: builtins.list[str] | None = None,
+        limit: int = 50,
+        *,
+        read_only_from_adapters: builtins.list[str] | None = None,
+    ) -> Iterator[MemoryEntry]:
+        """Yield memory entries with an optional adapter-allowlist filter.
+
+        Default behaviour (``read_only_from_adapters=None``) matches
+        :meth:`list`: every row is returned, including pre-migration rows
+        with NULL ``source_adapter``. Setting the keyword turns the read
+        into a strict allow-list - only rows whose ``source_adapter``
+        matches one of the supplied values are returned, and NULL-provenance
+        rows are excluded. Passing an empty list is treated as "no adapter
+        is allowed" and returns nothing.
+
+        The keyword is opt-in so existing operators are unaffected; the
+        SQL hot path stays untouched when the filter is not set.
+        """
+        select = (
+            "SELECT id, type, content, tags, importance, task_id, created_at, "
+            "source_agent, source_model, source_adapter FROM memory"
+        )
+        params: list[Any] = []
+        where: list[str] = []
+
+        if type:
+            where.append("type = ?")
+            params.append(type)
+
+        if tags:
+            tag_clauses = ["tags LIKE ?" for _ in tags]
+            where.append(f"({' OR '.join(tag_clauses)})")
+            params.extend([f"%{t}%" for t in tags])
+
+        if read_only_from_adapters is not None:
+            if not read_only_from_adapters:
+                # Empty allow-list = nobody allowed. Short-circuit without SQL.
+                return
+            placeholders = ",".join("?" for _ in read_only_from_adapters)
+            where.append(f"source_adapter IN ({placeholders})")
+            params.extend(read_only_from_adapters)
+
+        if where:
+            select += " WHERE " + " AND ".join(where)
+
+        select += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        with sqlite3.connect(self.db_path) as conn:
+            for row in conn.execute(select, params):
+                yield self._row_to_entry(row)
 
     def remove(self, entry_id: int) -> bool:
         """Remove a memory entry by ID."""
@@ -184,22 +337,56 @@ class SQLiteMemoryStore:
 
         return removed
 
-    def get_relevant(self, tags: list[str], limit: int = 10) -> list[MemoryEntry]:
-        """Find most relevant memories for a set of tags (e.g. from a task)."""
-        if not tags:
+    def get_relevant(
+        self,
+        tags: builtins.list[str],
+        limit: int = 10,
+        *,
+        read_only_from_adapters: builtins.list[str] | None = None,
+    ) -> builtins.list[MemoryEntry]:
+        """Find most relevant memories for a set of tags (e.g. from a task).
+
+        ``read_only_from_adapters`` mirrors :meth:`query`'s allow-list: when
+        set, only rows whose ``source_adapter`` matches one of the supplied
+        values are returned, and NULL-provenance rows are excluded. An empty
+        list means "no adapter is allowed" and returns nothing. Default
+        (``None``) preserves the legacy behaviour of returning every
+        matching row regardless of provenance.
+
+        This is a low-level, opt-in primitive. Callers that need a
+        higher-level default-enforced policy - e.g. the spawned-agent prompt
+        path - should use :mod:`bernstein.core.memory.trust_policy` instead
+        of relying on callers to remember to pass this keyword.
+        """
+        if read_only_from_adapters is not None and not read_only_from_adapters:
+            # Empty allow-list = nobody allowed. Short-circuit without SQL.
+            return []
+
+        if not tags and read_only_from_adapters is None:
             return self.list(limit=limit)
 
-        # Simple overlap-based ranking using SQLite
-        # We search for entries that share at least one tag, then rank by overlap + recency
-        tag_clauses = ["tags LIKE ?" for _ in tags]
-        query = f"""
-            SELECT id, type, content, tags, importance, task_id, created_at, source_agent, source_model
-            FROM memory
-            WHERE {" OR ".join(tag_clauses)}
-            ORDER BY importance DESC, created_at DESC
-            LIMIT ?
-        """
-        params = [f"%{t}%" for t in tags] + [limit]
+        where: list[str] = []
+        params: list[Any] = []
+
+        if tags:
+            # Simple overlap-based ranking using SQLite: entries that share
+            # at least one tag, ranked by overlap + recency.
+            tag_clauses = ["tags LIKE ?" for _ in tags]
+            where.append(f"({' OR '.join(tag_clauses)})")
+            params.extend(f"%{t}%" for t in tags)
+
+        if read_only_from_adapters is not None:
+            placeholders = ",".join("?" for _ in read_only_from_adapters)
+            where.append(f"source_adapter IN ({placeholders})")
+            params.extend(read_only_from_adapters)
+
+        query = (
+            "SELECT id, type, content, tags, importance, task_id, created_at, "
+            "source_agent, source_model, source_adapter FROM memory "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY importance DESC, created_at DESC LIMIT ?"
+        )
+        params.append(limit)
 
         entries: list[MemoryEntry] = []
         with sqlite3.connect(self.db_path) as conn:
@@ -217,7 +404,7 @@ class SQLiteMemoryStore:
         task_id: str,
         agent: str = "",
         model: str = "",
-        tags: list[str] | None = None,
+        tags: builtins.list[str] | None = None,
     ) -> int:
         """Record what happened -- task outcomes, failures, discoveries."""
         return self.add(
@@ -233,7 +420,7 @@ class SQLiteMemoryStore:
     def add_semantic(
         self,
         content: str,
-        tags: list[str] | None = None,
+        tags: builtins.list[str] | None = None,
         importance: float = 1.0,
     ) -> int:
         """Record facts about the codebase -- patterns, conventions, architecture."""
@@ -247,7 +434,7 @@ class SQLiteMemoryStore:
     def add_procedural(
         self,
         content: str,
-        tags: list[str] | None = None,
+        tags: builtins.list[str] | None = None,
     ) -> int:
         """Record how to do things -- test patterns, build steps, deploy procedures."""
         return self.add(
@@ -260,9 +447,9 @@ class SQLiteMemoryStore:
     def query_for_task(
         self,
         role: str,
-        context_files: list[str],
+        context_files: builtins.list[str],
         limit: int = 10,
-    ) -> list[MemoryEntry]:
+    ) -> builtins.list[MemoryEntry]:
         """Get relevant memories for a task based on role and file context.
 
         Builds a tag set from the role name and path prefixes of the
@@ -302,4 +489,5 @@ class SQLiteMemoryStore:
             created_at=row[6],
             source_agent=row[7] if len(row) > 7 and row[7] else "",
             source_model=row[8] if len(row) > 8 and row[8] else "",
+            source_adapter=row[9] if len(row) > 9 and row[9] else None,
         )

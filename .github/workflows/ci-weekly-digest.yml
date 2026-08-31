@@ -1,17 +1,30 @@
 name: CI Weekly Digest
 
-# Failure-category weekly digest -- aggregate the last 7 days of
-# auto-release-skipped + main-red CI events into a single tracking issue,
-# then close the per-event issues that already triggered. Targets the
-# alarm-fatigue failure class (per-event auto-release-skipped issues
-# #1433 / #1437 / #1443 / #1446 piling up unread).
+# Roll the last 7 days of main-branch CI signal into ONE rolling tracking
+# issue and close the per-event auto-release-skipped issues that already
+# fired. Keeps main-branch failure patterns visible without a fresh issue
+# every week piling up in the tracker.
 #
-# Borrowed-from: alarm-fatigue research. One aggregated weekly signal
-# beats N noisy per-event pages.
+# What the digest reports (and does not):
+#   * Headline "real failures" counts only conclusion failure/timed_out.
+#     Cancelled runs are concurrency-superseded almost every time
+#     (cancel-in-progress on rapid pushes, superseded schedule ticks) and
+#     are reported separately as informational -- they never inflate the
+#     failure count.
+#   * Failures are split by trigger (schedule vs push) so a chronically red
+#     nightly is distinguishable from a one-off push failure.
+#   * The aggregation lives in scripts/ci_weekly_digest.py (unit-tested,
+#     deterministic) so the numbers are trustworthy and re-runs produce a
+#     byte-identical body.
 #
-# Idempotent: if a digest issue for the current ISO week already exists,
-# the workflow edits that issue in place and only closes per-event
-# issues that have not been linked into the digest yet.
+# Rolling, not proliferating: publishing this week's digest auto-closes the
+# prior weeks' digest issues (bot-authored, title-matched only), so exactly
+# one digest issue stays open. The recommended action for the window is
+# always the first line of the digest body's TL;DR -- there is no separate
+# alert channel.
+#
+# Idempotent: if a digest issue for the current ISO week already exists, the
+# workflow edits it in place rather than opening a duplicate.
 
 on:
   schedule:
@@ -37,14 +50,20 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
       issues: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
-      - name: Build weekly digest
+      - name: Checkout (for the aggregation script)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Build and publish weekly digest
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -52,96 +71,60 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ISO week label (e.g. 2026-W20) makes the digest idempotent
-          # per calendar week regardless of which day the schedule fires.
+          # ISO week label (e.g. 2026-W28) makes the digest idempotent per
+          # calendar week regardless of which day the schedule fires.
           WEEK_LABEL=$(date -u +'%G-W%V')
           SINCE=$(date -u -d "${LOOKBACK_DAYS} days ago" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
             || date -u -v-"${LOOKBACK_DAYS}"d +'%Y-%m-%dT%H:%M:%SZ')
-          export SINCE
           TITLE="CI weekly digest ${WEEK_LABEL}"
+          export TITLE
 
           echo "Building digest for ${WEEK_LABEL} (since ${SINCE})"
 
-          # ----- collect: open + recently-closed auto-release-skipped issues
-          # We pull both states so the digest reflects what happened during
-          # the week even when per-event issues self-closed during cleanup.
-          mapfile -t SKIPPED_NUMBERS < <(
-            gh issue list --repo "${REPO}" --state all \
-              --search "in:title auto-release skipped updated:>=${SINCE%T*}" \
-              --json number,title,state,url,updatedAt \
-              --jq '.[].number' \
-              || true
-          )
+          # ----- collect: open + recently-closed auto-release-skipped issues.
+          # Both states, so the digest reflects the week even when per-event
+          # issues self-closed during cleanup. The exact ${SINCE} timestamp
+          # (not a midnight-truncated date) enforces the precise 7-day cutoff,
+          # and an explicit --limit prevents the default 30-item cap from
+          # silently undercounting on a busy week. No `|| true`: a
+          # transport/auth/pagination error must fail the step rather than
+          # publish a false "clean" digest while still closing tracking issues.
+          SKIPPED=$(gh issue list --repo "${REPO}" --state all \
+            --search "in:title auto-release skipped updated:>=${SINCE}" \
+            --limit 100 \
+            --json number --jq '[.[].number] | join(" ")')
 
-          # ----- collect: main-red CI runs from the last LOOKBACK_DAYS
-          # (workflow_runs on main with conclusion failure/cancelled/timed_out)
-          mapfile -t FAILED_RUN_LINES < <(
-            gh api -X GET "repos/${REPO}/actions/runs" \
-              -f branch=main \
-              -f per_page=100 \
-              --jq '
-                .workflow_runs[]
-                | select(.created_at >= env.SINCE)
-                | select(.conclusion == "failure"
-                         or .conclusion == "cancelled"
-                         or .conclusion == "timed_out")
-                | "\(.conclusion)\t\(.name)\t\(.head_sha[0:7])\t\(.html_url)"
-              ' \
-              || true
-          )
+          # ----- collect: main-branch runs in the window. Server-side
+          # `created` filter + --paginate means we see EVERY run in the
+          # window, not just the most recent 100 (the previous single-page
+          # query silently dropped failures on busy weeks). The full ${SINCE}
+          # timestamp keeps the cutoff exact; dropping `|| true` makes a failed
+          # collection fail the step instead of yielding an empty run set that
+          # reads as a clean week.
+          RUNS_FILE="$(mktemp)"
+          gh api --paginate -X GET "repos/${REPO}/actions/runs" \
+            -f branch=main \
+            -f "created=>=${SINCE}" \
+            -f per_page=100 \
+            --jq '.workflow_runs[] | {id, conclusion, event, name, head_sha, html_url}' \
+            > "${RUNS_FILE}"
 
-          # ----- summary counts
-          SKIPPED_COUNT=${#SKIPPED_NUMBERS[@]}
-          FAILED_COUNT=${#FAILED_RUN_LINES[@]}
+          # ----- classify + render (unit-tested, deterministic aggregation)
+          BODY_FILE="$(mktemp)"
+          SUMMARY_FILE="$(mktemp)"
+          python3 scripts/ci_weekly_digest.py \
+            --runs-file "${RUNS_FILE}" \
+            --skipped "${SKIPPED}" \
+            --week-label "${WEEK_LABEL}" \
+            --since "${SINCE}" \
+            --lookback-days "${LOOKBACK_DAYS}" \
+            --body-file "${BODY_FILE}" \
+            > "${SUMMARY_FILE}"
 
-          # ----- failure-class breakdown by workflow name
-          declare -A FAILS_BY_WORKFLOW=()
-          for line in "${FAILED_RUN_LINES[@]:-}"; do
-            [ -z "${line}" ] && continue
-            wf=$(printf '%s' "${line}" | cut -f2)
-            FAILS_BY_WORKFLOW["${wf}"]=$((${FAILS_BY_WORKFLOW["${wf}"]:-0} + 1))
-          done
+          REAL_FAILURES=$(jq -r '.real_failure_count' "${SUMMARY_FILE}")
+          echo "Summary: $(cat "${SUMMARY_FILE}")"
 
-          # ----- build body
-          BODY_FILE=$(mktemp)
-          {
-            printf '## TL;DR\n\n'
-            printf -- '- Window: last %s day(s) (since %s)\n' "${LOOKBACK_DAYS}" "${SINCE}"
-            printf -- '- main-red CI runs: **%s**\n' "${FAILED_COUNT}"
-            printf -- '- auto-release-skipped issues opened or updated: **%s**\n' "${SKIPPED_COUNT}"
-            printf '\n'
-            printf '## main-red CI runs by workflow\n\n'
-            if [ "${FAILED_COUNT}" -eq 0 ]; then
-              printf '_No main-red runs in the window._\n\n'
-            else
-              printf '| workflow | count |\n|---|---|\n'
-              for wf in "${!FAILS_BY_WORKFLOW[@]}"; do
-                printf '| %s | %s |\n' "${wf}" "${FAILS_BY_WORKFLOW[${wf}]}"
-              done
-              printf '\n<details><summary>Run list</summary>\n\n'
-              printf '| conclusion | workflow | sha | url |\n|---|---|---|---|\n'
-              for line in "${FAILED_RUN_LINES[@]}"; do
-                concl=$(printf '%s' "${line}" | cut -f1)
-                wf=$(printf '%s' "${line}" | cut -f2)
-                sha=$(printf '%s' "${line}" | cut -f3)
-                url=$(printf '%s' "${line}" | cut -f4)
-                printf '| %s | %s | `%s` | %s |\n' "${concl}" "${wf}" "${sha}" "${url}"
-              done
-              printf '\n</details>\n\n'
-            fi
-            printf '## auto-release-skipped issues rolled up\n\n'
-            if [ "${SKIPPED_COUNT}" -eq 0 ]; then
-              printf '_None._\n'
-            else
-              for n in "${SKIPPED_NUMBERS[@]}"; do
-                printf -- '- #%s\n' "${n}"
-              done
-            fi
-            printf '\n---\n'
-            printf '_Aggregated automatically by `ci-weekly-digest.yml`. Borrowed-from: alarm-fatigue research. Closes per-event noise issues to keep operator focus on root-cause patterns._\n'
-          } > "${BODY_FILE}"
-
-          # ----- idempotent upsert of the digest issue
+          # ----- idempotent upsert of the digest issue for this week
           EXISTING=$(gh issue list --repo "${REPO}" --state open \
             --search "in:title \"${TITLE}\"" \
             --json number,title \
@@ -154,35 +137,79 @@ jobs:
             DIGEST_NUMBER="${EXISTING}"
           else
             echo "Creating new digest issue"
-            DIGEST_URL=$(gh issue create --repo "${REPO}" \
-              --title "${TITLE}" \
-              --body-file "${BODY_FILE}" \
-              --label "ci,release-drift" 2>/dev/null \
-              || gh issue create --repo "${REPO}" \
+            # Apply the `ci` label only when it is confirmed to exist. A blind
+            # `create --label ci || create` retries on *any* failure -- including
+            # a transport error that already created the issue -- and can open a
+            # duplicate digest. Probing the label first makes the choice
+            # deterministic: exactly one create runs, chosen by a real condition,
+            # never an error-triggered second attempt.
+            LABELS=$(gh label list --repo "${REPO}" --limit 100 --json name --jq '.[].name')
+            if grep -qxF "ci" <<<"${LABELS}"; then
+              DIGEST_URL=$(gh issue create --repo "${REPO}" \
+                --title "${TITLE}" \
+                --body-file "${BODY_FILE}" \
+                --label "ci")
+            else
+              DIGEST_URL=$(gh issue create --repo "${REPO}" \
                 --title "${TITLE}" \
                 --body-file "${BODY_FILE}")
+            fi
             DIGEST_NUMBER=$(basename "${DIGEST_URL}")
           fi
 
-          # ----- close per-event auto-release-skipped issues with cross-link
-          # Only close OPEN ones; closed ones are already rolled up.
+          # ----- roll forward: close prior weeks' digest issues so exactly
+          # one digest stays open. Bot-authored + strict title match only;
+          # human issues are never touched.
+          mapfile -t OLD_DIGESTS < <(
+            gh issue list --repo "${REPO}" --state open \
+              --search "in:title \"CI weekly digest\"" \
+              --limit 100 \
+              --json number,title,author \
+              --jq '.[]
+                    | select(.author.is_bot == true)
+                    | select(.title | startswith("CI weekly digest "))
+                    | select(.title != env.TITLE)
+                    | .number' \
+              || true
+          )
+          for n in "${OLD_DIGESTS[@]:-}"; do
+            [ -z "${n}" ] && continue
+            [ "${n}" = "${DIGEST_NUMBER}" ] && continue
+            gh issue close "${n}" --repo "${REPO}" \
+              --comment "Superseded by the current weekly digest #${DIGEST_NUMBER}. Closing the prior week's digest to keep one rolling tracking issue; reopen if a specific week still needs investigation." \
+              || echo "::warning::failed to close old digest #${n}"
+          done
+
+          # ----- close per-event auto-release-skipped issues (open ones only;
+          # closed ones are already rolled up) with a cross-link.
           mapfile -t OPEN_SKIPPED < <(
             gh issue list --repo "${REPO}" --state open \
               --search "in:title auto-release skipped" \
+              --limit 100 \
               --json number \
               --jq '.[].number' \
               || true
           )
-
           for n in "${OPEN_SKIPPED[@]:-}"; do
             [ -z "${n}" ] && continue
-            # Defensive: never close the digest itself.
             if [ "${n}" = "${DIGEST_NUMBER}" ]; then
               continue
             fi
             gh issue close "${n}" --repo "${REPO}" \
-              --comment "Rolled up into weekly digest #${DIGEST_NUMBER}. Closing per alarm-fatigue policy; reopen if root-cause investigation needs a separate thread." \
+              --comment "Rolled up into weekly digest #${DIGEST_NUMBER}. Reopen if root-cause investigation needs a separate thread." \
               || echo "::warning::failed to close issue #${n}"
           done
 
-          echo "Digest #${DIGEST_NUMBER} published. Closed ${#OPEN_SKIPPED[@]} per-event issues."
+          # ----- run summary. This is the job's only step, so anything the
+          # digest needs to hand off must land here (GITHUB_STEP_SUMMARY) --
+          # a GITHUB_ENV write would have no later step in this job to read
+          # it and would be dead on arrival.
+          {
+            echo "### CI weekly digest ${WEEK_LABEL}"
+            echo ""
+            echo "- Real failures on main: **${REAL_FAILURES}**"
+            echo "- Digest issue: #${DIGEST_NUMBER}"
+            echo "- Closed ${#OLD_DIGESTS[@]} prior digest(s), ${#OPEN_SKIPPED[@]} per-event issue(s)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "Digest #${DIGEST_NUMBER} published (real failures: ${REAL_FAILURES})."

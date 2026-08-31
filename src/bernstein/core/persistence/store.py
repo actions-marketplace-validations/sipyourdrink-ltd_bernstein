@@ -1,20 +1,34 @@
 """Abstract TaskStore base class for pluggable storage backends.
 
 Concrete implementations:
-- TaskStore (server.py) — in-memory with JSONL persistence, zero dependencies.
-- PostgresTaskStore (store_postgres.py) — asyncpg + optional Redis locking.
+- TaskStore (server.py) - in-memory with JSONL persistence, zero dependencies.
+- PostgresTaskStore (store_postgres.py) - asyncpg + optional Redis locking.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
-    from bernstein.core.models import Task
-    from bernstein.core.server import ArchiveRecord, TaskCreate
+    from bernstein.core.server import TaskCreate
+    from bernstein.core.tasks.models import Task
+    from bernstein.core.tasks.task_store import ArchiveRecord
+
+
+def role_mismatch_error(task_id: str, task_role: str, agent_role: str) -> ValueError:
+    """Build the error raised when an agent claims a task of another role.
+
+    Owned here because both stores raise it and the ``claim_by_id`` /
+    ``claim_batch`` contracts below document it - one wording, so a caller
+    matching on it behaves the same whichever backend answers.
+    """
+    return ValueError(f"role mismatch: task {task_id} requires role '{task_role}', agent has role '{agent_role}'")
 
 
 @dataclass
@@ -99,6 +113,7 @@ class BaseTaskStore(ABC):
         task_id: str,
         expected_version: int | None = None,
         agent_role: str | None = None,
+        claimed_by_session: str | None = None,
     ) -> Task:
         """Claim a specific task, optionally with CAS version check and role matching.
 
@@ -108,6 +123,9 @@ class BaseTaskStore(ABC):
                 task version matches (compare-and-swap).
             agent_role: If set, the claim is rejected unless the task's role
                 matches the agent's role (role-locked claiming).
+            claimed_by_session: Parent orchestrator session recorded as the
+                owner of this claim.  Recorded as part of the claim itself,
+                so a claimed task always carries its owner.
 
         Returns:
             The claimed :class:`~bernstein.core.models.Task`.
@@ -123,6 +141,7 @@ class BaseTaskStore(ABC):
         task_ids: list[str],
         agent_id: str,
         agent_role: str | None = None,
+        claimed_by_session: str | None = None,
         tenant_id: str | None = None,
     ) -> tuple[list[str], list[str]]:
         """Atomically claim multiple tasks by ID with optional role matching.
@@ -132,6 +151,8 @@ class BaseTaskStore(ABC):
             agent_id: Claiming agent's identifier.
             agent_role: If set, only tasks whose role matches the agent's role
                 can be claimed.
+            claimed_by_session: Parent orchestrator session recorded as the
+                owner of the claims.
             tenant_id: If set, tasks must belong to this tenant scope.
                 The check happens atomically with the claim so it cannot be
                 invalidated by a concurrent delete or tenant rewrite.
@@ -195,7 +216,7 @@ class BaseTaskStore(ABC):
 
     @abstractmethod
     async def update(self, task_id: str, role: str | None, priority: int | None) -> Task:
-        """Update mutable task fields (role, priority) — manager corrections.
+        """Update mutable task fields (role, priority) - manager corrections.
 
         Only open or failed tasks should be reassigned; claimed tasks are left
         to finish before the new assignment takes effect.
@@ -235,6 +256,8 @@ class BaseTaskStore(ABC):
         self,
         status: str | None = None,
         cell_id: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
     ) -> list[Task]:
         """Return tasks, optionally filtered.
 
@@ -244,6 +267,33 @@ class BaseTaskStore(ABC):
         Args:
             status: If provided, only tasks with this status are returned.
             cell_id: If provided, only tasks in this cell are returned.
+            limit: If provided, return at most this many tasks after filtering.
+                Network-backed implementations (e.g. Postgres) must apply a
+                bound even when ``limit`` is ``None`` — an unbounded default
+                risks fetching the entire table on every call. An in-memory
+                implementation whose rows are already resident may return
+                every matching row when ``limit`` is ``None``, since doing so
+                costs nothing beyond what it already holds.
+            offset: If provided, skip this many tasks after filtering. Combine
+                with ``limit`` for paginated iteration.
+
+        Returns:
+            List of matching tasks.
+        """
+
+    @abstractmethod
+    async def count_tasks(
+        self,
+        status: str | None = None,
+        cell_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> int:
+        """Return task count, optionally filtered without constructing Task objects.
+
+        Args:
+            status: If provided, only count tasks with this status.
+            cell_id: If provided, only count tasks in this cell.
+            tenant_id: If provided, only count tasks for this tenant.
         """
 
     @abstractmethod

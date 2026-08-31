@@ -1,4 +1,4 @@
-"""MCP tool composition — chain multiple tools into workflows.
+"""MCP tool composition - chain multiple tools into workflows.
 
 Defines composite tool definitions that sequence multiple MCP tool calls
 into a single logical workflow.  Each step can reference outputs from
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_ANY = "dict[str, Any]"
+type _CAST_DICT_STR_ANY = dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -145,11 +145,11 @@ def resolve_template(
     for key, raw_value in template.items():
         match = _TEMPLATE_RE.fullmatch(raw_value)
         if match:
-            # Entire value is a single placeholder — inject the raw object.
+            # Entire value is a single placeholder - inject the raw object.
             ref_key = match.group(1)
             resolved[key] = context.get(ref_key, raw_value)
         elif _TEMPLATE_RE.search(raw_value):
-            # Mixed text + placeholders — string interpolation.
+            # Mixed text + placeholders - string interpolation.
             def _replace(m: re.Match[str]) -> str:
                 return str(context.get(m.group(1), m.group(0)))
 
@@ -275,7 +275,7 @@ def _parse_single_step(raw_step: dict[str, Any]) -> ToolStep:
         server=str(raw_step.get("server", "")),
         args_template=args_dict,
         output_key=str(raw_step.get("output_key", "")),
-        on_failure=on_failure,
+        on_failure=cast(Literal["stop", "skip", "retry"], on_failure),
     )
 
 

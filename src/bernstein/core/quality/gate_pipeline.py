@@ -7,11 +7,51 @@ from typing import TYPE_CHECKING, Any, Literal
 
 TIMED_OUT_PREFIX = "Timed out after "
 NO_PYTHON_FILES = "No Python files changed."
+# Prefix emitted by ``quality_gates._run_command`` when the subprocess could
+# not be started at all (OSError from ``subprocess.run``: missing shell,
+# vanished cwd, ...). Distinct from a non-zero exit with captured output,
+# which means the tool ran and reported a real failure. The gate runner maps
+# this prefix to ``inconclusive`` (reason ``evidence-missing``) — see
+# ``_command_failure_result``.
+COMMAND_ERROR_PREFIX = "Command error: "
 
 if TYPE_CHECKING:
     from bernstein.core.quality.quality_gates import QualityGatesConfig
 
-GateStatus = Literal["pass", "fail", "warn", "timeout", "skipped", "bypassed"]
+GateStatus = Literal["pass", "fail", "warn", "timeout", "skipped", "bypassed", "inconclusive", "command_not_found"]
+
+# Closed set of reason codes for the ``"inconclusive"`` verdict.
+#
+# A gate returns ``"inconclusive"`` (with one of these reason codes) when it
+# cannot honestly evaluate the evidence it was given — neither "pass" (which
+# would be a bypass) nor "fail" (which would be a lie that trains operators
+# to re-run until green). At a required gate, ``inconclusive`` blocks exactly
+# like ``"fail"``; the difference is the claim, not the outcome.
+#
+# Issue #4181 (sibling slice to #4182, which carries the verdict into
+# receipts and offline re-derivation). See ``gate_runner.py`` for the
+# producer sites and ``GateResult.reason`` for the field that carries it.
+INCONCLUSIVE_REASONS: frozenset[str] = frozenset(
+    {
+        # The gate found no evidence at all — no targets to scan, no journal
+        # to verify, no file to read. Distinct from "evidence present but
+        # unfavourable".
+        "evidence-missing",
+        # Evidence was located but could not be parsed or read back (binary
+        # garbage, truncation, permission denied, encoding error). Distinct
+        # from "evidence unfavourable".
+        "evidence-unreadable",
+        # The runner/subprocess died before producing output (timeout that
+        # bypassed the structured timeout path, uncaught exception inside
+        # the evaluator, subprocess killed by signal). Distinct from
+        # "evidence unfavourable".
+        "runner-died-before-output",
+        # The command specified for the gate was not found (exit code 127).
+        # Distinct from "evidence unfavourable" — no evidence was produced
+        # because the tool itself is missing.
+        "command-not-found",
+    }
+)
 
 VALID_GATE_NAMES = frozenset(
     {
@@ -30,6 +70,7 @@ VALID_GATE_NAMES = frozenset(
         "comment_quality",
         "import_cycle",
         "merge_conflict",
+        "run_config",
         "benchmark",
         "dep_audit",
         "migration_reversibility",
@@ -37,6 +78,7 @@ VALID_GATE_NAMES = frozenset(
         "integration_test_gen",
         "review_rubric",
         "test_expansion",
+        "agent_test_mutation",
         "incident_evals",
     }
 )
@@ -101,7 +143,29 @@ class GatePipelineStep:
 
 @dataclass
 class GateResult:
-    """Result for one gate execution."""
+    """Result for one gate execution.
+
+    Attributes:
+        name: Gate name.
+        status: Verdict from the closed ``GateStatus`` set. An
+            ``"inconclusive"`` status MUST carry a ``reason`` drawn from
+            :data:`INCONCLUSIVE_REASONS`; any other status MUST carry
+            ``reason=None``. This invariant is enforced by
+            ``__post_init__``.
+        required: Whether this gate blocks completion on failure.
+        blocked: Whether the runner is blocking promotion on this result.
+            At a required gate, ``"inconclusive"`` sets ``blocked=True``
+            just like ``"fail"`` — the verdict differs, the outcome does
+            not (issue #4181).
+        cached: Whether the result came from the per-task result cache.
+        duration_ms: Wall-clock duration of the gate execution.
+        details: Human-readable explanation (truncated at 2000 chars).
+        metadata: Structured per-gate metadata (scores, regression lists,
+            command strings). May not contain a ``"reason"`` key — that
+            lives on the dedicated ``reason`` field above.
+        reason: Closed-set reason code for an ``"inconclusive"`` status;
+            ``None`` for every other status.
+    """
 
     name: str
     status: GateStatus
@@ -111,6 +175,28 @@ class GateResult:
     duration_ms: int
     details: str
     metadata: dict[str, Any] = field(default_factory=_empty_metadata)
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        """Enforce the ``status ↔ reason`` invariant from the docstring."""
+        if self.status == "inconclusive":
+            if self.reason is None:
+                raise ValueError(
+                    "GateResult.status='inconclusive' requires a reason drawn "
+                    f"from INCONCLUSIVE_REASONS (got reason=None, name={self.name!r})"
+                )
+            if self.reason not in INCONCLUSIVE_REASONS:
+                raise ValueError(
+                    f"GateResult.reason={self.reason!r} is not in the closed "
+                    f"set INCONCLUSIVE_REASONS={sorted(INCONCLUSIVE_REASONS)} "
+                    f"(name={self.name!r})"
+                )
+        elif self.reason is not None:
+            raise ValueError(
+                f"GateResult.reason={self.reason!r} is only valid with "
+                f"status='inconclusive'; got status={self.status!r} "
+                f"(name={self.name!r})"
+            )
 
 
 @dataclass
@@ -147,6 +233,11 @@ _DEFAULT_GATE_SPECS: list[tuple[str, str, bool, str]] = [
     ("import_cycle_check", "import_cycle", True, "python_changed"),
     ("coverage_delta", "coverage_delta", True, "python_changed"),
     ("merge_conflict_check", "merge_conflict", True, "any_changed"),
+    # The run's own configuration is never part of a deliverable; a change
+    # that carries it would rewrite the repository's configuration for
+    # every user of it. Cheap (a set membership test over the changed-file
+    # names) and required, so a leak stops the run instead of shipping.
+    ("run_config", "run_config", True, "always"),
     ("pii_scan", "pii_scan", True, "any_changed"),
     ("dlp_scan", "dlp_scan", True, "any_changed"),
     ("mutation_testing", "mutation_testing", True, "python_changed"),

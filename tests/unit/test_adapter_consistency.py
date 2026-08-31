@@ -5,7 +5,7 @@ Parametrized test instantiating every adapter, verifying protocol compliance:
 - All have spawn() with the correct signature
 - All have name() method returning a non-empty string
 - spawn() returns SpawnResult with required fields
-- detect_tier() returns ApiTierInfo or None — never raises
+- detect_tier() returns ApiTierInfo or None - never raises
 - is_installed() is callable and returns bool (when present)
 - build_command() / _build_command() returns a list of strings (when present)
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import inspect
 import subprocess
+import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -24,9 +25,16 @@ from bernstein.core.models import ApiTierInfo, ModelConfig
 
 from bernstein.adapters.base import CLIAdapter, SpawnResult
 from bernstein.adapters.registry import _ADAPTERS, get_adapter
+from bernstein.core.agents.multimodal import (
+    ModalityType,
+    MultiModalContext,
+    MultiModalInput,
+    is_multimodal_capable,
+)
+from bernstein.core.agents.multimodal_attestation import CapabilityRefusal
 
 # ---------------------------------------------------------------------------
-# Adapter factories — enumerate every known adapter
+# Adapter factories - enumerate every known adapter
 # ---------------------------------------------------------------------------
 
 
@@ -55,7 +63,7 @@ for _name in _all_adapter_names():
 
 
 # ---------------------------------------------------------------------------
-# TEST-006a: Protocol compliance — interface checks
+# TEST-006a: Protocol compliance - interface checks
 # ---------------------------------------------------------------------------
 
 
@@ -89,6 +97,15 @@ class TestAdapterProtocolCompliance:
         sig = inspect.signature(adapter.spawn)
         assert "timeout_seconds" in sig.parameters, f"{adapter_name}.spawn() should accept timeout_seconds"
 
+    def test_spawn_has_optional_multimodal_context(self, adapter_name: str, adapter: CLIAdapter) -> None:
+        sig = inspect.signature(adapter.spawn)
+        assert "multimodal_context" in sig.parameters, f"{adapter_name}.spawn() should accept multimodal_context"
+        multimodal_param = sig.parameters["multimodal_context"]
+        assert multimodal_param.default is None, f"{adapter_name}.spawn() multimodal_context should default to None"
+        assert multimodal_param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"{adapter_name}.spawn() multimodal_context should be keyword-only"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TEST-006b: spawn() returns SpawnResult with valid fields (mocked subprocess)
@@ -121,6 +138,14 @@ class TestAdapterSpawnResult:
     ) -> None:
         popen_mock = _make_popen_mock()
         mod = type(adapter).__module__
+
+        # Adapters that refuse before spawning (e.g. experimental stubs) do not
+        # import subprocess and never return a SpawnResult; skip the process
+        # check for them, mirroring the external-binary skip below.
+        mod_obj = sys.modules[mod]
+        if not hasattr(mod_obj, "subprocess"):
+            pytest.skip(f"{adapter_name} does not launch a subprocess")
+            return
 
         # Create required directories
         sdd = tmp_path / ".sdd" / "runtime"
@@ -156,6 +181,48 @@ class TestAdapterSpawnResult:
         assert isinstance(result.pid, int), f"{adapter_name}: pid must be int"
         assert result.pid > 0, f"{adapter_name}: pid must be positive, got {result.pid}"
         assert isinstance(result.log_path, Path), f"{adapter_name}: log_path must be a Path"
+
+
+@pytest.mark.parametrize(
+    "adapter_name",
+    [name for name, _adapter in _TESTABLE_ADAPTERS],
+    ids=[t[0] for t in _TESTABLE_ADAPTERS],
+)
+class TestAdapterMultimodalRefusal:
+    """Adapters that cannot consume attachments must refuse before spawning."""
+
+    def test_non_multimodal_adapter_refuses_multimodal_context(
+        self,
+        adapter_name: str,
+        tmp_path: Path,
+    ) -> None:
+        if is_multimodal_capable(adapter_name):
+            pytest.skip(f"{adapter_name} supports multimodal attachments")
+
+        adapter = _instantiate_adapter(adapter_name)
+        attachment = tmp_path / "screenshot.png"
+        attachment.write_bytes(b"fake image")
+        context = MultiModalContext(
+            inputs=(
+                MultiModalInput(
+                    modality=ModalityType.IMAGE,
+                    content_path=attachment,
+                    mime_type="image/png",
+                    description="screenshot",
+                ),
+            ),
+            primary_modality=ModalityType.IMAGE,
+        )
+
+        with pytest.raises(CapabilityRefusal):
+            adapter.spawn(
+                prompt="Test prompt",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="sonnet", effort="high"),
+                session_id="test-sess-001",
+                timeout_seconds=0,
+                multimodal_context=context,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +316,7 @@ class TestAdapterBuildCommand:
                 "test prompt",
             )
         except (TypeError, AttributeError):
-            # Accept adapters with different _build_command signatures — just
+            # Accept adapters with different _build_command signatures - just
             # verify the method exists and is callable, which we already did.
             return
 
@@ -260,7 +327,7 @@ class TestAdapterBuildCommand:
 
 
 # ---------------------------------------------------------------------------
-# TEST-006c: Adapter registry — get_adapter by name
+# TEST-006c: Adapter registry - get_adapter by name
 # ---------------------------------------------------------------------------
 
 

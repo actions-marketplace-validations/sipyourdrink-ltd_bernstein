@@ -1,10 +1,10 @@
 """Structural assertions on ``.github/workflows/post-ci-dispatcher.yml``.
 
-The dispatcher consolidates five sibling ``workflow_run: CI completed``
-listeners (auto-release, auto-heal, bernstein-ci-fix, bisect-on-red,
-telegram-notify) into a single boot that calls each child via
-``workflow_call``. The acceptance criteria are encoded as tests here so
-the consolidation cannot silently regress.
+The dispatcher consolidates the sibling ``workflow_run: CI completed``
+listeners (auto-release, auto-heal, bernstein-ci-fix, bisect-on-red)
+into a single boot that calls each child via ``workflow_call``. The
+acceptance criteria are encoded as tests here so the consolidation
+cannot silently regress.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ CHILDREN = (
     "auto-heal",
     "bernstein-ci-fix",
     "bisect-on-red",
-    "telegram-notify",
 )
 
 
@@ -36,11 +35,19 @@ CHILDREN = (
 # dispatcher can forward only those (zizmor `secrets-inherit`: blanket
 # `secrets: inherit` would otherwise leak every repository secret to every
 # called workflow). GITHUB_TOKEN is auto-provided and never appears here.
+#
+# BERNSTEIN_AUTOSYNC_TOKEN is not incidental and must not be tidied away. Both
+# heal lanes open a pull request, and a reusable workflow sees only the secrets
+# its caller passes: drop the forward and `secrets.BERNSTEIN_AUTOSYNC_TOKEN`
+# reads as empty inside the callee, the `|| secrets.GITHUB_TOKEN` fallback
+# takes over, and the resulting pull request triggers no workflows, so no
+# required context ever reports and branch protection holds it at BLOCKED.
+# `test_bot_pull_request_tokens_yaml.py` asserts the forward from the other
+# side; the two guards have to agree.
 EXPECTED_CHILD_SECRETS: dict[str, frozenset[str]] = {
-    "telegram-notify": frozenset({"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}),
-    "auto-release": frozenset({"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}),
-    "auto-heal": frozenset({"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}),
-    "bernstein-ci-fix": frozenset({"GEMINI_API_KEY"}),
+    "auto-release": frozenset(),
+    "auto-heal": frozenset({"BERNSTEIN_AUTOSYNC_TOKEN"}),
+    "bernstein-ci-fix": frozenset({"BERNSTEIN_AUTOSYNC_TOKEN", "GEMINI_API_KEY"}),
     "bisect-on-red": frozenset(),
 }
 
@@ -164,7 +171,6 @@ def test_dispatcher_workflow_permissions_minimal(dispatcher: dict[str, Any]) -> 
         ".github/workflows/auto-heal.yml",
         ".github/workflows/bernstein-ci-fix.yml",
         ".github/workflows/bisect-on-red.yml",
-        ".github/workflows/telegram-notify.yml",
     ],
 )
 def test_children_expose_workflow_call(child_yaml: str) -> None:
@@ -181,3 +187,185 @@ def test_children_expose_workflow_call(child_yaml: str) -> None:
     on = _on(data)
     assert "workflow_call" in on, f"`{child_yaml}` must declare on: workflow_call:"
     assert "workflow_run" not in on, f"`{child_yaml}` must NOT keep workflow_run; the dispatcher owns that trigger now"
+
+
+# --- Reusable-workflow permission containment -------------------------------
+#
+# A called workflow inherits the *calling job's* GITHUB_TOKEN permissions.
+# When the caller grants less than any callee job requests, the Actions
+# validator rejects the call before scheduling anything: the whole
+# dispatcher run ends as `conclusion: startup_failure` with zero
+# check_runs. Nothing turns red, no check fails, no notification fires -
+# every child workflow simply stops running.
+#
+# That has bitten this dispatcher twice. The second time, a callee job
+# gained `actions: write` while the caller kept its narrower grant, and
+# auto-release, auto-heal, bernstein-ci-fix and bisect-on-red were all
+# silently dead for five days across 83 consecutive runs. The assertion
+# below turns that class of change into a red build instead.
+
+_PERMISSION_LEVELS = {"none": 0, "read": 1, "write": 2}
+
+# Scopes a job declares implicitly via the `read-all` / `write-all` shorthand.
+_ALL_SCOPES = "*"
+
+
+def _normalise_permissions(perms: Any) -> dict[str, str] | None:
+    """Map a `permissions:` block to `{scope: level}`.
+
+    Returns ``None`` when the block is absent, which means "inherit" and
+    therefore imposes no requirement of its own.
+    """
+    if perms is None:
+        return None
+    if isinstance(perms, str):
+        if perms in {"read-all", "write-all"}:
+            return {_ALL_SCOPES: perms.removesuffix("-all")}
+        # `permissions: {}` can round-trip through YAML as the string "{}".
+        return {}
+    assert isinstance(perms, dict), f"unsupported permissions block: {perms!r}"
+    return {str(scope): str(level) for scope, level in perms.items()}
+
+
+def _required_permissions(child: str) -> dict[str, str]:
+    """Union of the scopes every job in ``child.yml`` requests.
+
+    A job without its own block falls back to the child's workflow-level
+    block; when neither declares anything the job inherits the caller's
+    grant and so constrains nothing.
+    """
+    data = _load(REPO_ROOT / ".github" / "workflows" / f"{child}.yml")
+    workflow_level = _normalise_permissions(data.get("permissions"))
+    required: dict[str, str] = {}
+    for job in (data.get("jobs") or {}).values():
+        if not isinstance(job, dict):
+            continue
+        declared = _normalise_permissions(job.get("permissions"))
+        effective = workflow_level if declared is None else declared
+        for scope, level in (effective or {}).items():
+            if _PERMISSION_LEVELS.get(level, 0) > _PERMISSION_LEVELS.get(required.get(scope, "none"), 0):
+                required[scope] = level
+    return required
+
+
+@pytest.mark.parametrize("child", CHILDREN)
+def test_dispatcher_grants_cover_callee_requests(dispatcher: dict[str, Any], child: str) -> None:
+    """The calling job must grant at least what every callee job requests."""
+    job = (dispatcher.get("jobs") or {}).get(child)
+    assert isinstance(job, dict), f"dispatcher missing job for `{child}`"
+    granted = _normalise_permissions(job.get("permissions"))
+    required = _required_permissions(child)
+    assert granted is not None, (
+        f"job `{child}` must declare an explicit `permissions:` block; the repo default "
+        f"is read-only and would reject the call at boot (requires: {required})"
+    )
+    blanket = _PERMISSION_LEVELS.get(granted.get(_ALL_SCOPES, "none"), 0)
+    missing = {
+        scope: f"needs {level}, granted {granted.get(scope, 'nothing')}"
+        for scope, level in required.items()
+        if max(_PERMISSION_LEVELS.get(granted.get(scope, "none"), 0), blanket) < _PERMISSION_LEVELS[level]
+    }
+    assert not missing, (
+        f"dispatcher job `{child}` grants less than `{child}.yml` requests: {missing}. "
+        "The Actions validator rejects the call at boot, so the whole dispatcher run ends as "
+        "conclusion: startup_failure with zero check_runs and every child silently stops running. "
+        f"Widen the job's `permissions:` block to cover {required}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Merge-queue readiness: the auto-release chain must survive the queue (#2966)
+#
+# Chain under the queue:
+#   queue merges -> push to `main` at the SAME SHA the queue tested
+#                -> ci.yml (push) -> workflow_run -> this dispatcher
+#                -> auto-release -> tag -> publish.
+#
+# Two properties keep that chain intact, and both are one careless edit away
+# from silently breaking (green CI, no tag, no error). See
+# docs/operations/merge-queue.md :: "Auto-release through the queue".
+# ---------------------------------------------------------------------------
+
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+# The merge queue runs CI on an ephemeral ref named
+# `gh-readonly-queue/<base>/pr-<n>-<base_sha>`, never on `main` itself.
+MERGE_QUEUE_REF_PREFIX = "gh-readonly-queue/"
+
+# The auto-release gate keys on a `version = ` change in this file, so it must
+# never be excluded from the `push` CI run the dispatcher listens for.
+RELEASE_TRIGGER_PATH = "pyproject.toml"
+
+
+@pytest.fixture(scope="module")
+def ci_workflow() -> dict[str, Any]:
+    return _load(CI_WORKFLOW)
+
+
+def test_dispatcher_does_not_listen_on_merge_queue_refs(dispatcher: dict[str, Any]) -> None:
+    """A queue ref must never dispatch auto-release.
+
+    `merge_group` CI runs report `head_branch` as the ephemeral
+    `gh-readonly-queue/...` ref. Those runs are speculative - the entry can
+    still be ejected - so tagging off one would publish a release for a
+    commit that never landed on `main`. The `branches: [main]` filter is
+    what prevents it.
+    """
+    wfr = _on(dispatcher).get("workflow_run")
+    assert isinstance(wfr, dict)
+    branches = wfr.get("branches")
+    assert branches == ["main"], (
+        "dispatcher must stay filtered to `branches: [main]`. Widening it to the "
+        f"merge queue's `{MERGE_QUEUE_REF_PREFIX}**` refs would tag releases from "
+        "speculative queue builds that may never merge."
+    )
+    for pattern in branches:
+        assert not pattern.startswith(MERGE_QUEUE_REF_PREFIX), (
+            f"`{pattern}` matches a merge-queue ephemeral ref; see above"
+        )
+
+
+def test_ci_push_trigger_still_covers_main(ci_workflow: dict[str, Any]) -> None:
+    """The post-queue push to `main` is what reaches this dispatcher.
+
+    The merge queue advances `main` to the same SHA it tested and emits an
+    ordinary `push` event (actor `github-merge-queue[bot]`). If ci.yml ever
+    stopped triggering on `push` to `main`, no `workflow_run` would fire and
+    every release would stop silently.
+    """
+    push = _on(ci_workflow).get("push")
+    assert isinstance(push, dict), "ci.yml must keep a `push:` trigger"
+    assert push.get("branches") == ["main"], (
+        "ci.yml must keep `push.branches: [main]`; post-ci-dispatcher.yml listens "
+        "for the CI run produced by the post-queue push to main."
+    )
+
+
+def test_ci_push_paths_ignore_does_not_cover_release_trigger(
+    ci_workflow: dict[str, Any],
+) -> None:
+    """`pyproject.toml` must keep triggering CI on `main`.
+
+    auto-release only tags when the triggering commit changed `version = ` in
+    pyproject.toml. Path-ignoring it would mean the version-bump merge never
+    runs CI, never produces a `workflow_run`, and never reaches the release
+    gate - with no failure anywhere to notice.
+    """
+    push = _on(ci_workflow).get("push")
+    assert isinstance(push, dict)
+    ignored = [str(p) for p in (push.get("paths-ignore") or [])]
+    offenders = [p for p in ignored if not p.startswith("!") and (p == RELEASE_TRIGGER_PATH or p in {"*", "**"})]
+    assert not offenders, (
+        f"ci.yml `push.paths-ignore` must not exclude `{RELEASE_TRIGGER_PATH}` "
+        f"(found {offenders}); the auto-release listener would never fire for a "
+        "version bump."
+    )
+
+
+def test_ci_declares_merge_group_trigger(ci_workflow: dict[str, Any]) -> None:
+    """CI must run on the queue's ephemeral ref, otherwise nothing gates it."""
+    on = _on(ci_workflow)
+    assert "merge_group" in on, (
+        "ci.yml must declare a `merge_group:` trigger; without it the `CI gate` "
+        "required context never reports on a queued group and the queue wedges."
+    )

@@ -36,14 +36,15 @@ class PiAdapter(CLIAdapter):
         task_scope: str = "medium",
         budget_multiplier: float = 1.0,
         system_addendum: str = "",
+        multimodal_context: Any | None = None,
     ) -> SpawnResult:
         """Launch a Pi coding-agent session.
 
         Args:
             prompt: Task prompt passed as the single positional argument.
             workdir: Working directory for the agent process.
-            model_config: Model configuration (unused by ``pi`` which
-                selects its own model via its own settings).
+            model_config: Model and effort configuration. The selected model
+                is passed through to Pi when it is not ``auto``.
             session_id: Unique session identifier used for the log file.
             mcp_config: Unused. Pi manages its own integrations.
             timeout_seconds: Watchdog timeout in seconds.
@@ -58,10 +59,14 @@ class PiAdapter(CLIAdapter):
             RuntimeError: If the ``pi`` binary is missing or not
                 executable.
         """
+        self.refuse_multimodal_if_needed(multimodal_context)
         log_path = workdir / ".sdd" / "runtime" / f"{session_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = ["pi", prompt]
+        cmd = ["pi"]
+        if model_config.model and model_config.model.lower() != "auto":
+            cmd.extend(["--model", model_config.model])
+        cmd.append(prompt)
 
         pid_dir = workdir / ".sdd" / "runtime" / "pids"
         wrapped_cmd = build_worker_cmd(

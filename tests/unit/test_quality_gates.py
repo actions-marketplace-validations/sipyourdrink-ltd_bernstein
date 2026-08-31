@@ -41,34 +41,37 @@ def _make_task(*, id: str = "T-001", role: str = "backend") -> Task:
 
 class TestRunCommand:
     def test_success_exit_zero(self, tmp_path: Path) -> None:
-        ok, output = _run_command("exit 0", tmp_path, timeout_s=5)
+        ok, output, _exit_code = _run_command("exit 0", tmp_path, timeout_s=5)
         assert ok
         assert isinstance(output, str)
 
     def test_failure_nonzero_exit(self, tmp_path: Path) -> None:
-        ok, _output = _run_command("exit 1", tmp_path, timeout_s=5)
+        ok, _output, _exit_code = _run_command("exit 1", tmp_path, timeout_s=5)
         assert not ok
 
     def test_captures_stdout(self, tmp_path: Path) -> None:
-        ok, output = _run_command("echo hello_world", tmp_path, timeout_s=5)
+        ok, output, _exit_code = _run_command("echo hello_world", tmp_path, timeout_s=5)
         assert ok
         assert "hello_world" in output
 
     def test_timeout_returns_failure(self, tmp_path: Path) -> None:
-        ok, output = _run_command("sleep 10", tmp_path, timeout_s=1)
+        ok, output, _exit_code = _run_command("sleep 10", tmp_path, timeout_s=1)
         assert not ok
         assert "Timed out" in output
 
     def test_truncates_long_output(self, tmp_path: Path) -> None:
         long_str = "x" * 3000
-        ok, output = _run_command(f"echo '{long_str}'", tmp_path, timeout_s=5)
+        ok, output, _exit_code = _run_command(f"echo '{long_str}'", tmp_path, timeout_s=5)
         assert ok
         assert len(output) <= 2050  # 2000 + "... (truncated)"
 
     def test_bad_command_returns_failure(self, tmp_path: Path) -> None:
         # Command that doesn't exist
-        ok, _output = _run_command("nonexistent_command_xyz_12345", tmp_path, timeout_s=5)
+        ok, _output, exit_code = _run_command("nonexistent_command_xyz_12345", tmp_path, timeout_s=5)
         assert not ok
+        # 127 is the shell's "command not found"; the gate runner reads it to
+        # separate a missing tool from a tool that ran and found problems.
+        assert exit_code == 127
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +102,56 @@ class TestRunQualityGatesDisabled:
 
 
 # ---------------------------------------------------------------------------
+# run_quality_gates: CLAUDE.md session override (GATE-REPAIR regression)
+# ---------------------------------------------------------------------------
+
+
+class TestRunQualityGatesClaudeMdRestore:
+    def test_worktree_run_restores_tracked_claude_md(self, tmp_path: Path) -> None:
+        """A gate run in an agent worktree must not grade the session CLAUDE.md.
+
+        The orchestrator writes a session-specific CLAUDE.md (skip-worktree)
+        into every agent worktree; the tracked one documents the real
+        back-compat mechanism (_CoreRedirectFinder). Gates must restore the
+        tracked file first - test_claude_md_shim_doc reads it.
+        """
+        import subprocess
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+
+        def _git(*args: str) -> None:
+            subprocess.run(args, cwd=worktree, check=True, capture_output=True, text=True)
+
+        _git("git", "init", "-q", "-b", "main")
+        _git("git", "config", "user.email", "test@example.com")
+        _git("git", "config", "user.name", "Test")
+        (worktree / "CLAUDE.md").write_text("# docs\n_CoreRedirectFinder\n", encoding="utf-8")
+        _git("git", "add", "CLAUDE.md")
+        _git("git", "commit", "-q", "-m", "init")
+
+        # Simulate the session override worktree_claude_md.write_claude_md applies.
+        (worktree / "CLAUDE.md").write_text("# session override\n", encoding="utf-8")
+        _git("git", "update-index", "--skip-worktree", "CLAUDE.md")
+
+        config = QualityGatesConfig(enabled=True, pipeline=[])
+        task = _make_task()
+        result = run_quality_gates(task, worktree, tmp_path, config)
+        assert result.passed
+        assert "_CoreRedirectFinder" in (worktree / "CLAUDE.md").read_text(encoding="utf-8")
+
+    def test_main_checkout_run_leaves_claude_md_untouched(self, tmp_path: Path) -> None:
+        """When gates run in the main checkout (run_dir == workdir) the file is
+        not restored/replaced - it is already the tracked one."""
+        (tmp_path / "CLAUDE.md").write_text("# tracked\n_CoreRedirectFinder\n", encoding="utf-8")
+        config = QualityGatesConfig(enabled=True, pipeline=[])
+        task = _make_task()
+        with patch("bernstein.core.git.worktree_claude_md.restore_claude_md") as mock_restore:
+            run_quality_gates(task, tmp_path, tmp_path, config)
+            mock_restore.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # run_quality_gates: lint gate
 # ---------------------------------------------------------------------------
 
@@ -113,6 +166,7 @@ class TestLintGate:
             tests=False,
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         result = run_quality_gates(task, tmp_path, tmp_path, config)
@@ -131,6 +185,7 @@ class TestLintGate:
             tests=False,
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         result = run_quality_gates(task, tmp_path, tmp_path, config)
@@ -141,7 +196,13 @@ class TestLintGate:
 
     def test_lint_skipped_when_disabled(self, tmp_path: Path) -> None:
         config = QualityGatesConfig(
-            enabled=True, lint=False, type_check=False, tests=False, pii_scan=False, dlp_scan=False
+            enabled=True,
+            lint=False,
+            type_check=False,
+            tests=False,
+            pii_scan=False,
+            dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         with patch("bernstein.core.quality.quality_gates._run_command") as mock_run:
@@ -166,6 +227,7 @@ class TestTypeCheckGate:
             tests=False,
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         result = run_quality_gates(task, tmp_path, tmp_path, config)
@@ -181,6 +243,7 @@ class TestTypeCheckGate:
             tests=False,
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         result = run_quality_gates(task, tmp_path, tmp_path, config)
@@ -203,6 +266,7 @@ class TestTestGate:
             test_command="exit 0",
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         result = run_quality_gates(task, tmp_path, tmp_path, config)
@@ -218,6 +282,7 @@ class TestTestGate:
             test_command="exit 1",
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         result = run_quality_gates(task, tmp_path, tmp_path, config)
@@ -242,6 +307,7 @@ class TestMultipleGates:
             test_command="exit 0",
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         result = run_quality_gates(task, tmp_path, tmp_path, config)
@@ -263,6 +329,7 @@ class TestMultipleGates:
             test_command="exit 0",
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task()
         result = run_quality_gates(task, tmp_path, tmp_path, config)
@@ -285,6 +352,7 @@ class TestMetricsRecording:
             tests=False,
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task(id="T-metrics-1")
         run_quality_gates(task, tmp_path, tmp_path, config)
@@ -305,6 +373,7 @@ class TestMetricsRecording:
             tests=False,
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task(id="T-metrics-2")
         run_quality_gates(task, tmp_path, tmp_path, config)
@@ -322,6 +391,7 @@ class TestMetricsRecording:
             tests=False,
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
             cache_enabled=False,
         )
         task = _make_task(id="T-metrics-rich")
@@ -367,6 +437,7 @@ class TestMetricsRecording:
             tests=False,
             pii_scan=False,
             dlp_scan=False,
+            run_config=False,
         )
         task = _make_task(id="T-span")
         fake_span = MagicMock()
@@ -560,7 +631,7 @@ class TestParseIntentResponse:
 
 class TestGetIntentDiff:
     def test_returns_string_on_subprocess_failure(self, tmp_path: Path) -> None:
-        # Not a git repo — subprocess will fail
+        # Not a git repo - subprocess will fail
         diff = _get_intent_diff(tmp_path, [])
         assert isinstance(diff, str)
         assert len(diff) > 0
@@ -584,7 +655,7 @@ class TestIntentVerificationGate:
         )
 
     def test_disabled_by_default(self, tmp_path: Path) -> None:
-        """Intent verification gate is off by default — no LLM calls made."""
+        """Intent verification gate is off by default - no LLM calls made."""
         config = QualityGatesConfig(enabled=True, lint=False, type_check=False, tests=False)
         task = self._make_task_with_summary()
         with patch("bernstein.core.quality.quality_gates._run_intent_gate") as mock_gate:

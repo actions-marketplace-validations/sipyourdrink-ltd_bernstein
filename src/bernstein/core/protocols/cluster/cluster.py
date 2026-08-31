@@ -18,7 +18,7 @@ import socket
 import threading
 import time
 from contextlib import suppress
-from pathlib import Path  # noqa: TC003 — used at runtime in _load_persisted/_save
+from pathlib import Path  # noqa: TC003 - used at runtime in _load_persisted/_save
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -115,14 +115,18 @@ class NodeRegistry:
         """Register or re-register a node.
 
         If the node ID already exists, update its info (preserving
-        registered_at). Otherwise create a new entry.
+        registered_at, and any status the operator set). Otherwise create a new
+        entry, which starts ``ONLINE``.
         """
         existing = self._nodes.get(node.id)
         if existing is not None:
             existing.name = node.name or existing.name
             existing.url = node.url or existing.url
             existing.capacity = node.capacity
-            existing.status = NodeStatus.ONLINE
+            # Not unconditionally ONLINE: a cordon is an operator's instruction
+            # and a restart is not an answer to it. See
+            # _status_after_reregistration.
+            existing.status = _status_after_reregistration(existing.status, existing)
             existing.last_heartbeat = time.time()
             existing.labels = node.labels or existing.labels
             existing.cell_ids = node.cell_ids or existing.cell_ids
@@ -211,6 +215,21 @@ class NodeRegistry:
         """Look up a node by ID."""
         return self._nodes.get(node_id)
 
+    def find_by_identity(self, name: str, url: str) -> NodeInfo | None:
+        """Look up a node by its operator-visible identity (name + url).
+
+        ``register`` keys on the node id, which a caller that mints a fresh
+        ``NodeInfo`` per attempt does not carry across a restart. Registration
+        surfaces use this to resolve the id an already-known worker was given,
+        so a restarting worker updates its entry instead of adding one.
+
+        A blank ``name`` or ``url`` never matches: those carry no identity, so
+        collapsing them would merge unrelated anonymous nodes into one entry.
+        """
+        if not name or not url:
+            return None
+        return next((n for n in self._nodes.values() if n.name == name and n.url == url), None)
+
     def list_nodes(self, status: NodeStatus | None = None) -> list[NodeInfo]:
         """List all nodes, optionally filtered by status."""
         nodes = list(self._nodes.values())
@@ -230,14 +249,14 @@ class NodeRegistry:
             if node.status == NodeStatus.ONLINE and not node.is_alive(timeout):
                 node.status = NodeStatus.OFFLINE
                 stale.append(node)
-                logger.warning("Node %s (%s) marked offline — no heartbeat for %ds", node.id, node.name, timeout)
+                logger.warning("Node %s (%s) marked offline - no heartbeat for %ds", node.id, node.name, timeout)
                 _audit.record_node_left(node.id, reason="timeout")
         if stale:
             self._sync_node_count_metrics()
         return stale
 
     # ------------------------------------------------------------------
-    # Observability — keep the cluster_nodes_total gauge in sync with the
+    # Observability - keep the cluster_nodes_total gauge in sync with the
     # registry's authoritative view.  Called from every mutation path.
     # ------------------------------------------------------------------
 
@@ -309,6 +328,49 @@ class NodeRegistry:
             "active_agents": sum(n.capacity.active_agents for n in online),
             "nodes": [_node_to_dict(n) for n in nodes],
         }
+
+
+#: Statuses that record what an *operator* decided, as opposed to what the
+#: server last observed. Only these survive a re-registration.
+#:
+#: ``CORDONED`` and ``DRAINING`` are instructions -- keep work off this node --
+#: and the node restarting is not an answer to either. ``DEGRADED`` and
+#: ``OFFLINE`` are observations about a process, and the process re-registering
+#: is direct evidence they no longer hold, so those are right to reset.
+_OPERATOR_INTENT_STATUSES: frozenset[NodeStatus] = frozenset({NodeStatus.CORDONED, NodeStatus.DRAINING})
+
+
+def _status_after_reregistration(current: NodeStatus, node: NodeInfo) -> NodeStatus:
+    """What a re-registering node's status becomes: intent survives, health resets.
+
+    ``register`` used to set ``ONLINE`` unconditionally on this path, so a node
+    an operator had cordoned returned to ``ONLINE`` the moment it restarted and
+    its slots re-entered ``total_capacity``.
+
+    That inverts the property a cordon exists for. Cordoning is usually a
+    response to a node misbehaving, and a misbehaving node restarts more often
+    than a healthy one -- so the worse a worker behaved, the more reliably it
+    escaped its cordon. The domain convention agrees: a kubelet restart does not
+    clear ``spec.unschedulable``.
+
+    Args:
+        current: The status on the existing registry record.
+        node: The re-registering node, for the log line only.
+
+    Returns:
+        ``current`` when it records operator intent, else ``ONLINE``.
+    """
+    if current not in _OPERATOR_INTENT_STATUSES:
+        return NodeStatus.ONLINE
+    # Nothing said either way before this, so an operator learned a cordon had
+    # been cleared by watching work get scheduled onto the node. Say it plainly.
+    logger.info(
+        "Node %s (%s) re-registered; keeping operator-set status %s",
+        node.id,
+        node.name,
+        current.value,
+    )
+    return current
 
 
 def _node_to_dict(node: NodeInfo) -> dict[str, Any]:

@@ -3,11 +3,11 @@
 Builds a DAG from task ``depends_on`` fields and inferred file-overlap
 edges, then computes:
 
-* **Critical path** — the longest chain through the DAG (determines
+* **Critical path** - the longest chain through the DAG (determines
   minimum wall-clock completion time).
-* **Parallel width** — the maximum number of independent tasks that
+* **Parallel width** - the maximum number of independent tasks that
   can run concurrently at any point in the schedule.
-* **Bottleneck detection** — surfaces tasks that block the most
+* **Bottleneck detection** - surfaces tasks that block the most
   downstream work.
 """
 
@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from bernstein.core.models import Task, TaskStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -39,13 +39,13 @@ class EdgeType(StrEnum):
 
     Controls scheduling and context injection behaviour:
 
-    - ``BLOCKS`` — hard dependency. Successor cannot start until predecessor
+    - ``BLOCKS`` - hard dependency. Successor cannot start until predecessor
       completes.  This is the default for all existing edges.
-    - ``INFORMS`` — soft dependency. Predecessor output is available to the
+    - ``INFORMS`` - soft dependency. Predecessor output is available to the
       successor but does **not** block scheduling.
-    - ``VALIDATES`` — successor verifies predecessor output. A validator
+    - ``VALIDATES`` - successor verifies predecessor output. A validator
       failure triggers predecessor retry.  Blocks scheduling like ``BLOCKS``.
-    - ``TRANSFORMS`` — predecessor output is input to successor with an
+    - ``TRANSFORMS`` - predecessor output is input to successor with an
       optional mapping. Does **not** block scheduling.
     """
 
@@ -70,6 +70,18 @@ class Edge:
     semantic_type: EdgeType = EdgeType.BLOCKS  # scheduling behaviour
 
 
+@dataclass(frozen=True)
+class CycleBreak:
+    """A declared dependency cycle the graph had to open to stay schedulable.
+
+    ``edge`` is the edge that was dropped; ``cycle`` names every task on the
+    cycle, in order, so an operator can see which declaration to correct.
+    """
+
+    edge: Edge
+    cycle: tuple[str, ...]
+
+
 @dataclass
 class GraphAnalysis:
     """Results of analysing the task DAG."""
@@ -91,7 +103,7 @@ class TaskGraph:
     Nodes are task IDs; edges represent ordering constraints (either
     explicit ``depends_on`` or inferred from shared ``owned_files``).
 
-    The graph is immutable after construction — rebuild it each tick.
+    The graph is immutable after construction - rebuild it each tick.
     """
 
     def __init__(self, tasks: Sequence[Task]) -> None:
@@ -103,6 +115,8 @@ class TaskGraph:
         self._edges: list[Edge] = []
         # Reverse lookup: (target) → list of edges pointing into it
         self._edges_by_target: dict[str, list[Edge]] = defaultdict(list)
+        # Declared cycles opened during construction, in the order they were found
+        self._cycle_breaks: list[CycleBreak] = []
 
         self._build(tasks)
 
@@ -112,6 +126,7 @@ class TaskGraph:
         """Populate edges from explicit deps and file overlaps."""
         self._build_explicit_deps(tasks)
         self._build_file_overlap_edges(tasks)
+        self._break_declared_cycles()
 
     def _build_explicit_deps(self, tasks: Sequence[Task]) -> None:
         """Add edges for explicit depends_on relationships."""
@@ -134,8 +149,119 @@ class TaskGraph:
             for i in range(len(sorted_owners) - 1):
                 src = sorted_owners[i]
                 tgt = sorted_owners[i + 1]
-                if tgt.id not in self._forward.get(src.id, []):
-                    self._add_edge(src.id, tgt.id, "file_overlap")
+                if tgt.id in self._forward.get(src.id, []):
+                    continue
+                # The (priority, id) tie-break can point an inferred edge the
+                # opposite way to an explicit dependency - a reviewer owning
+                # every file its workers touch is the common case. The explicit
+                # edge is the authority, so the inferred edge is dropped on
+                # purpose rather than flipped: flipping would duplicate an
+                # ordering the existing path already expresses.
+                if self._reaches(tgt.id, src.id):
+                    continue
+                self._add_edge(src.id, tgt.id, "file_overlap")
+
+    def _reaches(self, source: str, target: str) -> bool:
+        """True if *target* is reachable from *source* along existing edges."""
+        if source == target:
+            return True
+        seen: set[str] = {source}
+        stack: list[str] = [source]
+        while stack:
+            node = stack.pop()
+            for child in self._forward.get(node, []):
+                if child == target:
+                    return True
+                if child not in seen:
+                    seen.add(child)
+                    stack.append(child)
+        return False
+
+    # -- Cycle backstop -----------------------------------------------------
+
+    def _break_declared_cycles(self) -> None:
+        """Open every cycle left in the graph so all tasks stay schedulable.
+
+        Inferred file-overlap edges are never allowed to close a cycle, so
+        anything found here comes from declared ``depends_on`` data - invalid
+        input that used to leave Kahn's algorithm unable to order any task in
+        the cycle. Rather than drop those tasks from every ordering for the
+        rest of the run, one edge per cycle is removed and recorded.
+
+        The edge chosen is the newest one on the cycle: ``self._edges`` is
+        append-only, so its index is the insertion order, and the last edge
+        added is the one that closed the cycle. That makes the break
+        deterministic - the same board always loses the same edge.
+
+        The cycle is not silenced: each break is logged at ``WARNING`` naming
+        the tasks involved, kept on :attr:`cycle_breaks`, and still reported
+        by ``DependencyValidator.validate``.
+        """
+        while (cycle := self._find_cycle()) is not None:
+            edge = self._newest_edge_on_cycle(cycle)
+            if edge is None:  # pragma: no cover - defensive, a cycle always has edges
+                return
+            self._remove_edge(edge)
+            self._cycle_breaks.append(CycleBreak(edge=edge, cycle=tuple(cycle)))
+            logger.warning(
+                "Declared dependency cycle %s - dropped its newest edge (%s -> %s, %s) "
+                "so the tasks stay schedulable; fix the depends_on declaration",
+                " -> ".join([*cycle, cycle[0]]),
+                edge.source,
+                edge.target,
+                edge.edge_type,
+            )
+
+    def _find_cycle(self) -> list[str] | None:
+        """Return one cycle as an ordered node list, or ``None`` if acyclic.
+
+        Iterative three-colour DFS. Roots are visited in task insertion order
+        so that a board with several cycles always yields them in the same
+        sequence.
+        """
+        white, grey, black = 0, 1, 2
+        colour: dict[str, int] = dict.fromkeys(self._tasks, white)
+
+        for root in self._tasks:
+            if colour[root] != white:
+                continue
+            path: list[str] = [root]
+            colour[root] = grey
+            stack: list[tuple[str, Iterator[str]]] = [(root, iter(self._forward.get(root, [])))]
+            while stack:
+                node, children = stack[-1]
+                descended = False
+                for child in children:
+                    if child not in colour:
+                        continue
+                    if colour[child] == grey:
+                        return path[path.index(child) :]
+                    if colour[child] == white:
+                        colour[child] = grey
+                        path.append(child)
+                        stack.append((child, iter(self._forward.get(child, []))))
+                        descended = True
+                        break
+                if not descended:
+                    colour[node] = black
+                    path.pop()
+                    stack.pop()
+        return None
+
+    def _newest_edge_on_cycle(self, cycle: list[str]) -> Edge | None:
+        """The most recently added edge lying on *cycle*."""
+        pairs = {(cycle[i], cycle[(i + 1) % len(cycle)]) for i in range(len(cycle))}
+        for edge in reversed(self._edges):
+            if (edge.source, edge.target) in pairs:
+                return edge
+        return None
+
+    def _remove_edge(self, edge: Edge) -> None:
+        """Drop *edge* from every adjacency structure that holds it."""
+        self._edges.remove(edge)
+        self._forward[edge.source].remove(edge.target)
+        self._reverse[edge.target].remove(edge.source)
+        self._edges_by_target[edge.target].remove(edge)
 
     def _add_edge(
         self,
@@ -188,6 +314,15 @@ class TaskGraph:
         """All edges in the graph."""
         return self._edges.copy()
 
+    @property
+    def cycle_breaks(self) -> list[CycleBreak]:
+        """Declared dependency cycles this graph had to open, if any.
+
+        Empty for a valid board. A non-empty list means the board carries
+        invalid ``depends_on`` data that an operator still needs to correct.
+        """
+        return self._cycle_breaks.copy()
+
     def dependents(self, task_id: str) -> list[str]:
         """Task IDs that directly depend on *task_id*."""
         return list(self._forward.get(task_id, []))
@@ -235,7 +370,7 @@ class TaskGraph:
     # -- Topological sort ---------------------------------------------------
 
     def topological_order(self) -> list[str]:
-        """Kahn's algorithm — returns [] if cycle detected."""
+        """Kahn's algorithm - returns [] if cycle detected."""
         in_degree: dict[str, int] = dict.fromkeys(self._tasks, 0)
         for tid in self._tasks:
             for dep in self._forward.get(tid, []):
@@ -254,7 +389,9 @@ class TaskGraph:
                         queue.append(child)
 
         if len(order) != len(self._tasks):
-            logger.warning("Cycle detected in task graph — topological sort incomplete")
+            # Defensive only: construction opens every cycle it can find, so a
+            # stall here means an edge was added after the graph was built.
+            logger.warning("Cycle detected in task graph - topological sort incomplete")
             return []
         return order
 

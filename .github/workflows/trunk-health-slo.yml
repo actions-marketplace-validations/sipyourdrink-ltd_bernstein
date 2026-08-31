@@ -1,24 +1,30 @@
 name: Trunk Health SLO
 
 # Compute the last-24h main-red rate (failed CI runs / total CI runs on
-# main) and toggle the repo variable TRUNK_UNSTABLE accordingly. A
-# companion gate workflow (`trunk-andon-gate.yml`) keys off that
-# variable to hold merges on every PR until the trunk recovers, unless
-# the PR carries the `hotfix-cleared` label.
+# main) and toggle a marker issue labeled `trunk-unstable` accordingly. A
+# companion gate step (the trunk andon gate in `pr-policy.yml`) keys off
+# that open issue to hold merges on every PR until the trunk recovers,
+# unless the PR carries the `hotfix-cleared` label. The flag is an issue
+# rather than an Actions variable because GITHUB_TOKEN can write issues
+# but not variables, so the mechanism needs no separately provisioned PAT.
 #
-# Borrowed-from: SPC (statistical process control) + Toyota Andon.
-# When the line goes red, stop new work from being committed until the
-# stop signal clears, except for the fix that clears it.
+# The toggle exists so a red trunk stops new merges from piling on top
+# of an already-broken main: while the red rate is over threshold the
+# gate holds PRs, and only the fix that clears the trunk is let through
+# (via the `hotfix-cleared` label). This keeps regressions from
+# compounding before main is green again.
 #
 # Threshold defaults to 5%. Override per-run via workflow_dispatch.
 
 on:
   schedule:
-    # Every two hours keeps the trunk-health view fresh enough for
-    # operator decisions while cutting GitHub API consumption by 75%
-    # versus the previous */30 cadence. Manual workflow_dispatch is
-    # still available for an immediate refresh after recovery.
-    - cron: "0 */2 * * *"
+    # Every six hours. The measured red rate moves on a merge cadence of
+    # roughly 2/hour, so a 2h sample added little over a 6h one, and the
+    # lane has 1 failure in 574 runs. Manual workflow_dispatch is still
+    # available for an immediate refresh after recovery, which is the
+    # supported path for clearing TRUNK_UNSTABLE without waiting for the
+    # next tick.
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       threshold_pct:
@@ -38,16 +44,28 @@ permissions: {}
 
 jobs:
   compute:
-    name: Compute trunk red-rate and toggle TRUNK_UNSTABLE
+    name: Compute trunk red-rate and toggle the andon marker
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       actions: read
+      # The andon flag is a marker issue (opened on red, closed on green).
+      issues: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
 
       - name: Compute red-rate
         id: compute
@@ -57,88 +75,68 @@ jobs:
           THRESHOLD_PCT: ${{ github.event.inputs.threshold_pct || '5' }}
           LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '24' }}
         run: |
-          set -euo pipefail
+          python scripts/trunk_health_slo.py \
+            --repo "${REPO}" \
+            --threshold-pct "${THRESHOLD_PCT}" \
+            --lookback-hours "${LOOKBACK_HOURS}"
 
-          SINCE=$(date -u -d "${LOOKBACK_HOURS} hours ago" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
-            || date -u -v-"${LOOKBACK_HOURS}"H +'%Y-%m-%dT%H:%M:%SZ')
-          export SINCE
-
-          echo "Computing red-rate on main since ${SINCE}"
-
-          # Pull last 100 CI workflow runs on main; filter to the
-          # primary "CI" workflow only to avoid scoring scheduled
-          # housekeeping runs as outages.
-          ALL_JSON=$(gh api -X GET "repos/${REPO}/actions/runs" \
-            -f branch=main \
-            -f per_page=100 \
-            --jq '[
-              .workflow_runs[]
-              | select(.name == "CI")
-              | select(.created_at >= env.SINCE)
-              | {conclusion, sha: .head_sha, url: .html_url}
-            ]')
-
-          TOTAL=$(printf '%s' "${ALL_JSON}" | jq 'length')
-          if [ "${TOTAL}" = "0" ]; then
-            echo "No CI runs on main in window. Treating as healthy."
-            UNSTABLE=false
-            RED=0
-            RED_PCT=0
-          else
-            RED=$(printf '%s' "${ALL_JSON}" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
-            # Integer percentage: enough resolution for the threshold.
-            RED_PCT=$(( (RED * 100) / TOTAL ))
-            if [ "${RED_PCT}" -ge "${THRESHOLD_PCT}" ]; then
-              UNSTABLE=true
-            else
-              UNSTABLE=false
-            fi
-          fi
-
-          echo "TOTAL=${TOTAL} RED=${RED} RED_PCT=${RED_PCT}% THRESHOLD=${THRESHOLD_PCT}% UNSTABLE=${UNSTABLE}"
-          {
-            echo "unstable=${UNSTABLE}"
-            echo "red_pct=${RED_PCT}"
-            echo "red=${RED}"
-            echo "total=${TOTAL}"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Toggle TRUNK_UNSTABLE repo variable
+      - name: Toggle the trunk-unstable marker issue
         env:
-          # Variable management needs a token with `actions:variables`
-          # scope on the repo. Falls back to GITHUB_TOKEN if no special
-          # PAT is provisioned; logs a warning when the API rejects.
-          GH_TOKEN: ${{ secrets.BOT_PAT || github.token }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           UNSTABLE: ${{ steps.compute.outputs.unstable }}
           RED_PCT: ${{ steps.compute.outputs.red_pct }}
           RED: ${{ steps.compute.outputs.red }}
           TOTAL: ${{ steps.compute.outputs.total }}
+          INSUFFICIENT: ${{ steps.compute.outputs.insufficient_sample }}
         run: |
           set -euo pipefail
 
-          NEW_VALUE="${UNSTABLE}"
-
-          # Idempotent upsert: try PATCH, fall back to POST on 404.
-          if gh api -X PATCH "repos/${REPO}/actions/variables/TRUNK_UNSTABLE" \
-              -f name=TRUNK_UNSTABLE \
-              -f value="${NEW_VALUE}" \
-              >/dev/null 2>&1; then
-            echo "Updated TRUNK_UNSTABLE=${NEW_VALUE}"
-          else
-            if gh api -X POST "repos/${REPO}/actions/variables" \
-                -f name=TRUNK_UNSTABLE \
-                -f value="${NEW_VALUE}" \
-                >/dev/null 2>&1; then
-              echo "Created TRUNK_UNSTABLE=${NEW_VALUE}"
-            else
-              echo "::warning::Failed to set TRUNK_UNSTABLE; insufficient token scope. Provision a BOT_PAT with actions:variables to enable Andon."
-              exit 0
-            fi
+          if [ "${INSUFFICIENT}" = "true" ]; then
+            echo "::warning::Insufficient sample size (${TOTAL} runs, need 10). Will not open a new marker, but will close any existing one to avoid latching the repo."
           fi
 
-          # Record a short status note for operator visibility. Step
-          # summary survives in the run UI without spamming issues.
+          gh label create trunk-unstable \
+            --repo "${REPO}" \
+            --description "Open while the main-branch red-rate is over the SLO threshold; closed automatically on recovery" \
+            --color B60205 --force
+
+          OPEN_MARKERS=$(gh api "repos/${REPO}/issues?labels=trunk-unstable&state=open&per_page=100" \
+            --jq '[.[] | select(.pull_request | not) | .number] | join(" ")')
+
+          # Suppress opening on insufficient sample, but still allow closing
+          if [ "${UNSTABLE}" = "true" ] && [ "${INSUFFICIENT}" != "true" ]; then
+            if [ -z "${OPEN_MARKERS}" ]; then
+              gh api -X POST "repos/${REPO}/issues" \
+                -f title="Trunk unstable: ${RED_PCT}% of main CI runs red over the SLO window" \
+                -f body="$(printf '%s\n' \
+                  "The scheduled trunk-health check measured ${RED}/${TOTAL} failed CI runs on main (${RED_PCT}%), over the configured threshold." \
+                  "" \
+                  "While this issue is open, the andon gate in pr-policy holds merges on every PR except those labeled \`hotfix-cleared\`, so regressions stop compounding on an already-red main." \
+                  "" \
+                  "This issue closes automatically on the next scheduled check once the red-rate is back under threshold; run the Trunk Health SLO workflow manually for an immediate re-check after landing the fix.")" \
+                -f "labels[]=trunk-unstable" >/dev/null
+              echo "Opened the trunk-unstable marker issue."
+            else
+              echo "Marker issue already open (#${OPEN_MARKERS}); leaving it in place."
+            fi
+          elif [ -n "${OPEN_MARKERS}" ]; then
+            if [ "${INSUFFICIENT}" = "true" ]; then
+              CLOSE_MSG="Insufficient sample size (${TOTAL} runs in window, need 10). Marker released for lack of evidence; merges resume."
+            else
+              CLOSE_MSG="Red-rate is back under threshold (${RED_PCT}% over the last window). Closing; merges resume."
+            fi
+            for issue_number in ${OPEN_MARKERS}; do
+              gh api -X POST "repos/${REPO}/issues/${issue_number}/comments" \
+                -f body="${CLOSE_MSG}" >/dev/null
+              gh api -X PATCH "repos/${REPO}/issues/${issue_number}" -f state=closed >/dev/null
+            done
+            echo "Closed marker issue(s): ${OPEN_MARKERS}"
+          else
+            echo "Trunk healthy; no marker open."
+          fi
+
+          # Record a short status note for operator visibility.
           {
             echo "## Trunk health SLO"
             echo ""
@@ -147,5 +145,15 @@ jobs:
             echo "| CI runs on main (window) | ${TOTAL} |"
             echo "| failed runs | ${RED} |"
             echo "| red-rate | ${RED_PCT}% |"
-            echo "| TRUNK_UNSTABLE | ${NEW_VALUE} |"
+            echo "| insufficient sample | ${INSUFFICIENT} |"
+            echo "| trunk-unstable marker | $([ "${UNSTABLE}" = "true" ] && [ "${INSUFFICIENT}" != "true" ] && echo open || echo closed) |"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+          # Say plainly what a thin window did and did not decide, so the
+          # summary is not read as a measured all-clear.
+          if [ "${INSUFFICIENT}" = "true" ]; then
+            {
+              echo ""
+              echo "Only ${TOTAL} CI runs in the window (need 10), so the red-rate above is not a verdict. No marker is opened on a sample this thin, and any marker already open is released for lack of evidence rather than held: a quiet trunk must not be able to latch merges shut."
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi

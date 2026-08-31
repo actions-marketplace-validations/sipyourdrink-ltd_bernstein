@@ -39,6 +39,14 @@ class CacheBreakReason(Enum):
     UNKNOWN = "unknown"  # cause not determined
 
 
+def _empty_str_list() -> list[str]:
+    return []
+
+
+def _empty_metadata() -> dict[str, Any]:
+    return {}
+
+
 # Savings-per-token at Anthropic's cached-input discount (90% off vs standard
 # claude-sonnet-4 input price of $3.00/MTok).  Standard - cached = $2.70/MTok.
 CACHED_SAVINGS_PER_TOKEN: float = 2.70 / 1_000_000
@@ -289,7 +297,7 @@ def extract_system_prefix(prompt: str) -> tuple[str, str]:
     """
     task_marker = "\n## Assigned tasks\n"
     instruction_marker = "\n## Instructions\n"
-    signal_marker = "\n## Signal files —"
+    signal_marker = "\n## Signal files -"
 
     split_points: list[int] = []
     for marker in (task_marker, instruction_marker, signal_marker):
@@ -316,7 +324,7 @@ class AgentCacheTracker:
     cap is exceeded the oldest entry (first inserted, first out) is evicted
     so memory stays bounded during long-running multi-agent runs.
 
-    Eviction policy: **FIFO** — the first session registered is the first to
+    Eviction policy: **FIFO** - the first session registered is the first to
     be evicted when the cap is reached.  Updating an existing session's cache
     key does **not** change its eviction priority (it keeps its original
     insertion position).
@@ -350,13 +358,13 @@ class AgentCacheTracker:
             The evicted *session_id* if eviction occurred, otherwise ``None``.
         """
         if session_id in self._entries:
-            # Update in-place — insertion order (FIFO priority) unchanged.
+            # Update in-place - insertion order (FIFO priority) unchanged.
             self._entries[session_id] = cache_key
             return None
 
         evicted: str | None = None
         if len(self._entries) >= self.max_entries:
-            evicted, _ = self._entries.popitem(last=False)  # oldest = FIFO
+            evicted, _ = self._entries.popitem(last=False)  # FIFO: remove oldest session.
             logger.debug(
                 "AgentCacheTracker: evicted session %s (cap=%d reached)",
                 evicted,
@@ -687,7 +695,7 @@ class CacheSafeParams:
         fork_model: Model override for the forked agent (empty = inherit parent).
         fork_messages: Optional conversation messages to pass to the forked
             agent for continuation context.
-        cache_safe: Always True when built via this class — signals to the
+        cache_safe: Always True when built via this class - signals to the
             spawner that prompt caching is safe.
     """
 
@@ -782,7 +790,7 @@ class CacheBreak:
     new_hash: str
     old_content: str
     new_content: str
-    diff_lines: list[str] = field(default_factory=list)
+    diff_lines: list[str] = field(default_factory=_empty_str_list)
     timestamp: float = field(default_factory=time.time)
 
     def generate_diff(self, context_lines: int = 3) -> None:
@@ -847,7 +855,7 @@ class CacheBaselineAlert:
     drop_percentage: float
     threshold: float
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=_empty_metadata)
 
 
 class CacheBaselineMonitor:
@@ -983,7 +991,7 @@ class BreakCorrelation:
         reasons: Cache break reasons seen in this group.
         timestamps: Timestamps of all matching events (ascending).
         is_systemic: True when ``len(agent_ids) >= min_agents_for_systemic``.
-        label: Human-readable label — ``"systemic"`` or ``"local"``.
+        label: Human-readable label - ``"systemic"`` or ``"local"``.
         window_start: Earliest timestamp in this correlation window.
         window_end: Latest timestamp in this correlation window.
     """
@@ -1017,7 +1025,7 @@ class CacheBreakCorrelator:
     Maintains a rolling buffer of recent events grouped by
     ``component_fingerprint``.  When ``min_agents_for_systemic`` or more
     distinct agents report a break with the same fingerprint within
-    ``window_seconds``, the group is classified as **systemic** — caused by a
+    ``window_seconds``, the group is classified as **systemic** - caused by a
     shared upstream change such as a template update or global model-config
     change.  Single-agent breaks are classified as **local** drift.
 

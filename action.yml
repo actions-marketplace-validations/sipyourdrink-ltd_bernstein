@@ -1,5 +1,5 @@
-name: "Bernstein — Multi-Agent Orchestration"
-description: "Run Bernstein to orchestrate CLI coding agents from GitHub Actions. Supports ad-hoc tasks and automatic CI-fix mode."
+name: "Bernstein - agent orchestration"
+description: "The open-source governance layer for AI agents, run from GitHub Actions. No model in the coordination loop, so parallel runs in per-task git worktrees replay byte-identically. Supports ad-hoc tasks and automatic CI-fix mode."
 author: "Bernstein contributors"
 
 branding:
@@ -60,12 +60,12 @@ runs:
   using: "composite"
   steps:
     - name: Set up Python
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: ${{ inputs.python-version }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       with:
         enable-cache: true
 
@@ -95,7 +95,7 @@ runs:
         # default commit-and-push so they can stage the work into a
         # dedicated branch / PR themselves.
         if [ "${BERNSTEIN_SKIP_AUTO_COMMIT:-false}" = "true" ]; then
-          echo "BERNSTEIN_SKIP_AUTO_COMMIT=true — leaving working tree dirty for caller."
+          echo "BERNSTEIN_SKIP_AUTO_COMMIT=true - leaving working tree dirty for caller."
           exit 0
         fi
 

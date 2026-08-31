@@ -1,4 +1,4 @@
-"""``bernstein resume <task-id>`` — pick up a task from its last checkpoint.
+"""``bernstein resume <task-id>`` - pick up a task from its last checkpoint.
 
 Loads the per-task checkpoint written by the orchestrator after every
 successful step transition, validates it, bumps ``resume_count``, fires
@@ -6,7 +6,7 @@ the ``task.resume`` lifecycle event, and hands control back so the
 orchestrator can re-spawn the task from the next step boundary.
 
 See ``feat-resume-from-checkpoint`` spec for the full contract. v1 scope
-is local-only — cross-machine resume, distributed checkpoint storage,
+is local-only - cross-machine resume, distributed checkpoint storage,
 and resuming across role-definition changes are explicitly out of scope.
 """
 
@@ -23,6 +23,10 @@ from rich.table import Table
 from bernstein.adapters._contract import resume_capability, strategy_for
 from bernstein.cli.helpers import console
 from bernstein.core.lifecycle.hooks import HookRegistry, LifecycleContext, LifecycleEvent
+from bernstein.core.persistence.agent_checkpoint import (
+    find_checkpoint_for_task,
+    is_checkpoint_recoverable,
+)
 from bernstein.core.persistence.resume_prompt import build_resume_context
 from bernstein.core.persistence.task_resume import (
     CheckpointCorruptError,
@@ -39,6 +43,16 @@ EXIT_OK: int = 0
 EXIT_NO_CHECKPOINT: int = 2
 EXIT_CORRUPT: int = 3
 EXIT_HOOK_FAILED: int = 4
+EXIT_GRANT_REFUSED: int = 5
+
+
+class GrantRefusedError(RuntimeError):
+    """Raised when the agent's grant no longer matches current configuration.
+
+    The message names the grant bindings the stored hash covers (role
+    permissions, task, parent run, chain head) so the operator can act
+    without reading source.
+    """
 
 
 @dataclass(frozen=True)
@@ -63,6 +77,7 @@ def prepare_resume(
     task_id: str,
     *,
     hooks: HookRegistry | None = None,
+    override_interpreter: bool = False,
 ) -> ResumePlan:
     """Load + validate the checkpoint, bump ``resume_count``, fire the hook.
 
@@ -70,6 +85,9 @@ def prepare_resume(
         workdir: Project root containing ``.sdd/runtime/checkpoints``.
         task_id: Task to resume.
         hooks: Optional registry; ``task.resume`` fires on it when given.
+        override_interpreter: When ``True``, bypass the interpreter mismatch
+            check (``--override-interpreter``) so a resume proceeds even
+            though the adapter or resolved model moved.
 
     Returns:
         A :class:`ResumePlan` ready for the orchestrator.
@@ -81,7 +99,30 @@ def prepare_resume(
     """
     # Reading once before the bump gives us a clear error path: if the
     # file is corrupt we exit before incrementing the counter.
-    load_checkpoint(workdir, task_id)
+    checkpoint = load_checkpoint(workdir, task_id)
+
+    # --- Grant + interpreter authority checks (issues #3649, #3852) ---
+    # Look up the AgentCheckpoint for this task (written by the orchestrator
+    # at suspend time).  Checkpoints are stored per agent, so the lookup
+    # scans for the task rather than treating the task id as an agent id.
+    # If the checkpoint carries a grant_hash we verify the current
+    # configuration still matches before taking any side effect (bump,
+    # hook, signal); a stale grant refuses with the bindings named.  The
+    # same pre-side-effect gate verifies the interpreter (adapter + resolved
+    # model) still matches, unless the operator overrides it.
+    _runtime_dir = workdir / ".sdd" / "runtime"
+    _agent_checkpoint = find_checkpoint_for_task(task_id, _runtime_dir)
+    if _agent_checkpoint is not None:
+        _ok, _reason = is_checkpoint_recoverable(
+            _agent_checkpoint,
+            current_task_id=task_id,
+            current_adapter=checkpoint.adapter or None,
+            current_model=checkpoint.meta.get("model") or None,
+            override_interpreter=override_interpreter,
+        )
+        if not _ok:
+            raise GrantRefusedError(_reason)
+
     checkpoint = bump_resume_count(workdir, task_id)
     adapter_name = checkpoint.adapter or ""
     capability = resume_capability(adapter_name)
@@ -176,7 +217,19 @@ def _render_plan(workdir: Path, plan: ResumePlan, *, output_json: bool) -> None:
     default=False,
     help="Validate + bump resume_count + print plan; do not re-spawn.",
 )
-def resume_cmd(task_id: str, workdir: Path | None, output_json: bool, dry_run: bool) -> None:
+@click.option(
+    "--override-interpreter",
+    is_flag=True,
+    default=False,
+    help="Resume even though the adapter or resolved model moved since suspend.",
+)
+def resume_cmd(
+    task_id: str,
+    workdir: Path | None,
+    output_json: bool,
+    dry_run: bool,
+    override_interpreter: bool,
+) -> None:
     """Pick up a paused/killed/crashed task from its last checkpoint.
 
     \b
@@ -185,12 +238,14 @@ def resume_cmd(task_id: str, workdir: Path | None, output_json: bool, dry_run: b
         2  no checkpoint on disk
         3  checkpoint corrupt / failed schema validation
         4  task.resume lifecycle hook failed
+        5  grant mismatch — role narrowed, task reassigned, or parent cancelled
     """
     project_root = workdir or Path.cwd()
     try:
-        plan = prepare_resume(project_root, task_id)
+        plan = prepare_resume(project_root, task_id, override_interpreter=override_interpreter)
     except CheckpointMissingError as exc:
         console.print(f"[red]No checkpoint:[/red] {exc}")
+        _hint_work_ledger(project_root, task_id)
         raise SystemExit(EXIT_NO_CHECKPOINT) from None
     except CheckpointCorruptError as exc:
         console.print(f"[red]Corrupt checkpoint for {task_id!r}:[/red] {exc}")
@@ -198,6 +253,13 @@ def resume_cmd(task_id: str, workdir: Path | None, output_json: bool, dry_run: b
             "[dim]Inspect the file under .sdd/runtime/checkpoints/<task-id>/ and remove it to run the task fresh.[/dim]"
         )
         raise SystemExit(EXIT_CORRUPT) from None
+    except GrantRefusedError as exc:
+        console.print(f"[red]Grant mismatch — resume refused:[/red] {exc}")
+        console.print(
+            "[dim]The role's permissions, task assignment, or parent run changed since this"
+            " checkpoint was written. Re-run the task from scratch or restore the original grant.[/dim]"
+        )
+        raise SystemExit(EXIT_GRANT_REFUSED) from None
 
     _render_plan(project_root, plan, output_json=output_json)
 
@@ -209,6 +271,35 @@ def resume_cmd(task_id: str, workdir: Path | None, output_json: bool, dry_run: b
     # call from the dashboard / API and stays unit-testable. The CLI
     # signals intent by writing a one-line marker the spawner watches.
     _write_resume_signal(project_root, plan)
+
+
+def _hint_work_ledger(workdir: Path, resume_id: str) -> None:
+    """Point the operator at the durable work ledger when one matches.
+
+    A per-task checkpoint is machine-local; a run whose state was anchored
+    to the work-ledger ref (#2358) resumes on any clone via
+    ``bernstein ledger resume``. When the id the operator passed matches a
+    local or anchored ledger, say so instead of dead-ending.
+    """
+    from bernstein.core.persistence.ledger_git import LedgerGitError, ledger_ref, list_ledger_runs
+    from bernstein.core.persistence.work_ledger import LedgerReader, run_ledger_dir
+
+    try:
+        ledger_ref(resume_id)
+    except LedgerGitError:
+        return
+    has_local = LedgerReader(run_ledger_dir(workdir / ".sdd", resume_id)).exists()
+    has_anchor = False
+    if not has_local:
+        try:
+            has_anchor = resume_id in list_ledger_runs(workdir)
+        except LedgerGitError:
+            has_anchor = False
+    if has_local or has_anchor:
+        console.print(
+            f"[yellow]A durable work ledger exists for {resume_id!r}.[/yellow] "
+            f"Resume the run from its verified chain with: bernstein ledger resume {resume_id}"
+        )
 
 
 def _write_resume_signal(workdir: Path, plan: ResumePlan) -> None:

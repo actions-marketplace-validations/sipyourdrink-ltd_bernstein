@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import Any, cast
 
@@ -23,6 +24,12 @@ logger = logging.getLogger(__name__)
 
 # prometheus_client can hang on Windows during import due to multiprocessing issues.
 # Make it optional with stub fallbacks for Windows compatibility.
+
+# How long the Windows import gets before this module gives up on it. Raising it
+# is the fix for a machine slow enough that metrics disable themselves on every
+# start; the default is what CI runners have always used.
+_IMPORT_TIMEOUT_SECONDS = float(os.environ.get("BERNSTEIN_PROMETHEUS_IMPORT_TIMEOUT", "3.0"))
+
 _PROMETHEUS_AVAILABLE = False
 try:
     # Set a short import timeout using threading on Windows
@@ -31,31 +38,59 @@ try:
 
         _import_done = threading.Event()
         _import_error: Exception | None = None
+        # The worker publishes here and never touches this module's public names.
+        # An import that lands after the timeout finds nobody reading the box: by
+        # then the stubs below are defined and ``registry`` is built from them, and
+        # rebinding ``Counter`` to the real class at that point would hand a real
+        # metric constructor a stub registry to register itself into.
+        _import_result: dict[str, Any] = {}
 
         def _try_import() -> None:
-            global _PROMETHEUS_AVAILABLE, _import_error
+            global _import_error
             try:
-                global CollectorRegistry, Counter, Gauge, Histogram, generate_latest
                 from prometheus_client import (
-                    CollectorRegistry,
-                    Counter,
-                    Gauge,
-                    Histogram,
-                    generate_latest,
+                    CollectorRegistry as _RealCollectorRegistry,
                 )
-
-                _PROMETHEUS_AVAILABLE = True
+                from prometheus_client import (
+                    Counter as _RealCounter,
+                )
+                from prometheus_client import (
+                    Gauge as _RealGauge,
+                )
+                from prometheus_client import (
+                    Histogram as _RealHistogram,
+                )
+                from prometheus_client import (
+                    generate_latest as _real_generate_latest,
+                )
             except Exception as e:
                 _import_error = e
+            else:
+                _import_result.update(
+                    CollectorRegistry=_RealCollectorRegistry,
+                    Counter=_RealCounter,
+                    Gauge=_RealGauge,
+                    Histogram=_RealHistogram,
+                    generate_latest=_real_generate_latest,
+                )
             finally:
                 _import_done.set()
 
         t = threading.Thread(target=_try_import, daemon=True)
         t.start()
-        if not _import_done.wait(timeout=3.0):
+        if not _import_done.wait(timeout=_IMPORT_TIMEOUT_SECONDS):
             logger.warning("prometheus_client import timed out on Windows - metrics disabled")
         elif _import_error:
             logger.warning("prometheus_client import failed: %s - metrics disabled", _import_error)
+        else:
+            # ``wait`` returned True, so the worker's dict writes happened before
+            # the event was set and are visible here.
+            CollectorRegistry = _import_result["CollectorRegistry"]
+            Counter = _import_result["Counter"]
+            Gauge = _import_result["Gauge"]
+            Histogram = _import_result["Histogram"]
+            generate_latest = _import_result["generate_latest"]
+            _PROMETHEUS_AVAILABLE = True
     else:
         from prometheus_client import (
             CollectorRegistry,
@@ -69,40 +104,64 @@ try:
 except ImportError as e:
     logger.warning("prometheus_client not available: %s - metrics disabled", e)
 
-# Stub classes for when prometheus is unavailable
+# Stubs for when prometheus is unavailable. Defined unconditionally so they can
+# be inspected and tested on a machine where the real client imports fine; only
+# the binding below is conditional.
+
+
+class _StubCollectorRegistry:
+    """No-op collector registry when prometheus_client is unavailable.
+
+    It answers every call made on ``registry`` anywhere in this module, and the
+    ``register`` that a real metric constructor performs on the registry it is
+    handed. A stub that raises on those turns "metrics are disabled" into an
+    import-time ``AttributeError``, which is worse than having no metrics and
+    reads in CI as a broken conftest rather than as a fallback.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Stub: prometheus_client not installed
+
+    def register(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Stub: nothing to collect from
+
+    def unregister(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Stub: nothing was registered
+
+    def collect(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        return ()
+
+
+class _StubMetric:
+    """No-op metric stub when prometheus_client is unavailable."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Stub: no-op metric
+
+    def labels(self, *args: Any, **kwargs: Any) -> _StubMetric:
+        return self
+
+    def inc(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Stub: no-op increment
+
+    def dec(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Stub: no-op decrement
+
+    def set(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Stub: no-op set
+
+    def observe(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Stub: no-op observe
+
+
+def _stub_generate_latest(*args: Any, **kwargs: Any) -> bytes:
+    return b""
+
+
 if not _PROMETHEUS_AVAILABLE:
-
-    class CollectorRegistry:  # type: ignore[no-redef]
-        """No-op collector registry when prometheus_client is unavailable."""
-
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass  # Stub: prometheus_client not installed
-
-    class _StubMetric:
-        """No-op metric stub when prometheus_client is unavailable."""
-
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass  # Stub: no-op metric
-
-        def labels(self, *args: Any, **kwargs: Any) -> _StubMetric:
-            return self
-
-        def inc(self, *args: Any, **kwargs: Any) -> None:
-            pass  # Stub: no-op increment
-
-        def dec(self, *args: Any, **kwargs: Any) -> None:
-            pass  # Stub: no-op decrement
-
-        def set(self, *args: Any, **kwargs: Any) -> None:
-            pass  # Stub: no-op set
-
-        def observe(self, *args: Any, **kwargs: Any) -> None:
-            pass  # Stub: no-op observe
-
+    CollectorRegistry = _StubCollectorRegistry  # type: ignore[misc,assignment]
     Counter = Gauge = Histogram = _StubMetric  # type: ignore[misc,assignment]
-
-    def generate_latest(*args: Any, **kwargs: Any) -> bytes:
-        return b""
+    generate_latest = _stub_generate_latest  # type: ignore[assignment]
 
 
 __all__ = [
@@ -152,7 +211,7 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Dedicated registry — avoids polluting the default global registry, which
+# Dedicated registry - avoids polluting the default global registry, which
 # matters in tests where multiple apps share a process.
 # ---------------------------------------------------------------------------
 
@@ -348,7 +407,7 @@ best_of_n_judge_score: Histogram = Histogram(
     registry=registry,
 )
 
-# Rework-rate ledger surface — see ``bernstein.core.routing.rework_ledger``.
+# Rework-rate ledger surface - see ``bernstein.core.routing.rework_ledger``.
 rework_rate_per_model: Gauge = Gauge(
     "bernstein_rework_rate_per_model",
     "Observed rework rate per (model, effort, phase) bucket from the rework ledger.",
@@ -364,7 +423,7 @@ cascade_auto_promotions_total: Counter = Counter(
 )
 
 # ---------------------------------------------------------------------------
-# Prompt-cache locality — see ``bernstein.core.agents.prompt_cache_locality``.
+# Prompt-cache locality - see ``bernstein.core.agents.prompt_cache_locality``.
 # Drift events fire when consecutive same-role spawns disagree on the
 # cacheable prefix, breaking Anthropic's 90% / OpenAI's 50% cache discount.
 # Reason labels are bucketed against a closed taxonomy in the locality
@@ -415,7 +474,7 @@ sandbox_exec_count_total: Counter = Counter(
 )
 
 # ---------------------------------------------------------------------------
-# Skill-pack sanitization — counts invisible Unicode Tag codepoints stripped
+# Skill-pack sanitization - counts invisible Unicode Tag codepoints stripped
 # from a skill body before it is injected into an agent worktree. Labelled by
 # the owning :class:`SkillSource` name so operators can spot a poisoned source
 # without re-scanning the index. See ``bernstein.core.skills.sanitizer``.
@@ -429,7 +488,7 @@ skills_unicode_tags_stripped_total: Counter = Counter(
 )
 
 # ---------------------------------------------------------------------------
-# Cardinality guard — only allow known TransitionReason enum values as labels.
+# Cardinality guard - only allow known TransitionReason enum values as labels.
 # Unknown values are bucketed under "unknown" to prevent cardinality explosion.
 # ---------------------------------------------------------------------------
 
@@ -472,7 +531,7 @@ def _sanitize_reason(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cluster observability — node registry, task stealing, autoscaler.
+# Cluster observability - node registry, task stealing, autoscaler.
 # Labels are bucketed against closed sets below to prevent cardinality
 # explosion on operator-supplied values.
 # ---------------------------------------------------------------------------
@@ -514,7 +573,7 @@ cluster_admission_failures_total: Counter = Counter(
 
 
 # ---------------------------------------------------------------------------
-# Cluster cardinality guards — keep the label sets bounded so an attacker
+# Cluster cardinality guards - keep the label sets bounded so an attacker
 # (or a buggy worker) cannot blow up Prometheus storage by sending novel
 # strings on every call.
 # ---------------------------------------------------------------------------
@@ -675,13 +734,13 @@ def record_transition_reason(
 ) -> None:
     """Increment the transition-reason counter for a lifecycle event.
 
-    Safe to call from hot paths — respects the kill-switch and silently
+    Safe to call from hot paths - respects the kill-switch and silently
     drops bad input rather than raising.
 
     Args:
         reason: The ``TransitionReason`` value (or raw string).
         role: Agent/task role label (e.g. ``"backend"``, ``"qa"``).
-        entity_type: ``"agent"`` or ``"task"`` — selects which counter family.
+        entity_type: ``"agent"`` or ``"task"`` - selects which counter family.
     """
     if not _prometheus_enabled:
         return
@@ -697,7 +756,7 @@ def record_transition_reason(
 
 
 # ---------------------------------------------------------------------------
-# Kill-switch — lets operators disable the Prometheus sink without restarting
+# Kill-switch - lets operators disable the Prometheus sink without restarting
 # ---------------------------------------------------------------------------
 
 _prometheus_enabled: bool = True

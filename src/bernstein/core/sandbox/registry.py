@@ -1,4 +1,4 @@
-"""SandboxBackend registry — first-party backends + pluggy entry points.
+"""SandboxBackend registry - first-party backends + pluggy entry points.
 
 The registry is the single lookup surface for sandbox backends. It
 loads first-party backends eagerly (``worktree``, ``docker``) and
@@ -11,7 +11,7 @@ entry point in their ``pyproject.toml``::
 
 Optional backends (``e2b``, ``modal``) import their provider SDK lazily
 inside the backend module, so importing the registry never crashes even
-when the SDK is missing — instantiation of the corresponding backend
+when the SDK is missing - instantiation of the corresponding backend
 will raise a clear error instead.
 """
 
@@ -150,6 +150,7 @@ class _Registry:
         from bernstein.core.sandbox.backends.blaxel import BlaxelSandboxBackend
         from bernstein.core.sandbox.backends.daytona import DaytonaSandboxBackend
         from bernstein.core.sandbox.backends.docker import DockerSandboxBackend
+        from bernstein.core.sandbox.backends.microvm import MicroVMSandboxBackend
         from bernstein.core.sandbox.backends.runloop import RunloopSandboxBackend
         from bernstein.core.sandbox.backends.vercel import VercelSandboxBackend
         from bernstein.core.sandbox.backends.worktree import WorktreeSandboxBackend
@@ -157,6 +158,7 @@ class _Registry:
         builtins: tuple[tuple[str, type[SandboxBackend]], ...] = (
             ("worktree", WorktreeSandboxBackend),
             ("docker", DockerSandboxBackend),
+            ("microvm", MicroVMSandboxBackend),
             ("blaxel", BlaxelSandboxBackend),
             ("daytona", DaytonaSandboxBackend),
             ("runloop", RunloopSandboxBackend),
@@ -229,7 +231,7 @@ def list_backend_names() -> list[str]:
 
 
 def _reset_for_tests() -> None:
-    """Drop cached state. Tests only — not part of the public API.
+    """Drop cached state. Tests only - not part of the public API.
 
     Intentionally referenced by the test fixture in
     ``tests/unit/sandbox/test_registry.py``. Pyright would flag it

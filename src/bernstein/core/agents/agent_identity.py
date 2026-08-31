@@ -16,11 +16,16 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, cast, get_args
 
 from bernstein.core.auth import create_jwt, verify_jwt
+from bernstein.core.path_scope import ScopePatternError, validate_repo_relative_pattern
 from bernstein.core.sanitize import sanitize_log
-from bernstein.core.tenanting import normalize_tenant_id
+from bernstein.core.tenanting import (
+    DEFAULT_TENANT_ID,
+    InvalidTenantIdError,
+    normalize_tenant_id,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -144,6 +149,191 @@ def permissions_for_role(role: str) -> frozenset[str]:
 # ---------------------------------------------------------------------------
 
 
+# Sentinel for "the record has no ``tenant_id`` key at all", which is not the
+# same thing as a key whose stored value happens to be ``null``.  Only the
+# former is a pre-field record; see :func:`_credential_tenant_id`.
+_TENANT_KEY_ABSENT: Final[object] = object()
+
+#: The kinds a credential may declare.  ``opaque`` is verified against the
+#: stored token hash alone; ``jwt`` additionally has its claims checked
+#: against the identity, so which one a record says decides which validation
+#: it gets (see :func:`_credential_token_type`).
+TokenType = Literal["opaque", "jwt"]
+
+#: The runtime spelling of :data:`TokenType`, derived from it rather than
+#: restated.  A hand-written copy is one edit away from admitting less than
+#: the type permits: adding a kind means touching the annotation, which is
+#: where the type lives, and a stale allowlist then refuses a kind that
+#: type-checks clean.  Deriving it makes that unreachable rather than
+#: discouraged, which is what the comment here used to claim (#4015).
+_CREDENTIAL_TOKEN_TYPES: Final[tuple[TokenType, ...]] = get_args(TokenType)
+
+
+def _string_list(raw: Any, field: str) -> list[str]:
+    """Return a persisted list-of-strings field, refusing any other shape.
+
+    ``list()`` and ``frozenset()`` accept any iterable, which makes them the
+    wrong tool for reading a stored authorization decision.  A stored string
+    becomes a collection of its characters; a stored mapping becomes a
+    collection of its *keys*, so ``{"admin:manage": 1}`` deserialises into a
+    real held permission.  And an empty mapping becomes an empty list, which
+    for ``task_ids`` and ``allowed_files`` is not "no data" but "no
+    restriction" - collapsing a scoped credential into an unscoped one.
+
+    These three fields are what an agent is allowed to do, so a value that is
+    not a list of strings is refused rather than reinterpreted into one.  The
+    ``ValueError`` is already handled by :meth:`AgentIdentityStore._read_identity`,
+    so the record is skipped like any other unreadable one.
+
+    Args:
+        raw: The stored value.  An absent key is passed as an empty tuple by
+            the caller; ``None`` is a stored null and is refused.
+        field: Field name, for the error message.
+
+    Raises:
+        ValueError: The value is not a list, or holds a non-string entry.
+    """
+    if not isinstance(raw, list | tuple):
+        raise ValueError(f"{field} must be a list, got {type(raw).__name__}")
+    entries = cast("list[Any]", list(raw))
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValueError(f"{field} entries must be strings, got {type(entry).__name__}")
+    return [str(entry) for entry in entries]
+
+
+def _claim_string_list(raw: object) -> list[str] | None:
+    """Return a signed-token claim as a list of strings, or ``None`` if it is not one.
+
+    The same reasoning as :func:`_string_list`, applied to the claim side of
+    the comparison rather than the stored side.  ``map(str)`` would coerce a
+    claim before comparing it, so a claim carrying ``1`` would compare equal
+    to a stored ``"1"`` and a claim carrying ``True`` to a stored ``"True"``.
+    The point of the comparison is that the token's scope is the credential's
+    scope, and a coerced match does not establish that.
+
+    Returns ``None`` rather than raising: the caller turns any non-match into
+    a failed authentication, and a malformed claim is a failed authentication
+    like any other.
+    """
+    if not isinstance(raw, list | tuple):
+        return None
+    entries = cast("list[Any]", list(raw))
+    if any(not isinstance(entry, str) for entry in entries):
+        return None
+    return [str(entry) for entry in entries]
+
+
+def _require_matching_scope(field: str, on_identity: list[str], on_credential: list[str]) -> None:
+    """Refuse a persisted identity whose scope disagrees with its credential's.
+
+    Both copies of ``task_ids`` and ``allowed_files`` are read back as
+    authorization state, but by different consumers: the request middleware
+    reads the identity's copy, while the JWT claim check reads the
+    credential's.  A record where the two disagree therefore has two
+    different answers to "what may this agent act on", and the widest one
+    wins wherever it happens to be read - an identity holding an empty list
+    beside a scoped credential is treated as unrestricted by the middleware,
+    and an opaque token never reaches the claim check that would have
+    disagreed.
+
+    Nothing writes such a record: ``create_identity`` puts the same list in
+    both places.  A record carrying two answers was therefore hand-edited or
+    written by something else, so it is refused through the same
+    ``ValueError`` path as any other unreadable record rather than
+    authenticated under whichever scope is read first.
+
+    Raises:
+        ValueError: The two copies of the field differ.
+    """
+    if sorted(on_identity) != sorted(on_credential):
+        raise ValueError(
+            f"{field} on the identity does not match the credential: {sorted(on_identity)} vs {sorted(on_credential)}"
+        )
+
+
+def _credential_tenant_id(raw: Any) -> str:
+    """Return the tenant a persisted credential is scoped to.
+
+    The value is read back as the authenticated scope for every request this
+    credential authenticates, so the deserialisation boundary is where it has
+    to be established as a real tenant id.  ``str()`` coercion would accept
+    whatever shape happened to be stored and hand the result on as a usable
+    scope, so a stored value that is not a non-blank string is refused
+    instead.
+
+    Leniency is keyed on the *key* being absent, not on the value being
+    empty: a record written before the field existed carries no ``tenant_id``
+    at all and belongs to :data:`DEFAULT_TENANT_ID`.  A record that carries
+    the key with ``null`` in it is a different thing - something wrote a
+    tenant and wrote a non-tenant - and it is refused like any other value
+    that is not a real tenant id, rather than being quietly authenticated
+    under the default tenant.
+
+    Args:
+        raw: The stored value, or :data:`_TENANT_KEY_ABSENT` when the record
+            has no ``tenant_id`` key.
+
+    Raises:
+        ValueError: The record carries a ``tenant_id`` that is not a
+            non-blank string.
+    """
+    if raw is _TENANT_KEY_ABSENT:
+        return DEFAULT_TENANT_ID
+    if not isinstance(raw, str):
+        raise ValueError(f"credential tenant_id must be a string, got {type(raw).__name__}")
+    if not raw.strip():
+        raise ValueError("credential tenant_id must not be blank")
+    return normalize_tenant_id(raw)
+
+
+def _credential_token_type(raw: Any) -> TokenType:
+    """Return the token kind a persisted credential declares.
+
+    ``token_type`` selects which validation a token gets: ``_validate_jwt_claims``
+    refuses anything whose credential does not say ``"jwt"``, so authentication
+    falls through to the opaque hash comparison for every other value.  A
+    ``str()`` coercion of the stored value therefore does not merely widen a
+    type - it routes an authentication decision on a value nothing has
+    established, and the routing is by whichever comparison runs first rather
+    than by a recognised kind.
+
+    An unknown kind is refused here instead, in the same style as
+    :func:`_credential_tenant_id` beside it: the boundary where a record on
+    disk becomes an object the rest of the code trusts is where a value that
+    is not one of the two real kinds stops.
+
+    Leniency is for age, not for content: a record written before the field
+    existed carries no ``token_type`` at all and is an opaque credential,
+    which is what the dataclass default has always said.  A record that
+    carries the key with something else in it asserted a kind, and an
+    unrecognised assertion is refused rather than defaulted - defaulting it
+    would rewrite a security-relevant field on the way in and lose the fact
+    that the store holds something nothing wrote.
+
+    The ``isinstance`` check is what makes that refusal reachable for every
+    stored shape rather than most of them.  A membership test hashes its left
+    operand, and JSON persists two values that cannot be hashed: a list and
+    an object.  Without the guard those two raise ``TypeError: unhashable
+    type: 'list'`` out of the lookup itself - caught by
+    :meth:`AgentIdentityStore._read_identity` like any other refusal, so the
+    store stays readable, but naming neither the field nor the value, which
+    is the whole point of the message below.  It is also the shape
+    :func:`_credential_tenant_id` beside it already uses.
+
+    Args:
+        raw: The stored value, or ``"opaque"`` when the record has no
+            ``token_type`` key.
+
+    Raises:
+        ValueError: The record carries a ``token_type`` outside
+            :data:`TokenType`.
+    """
+    if isinstance(raw, str) and raw in _CREDENTIAL_TOKEN_TYPES:
+        return cast("TokenType", raw)
+    raise ValueError(f"credential token_type must be one of {sorted(_CREDENTIAL_TOKEN_TYPES)}, got {raw!r}")
+
+
 @dataclass
 class AgentCredential:
     """Bearer token for agent-to-server authentication.
@@ -156,14 +346,14 @@ class AgentCredential:
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0  # 0 = no expiry (session-scoped)
     revoked: bool = False
-    token_type: Literal["opaque", "jwt"] = "opaque"
+    token_type: TokenType = "opaque"
     algorithm: str = "HS256"
     jti: str = ""
     tenant_id: str = "default"
-    # Zero-trust: task scope — the task IDs this credential is authorised to act on.
+    # Zero-trust: task scope - the task IDs this credential is authorised to act on.
     # An empty list means no task-scope restriction (legacy / manager tokens).
     task_ids: list[str] = field(default_factory=list)
-    # Zero-trust: file scope — glob patterns for files this credential may write.
+    # Zero-trust: file scope - glob patterns for files this credential may write.
     # An empty list means no file-scope restriction.
     allowed_files: list[str] = field(default_factory=list)
 
@@ -198,12 +388,12 @@ class AgentCredential:
             created_at=float(d.get("created_at", 0)),
             expires_at=float(d.get("expires_at", 0)),
             revoked=bool(d.get("revoked", False)),
-            token_type=str(d.get("token_type", "opaque")),
+            token_type=_credential_token_type(d.get("token_type", "opaque")),
             algorithm=str(d.get("algorithm", "HS256")),
             jti=str(d.get("jti", "")),
-            tenant_id=normalize_tenant_id(str(d.get("tenant_id", "default") or "default")),
-            task_ids=[str(t) for t in d.get("task_ids", [])],
-            allowed_files=[str(f) for f in d.get("allowed_files", [])],
+            tenant_id=_credential_tenant_id(d.get("tenant_id", _TENANT_KEY_ABSENT)),
+            task_ids=_string_list(d.get("task_ids", ()), "credential task_ids"),
+            allowed_files=_string_list(d.get("allowed_files", ()), "credential allowed_files"),
         )
 
 
@@ -246,10 +436,10 @@ class AgentIdentity:
     credential: AgentCredential | None = None
     parent_identity_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    # Zero-trust task scope — tasks this identity is allowed to report on.
+    # Zero-trust task scope - tasks this identity is allowed to report on.
     # Empty means unrestricted (manager / orchestrator tokens).
     task_ids: list[str] = field(default_factory=list)
-    # Zero-trust file scope — glob patterns for files this identity may write.
+    # Zero-trust file scope - glob patterns for files this identity may write.
     allowed_files: list[str] = field(default_factory=list)
 
     @property
@@ -285,21 +475,27 @@ class AgentIdentity:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AgentIdentity:
         cred_data = d.get("credential")
+        credential = AgentCredential.from_dict(cred_data) if cred_data else None
+        task_ids = _string_list(d.get("task_ids", ()), "task_ids")
+        allowed_files = _string_list(d.get("allowed_files", ()), "allowed_files")
+        if credential is not None:
+            _require_matching_scope("task_ids", task_ids, credential.task_ids)
+            _require_matching_scope("allowed_files", allowed_files, credential.allowed_files)
         return cls(
             id=str(d["id"]),
             role=str(d["role"]),
             session_id=str(d["session_id"]),
-            permissions=frozenset(d.get("permissions", [])),
+            permissions=frozenset(_string_list(d.get("permissions", ()), "permissions")),
             status=AgentIdentityStatus(d.get("status", "active")),
             created_at=float(d.get("created_at", 0)),
             last_authenticated_at=float(d.get("last_authenticated_at", 0)),
             revoked_at=float(d.get("revoked_at", 0)),
             revocation_reason=str(d.get("revocation_reason", "")),
-            credential=AgentCredential.from_dict(cred_data) if cred_data else None,
+            credential=credential,
             parent_identity_id=d.get("parent_identity_id"),
             metadata=dict(d.get("metadata", {})),
-            task_ids=[str(t) for t in d.get("task_ids", [])],
-            allowed_files=[str(f) for f in d.get("allowed_files", [])],
+            task_ids=task_ids,
+            allowed_files=allowed_files,
         )
 
 
@@ -394,26 +590,60 @@ class AgentIdentityStore:
         path = self._identity_path(identity.id)
         path.write_text(json.dumps(identity.to_dict(), indent=2), encoding="utf-8")
 
+    def _read_identity(self, path: Path) -> AgentIdentity | None:
+        """Deserialise one persisted identity file, or None when unusable.
+
+        Every reader in this store goes through here, so a record that cannot
+        be turned into an identity is skipped identically everywhere: the
+        startup token-index scan, ``list_identities``, and the ``_load``
+        lookup behind authentication and the lifecycle mutators.  Before this
+        was shared, each reader picked off raw JSON with its own exception
+        list, so the same bad file could block startup on one path, escape as
+        a 500 on another, and merely be omitted on a third.
+
+        Everything a bad record can raise is caught: a top-level value that
+        is not an object, a nested value that is not subscriptable, a missing
+        key, an enum or tenant value that is not a legitimate one, and the
+        filesystem errors of reading the file at all.  All of them mean the
+        same thing to a caller - there is no identity here - so all of them
+        produce ``None`` rather than an exception the caller cannot act on.
+        """
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                msg = f"identity record must be a JSON object, got {type(data).__name__}"
+                raise TypeError(msg)
+            return AgentIdentity.from_dict(cast("dict[str, Any]", data))
+        except (OSError, json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError):
+            logger.warning("Skipping corrupt identity file: %s", path)
+            return None
+
     def _load(self, identity_id: str) -> AgentIdentity | None:
+        """Read one identity by id, or None when it is missing or unusable."""
         path = self._identity_path(identity_id)
         if not path.exists():
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return AgentIdentity.from_dict(data)
+        return self._read_identity(path)
 
     def _rebuild_token_index(self) -> None:
-        """Scan persisted identities and populate the token→identity lookup."""
+        """Scan persisted identities and populate the token→identity lookup.
+
+        Runs from ``__init__``, so anything that escapes here blocks server
+        startup.  It indexes only records that fully deserialise, which is
+        also the only useful set: a record ``_read_identity`` rejects cannot
+        authenticate anyway, so indexing its token would map a live token to
+        an identity that always resolves to ``None``.
+        """
         self._token_index.clear()
         if not self._identities_dir.exists():
             return
         for path in self._identities_dir.glob("*.json"):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                cred = data.get("credential")
-                if cred and not cred.get("revoked", False):
-                    self._token_index[cred["token_hash"]] = data["id"]
-            except (json.JSONDecodeError, KeyError):
-                logger.warning("Skipping corrupt identity file: %s", path)
+            identity = self._read_identity(path)
+            if identity is None:
+                continue
+            cred = identity.credential
+            if cred is not None and not cred.revoked:
+                self._token_index[cred.token_hash] = identity.id
 
     def _append_audit(self, event: IdentityAuditEvent) -> None:
         with self._audit_path.open("a", encoding="utf-8") as f:
@@ -436,9 +666,13 @@ class AgentIdentityStore:
         """Create a new agent identity with a short-lived, task-scoped JWT.
 
         Each agent receives a JWT that is scoped to its assigned task IDs and
-        (optionally) a list of file glob patterns it may write.  The task server
-        enforces these scopes on every incoming request so that a compromised
-        agent cannot modify tasks outside its own scope.
+        (optionally) a list of file glob patterns its work may touch.  The task
+        server enforces ``task_ids`` on every incoming request, so a compromised
+        agent cannot modify tasks outside its own scope.  ``allowed_files`` is
+        enforced at a different place and buys a different thing: the merge
+        acceptance gate refuses to bring in a change that falls outside it
+        (#3914), which contains an out-of-scope write rather than preventing
+        it.  See ``docs/operations/security-and-identity.md``.
 
         Args:
             session_id: Unique agent session identifier.
@@ -450,20 +684,49 @@ class AgentIdentityStore:
                 task-scoped tokens or 24 h for unrestricted manager tokens.
             task_ids: Task IDs this identity is authorised to act on.  An empty
                 list means no restriction (orchestrator / manager role).
-            allowed_files: File glob patterns this identity may write to.  An
-                empty list means no restriction.
+            allowed_files: Repository-relative glob patterns this identity's
+                work may touch.  An empty list means no restriction, which is
+                what every identity minted before the gate existed carries.
+                Each pattern is validated here, so a scope that could name a
+                file outside the repository never becomes a signed one.
 
         Returns:
-            Tuple of ``(AgentIdentity, raw_token)`` — the raw bearer token is
+            Tuple of ``(AgentIdentity, raw_token)`` - the raw bearer token is
             returned exactly once and must be passed to the agent securely.
+
+        Raises:
+            ValueError: ``task_ids`` or ``allowed_files`` is not a list of
+                strings, or an ``allowed_files`` pattern is not
+                repository-relative.  Refused before the token is signed, so a
+                bad scope cannot become a credential that fails to load.
         """
         identity_id = session_id  # 1:1 mapping with agent session
         permissions = permissions_for_role(role)
         if extra_permissions:
             permissions = permissions | extra_permissions
 
-        scoped_task_ids: list[str] = list(task_ids) if task_ids else []
-        scoped_files: list[str] = list(allowed_files) if allowed_files else []
+        # Validated here rather than at the read side alone: these two lists are
+        # signed into the token and persisted beside it, so a caller passing a
+        # non-string entry would mint a credential that its own reader refuses,
+        # leaving an agent whose token authenticates as an unknown identity.
+        # Only ``None`` means "not supplied".  ``or ()`` would have sent every
+        # falsy value down the unrestricted path, so an empty mapping or an
+        # empty string - refused as corrupt when read back - would instead have
+        # signed a token with no task scope at all.
+        scoped_task_ids = _string_list(() if task_ids is None else task_ids, "task_ids")
+        scoped_files = _string_list(() if allowed_files is None else allowed_files, "allowed_files")
+        # Shape is not enough for the file scope: the merge gate reads these as
+        # repository-relative globs, so a pattern that names a drive or walks
+        # out of the root is refused before it can be signed.  Validated only
+        # here, at declaration -- records written before this existed stay
+        # loadable, and an uninterpretable pattern simply admits nothing when
+        # the gate matches against it.
+        for index, pattern in enumerate(scoped_files):
+            try:
+                validate_repo_relative_pattern(pattern)
+            except ScopePatternError as exc:
+                msg = f"allowed_files[{index}]: {exc}"
+                raise ValueError(msg) from exc
 
         now = time.time()
         # Use shorter expiry (4 h) for task-scoped tokens to limit blast radius.
@@ -649,16 +912,24 @@ class AgentIdentityStore:
             return False
         if str(claims.get("role", "")) != identity.role:
             return False
-        if normalize_tenant_id(str(claims.get("tenant_id", "default"))) != cred.tenant_id:
+        # A malformed tenant claim can never match the credential's own
+        # (already valid) tenant, so it is a claim mismatch like any other -
+        # deny rather than letting the refusal escape this bool-returning
+        # validator and surface as a server error at the auth boundary.
+        try:
+            claim_tenant = normalize_tenant_id(str(claims.get("tenant_id", "default")))
+        except InvalidTenantIdError:
             return False
-        claim_scopes = claims.get("scopes", [])
-        if not isinstance(claim_scopes, list) or set(map(str, claim_scopes)) != set(identity.permissions):
+        if claim_tenant != cred.tenant_id:
             return False
-        claim_task_ids = claims.get("task_ids", [])
-        if not isinstance(claim_task_ids, list) or sorted(map(str, claim_task_ids)) != sorted(cred.task_ids):
+        claim_scopes = _claim_string_list(claims.get("scopes", []))
+        if claim_scopes is None or set(claim_scopes) != set(identity.permissions):
             return False
-        claim_files = claims.get("allowed_files", [])
-        return isinstance(claim_files, list) and sorted(map(str, claim_files)) == sorted(cred.allowed_files)
+        claim_task_ids = _claim_string_list(claims.get("task_ids", []))
+        if claim_task_ids is None or sorted(claim_task_ids) != sorted(cred.task_ids):
+            return False
+        claim_files = _claim_string_list(claims.get("allowed_files", []))
+        return claim_files is not None and sorted(claim_files) == sorted(cred.allowed_files)
 
     def _audit_denial(self, identity_id: str, reason: str) -> None:
         """Log a denied authentication attempt."""
@@ -824,16 +1095,17 @@ class AgentIdentityStore:
         """List all identities, optionally filtered by status and/or role."""
         results: list[AgentIdentity] = []
         for path in sorted(self._identities_dir.glob("*.json")):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                identity = AgentIdentity.from_dict(data)
-                if status is not None and identity.status != status:
-                    continue
-                if role is not None and identity.role != role:
-                    continue
-                results.append(identity)
-            except (json.JSONDecodeError, KeyError):
-                logger.warning("Skipping corrupt identity file: %s", path)
+            # Shared reader: a record that does not deserialise is skipped
+            # rather than listed with a value derived from a bad record, and
+            # a malformed file cannot escape this route as a 500 either.
+            identity = self._read_identity(path)
+            if identity is None:
+                continue
+            if status is not None and identity.status != status:
+                continue
+            if role is not None and identity.role != role:
+                continue
+            results.append(identity)
         return results
 
     def get_audit_trail(self, identity_id: str | None = None, *, limit: int = 100) -> list[IdentityAuditEvent]:

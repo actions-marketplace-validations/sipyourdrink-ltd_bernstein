@@ -9,25 +9,36 @@ name: static-analysis (extended)
 # Each job runs in parallel and uploads SARIF to GitHub Code
 # Scanning so the Security tab is the single source of truth.
 #
+# Lane split (issue #2764): the security-signal jobs (semgrep, trivy-fs,
+# trivy-iac) run on push to main and on the schedule. The advisory
+# style-and-hygiene jobs (vulture, refurb, perflint) run on the weekly
+# schedule and workflow_dispatch only, so the code-scanning alert feed
+# stays a security signal. The refurb SARIF
+# upload is additionally filtered to error-level results so its style
+# findings no longer create alerts that bury real security findings.
+#
+# Not on merge_group, deliberately. Two independent reasons:
+#
+#   1. The queue's only required context is `CI gate`, so this lane never
+#      gated a queue merge - it competed with ci.yml for runners on every
+#      queue entry and every queue reshuffle, starving the one check the
+#      queue actually waits for.
+#   2. Code Scanning attaches alerts to the ref the run was for, and a
+#      merge-queue ref (`gh-readonly-queue/main/pr-<n>-<sha>`) is deleted
+#      the moment the entry merges or the queue re-shuffles. These
+#      scanners take minutes, so the SARIF upload regularly landed after
+#      the branch was gone and failed the job over a report that had
+#      nowhere to go, while the scan itself had passed.
+#
+# The alerts that matter are the ones on `main`; the push trigger above
+# uploads those against a ref that persists, at most minutes after the
+# queue would have produced the same finding.
+#
 # Ref: .sdd/backlog/open/2026-05-19-feat-ci-semgrep-trivy-pipaudit.md
 
 on:
   push:
     branches: [main]
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "scripts/**"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "Dockerfile"
-      - "docker/**"
-      - "deploy/**"
-      - "examples/**/Dockerfile*"
-      - "examples/**/docker-compose*.yml"
-      - ".github/workflows/static-analysis-extended.yml"
-      - ".semgrep/**"
-  pull_request:
     paths:
       - "src/**"
       - "tests/**"
@@ -50,7 +61,10 @@ on:
 
 concurrency:
   group: static-analysis-extended-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs only for PRs. A push-to-main scan must never be
+  # cancelled by the next merge landing seconds later: a cancelled run shows
+  # grey, not red, so the earlier commit would silently lose its scan.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -69,18 +83,18 @@ jobs:
       security-events: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Full history required so --baseline-commit can resolve the
           # merge-base on pull_request runs.
           fetch-depth: 0
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
       - name: Install Semgrep (isolated env)
@@ -130,7 +144,7 @@ jobs:
             semgrep.sarif > semgrep.filtered.sarif
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28  # v4
         with:
           sarif_file: semgrep.filtered.sarif
           category: semgrep-ce
@@ -155,11 +169,11 @@ jobs:
       security-events: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Run Trivy filesystem scan (SARIF)
@@ -179,7 +193,7 @@ jobs:
             trivy-fs.sarif > trivy-fs.filtered.sarif
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28  # v4
         with:
           sarif_file: trivy-fs.filtered.sarif
           category: trivy-fs
@@ -187,6 +201,12 @@ jobs:
         # Re-run with exit-code=1 to fail the job on any HIGH/CRITICAL
         # finding. We split SARIF upload from the failing gate so
         # findings still reach Code Scanning when the gate fires.
+        #
+        # PR-exempt: a newly-disclosed CVE in an unchanged dependency would
+        # otherwise redden PRs that never touched it. The SARIF upload above
+        # still surfaces the finding on PRs, and dependency-review covers
+        # dependency changes, so the hard gate only runs on push/schedule.
+        if: github.event_name != 'pull_request'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: fs
@@ -216,11 +236,11 @@ jobs:
       security-events: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Run Trivy IaC scan (SARIF)
@@ -245,7 +265,7 @@ jobs:
             trivy-iac.sarif > trivy-iac.filtered.sarif
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28  # v4
         with:
           sarif_file: trivy-iac.filtered.sarif
           category: trivy-iac
@@ -273,7 +293,9 @@ jobs:
     # within a file; vulture spots unused functions/classes/vars
     # across the 40-adapter tree. Findings are advisory (job does
     # not fail) until the existing dead-code follow-ups land.
+    # Advisory lane: weekly schedule + manual dispatch only (#2764).
     name: vulture (dead code)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -281,15 +303,15 @@ jobs:
       security-events: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
       - name: Install vulture (isolated env)
@@ -317,7 +339,7 @@ jobs:
             vulture.sarif > vulture.filtered.sarif
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28  # v4
         with:
           sarif_file: vulture.filtered.sarif
           category: vulture
@@ -336,7 +358,9 @@ jobs:
     # Outdated-idiom detection. refurb flags constructs that have
     # cleaner modern Python equivalents (e.g. `list(map(...))` ->
     # list comprehension). Advisory.
+    # Advisory lane: weekly schedule + manual dispatch only (#2764).
     name: refurb (idioms)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -344,15 +368,15 @@ jobs:
       security-events: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
       - name: Install refurb (isolated env)
@@ -372,9 +396,32 @@ jobs:
         run: |
           python3 scripts/sarif_drop_suppressed.py \
             refurb.sarif > refurb.filtered.sarif
+      - name: Keep error-level results only (#2764)
+        # refurb findings convert to SARIF at warning level; ingesting
+        # them as code-scanning alerts buried the small number of real
+        # security findings in the feed. Keep only error-level results in
+        # the upload so the alert feed stays a security signal; the full
+        # text output remains available in the workflow artifact below.
+        if: always()
+        run: |
+          python3 - <<'FILTER'
+          import json
+
+          with open("refurb.filtered.sarif", encoding="utf-8") as fh:
+              doc = json.load(fh)
+          dropped = 0
+          for run in doc.get("runs", []):
+              results = run.get("results", [])
+              kept = [r for r in results if r.get("level") == "error"]
+              dropped += len(results) - len(kept)
+              run["results"] = kept
+          with open("refurb.filtered.sarif", "w", encoding="utf-8") as fh:
+              json.dump(doc, fh)
+          print(f"dropped {dropped} non-error refurb results from the upload")
+          FILTER
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28  # v4
         with:
           sarif_file: refurb.filtered.sarif
           category: refurb
@@ -394,7 +441,9 @@ jobs:
     # have measurable cost in tight loops (string concat in loops,
     # try/except in hot paths, etc.). Matters for the orchestrator
     # tick loop. Advisory.
+    # Advisory lane: weekly schedule + manual dispatch only (#2764).
     name: perflint (hot-path antipatterns)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -402,15 +451,15 @@ jobs:
       security-events: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
       - name: Install perflint (isolated env)
@@ -441,7 +490,7 @@ jobs:
             perflint.sarif > perflint.filtered.sarif
       - name: Upload SARIF to Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28  # v4
         with:
           sarif_file: perflint.filtered.sarif
           category: perflint

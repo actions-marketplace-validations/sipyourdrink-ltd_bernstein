@@ -17,7 +17,7 @@ permission mode determines which levels are enforced:
 ✓ = rule enforced (deny/ask applies) · ✗ = rule relaxed (overridden to allow)
 
 **Critical rules are always enforced, regardless of mode.** `bypass` does not disable
-safety guardrails — it only relaxes medium and high severity rules for non-interactive runs.
+safety guardrails - it only relaxes medium and high severity rules for non-interactive runs.
 
 Set the mode in config or via environment variable:
 
@@ -34,7 +34,7 @@ When no rule matches a tool call, `default` mode falls back to `ask` (escalate t
 All other modes fall back to `allow`.
 
 **Legacy flag migration:** earlier Bernstein versions used `--dangerously-skip-permissions`.
-That flag now maps to `bypass` mode — critical rules are still enforced.
+That flag now maps to `bypass` mode - critical rules are still enforced.
 
 ## Permission rule engine
 
@@ -72,8 +72,8 @@ permission_rules:
 
 | Field         | Required | Default    | Description                                              |
 |---------------|----------|------------|----------------------------------------------------------|
-| `id`          | yes      | —          | Unique rule identifier for logging and audit             |
-| `action`      | yes      | —          | `deny`, `ask`, or `allow`                                |
+| `id`          | yes      | -          | Unique rule identifier for logging and audit             |
+| `action`      | yes      | -          | `deny`, `ask`, or `allow`                                |
 | `severity`    | no       | `medium`   | Controls which permission modes enforce this rule        |
 | `tool`        | no       | `*`        | Glob matched against tool name (case-insensitive)        |
 | `path`        | no       | (any)      | Glob matched against `file_path`/`path` in tool input    |
@@ -130,7 +130,7 @@ permission_rules:
 ## Policy-as-code engine
 
 The permission rule engine controls individual tool calls at runtime. The policy-as-code
-engine is a separate layer that runs at merge time — it evaluates agent-produced diffs
+engine is a separate layer that runs at merge time - it evaluates agent-produced diffs
 against YAML or Rego policies before any changes are merged to your branch.
 
 Policies live in `.sdd/policies/`. Bernstein loads all `*.yaml`, `*.yml`, and `*.rego`
@@ -210,9 +210,9 @@ any_test_file_changed if {
 
 The `input` object passed to Rego contains:
 - `input.task.id`, `input.task.title`, `input.task.description`, `input.task.role`
-- `input.diff_text` — full git diff
-- `input.files` — array of `{ "path": "...", "content": "..." }`
-- `input.files_changed` — count of changed files
+- `input.diff_text` - full git diff
+- `input.files` - array of `{ "path": "...", "content": "..." }`
+- `input.files_changed` - count of changed files
 
 Install OPA:
 
@@ -234,10 +234,10 @@ bernstein recap                     # Shows violations alongside task results
 bernstein trace <task-id>           # Per-task policy evaluation detail
 ```
 
-All violations — block and warn — are included in the compliance report:
+All violations - block and warn - are included in the compliance report:
 
 ```bash
-bernstein admin compliance-report
+bernstein compliance report
 ```
 
 ## Role-based file permissions
@@ -253,7 +253,7 @@ Denied paths always override allowed paths.
 | `frontend`  | `src/*`, `tests/*`, `docs/*`, `public/*`, `static/*`, `package.json` | `.github/*`, `.sdd/*`, `templates/roles/*` |
 | `qa`        | `tests/*`, `src/*`, `docs/*`, `scripts/*`                   | `.github/*`, `.sdd/*`, `templates/roles/*` |
 | `security`  | `src/*`, `tests/*`, `.github/workflows/*`, `docs/*`, `scripts/*` | `.sdd/*`, `templates/roles/*`          |
-| `devops`    | `.github/*`, `Dockerfile`, `docker-compose.yml`, `scripts/*`, `Makefile` | `.sdd/*`, `src/*`, `templates/roles/*` |
+| `devops`    | `.github/*`, `Dockerfile`, `docker-compose.yaml`, `docker-compose.yml`, `scripts/*`, `Makefile` | `.sdd/*`, `src/*`, `templates/roles/*` |
 | `docs`      | `docs/*`, `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`   | `.github/*`, `.sdd/*`, `src/*`, `tests/*`, `templates/roles/*` |
 | `manager`   | `docs/*`, `.sdd/backlog/*`, `plans/*`                       | `src/*`, `tests/*`, `.github/*`          |
 | `architect` | `src/*`, `tests/*`, `docs/*`, `scripts/*`                   | `.github/*`, `.sdd/*`, `templates/roles/*` |
@@ -332,10 +332,19 @@ command_policy:
 
 ### Git worktree isolation
 
-By default, each agent runs in an isolated git worktree under `.sdd/worktrees/`. This means:
+By default, each coding agent runs in an isolated git worktree under `.sdd/worktrees/`. This means:
 - Agents cannot access each other's in-progress changes
 - A failing agent cannot corrupt the main branch
 - Merge to main only happens after the janitor verifies the output
+
+An artifact-mode task - one that completes on a signed lineage receipt
+rather than a commit - runs in an isolated plain directory under
+`.sdd/workspaces/` instead: a per-session working directory with no
+checkout and no agent branch, so there is nothing to merge back. That
+directory provides the same thing the worktree it replaces provides:
+working-directory separation between agents, not kernel-level isolation.
+The sandbox and network enforcement layers described elsewhere in this
+document are unchanged and orthogonal to a task's output mode.
 
 To inspect an agent's worktree before merge:
 
@@ -359,17 +368,17 @@ audit:
   archive_compressed: true
 ```
 
-Each entry in `.sdd/metrics/audit.jsonl` contains a chain hash linking it to the previous
-entry. Any insertion, deletion, or modification breaks the chain.
+Each entry in `.sdd/audit/<YYYY-MM-DD>.jsonl` (daily-rotated) contains a chain hash linking
+it to the previous entry. Any insertion, deletion, or modification breaks the chain.
 
 ### Verify audit log integrity
 
 ```bash
-# Verify the full HMAC chain is intact
-bernstein admin verify-audit-log
+# Verify the full HMAC chain and Merkle tree are intact
+bernstein audit verify
 
-# Check a specific date range
-bernstein admin verify-audit-log --from 2026-01-01 --to 2026-03-31
+# Inspect events from a specific date onward
+bernstein audit query --since 2026-01-01 --limit 500
 ```
 
 ### Export to SIEM
@@ -442,7 +451,10 @@ bernstein stop && bernstein run   # Restart to pick up new secret
 # Override with: export BERNSTEIN_AUDIT_KEY_PATH=/secure/path/audit.key
 KEY_PATH="${BERNSTEIN_AUDIT_KEY_PATH:-${XDG_STATE_HOME:-$HOME/.local/state}/bernstein/audit.key}"
 cp "$KEY_PATH" "${KEY_PATH}.bak"
-bernstein admin rotate-audit-key
+# Write a fresh HMAC key, then move pre-rotation chain files out of the
+# active chain so verification does not fail on the old key.
+openssl rand -hex 32 > "$KEY_PATH"
+bernstein audit archive --corrupt --yes
 ```
 
 ### PII detection
@@ -527,10 +539,11 @@ auth:
   token_expiry_s: 3600
 ```
 
-Generate a token for API access:
+Obtain a session token for API access. Token lifetime is controlled by
+`token_expiry_s` in the `auth` config above:
 
 ```bash
-bernstein auth token --expiry 24h
+bernstein auth login
 ```
 
 Include the token in API requests:
@@ -578,10 +591,12 @@ cluster:
     token_expiry_hours: 24
 ```
 
-Revoke a node token to immediately deny a compromised worker:
+To immediately deny a compromised worker, rotate the shared cluster secret
+and restart the cluster so outstanding node tokens no longer validate:
 
 ```bash
-bernstein admin revoke-node <node-id>
+export BERNSTEIN_CLUSTER_SECRET="$(openssl rand -hex 32)"
+bernstein stop && bernstein run
 ```
 
 ### Dashboard authentication
@@ -655,10 +670,10 @@ Output includes:
 
 ```bash
 # Structured JSON output for ingestion into compliance tooling
-bernstein admin compliance-report --format json > compliance-$(date +%Y%m%d).json
+bernstein compliance report --json-output > compliance-$(date +%Y%m%d).json
 
 # Human-readable summary
-bernstein admin compliance-report
+bernstein compliance report
 ```
 
 The report covers:
@@ -685,6 +700,21 @@ dependency_scan:
     - "BSD-3-Clause"
     - "ISC"
 ```
+
+#### Scheduled scan scope
+
+The orchestrator's scheduled (weekly) dependency scan is separate from the
+compliance scan above and is **off by default**
+(`OrchestratorConfig.dependency_scan_enabled = False`), so a scoped run is
+never given unrequested remediation tasks. When it is enabled:
+
+- It audits only the dependencies the target repo declares
+  (`requirements*.txt`, `pyproject.toml`, `setup.py`/`setup.cfg`, or a
+  lockfile). A repo with no Python dependency manifest is skipped rather than
+  having the orchestrator's own tool environment audited.
+- The first tick of a fresh run records a baseline instead of firing
+  immediately, so the weekly interval starts from that baseline rather than
+  treating a missing scan state as overdue.
 
 ### Data residency
 
@@ -746,4 +776,4 @@ Before deploying Bernstein in a production environment:
 - [ ] Retention policy configured
 - [ ] Dependency scanning enabled
 - [ ] `bernstein doctor --security` passes clean
-- [ ] `bernstein admin compliance-report` reviewed and archived
+- [ ] `bernstein compliance report` reviewed and archived

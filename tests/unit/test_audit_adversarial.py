@@ -9,7 +9,7 @@ in ``test_audit.py``/``test_audit_integrity.py``:
 - Cross-file (post-rotation) chain continuity and tamper cascade.
 - Replay attack where an old record is copied forward.
 - Truncated last record (simulated crash mid-write).
-- Concurrent writers across two processes — verifies the chain after the race.
+- Concurrent writers across two processes - verifies the chain after the race.
 - Attacker who rewrites HMACs with a *wrong* key.
 - Genesis chain on an empty file vs. an empty directory.
 - Reordering of records.
@@ -172,7 +172,7 @@ class TestFieldModificationCascade:
             log.log(f"e{i}", f"a{i}", "task", f"i{i}")
 
         path, lines = _read_lines(audit_dir)
-        # Modify entry at index 2 — change actor only.
+        # Modify entry at index 2 - change actor only.
         target = json.loads(lines[2])
         target["actor"] = "TAMPERED"
         lines[2] = json.dumps(target, sort_keys=True)
@@ -377,7 +377,7 @@ class TestConcurrentWriters:
     (each ``json.dumps(entry, sort_keys=True) + "\\n"`` is well under
     PIPE_BUF=4096), meaning **no record is corrupted on disk**. However,
     each AuditLog instance caches ``_prev_hmac`` independently and there is
-    no inter-process locking — so the **HMAC chain breaks** when two writers
+    no inter-process locking - so the **HMAC chain breaks** when two writers
     race because both compute against the same cached ``_prev_hmac``.
 
     A ``multiprocessing.Barrier`` is used to force interleaved execution so
@@ -407,15 +407,16 @@ class TestConcurrentWriters:
         # POSIX O_APPEND guarantees data atomicity for sub-PIPE_BUF writes.
         assert total == 10, f"expected 10 records, got {total}"
 
-    def test_concurrent_chain_break_is_detected(self, tmp_path: Path) -> None:
-        """Without a file lock, two interleaved writers MUST break the chain.
+    def test_concurrent_writers_keep_the_chain_intact(self, tmp_path: Path) -> None:
+        """With the append lock, two interleaved writers keep one valid chain.
 
-        Both processes load ``_prev_hmac = GENESIS`` on their fresh AuditLog
-        instances. Synchronized via a barrier, they then race-write against the
-        same cached prev_hmac → ``verify()`` reports HMAC mismatches.
-
-        If a future fix adds inter-process locking with proper prev_hmac
-        re-read on each append, this assertion flips and guards the lock.
+        ``AuditLog.log()`` holds a per-audit-dir ``fcntl`` lock across
+        tail-recovery and append, re-reading the on-disk tail when another
+        writer appended, so barrier-synchronized racing processes serialize
+        into a single verifiable chain. This inverts the pre-lock expectation
+        this test used to document (racing writers breaking the chain) and
+        now guards the lock itself: if it starts failing, the cross-process
+        append lock has regressed.
         """
         audit_dir = tmp_path / "audit"
         audit_dir.mkdir()
@@ -430,15 +431,11 @@ class TestConcurrentWriters:
 
         log = AuditLog(audit_dir, key=_TEST_KEY)
         valid, errors = log.verify()
-        # Without inter-process locking, the chain must be detected as broken.
-        # Note: this test documents the current limitation — a future fix
-        # that adds proper locking would flip this assertion.
-        assert valid is False, (
-            "Concurrent writers without a file lock should produce a broken "
-            "chain that verify() detects. If this assertion flips, a lock "
-            "has been added (good!) — invert this expectation."
+        assert valid is True, (
+            "Concurrent writers must serialize through the cross-process "
+            f"append lock into one verifiable chain; verify() errors: {errors}"
         )
-        assert errors, "broken chain should produce at least one error"
+        assert errors == [], "an intact chain must produce no verify errors"
 
 
 # -- 8. Wrong-key tamper attempt -------------------------------------------

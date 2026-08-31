@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from bernstein.evolution.aggregator import MetricsCollector
+    from bernstein.evolution.observability_signals import ObservabilityRegression
 
 
 class UpgradeCategory(Enum):
@@ -41,6 +42,31 @@ class ImprovementOpportunity:
     risk_level: Literal["low", "medium", "high"]
     affected_components: list[str] = field(default_factory=list[str])
     estimated_cost_impact_usd: float = 0.0
+
+
+_SEVERITY_RISK: dict[str, Literal["low", "medium", "high"]] = {
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+}
+
+
+def _regression_to_opportunity(reg: ObservabilityRegression) -> ImprovementOpportunity:
+    """Map an observability regression to an ``ImprovementOpportunity``."""
+
+    prev_txt = "n/a" if reg.prev is None else f"{reg.prev:g}"
+    return ImprovementOpportunity(
+        category=UpgradeCategory.POLICY_UPDATE,
+        title=f"Resolve {reg.backend} {reg.metric} increase",
+        description=(
+            f"{reg.backend} {reg.metric} rose {reg.delta:+g} ({prev_txt} -> {reg.curr:g}) "
+            "between the two most recent observability snapshots."
+        ),
+        expected_improvement=f"Clear the new {reg.metric} finding(s)",
+        confidence=0.9 if reg.severity == "high" else 0.7,
+        risk_level=_SEVERITY_RISK.get(reg.severity, "medium"),
+        affected_components=[reg.backend],
+    )
 
 
 @dataclass
@@ -237,10 +263,16 @@ class OpportunityDetector:
         collector: MetricsCollector,
         failure_analyzer: FailureAnalyzer | None = None,
         analysis_dir: Path | None = None,
+        observability_snapshots_dir: Path | None = None,
     ) -> None:
         self.collector = collector
         self.failure_analyzer = failure_analyzer
         self._analysis_dir = analysis_dir
+        # When set, the detector reads the daily observe snapshot corpus and
+        # emits opportunities for external security / coverage regressions.
+        # Left None (the default) it is a no-op, so callers that only care
+        # about internal cost / task metrics are unaffected.
+        self._observability_snapshots_dir = observability_snapshots_dir
 
     def identify_opportunities(self) -> list[ImprovementOpportunity]:
         """Identify improvement opportunities from recent metrics."""
@@ -285,10 +317,46 @@ class OpportunityDetector:
         # Check for failure-driven opportunities
         opportunities.extend(self.identify_failure_opportunities())
 
+        # Check for external repo-health regressions (security / coverage).
+        opportunities.extend(self.identify_observability_opportunities())
+
         if self._analysis_dir is not None:
             self._write_opportunities(opportunities)
 
         return opportunities
+
+    def identify_observability_opportunities(self) -> list[ImprovementOpportunity]:
+        """Emit opportunities for security / coverage regressions in snapshots.
+
+        Reads the two most recent ``bernstein doctor observe`` snapshots and
+        turns each security or coverage regression into an
+        ``ImprovementOpportunity``. This feeds external repo-health signals
+        into the self-improvement loop, which otherwise sees only internal
+        cost and task metrics.
+
+        Guarded: returns an empty list when no snapshots directory is
+        configured or the scan cannot run. A missing baseline (absent
+        directory or fewer than two snapshots) is logged as an explicit
+        skipped comparison rather than treated as a clean scan. Never
+        raises.
+        """
+
+        if self._observability_snapshots_dir is None:
+            return []
+        try:
+            from bernstein.evolution.observability_signals import detect_regressions
+
+            scan = detect_regressions(self._observability_snapshots_dir)
+        except Exception:
+            logger.exception("observability regression scan failed")
+            return []
+        if not scan.baseline_present:
+            logger.info(
+                "observability snapshots in %s lack a baseline; regression comparison not performed",
+                self._observability_snapshots_dir,
+            )
+            return []
+        return [_regression_to_opportunity(reg) for reg in scan.regressions]
 
     def _write_opportunities(self, opportunities: list[ImprovementOpportunity]) -> None:
         """Write detected opportunities to .sdd/analysis/opportunities.json."""
@@ -328,7 +396,7 @@ class OpportunityDetector:
                 continue
 
             if len(pattern.affected_models) == 1:
-                # Failures concentrated on a single model — route away from it
+                # Failures concentrated on a single model - route away from it
                 model = pattern.affected_models[0]
                 opportunities.append(
                     ImprovementOpportunity(
@@ -345,7 +413,7 @@ class OpportunityDetector:
                     )
                 )
             elif pattern.task_type and len(pattern.affected_models) != 1:
-                # Failures spread across models but tied to a role — fix the template
+                # Failures spread across models but tied to a role - fix the template
                 if len(pattern.affected_models) <= 1:
                     # Should not happen given outer condition, but defensive
                     category = UpgradeCategory.POLICY_UPDATE
@@ -367,7 +435,7 @@ class OpportunityDetector:
                     )
                 )
             else:
-                # Broad pattern — suggest policy review
+                # Broad pattern - suggest policy review
                 opportunities.append(
                     ImprovementOpportunity(
                         category=UpgradeCategory.POLICY_UPDATE,
@@ -506,7 +574,7 @@ class FeatureDiscovery:
     def _load_existing_titles(self) -> set[str]:
         """Return normalized titles from all open and closed backlog tickets."""
         titles: set[str] = set()
-        _heading = re.compile(r"^#\s+\d+\s+[—\-]\s+(.+)$", re.MULTILINE)
+        _heading = re.compile(r"^#\s+\d+\s+-\s+(.+)$", re.MULTILINE)
         for subdir in ("open", "closed"):
             d = self._backlog_dir / subdir
             if not d.is_dir():
@@ -611,7 +679,7 @@ class FeatureDiscovery:
         filename = f"{ticket.ticket_id}-{slug}.md"
         file_path = open_dir / filename
         content = (
-            f"# {ticket.ticket_id} — {ticket.title}\n\n"
+            f"# {ticket.ticket_id} - {ticket.title}\n\n"
             f"**Role:** {ticket.role}\n"
             f"**Priority:** {ticket.priority}\n"
             f"**Scope:** {ticket.scope}\n"

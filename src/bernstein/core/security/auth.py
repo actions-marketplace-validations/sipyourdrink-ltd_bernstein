@@ -15,7 +15,7 @@ any claim is trusted. The certificate is read from
 PEM-encoded X.509 certificate (newlines encoded as ``\\n`` when provided
 via an environment variable). The ``signxml`` library performs the W3C
 XML Signature verification. If the env var is empty while
-``BERNSTEIN_SAML_ENABLED=true``, every assertion is rejected — Bernstein
+``BERNSTEIN_SAML_ENABLED=true``, every assertion is rejected - Bernstein
 will not silently accept unsigned SAML responses.
 """
 
@@ -30,13 +30,17 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from bernstein.core.security.tenanting import DEFAULT_TENANT_ID, normalize_tenant_id
+
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from signxml import VerifyResult
 
 _PERM_BULLETIN_READ = "bulletin:read"
 
@@ -107,7 +111,7 @@ _ROLE_PERMISSIONS: dict[AuthRole, frozenset[str]] = {
             _PERM_BULLETIN_READ,
             "bulletin:write",
             # Operator-level gate for shutdown, broadcast, drain, and the
-            # config writer — held only by ADMIN.  OPERATOR and VIEWER must
+            # config writer - held only by ADMIN.  OPERATOR and VIEWER must
             # NOT have this permission or they could SIGTERM the server.
             "admin:manage",
         }
@@ -166,6 +170,15 @@ class AuthUser:
     sso_groups: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_login_at: float = field(default_factory=time.time)
+    # Tenant this user works in.  Carried into every token issued for them
+    # (see ``AuthService._issue_token``) so the request scope is derived from
+    # the user record rather than from request input.  Users provisioned
+    # without one work in ``DEFAULT_TENANT_ID``.
+    #
+    # Declared last on purpose: every field here is positional, so inserting
+    # one ahead of ``created_at``/``last_login_at`` would silently rebind the
+    # timestamps of any caller that constructs positionally.
+    tenant_id: str = DEFAULT_TENANT_ID
 
     def has_permission(self, permission: str) -> bool:
         """Check if this user has a specific permission."""
@@ -181,6 +194,7 @@ class AuthUser:
             "sso_provider": self.sso_provider,
             "sso_subject": self.sso_subject,
             "sso_groups": self.sso_groups,
+            "tenant_id": self.tenant_id,
             "created_at": self.created_at,
             "last_login_at": self.last_login_at,
         }
@@ -196,6 +210,7 @@ class AuthUser:
             sso_provider=str(d.get("sso_provider", "")),
             sso_subject=str(d.get("sso_subject", "")),
             sso_groups=list(d.get("sso_groups", [])),
+            tenant_id=normalize_tenant_id(str(d.get("tenant_id", "") or "")),
             created_at=float(d.get("created_at", 0)),
             last_login_at=float(d.get("last_login_at", 0)),
         )
@@ -271,7 +286,7 @@ class DeviceAuthRequest:
 
 
 # ---------------------------------------------------------------------------
-# SSO configuration (Pydantic settings — reads from env / .env)
+# SSO configuration (Pydantic settings - reads from env / .env)
 # ---------------------------------------------------------------------------
 
 
@@ -353,7 +368,7 @@ class SSOConfig(BaseSettings):
     #
     # Supplied as a comma-separated list in env vars
     # (``BERNSTEIN_AUTH_EXPECTED_RESOURCE="https://a.example,https://b.example"``)
-    # or as a single string. Any-match semantics — the token only has to
+    # or as a single string. Any-match semantics - the token only has to
     # match one entry in the list.
     expected_resource: str = ""
 
@@ -563,7 +578,7 @@ def resolve_role(
 
 
 # ---------------------------------------------------------------------------
-# Auth store — file-based persistence in .sdd/auth/
+# Auth store - file-based persistence in .sdd/auth/
 # ---------------------------------------------------------------------------
 
 
@@ -780,7 +795,7 @@ class AuthStore:
 
 
 # ---------------------------------------------------------------------------
-# Auth service — orchestrates authentication flows
+# Auth service - orchestrates authentication flows
 # ---------------------------------------------------------------------------
 
 
@@ -821,7 +836,7 @@ def _verify_saml_signature(xml_bytes: bytes, idp_x509_cert: str) -> bytes:
             :attr:`SAMLConfig.idp_x509_cert`.
 
     Returns:
-        The canonical bytes of the element covered by the signature — the
+        The canonical bytes of the element covered by the signature - the
         ``signed_xml`` returned by ``signxml``. Only this payload may be
         trusted; the raw input must not be parsed for claims.
 
@@ -866,12 +881,16 @@ def _verify_saml_signature(xml_bytes: bytes, idp_x509_cert: str) -> bytes:
         msg = f"SAML signature verification error: {exc}"
         raise SAMLSignatureError(msg) from exc
 
-    signed_element = verified.signed_xml
+    # ``XMLVerifier.verify`` returns a list of results only when the
+    # signature configuration expects more than one reference; this call
+    # uses the default (``expect_references=1``), so the result is a single
+    # ``VerifyResult``.
+    signed_element = cast("VerifyResult", verified).signed_xml
     if signed_element is None:
         msg = "SAML signature verification returned no signed payload"
         raise SAMLSignatureError(msg)
 
-    # Return the canonical bytes of the element that was actually signed —
+    # Return the canonical bytes of the element that was actually signed -
     # following signxml's "see what is signed" guidance.
     return etree.tostring(signed_element)  # type: ignore[no-any-return]
 
@@ -1142,7 +1161,7 @@ class AuthService:
             return None
         except DefusedXmlException as exc:
             # Internal entity expansion, DTD, or external entity reference.
-            # Never trust the payload — reject and let the caller return 401.
+            # Never trust the payload - reject and let the caller return 401.
             logger.error("Rejecting unsafe SAML assertion XML: %s", type(exc).__name__)
             return None
 
@@ -1181,7 +1200,7 @@ class AuthService:
         try:
             signed_bytes = _verify_saml_signature(xml_bytes, self.config.saml.idp_x509_cert)
         except SAMLSignatureError as exc:
-            # SECURITY: reject — do NOT fall back to parsing the unsigned XML.
+            # SECURITY: reject - do NOT fall back to parsing the unsigned XML.
             logger.error("Rejecting SAML response: %s", exc)
             return None
 
@@ -1280,6 +1299,11 @@ class AuthService:
                 "email": user.email,
                 "role": user.role.value,
                 "session_id": session.id,
+                # Signed into the token so the auth middleware can bind the
+                # request's tenant from the credential.  The value comes from
+                # the persisted user record, never from the login request, so
+                # a caller cannot influence which tenant their token carries.
+                "tenant_id": normalize_tenant_id(user.tenant_id),
             },
             secret=self.config.jwt_secret,
             algorithm=self.config.jwt_algorithm,

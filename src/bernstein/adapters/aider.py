@@ -16,7 +16,7 @@ from bernstein.adapters.env_isolation import build_filtered_env
 # Map Bernstein short model names to aider model identifiers.
 # Aider accepts provider-prefixed names (e.g. "openai/gpt-5.5", "anthropic/claude-opus-4-7").
 # Short names are mapped to the most common aider-compatible IDs; unknown names pass through.
-# Last verified against upstream aider-chat 0.86.2 on 2026-05-19 - install: `pip install aider-chat`.
+# Last verified against upstream aider-chat 0.86.2 on 2026-08-10 - install: `pip install aider-chat`.
 _MODEL_MAP: dict[str, str] = {
     "opus": "anthropic/claude-opus-4-7",
     "opus-4-6": "anthropic/claude-opus-4-6",  # pinned fallback
@@ -50,9 +50,12 @@ class AiderAdapter(CLIAdapter):
         task_scope: str = "medium",
         budget_multiplier: float = 1.0,
         system_addendum: str = "",
+        multimodal_context: Any | None = None,
     ) -> SpawnResult:
+        self.refuse_multimodal_if_needed(multimodal_context)
         self.enforce_network_policy()
         log_path = workdir / ".sdd" / "runtime" / f"{session_id}.log"
+        analytics_log_path = workdir / ".sdd" / "runtime" / f"analytics_{session_id}.jsonl"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         model_id = _MODEL_MAP.get(model_config.model, model_config.model)
@@ -68,6 +71,8 @@ class AiderAdapter(CLIAdapter):
             "--map-tokens",
             "2048",  # larger repo map for better codebase navigation
             "--no-auto-lint",  # lint is orchestrator's job, not each agent's
+            "--analytics-log",
+            str(analytics_log_path),
         ]
 
         # Wrap with bernstein-worker for process visibility

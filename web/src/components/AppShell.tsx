@@ -1,14 +1,15 @@
-// Bernstein chrome — Variant A "Decision-Grade Quiet Command".
+// Bernstein chrome - Variant A "Decision-Grade Quiet Command".
 // Source of truth: design_handoff_bernstein_phase1/design-source/chrome.jsx.
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import {
   Activity,
   ChevronRight,
   Command,
   DollarSign,
+  GitPullRequest,
   ListChecks,
   Moon,
   Network,
@@ -17,6 +18,7 @@ import {
   Settings as SettingsIcon,
   ShieldCheck,
   Sun,
+  Target,
   User,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -33,11 +35,12 @@ const NAV = [
   { to: '/approvals', label: 'Approvals', icon: ShieldCheck, key: 'approvals' as const },
   { to: '/audit', label: 'Audit', icon: ScrollText, key: 'audit' as const },
   { to: '/costs', label: 'Costs', icon: DollarSign, key: 'costs' as const },
+  { to: '/missions', label: 'Missions', icon: Target, key: 'missions' as const },
   { to: '/fleet', label: 'Fleet', icon: Network, key: 'fleet' as const },
   { to: '/settings', label: 'Settings', icon: SettingsIcon, key: 'settings' as const },
 ] as const;
 
-// Routes reachable via topbar / user-menu but not in the sidebar — used to
+// Routes reachable via topbar / user-menu but not in the sidebar - used to
 // label the topbar when the user is on these screens.  Fleet and Settings
 // both have sidebar entries now (smoke-test follow-up), but keep the map
 // so any future "topbar-only" routes have a consistent home.
@@ -45,11 +48,12 @@ const TOPBAR_LABELS: Record<string, string> = {};
 
 const FLEET_STORAGE_KEY = 'bernstein-fleet-mode';
 const FLEET_URL_PARAM = 'fleet';
+const REVIEW_BOARD_PATH = '/dashboard/review-board';
 
 /** Hoisted helper so it can be reused by tests and the deep-link card. */
 function readInitialFleetMode(): boolean {
   if (typeof window === 'undefined') return false;
-  // URL wins for deep-linking — a teammate sharing `…?fleet=1` should land in
+  // URL wins for deep-linking - a teammate sharing `…?fleet=1` should land in
   // fleet mode even if their local storage still says single.
   const params = new URLSearchParams(window.location.search);
   if (params.has(FLEET_URL_PARAM)) {
@@ -123,7 +127,7 @@ function useFooterStats(): FooterStats {
 
 function useApprovalsBadge(): number {
   type ApprovalsLite = { pending?: unknown[]; items?: unknown[] };
-  // NOTE: do not swallow errors in the queryFn — let React Query mark the
+  // NOTE: do not swallow errors in the queryFn - let React Query mark the
   // query as errored so its retry/backoff machinery can recover. Otherwise a
   // single failed first fetch would leave the badge stuck at 0 forever even
   // when the API recovers (because returning {} looks like a successful empty
@@ -138,7 +142,7 @@ function useApprovalsBadge(): number {
 }
 
 function useGuiMetaLabel(): string {
-  // Was a one-shot `fetch` with no retry + no auth header — a single 401/5xx
+  // Was a one-shot `fetch` with no retry + no auth header - a single 401/5xx
   // would lock the build chip on "connecting…" forever. React Query gives us
   // exponential backoff for free, and apiGet attaches the bearer token.
   const q = useQuery({
@@ -208,7 +212,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
     setMenuOpen(false);
   }, [location.pathname]);
 
-  // Active-route lookup for sidebar / topbar — match either exact or nested.
+  // Active-route lookup for sidebar / topbar - match either exact or nested.
   const matchNavItem = (path: string) =>
     NAV.find((n) => path === n.to || path.startsWith(`${n.to}/`));
   const current = matchNavItem(location.pathname);
@@ -278,7 +282,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
   return (
     <>
       <div className="min-h-screen flex bg-background text-foreground">
-        {/* Sidebar — 220 px, secondary background */}
+        {/* Sidebar - 220 px, secondary background */}
         <aside className="relative w-[220px] shrink-0 border-r border-border bg-secondary flex flex-col">
           <div className="px-[18px] pt-[18px] pb-[16px] border-b border-border-subtle">
             <Link to="/tasks" className="flex items-center gap-[10px]">
@@ -319,6 +323,13 @@ export default function AppShell({ children }: { children: ReactNode }) {
                 </Link>
               );
             })}
+            <a
+              href={REVIEW_BOARD_PATH}
+              className="flex items-center gap-[10px] px-3 py-[9px] rounded-md text-[13px] -tracking-[0.005em] text-muted-foreground hover:text-foreground hover:bg-card/60"
+            >
+              <GitPullRequest className="size-3.5 shrink-0" strokeWidth={1.5} />
+              <span className="flex-1">Review board</span>
+            </a>
           </nav>
 
           {/* Variant A signature: thin score-line stub */}
@@ -339,7 +350,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
 
         {/* Main column */}
         <main className="flex-1 min-w-0 flex flex-col">
-          {/* Topbar — 52 px */}
+          {/* Topbar - 52 px */}
           <header className="h-[52px] shrink-0 flex items-center justify-between px-5 bg-background border-b border-border">
             <div className="flex items-center gap-3 min-w-0">
               {breadcrumb ? (
@@ -467,7 +478,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
           {/* Page body */}
           <div className="flex-1 min-h-0 overflow-auto">{children}</div>
 
-          {/* Footer bar — 26 px */}
+          {/* Footer bar - 26 px */}
           <FooterBar stats={stats} />
         </main>
       </div>
@@ -480,6 +491,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
           navigate(path);
         }}
         nav={NAV.map((n) => ({ label: n.label, to: n.to }))}
+        externalNav={[{ label: 'Review board', href: REVIEW_BOARD_PATH }]}
       />
     </>
   );
@@ -508,7 +520,7 @@ function FooterBar({ stats }: { stats: FooterStats }) {
         <span>
           today{' '}
           <span className="text-foreground tabular-nums">
-            {stats.todayUsd != null ? formatUSD(stats.todayUsd) : '—'}
+            {stats.todayUsd != null ? formatUSD(stats.todayUsd) : '-'}
           </span>
           {stats.budgetUsd != null && (
             <>
@@ -517,7 +529,7 @@ function FooterBar({ stats }: { stats: FooterStats }) {
           )}
         </span>
         <span>
-          queue · <span className="tabular-nums">{stats.queueDepth ?? '—'}</span> pending
+          queue · <span className="tabular-nums">{stats.queueDepth ?? '-'}</span> pending
         </span>
       </div>
     </footer>

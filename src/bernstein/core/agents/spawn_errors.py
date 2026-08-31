@@ -112,7 +112,7 @@ class PermissionDeniedError(CategorizedSpawnError):
 
 
 class RateLimitError(CategorizedSpawnError):
-    """Provider rate limit hit — try a different provider."""
+    """Provider rate limit hit - try a different provider."""
 
     retry_strategy = RetryStrategy.RETRY_FALLBACK
 
@@ -124,6 +124,44 @@ class ResourceExhaustedError(CategorizedSpawnError):
     """
 
     retry_strategy = RetryStrategy.RETRY_SAME
+
+
+class ModelNotConfiguredError(CategorizedSpawnError):
+    """A task requires a model but none is configured anywhere.
+
+    Bernstein never silently falls back to a default model (e.g. Claude
+    Sonnet/Opus) - an operator must explicitly configure a model via the
+    task, ``role_model_policy``, an adapter default, or the seed config.
+    Raised at the routing/spawn boundary when every one of those sources is
+    empty, so a run never incurs a surprise bill on an unconfigured model.
+
+    ``CategorizedSpawnError`` subclasses ``RuntimeError``, so the existing
+    spawn-loop callers (``task_lifecycle.py``, ``multi_cell.py``,
+    ``workflow_runner.py``) already catch this at the per-batch spawn
+    boundary and log an error + skip/fail just the affected task(s) instead
+    of crashing the whole orchestrator.
+    """
+
+    retry_strategy = RetryStrategy.RETRY_AFTER_FIX
+
+
+class AdapterNotConfiguredError(CategorizedSpawnError):
+    """An explicitly configured ``cli`` does not name a resolvable adapter.
+
+    ``role_model_policy.<role>.cli`` and a task's per-step ``cli:`` field are
+    operator selections of an adapter, and neither is validated against the
+    adapter catalog at parse time (any non-empty string parses). When such a
+    selection resolves to nothing, the spawn path used to fall through to the
+    run-level adapter, so the run died later with an error naming an adapter
+    the operator never asked for (issue #4134: ``cli: ollama`` reported
+    ``command not found: claude``). Refusing here instead names the value the
+    operator actually wrote.
+
+    ``provider`` carries the unresolvable ``cli`` value so callers can report
+    it without parsing the message.
+    """
+
+    retry_strategy = RetryStrategy.RETRY_AFTER_FIX
 
 
 _SPAWN_ERROR_PATTERNS: list[tuple[type[CategorizedSpawnError], str, tuple[str, ...]]] = [

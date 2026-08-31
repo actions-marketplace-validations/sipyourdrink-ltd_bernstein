@@ -1,8 +1,9 @@
-"""Tests for POST /webhook — generic inbound webhook task creation."""
+"""Tests for POST /webhook - generic inbound webhook task creation."""
 
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from bernstein.core.webhook_signatures import sign_hmac_sha256
 from httpx import ASGITransport, AsyncClient
 
+from bernstein.core.routes._unconfigured import UNCONFIGURED_STATUS
 from bernstein.core.server import create_app
 
 
@@ -23,7 +25,7 @@ _WEBHOOK_SECRET = "s3cr3t"
 
 @pytest.fixture()
 def app(jsonl_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # audit-042: endpoint now fail-closes when the secret is unset —
+    # audit-042: endpoint now fail-closes when the secret is unset -
     # every basic-creation test must therefore configure the secret and
     # pass it on each request.
     monkeypatch.setenv("BERNSTEIN_WEBHOOK_SECRET", _WEBHOOK_SECRET)
@@ -53,7 +55,7 @@ def _signed(
     """Build valid HMAC + timestamp headers for ``POST /webhook`` (audit-121).
 
     ``ts`` is the value placed in the ``X-Bernstein-Timestamp`` header.
-    ``signed_ts`` is the value used when deriving the HMAC input —
+    ``signed_ts`` is the value used when deriving the HMAC input -
     defaults to ``ts`` so the signature matches.  Pass a different
     ``signed_ts`` to construct a mismatched request for negative tests.
     """
@@ -127,10 +129,15 @@ async def test_webhook_task_is_retrievable(client: AsyncClient) -> None:
 async def test_webhook_no_secret_configured_disables_endpoint(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When BERNSTEIN_WEBHOOK_SECRET is unset, the endpoint is disabled (audit-042)."""
+    """When BERNSTEIN_WEBHOOK_SECRET is unset, the endpoint is disabled (audit-042).
+
+    The refusal is a 404: an unconfigured receiver is a permanent property
+    of this deployment, not a transient fault, and senders that retry on
+    5xx would redeliver forever. See ``bernstein.core.routes._unconfigured``.
+    """
     monkeypatch.delenv("BERNSTEIN_WEBHOOK_SECRET", raising=False)
     resp = await client.post("/webhook", json=_WEBHOOK_PAYLOAD)
-    assert resp.status_code == 503
+    assert resp.status_code == UNCONFIGURED_STATUS
     assert "not configured" in resp.json()["detail"].lower()
 
 
@@ -214,7 +221,7 @@ async def test_webhook_timestamp_header_bound_into_hmac(client: AsyncClient, mon
     monkeypatch.setenv("BERNSTEIN_WEBHOOK_SECRET", _WEBHOOK_SECRET)
     body = json.dumps(_WEBHOOK_PAYLOAD).encode()
     now = int(time.time())
-    # Sign with one timestamp, advertise another — the server must reject.
+    # Sign with one timestamp, advertise another - the server must reject.
     headers = _signed(body, ts=now, signed_ts=now - 1)
     resp = await client.post("/webhook", content=body, headers=headers)
     assert resp.status_code == 401
@@ -261,7 +268,7 @@ async def test_webhook_with_correct_signature_creates_task(
 
 @pytest.mark.anyio
 async def test_webhook_endpoint_disabled_without_secret(client: AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Endpoint returns 503 when no secret is configured, even for signed requests."""
+    """Endpoint refuses when no secret is configured, even for signed requests."""
     monkeypatch.delenv("BERNSTEIN_WEBHOOK_SECRET", raising=False)
     body = json.dumps(_WEBHOOK_PAYLOAD).encode()
     resp = await client.post(
@@ -269,7 +276,7 @@ async def test_webhook_endpoint_disabled_without_secret(client: AsyncClient, mon
         content=body,
         headers=_signed(body, secret="attacker-guess"),
     )
-    assert resp.status_code == 503
+    assert resp.status_code == UNCONFIGURED_STATUS
     assert "not configured" in resp.json()["detail"].lower()
 
 
@@ -282,7 +289,7 @@ async def test_webhook_endpoint_disabled_without_secret(client: AsyncClient, mon
 async def test_github_webhook_endpoint_disabled_without_secret(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """/webhooks/github returns 503 when GITHUB_WEBHOOK_SECRET is unset."""
+    """/webhooks/github refuses when GITHUB_WEBHOOK_SECRET is unset."""
     monkeypatch.delenv("GITHUB_WEBHOOK_SECRET", raising=False)
     body = b'{"action":"opened"}'
     resp = await client.post(
@@ -290,7 +297,7 @@ async def test_github_webhook_endpoint_disabled_without_secret(
         content=body,
         headers={"X-GitHub-Event": "issues", "Content-Type": "application/json"},
     )
-    assert resp.status_code == 503
+    assert resp.status_code == UNCONFIGURED_STATUS
     assert "not configured" in resp.json()["detail"].lower()
 
 
@@ -319,14 +326,14 @@ async def test_github_webhook_rejects_stale_timestamp_when_supplied(
 async def test_gitlab_webhook_endpoint_disabled_without_token(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """/webhooks/gitlab returns 503 when GITLAB_WEBHOOK_TOKEN is unset."""
+    """/webhooks/gitlab refuses when GITLAB_WEBHOOK_TOKEN is unset."""
     monkeypatch.delenv("GITLAB_WEBHOOK_TOKEN", raising=False)
     resp = await client.post(
         "/webhooks/gitlab",
         content=b'{"object_kind":"pipeline"}',
         headers={"Content-Type": "application/json"},
     )
-    assert resp.status_code == 503
+    assert resp.status_code == UNCONFIGURED_STATUS
     assert "not configured" in resp.json()["detail"].lower()
 
 
@@ -392,3 +399,59 @@ async def test_gitlab_webhook_rejects_stale_timestamp_when_supplied(
         },
     )
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# #2763: the webhook secret never reaches a log record
+# ---------------------------------------------------------------------------
+
+_WEBHOOKS_LOGGER = "bernstein.core.routes.webhooks"
+
+
+@pytest.mark.anyio
+async def test_unconfigured_webhook_refusal_log_interpolates_nothing(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The refusal log is fully literal - no value flows into the call.
+
+    A logging call that interpolates a secret-shaped binding can leak it
+    into persisted log sinks; keeping the refusal message literal makes
+    that impossible by construction.
+    """
+    monkeypatch.delenv("BERNSTEIN_WEBHOOK_SECRET", raising=False)
+    body = json.dumps(_WEBHOOK_PAYLOAD).encode()
+    with caplog.at_level(logging.ERROR, logger=_WEBHOOKS_LOGGER):
+        resp = await client.post("/webhook", content=body, headers={"content-type": "application/json"})
+    assert resp.status_code == UNCONFIGURED_STATUS
+    refusals = [r for r in caplog.records if r.name == _WEBHOOKS_LOGGER]
+    assert refusals, "expected the unconfigured-endpoint refusal to be logged"
+    for record in refusals:
+        assert not record.args, "refusal log must not interpolate any value"
+
+
+@pytest.mark.anyio
+async def test_webhook_secret_absent_from_all_log_records(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No record captured while handling POST /webhook contains the secret.
+
+    Exercises the accepted, forged-signature, and unsigned paths and then
+    checks every captured record - message and interpolation args alike -
+    for the raw secret value.
+    """
+    monkeypatch.setenv("BERNSTEIN_WEBHOOK_SECRET", _WEBHOOK_SECRET)
+    body = json.dumps(_WEBHOOK_PAYLOAD).encode()
+    with caplog.at_level(logging.DEBUG):
+        accepted = await client.post("/webhook", content=body, headers=_signed(body))
+        forged = await client.post("/webhook", content=body, headers=_signed(body, secret="wrong-secret"))
+        unsigned = await client.post("/webhook", content=body, headers={"content-type": "application/json"})
+    assert accepted.status_code == 201
+    assert forged.status_code == 401
+    assert unsigned.status_code == 401
+    for record in caplog.records:
+        assert _WEBHOOK_SECRET not in record.getMessage()
+        assert _WEBHOOK_SECRET not in repr(record.args)

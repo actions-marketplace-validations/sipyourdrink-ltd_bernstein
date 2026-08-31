@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from bernstein.core.ci_fix import (
@@ -14,6 +15,7 @@ from bernstein.core.ci_fix import (
     CIFixPipeline,
     CIFixResult,
     build_task_payload,
+    check_test_dependencies,
     install_pre_push_hook,
     parse_failures,
     write_ci_fix_task,
@@ -128,16 +130,25 @@ class TestInstallPrePushHook:
         assert hook.exists()
         assert "ruff" in hook.read_text()
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="Unix file permissions not applicable on Windows")
     def test_hook_is_executable(self, tmp_path: Path) -> None:
+        """The installed hook is runnable (platform-keyed assertion).
+
+        Runs on every OS. POSIX asserts the owner-execute mode bit; Windows has
+        no execute bit (git runs the hook through the shell), so it asserts the
+        hook was written with the expected body instead of skipping the lane.
+        """
         import stat
 
         git_hooks = tmp_path / ".git" / "hooks"
         git_hooks.mkdir(parents=True)
         install_pre_push_hook(tmp_path)
         hook = tmp_path / ".git" / "hooks" / "pre-push"
-        mode = hook.stat().st_mode
-        assert mode & stat.S_IXUSR
+        if sys.platform == "win32":
+            assert hook.exists()
+            assert "ruff" in hook.read_text()
+        else:
+            mode = hook.stat().st_mode
+            assert mode & stat.S_IXUSR
 
     def test_skips_existing_without_force(self, tmp_path: Path) -> None:
         git_hooks = tmp_path / ".git" / "hooks"
@@ -166,6 +177,64 @@ class TestInstallPrePushHook:
         git_hooks = tmp_path / ".git" / "hooks"
         git_hooks.mkdir(parents=True)
         install_pre_push_hook(tmp_path)
+
+
+class TestCheckTestDependencies:
+    def test_no_uv_returns_result_instead_of_raising(self) -> None:
+        """A missing ``uv`` on PATH must be reported, not raised.
+
+        Regression test: ``check_test_dependencies`` previously let
+        ``FileNotFoundError`` (WinError 2 on Windows) from ``subprocess.run``
+        propagate, crashing ``bernstein doctor`` for anyone who installed
+        Bernstein with pipx/pip instead of uv.
+        """
+        with patch("bernstein.core.quality.ci_fix.subprocess.run", side_effect=FileNotFoundError):
+            checks = check_test_dependencies()
+
+        assert len(checks) == 3
+        for check in checks:
+            assert check["ok"] == "False"
+            assert check["fix"]
+
+    def test_uv_present_reports_ok(self) -> None:
+        mock_result = Mock(returncode=0, stdout="ruff 0.1.0\n", stderr="")
+        with patch("bernstein.core.quality.ci_fix.subprocess.run", return_value=mock_result):
+            checks = check_test_dependencies()
+
+        assert all(check["ok"] == "True" for check in checks)
+        assert all(check["fix"] == "" for check in checks)
+
+    def test_slow_uv_returns_result_instead_of_raising(self) -> None:
+        """A probe that exceeds its budget must be reported, not raised.
+
+        ``uv run`` serialises on a shared cache lock, so on a loaded host the
+        probe can exceed its 10s budget and ``subprocess.run`` raises
+        ``TimeoutExpired``. That escaped the probe and aborted ``bernstein
+        doctor`` mid-run, before it had written anything at all -- including
+        the ``--json`` payload. A probe that cannot answer is a failed check,
+        not a crash.
+        """
+        timeout = subprocess.TimeoutExpired(cmd=["uv", "run", "ruff", "--version"], timeout=10)
+        with patch("bernstein.core.quality.ci_fix.subprocess.run", side_effect=timeout):
+            checks = check_test_dependencies()
+
+        assert len(checks) == 3
+        for check in checks:
+            assert check["ok"] == "False"
+            assert "timed out" in check["detail"]
+            assert check["fix"]
+
+    def test_unreadable_uv_returns_result_instead_of_raising(self) -> None:
+        """Any OS-level failure to launch the probe is a failed check too."""
+        with patch(
+            "bernstein.core.quality.ci_fix.subprocess.run",
+            side_effect=PermissionError(13, "Permission denied"),
+        ):
+            checks = check_test_dependencies()
+
+        assert len(checks) == 3
+        assert all(check["ok"] == "False" for check in checks)
+        assert all(check["fix"] for check in checks)
 
 
 # ---------------------------------------------------------------------------

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 
 from bernstein.cli.helpers import console
+
+if TYPE_CHECKING:
+    from bernstein.agents.agency_provider import AgencyProvider
 
 _AGENCY_DIR = ".sdd/agents/agency"
 
@@ -90,7 +93,7 @@ def _sync_agency_local_yaml() -> None:
         console.print(f"    [dim]… and {len(catalog) - 5} more[/dim]")
 
 
-def _sync_agency_github(provider_cls: type, *, force: bool) -> None:
+def _sync_agency_github(provider_cls: type[AgencyProvider], *, force: bool) -> None:
     """Sync agency catalog from GitHub."""
     default_agency_path = provider_cls.default_cache_path()
     console.print(f"\n[cyan]→ agency (GitHub)[/cyan] {default_agency_path}")
@@ -106,7 +109,7 @@ def _sync_agency_github(provider_cls: type, *, force: bool) -> None:
     agency_agents = asyncio.run(provider.fetch_agents())
     console.print(f"  [green]✓[/green] {len(agency_agents)} specialist agent(s) available")
     for a in agency_agents[:5]:
-        caps = ", ".join(a.capabilities[:3]) if a.capabilities else "—"
+        caps = ", ".join(a.capabilities[:3]) if a.capabilities else "-"
         console.print(f"    [dim]{a.name}[/dim] ({a.role})  {caps}")
     if len(agency_agents) > 5:
         console.print(f"    [dim]… and {len(agency_agents) - 5} more[/dim]")
@@ -184,7 +187,7 @@ def _collect_local_agents(
 def _collect_agency_agents(
     rows: list[tuple[str, str, str, str, str]],
     source: str,
-    provider_cls: type,
+    provider_cls: type[AgencyProvider],
 ) -> None:
     """Collect agents from agency catalogs (local YAML + GitHub) into rows."""
     if source not in ("agency", "all"):
@@ -268,7 +271,7 @@ def agents_list(source: str, definitions_dir: str, identities: bool, identity_st
         table.add_row(
             name,
             role,
-            caps or "[dim]—[/dim]",
+            caps or "[dim]-[/dim]",
             f"[{src_color}]{src}[/{src_color}]",
         )
 
@@ -358,7 +361,7 @@ def _validate_agency_catalog(issues: list[str]) -> None:
 
 def _format_metrics(m: Any) -> tuple[str, str]:
     """Format metrics for a source into (assigned_count, rate_string)."""
-    rate = f"{m.success_rate * 100:.0f}%" if m and m.tasks_assigned else "—"
+    rate = f"{m.success_rate * 100:.0f}%" if m and m.tasks_assigned else "-"
     assigned = str(m.tasks_assigned) if m else "0"
     return assigned, rate
 
@@ -432,7 +435,7 @@ def agents_showcase(definitions_dir: str) -> None:
     source_order = {"agency": 0, "local": 1, "builtin": 2}
     rows.sort(key=lambda r: (source_order.get(r[3], 9), r[1], r[0]))
 
-    # Identify "featured" agents — top success rates with >= 3 tasks
+    # Identify "featured" agents - top success rates with >= 3 tasks
     top_sources = {m.source for m in discovery.top_sources(min_tasks=3)}
 
     table = Table(
@@ -455,7 +458,7 @@ def agents_showcase(definitions_dir: str) -> None:
         table.add_row(
             name_text,
             role,
-            desc or "[dim]—[/dim]",
+            desc or "[dim]-[/dim]",
             f"[{src_color}]{src}[/{src_color}]",
             assigned,
             rate,
@@ -513,13 +516,13 @@ def agents_match(role: str, task_description: str) -> None:
     t.append("  Name      ", style="dim")
     t.append(f"{match.name}\n", style=_STYLE_BOLD_CYAN)
     t.append("  ID        ", style="dim")
-    t.append(f"{match.id or '—'}\n")
+    t.append(f"{match.id or '-'}\n")
     t.append("  Source    ", style="dim")
     t.append(f"{match.source}\n")
     t.append("  Priority  ", style="dim")
     t.append(f"{match.priority}\n")
     t.append("  Tools     ", style="dim")
-    t.extend((", ".join(match.tools) if match.tools else "—", "\n\n"))
+    t.append(f"{', '.join(match.tools) if match.tools else '-'}\n\n")
     t.append("  Description\n", style="dim")
     t.append(f"    {match.description[:120]}\n")
 
@@ -558,14 +561,15 @@ def agents_sandbox_backends() -> None:
 
     for backend in sorted(backends, key=lambda b: b.name):
         caps = ", ".join(sorted(c.value for c in backend.capabilities))
-        table.add_row(backend.name, caps or "[dim]—[/dim]")
+        table.add_row(backend.name, caps or "[dim]-[/dim]")
 
     console.print(table)
     console.print(f"\n[dim]{len(backends)} backend(s) installed[/dim]")
 
 
 @agents_group.command("parked")
-def agents_parked() -> None:
+@click.option("--workdir", default=".", show_default=True, type=click.Path(), help="Project root (parent of .sdd/).")
+def agents_parked(workdir: str) -> None:
     """List sessions parked after exhausting their respawn budget.
 
     \b
@@ -574,10 +578,17 @@ def agents_parked() -> None:
       bernstein agents resume <id>
     """
     from bernstein.core.agents.spawn_supervisor import get_supervisor
+    from bernstein.core.orchestration.supervisor_aggregator import observed_parked_sessions
 
-    parked = get_supervisor().parked_sessions()
+    root = Path(workdir).resolve()
+    state = observed_parked_sessions(root, in_process=get_supervisor(root).parked_sessions())
+    parked = sorted(state.session_ids)
     if not parked:
-        console.print("[green]No parked sessions.[/green]")
+        if state.available:
+            console.print("[green]No parked sessions.[/green]")
+        else:
+            console.print("[yellow]Parked state unavailable.[/yellow]")
+            console.print(f"[dim]No supervisor has written to {root}; this is not a report of zero.[/dim]")
         return
 
     console.print(f"[bold yellow]Parked sessions ({len(parked)}):[/bold yellow]")
@@ -588,7 +599,8 @@ def agents_parked() -> None:
 
 @agents_group.command("resume")
 @click.argument("session_id")
-def agents_resume(session_id: str) -> None:
+@click.option("--workdir", default=".", show_default=True, type=click.Path(), help="Project root (parent of .sdd/).")
+def agents_resume(session_id: str, workdir: str) -> None:
     """Resume a parked agent session, resetting its respawn budget.
 
     \b
@@ -596,11 +608,91 @@ def agents_resume(session_id: str) -> None:
       bernstein agents resume worker-3
     """
     from bernstein.core.agents.spawn_supervisor import get_supervisor
+    from bernstein.core.orchestration.supervisor_aggregator import load_parked_sessions
 
-    if get_supervisor().resume(session_id):
+    root = Path(workdir).resolve()
+    supervisor = get_supervisor(root)
+    # The session was parked by the orchestrator's process, not this one,
+    # so resume has to clear the on-disk store rather than only the
+    # in-memory record this process happens to hold (#3453).
+    if supervisor.resume(session_id) or supervisor.clear_parked(session_id):
         console.print(f"[green]Resumed session '{session_id}'; respawn budget reset.[/green]")
-    else:
-        console.print(f"[yellow]No tracked session '{session_id}'.[/yellow]")
+        return
+    if session_id in load_parked_sessions(root):
+        console.print(f"[yellow]Session '{session_id}' is parked but could not be cleared.[/yellow]")
+        return
+    console.print(f"[yellow]No tracked session '{session_id}'.[/yellow]")
+
+
+@agents_group.command("trust")
+@click.option(
+    "--workdir",
+    default=".",
+    show_default=True,
+    type=click.Path(),
+    help="Project root (parent of .sdd/).",
+)
+@click.option("--agent", "agent_id", default=None, help="Show the full profile for one agent id.")
+@click.option("--as-json", "as_json", is_flag=True, default=False, help="Output raw JSON.")
+def agents_trust(workdir: str, agent_id: str | None, as_json: bool) -> None:
+    """Show per-agent trust tiers and the permissions each tier grants.
+
+    Trust is recorded from task outcomes in ``.sdd/trust/<agent_id>.json``:
+    completions raise the consecutive-success streak, failures reset it, and
+    a security violation both resets the streak and counts against the
+    promotion policy.  ``--agent`` prints one agent's permission profile.
+    """
+    import json as _json
+
+    from bernstein.core.agents.agent_trust import AgentTrustStore, TrustEvaluator
+
+    store = AgentTrustStore(Path(workdir).resolve() / ".sdd")
+    scores = store.list_all()
+    if agent_id is not None:
+        scores = [s for s in scores if s.agent_id == agent_id]
+
+    if as_json:
+        click.echo(_json.dumps([s.to_dict() for s in scores], indent=2))
+        return
+
+    if not scores:
+        console.print("[dim]No agent trust records yet. Trust accrues as tasks complete.[/dim]")
+        return
+
+    from rich.table import Table
+
+    evaluator = TrustEvaluator()
+    table = Table(title="Agent trust", show_header=True, header_style="bold cyan")
+    table.add_column("Agent")
+    table.add_column("Tier")
+    table.add_column("Done")
+    table.add_column("Failed")
+    table.add_column("Violations")
+    table.add_column("Streak")
+    table.add_column("Next promotion")
+
+    for score in sorted(scores, key=lambda s: s.agent_id):
+        can_promote, reason = evaluator.can_promote(score)
+        table.add_row(
+            score.agent_id,
+            score.trust_level.value,
+            str(score.tasks_completed),
+            str(score.tasks_failed),
+            f"[red]{score.security_violations}[/red]" if score.security_violations else "0",
+            str(score.consecutive_successes),
+            "[green]eligible[/green]" if can_promote else f"[dim]{reason}[/dim]",
+        )
+
+    console.print(table)
+
+    if agent_id is not None and scores:
+        perms = scores[0].permissions
+        console.print()
+        console.print(f"[bold]Permission profile for tier {scores[0].trust_level.value}[/bold]")
+        console.print(f"  allowed paths:    {', '.join(perms.allowed_paths) or '(none)'}")
+        console.print(f"  denied paths:     {', '.join(perms.denied_paths) or '(none)'}")
+        console.print(f"  allowed commands: {', '.join(perms.allowed_commands) or '(none)'}")
+        console.print(f"  denied commands:  {', '.join(perms.denied_commands) or '(none)'}")
 
 
 @agents_group.command("discover")

@@ -9,10 +9,10 @@ Design:
   (one JSON-line per ``result`` event: ``{"ts": float, "in": int, "out": int}``).
 - The monitor reads these files each tick, maintains a rolling history of
   ``(timestamp, cumulative_tokens)`` pairs per session, and checks two criteria:
-    1. **Quadratic growth alert** — the per-interval growth rate is itself
+    1. **Quadratic growth alert** - the per-interval growth rate is itself
        increasing across the last three windows, signalling unbounded context
        accumulation.
-    2. **Auto-kill** — total tokens > ``_KILL_THRESHOLD`` with zero file changes
+    2. **Auto-kill** - total tokens > ``_KILL_THRESHOLD`` with zero file changes
        in any progress snapshot.  The agent is consuming tokens with no output.
 
 Token counts update ``AgentSession.tokens_used`` so the dashboard can display
@@ -49,7 +49,7 @@ from bernstein.core.tokens.token_estimation import estimate_tokens_for_file
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Thresholds — sourced from bernstein.core.defaults.TOKEN
+# Thresholds - sourced from bernstein.core.defaults.TOKEN
 # ---------------------------------------------------------------------------
 
 _KILL_THRESHOLD: int = TOKEN.kill_threshold
@@ -67,7 +67,7 @@ _WARN_RESET_CLEAN_SAMPLES: int = 10
 #: Per-tenant kill threshold overrides.  Keys are tenant IDs (e.g. ``"enterprise"``,
 #: ``"free"``); values are kill thresholds in tokens.  Consulted by
 #: :func:`check_token_growth` via :meth:`TokenGrowthMonitor.kill_threshold_for`.
-#: Empty by default — populate via ``TokenGrowthMonitor(tenant_kill_thresholds=...)``
+#: Empty by default - populate via ``TokenGrowthMonitor(tenant_kill_thresholds=...)``
 #: or assign ``get_monitor().tenant_kill_thresholds = {...}`` at startup.
 TOKEN_CFG: dict[str, int] = {}
 
@@ -273,7 +273,7 @@ class TokenGrowthMonitor:
     #: Default nudge text injected via the WAKEUP signal.
     _DEFAULT_NUDGE_TEXT: str = (
         "You are approaching your token budget (>80% consumed). Take these steps:\n"
-        "1. Finish the current file edit — do not leave partial changes\n"
+        "1. Finish the current file edit - do not leave partial changes\n"
         "2. Run tests on files you changed: `uv run pytest tests/unit/test_<relevant>.py -x -q`\n"
         '3. Commit your work: `git add <changed_files> && git commit -m "[WIP] <task_title>"`\n'
         "4. Mark your task as complete (or failed if unfinished) via the task server\n"
@@ -811,7 +811,7 @@ def _handle_auto_kill(orch: Any, session: Any, monitor: Any, total: int) -> bool
     # "token" here counts LLM context tokens, not credentials.
     # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
     logger.warning(
-        "Token runaway: agent %s consumed %d tokens with 0 file changes (tenant=%s threshold=%d) — killing",
+        "Token runaway: agent %s consumed %d tokens with 0 file changes (tenant=%s threshold=%d) - killing",
         session.id,
         total,
         tenant_id,
@@ -848,6 +848,35 @@ def _handle_quadratic_warning(orch: Any, session: Any, monitor: Any, total: int)
     )
     _send_wakeup(orch, session)
     monitor.mark_warned(session.id)
+
+
+def _handle_proactive_compaction(orch: Any, session: Any) -> bool:
+    """Run the proactive compaction lane for one session (issue #2246).
+
+    Converts the session's context utilization percentage into the
+    fraction the proactive lane expects and delegates. The lane itself
+    enforces its feature flag (off by default), threshold, and
+    per-task attempt budget, so this hook is a no-op for existing runs.
+
+    Args:
+        orch: Orchestrator instance.
+        session: The live agent session being inspected this tick.
+
+    Returns:
+        True when a validated compaction was applied and receipted.
+    """
+    pct = float(getattr(session, "context_utilization_pct", 0.0) or 0.0)
+    if pct <= 0.0:
+        return False
+    # Lazy import: tokens -> orchestration only inside the tick hook, so
+    # module import order stays acyclic.
+    from bernstein.core.orchestration.proactive_compaction import maybe_compact_proactively
+
+    try:
+        return maybe_compact_proactively(orch, session, utilization_fraction=pct / 100.0)
+    except Exception as exc:
+        logger.warning("Proactive compaction hook failed for session %s: %s", session.id, exc)
+        return False
 
 
 def _handle_context_utilization(orch: Any, session: Any, monitor: Any) -> None:
@@ -908,9 +937,12 @@ def check_token_growth(orch: Any) -> None:
     3. Fetches the latest ``files_changed`` count from progress snapshots.
     4. If tokens exceed ``_KILL_THRESHOLD`` with zero file changes → SIGKILL.
     5. If quadratic growth is detected → log a warning (once per session).
-    6. If context utilization exceeds the compact threshold → send compaction
+    6. If the ``compaction.proactive`` config is on and utilization crossed
+       its threshold → run the validated, receipted proactive compaction
+       lane (``orchestration.proactive_compaction``) before any overflow.
+    7. If context utilization exceeds the compact threshold → send compaction
        WAKEUP signal, guarded by the circuit breaker.
-    7. If tokens used exceed the configured nudge threshold fraction of the
+    8. If tokens used exceed the configured nudge threshold fraction of the
        session's token budget → send a continuation WAKEUP nudge (once per
        session).
 
@@ -934,6 +966,7 @@ def check_token_growth(orch: Any) -> None:
             continue
 
         _handle_quadratic_warning(orch, session, monitor, total)
+        _handle_proactive_compaction(orch, session)
         _handle_context_utilization(orch, session, monitor)
         _handle_budget_nudge(orch, session, monitor)
 
@@ -942,7 +975,7 @@ def _get_files_changed(orch: Any, session: Any, base: str) -> int:
     """Fetch total files changed across all tasks owned by *session*.
 
     Reads the latest progress snapshot for each task.  Returns 0 if no
-    snapshots exist yet (conservative — don't kill until we have evidence).
+    snapshots exist yet (conservative - don't kill until we have evidence).
 
     Args:
         orch: Orchestrator instance (for HTTP client and tasks dict).
@@ -972,7 +1005,7 @@ def _get_files_changed(orch: Any, session: Any, base: str) -> int:
         total_changed += int(latest.get("files_changed", 0))
 
     if not has_any_snapshot:
-        # No snapshot data yet — return -1 to skip kill check (be conservative)
+        # No snapshot data yet - return -1 to skip kill check (be conservative)
         return -1
 
     return total_changed

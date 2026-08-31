@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 from bernstein.core.home import BernsteinHome, resolve_config_bundle
 from bernstein.core.prometheus import get_transition_reason_histogram
@@ -22,6 +22,7 @@ from bernstein.core.runtime_state import (
     read_config_state,
     read_supervisor_state,
 )
+from bernstein.core.tasks.lifecycle import is_agent_alive
 from bernstein.core.worktree import WorktreeManager
 
 _SDD_NOT_CONFIGURED = "sdd_dir not configured"
@@ -49,8 +50,26 @@ __all__ = [
 ]
 
 
-# Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_ANY = "dict[str, Any]"
+# Shared cast-type alias to avoid duplication at cast() call sites (Sonar S1192).
+type _CAST_DICT_STR_ANY = dict[str, Any]
+
+
+# Canonical "is this agent still alive?" test. ``AgentSession.status`` is a
+# plain string (a Literal of "starting" / "working" / "idle" / "dead"), but
+# the /status surfaces historically tested it two different ways -
+# ``str(agent.status) != "dead"`` in one place and ``agent.status != "dead"``
+# in another. That let ``summary.agents``, ``agents.count`` and the rendered
+# ``Active agents: N`` line all disagree about the same run (issue #4360).
+# One helper owns that call so every surface reports the same live count.
+#
+# That helper is ``lifecycle.is_agent_alive``, which also accepts the agent
+# object and the snapshot dict, because the third surface the issue names -
+# the rendered ``Active agents: N`` line in ``cli/ui.py`` - holds a different
+# shape than these routes do. This module-local name stays as a thin
+# delegate so the status-string call site and its test keep reading plainly.
+def _agent_is_alive(status: str) -> bool:
+    """Return True when an agent status is not a reaped (dead) one."""
+    return is_agent_alive(status)
 
 
 def _get_store(request: Request) -> TaskStore:
@@ -138,9 +157,15 @@ def _active_worktree_count(request: Request) -> int:
     return sum(1 for entry in worktrees_dir.iterdir() if entry.is_dir())
 
 
-def _last_completion(store: TaskStore) -> dict[str, Any] | None:
-    """Return the latest archive record in a dashboard-friendly shape."""
-    latest = store.read_archive(limit=1)
+def _last_completion(store: TaskStore, tenant_id: str | None = None) -> dict[str, Any] | None:
+    """Return the latest archive record in a dashboard-friendly shape.
+
+    The record is rendered with its task id and title, so ``tenant_id`` is
+    pushed into ``read_archive`` - which narrows before taking the last
+    record, so a caller still gets its own most recent completion rather than
+    nothing whenever the newest archived row belongs to somebody else.
+    """
+    latest = store.read_archive(limit=1, tenant_id=tenant_id)
     if not latest:
         return None
     record = latest[-1]
@@ -178,7 +203,33 @@ def _safe_call(label: str, fn: Any, default: Any) -> Any:
         return default
 
 
-def _runtime_summary(request: Request, store: TaskStore) -> dict[str, Any]:
+def _seed_config_overrides(
+    request: Request, config_state: dict[str, Any] | None
+) -> tuple[dict[str, object], str | None]:
+    """Extract the run seed's effective config values for provenance threading.
+
+    Returns ``(overrides, seed_path)`` where *overrides* maps config keys to
+    the values the server's loaded seed (``app.state.seed_config``) enforces.
+    Empty when no seed is loaded, so the resolver falls back to the file-based
+    chain byte-for-byte as before (#2874). ``budget`` is only threaded when the
+    seed actually sets it (``budget_usd is not None``); an unset seed budget
+    must not shadow a project/global budget layer.
+    """
+    seed_config = getattr(request.app.state, "seed_config", None)
+    if seed_config is None:
+        return {}, None
+    overrides: dict[str, object] = {}
+    max_agents = getattr(seed_config, "max_agents", None)
+    if isinstance(max_agents, int):
+        overrides["max_agents"] = max_agents
+    budget_usd = getattr(seed_config, "budget_usd", None)
+    if budget_usd is not None:
+        overrides["budget"] = budget_usd
+    seed_path = config_state.get("seed_path") if config_state else None
+    return overrides, seed_path if isinstance(seed_path, str) else None
+
+
+def _runtime_summary(request: Request, store: TaskStore, tenant_id: str | None = None) -> dict[str, Any]:
     """Build runtime operational metadata for status and TUI consumers.
 
     Expensive ops (disk scan, git subprocess) are cached for 10 seconds
@@ -187,6 +238,11 @@ def _runtime_summary(request: Request, store: TaskStore) -> dict[str, Any]:
     Every field is wrapped in ``_safe_call`` so a single broken metric cannot
     take the whole endpoint down. Failing fields fall back to neutral defaults
     and are logged at WARNING.
+
+    ``last_completed`` is the one field here built from a task row, so it
+    takes *tenant_id*.  It is recomputed on the cache fast path as well as on
+    a rebuild, which is what keeps the shared 10-second cache from handing one
+    caller's completion to the next.
     """
     import time as _time
 
@@ -196,7 +252,9 @@ def _runtime_summary(request: Request, store: TaskStore) -> dict[str, Any]:
     # Fast path: return cached result if fresh
     if _runtime_cache and (now - _runtime_cache_ts) < _RUNTIME_CACHE_TTL:
         # Update only the cheap fields
-        _runtime_cache["last_completed"] = _safe_call("last_completed", lambda: _last_completion(store), None)
+        _runtime_cache["last_completed"] = _safe_call(
+            "last_completed", lambda: _last_completion(store, tenant_id), None
+        )
         return _runtime_cache
 
     sdd_dir = getattr(request.app.state, "sdd_dir", None)
@@ -211,13 +269,20 @@ def _runtime_summary(request: Request, store: TaskStore) -> dict[str, Any]:
         disk_usage_bytes = _safe_call("disk_usage_bytes", lambda: directory_size_bytes(sdd_dir), 0)
         config_state = _safe_call("config_state", lambda: read_config_state(sdd_dir), None)
 
+    # The run seed (``bernstein.yaml``) is the value the orchestrator caps
+    # concurrency and spend with, but the file resolver only reads
+    # ``.sdd/config.yaml``. Thread the seed the server loaded at bootstrap so
+    # the dashboard capacity denominator is honest for seed-configured runs
+    # (#2874) rather than falling back to the built-in default of 6.
+    seed_overrides, seed_overrides_path = _seed_config_overrides(request, config_state)
+
     _runtime_cache = {
         "git_branch": _safe_call("git_branch", lambda: current_git_branch(workdir), ""),
         "restart_count": restart_count,
         "memory_mb": _safe_call("memory_mb", memory_usage_mb, 0.0),
         "active_worktrees": _safe_call("active_worktrees", lambda: _active_worktree_count(request), 0),
         "disk_usage_mb": round(disk_usage_bytes / (1024 * 1024), 2),
-        "last_completed": _safe_call("last_completed", lambda: _last_completion(store), None),
+        "last_completed": _safe_call("last_completed", lambda: _last_completion(store, tenant_id), None),
         "config_reloaded_at": float(config_state["reloaded_at"])
         if config_state and config_state.get("reloaded_at")
         else 0.0,
@@ -229,6 +294,8 @@ def _runtime_summary(request: Request, store: TaskStore) -> dict[str, Any]:
                 home=BernsteinHome.default(),
                 project_dir=workdir,
                 keys=_STATUS_CONFIG_KEYS,
+                seed_overrides=seed_overrides or None,
+                seed_overrides_path=seed_overrides_path,
             ),
             {},
         ),
@@ -276,6 +343,12 @@ def _status_task_items(tasks: list[Task], now: float) -> list[dict[str, Any]]:
         items.append(
             {
                 "id": task.id,
+                # The retry lineage root: a failed task's retry is a NEW task
+                # with a fresh id carrying metadata.original_task_id, so raw
+                # done-row counts double-count a lineage that was retried.
+                # Consumers that compare progress against a seeded total
+                # (demo, quickstart) must count distinct lineage_ids instead.
+                "lineage_id": str(task.metadata.get("original_task_id") or task.id),
                 "title": task.title,
                 "role": task.role,
                 "status": task.status.value,
@@ -297,6 +370,25 @@ def _status_task_items(tasks: list[Task], now: float) -> list[dict[str, Any]]:
     return items
 
 
+def _agent_model_label(agent: Any) -> str:
+    """Return the agent's real spawn model for dashboard display.
+
+    Reads the model from the agent's ``model_config`` (attribute- or
+    dict-shaped), then the agent's own ``model`` field. When none is known it
+    falls back to the provider or a neutral ``"unknown"`` - never a hardcoded
+    ``"sonnet"``, which mislabels non-Claude agents (issue #2800).
+    """
+    mc = getattr(agent, "model_config", None)
+    model = getattr(mc, "model", None)
+    if model is None and isinstance(mc, dict):
+        model = mc.get("model")
+    if model is None:
+        model = getattr(agent, "model", None)
+    if model:
+        return str(model)
+    return str(getattr(agent, "provider", None) or "unknown")
+
+
 def _status_agent_items(
     store: TaskStore,
     agent_snapshots: dict[str, dict[str, Any]],
@@ -305,11 +397,15 @@ def _status_agent_items(
 ) -> list[dict[str, Any]]:
     """Build normalized agent rows for shared operational surfaces."""
     items: list[dict[str, Any]] = []
-    live_agents = list(store.agents.values())
+    store_agents = store.agents.values()
+    live_agents = [agent for agent in store_agents if _agent_is_alive(agent.status)]
     for agent in live_agents:
         snapshot = agent_snapshots.get(agent.id, {})
-        model_name = agent.model_config.model if hasattr(agent.model_config, "model") else "sonnet"
-        role_alive_count = max(1, len([candidate for candidate in live_agents if candidate.role == agent.role]))
+        model_name = _agent_model_label(agent)
+        role_alive_count = max(
+            1,
+            len([candidate for candidate in live_agents if candidate.role == agent.role and is_agent_alive(candidate)]),
+        )
         estimated_cost = total_cost_by_role.get(agent.role, 0.0) / role_alive_count
         items.append(
             {
@@ -333,6 +429,10 @@ def _status_agent_items(
     if items:
         return items
 
+    # No live agent in the store: fall back to the on-disk snapshot, which is
+    # the archival view of the run. Every snapshot row is emitted, reaped ones
+    # included - issue #953 holds this path to a full dict per agent, and the
+    # caller counts liveness per row rather than trusting the list length.
     for snapshot in agent_snapshots.values():
         items.append(
             {
@@ -438,7 +538,7 @@ def _health_components(request: Request, store: TaskStore) -> dict[str, dict[str
         database_status = "down"
         database_detail = str(exc)
 
-    agent_count = int(getattr(store, "agent_count", 0))
+    agent_count = sum(1 for a in store.agents.values() if is_agent_alive(a))
     agents_detail = f"{agent_count} active" if agent_count > 0 else "no active agents"
 
     return {
@@ -514,10 +614,16 @@ def _read_cost_history(store: TaskStore) -> list[dict[str, Any]]:
     return points
 
 
-def _task_status_alerts(store: TaskStore) -> list[dict[str, str]]:
-    """Generate alerts for failed and blocked tasks."""
+def _task_status_alerts(store: TaskStore, tenant_id: str | None = None) -> list[dict[str, str]]:
+    """Generate alerts for failed and blocked tasks.
+
+    Each alert's ``detail`` is built from the titles of the rows behind it, so
+    the read narrows to *tenant_id* when one is given.  It stays optional
+    because the alert builder is also called from the webhook dispatcher,
+    which has no request and therefore no scope to resolve.
+    """
     alerts: list[dict[str, str]] = []
-    all_tasks = store.list_tasks()
+    all_tasks = store.list_tasks(tenant_id=tenant_id)
     failed_tasks = [t for t in all_tasks if t.status.value == "failed"]
     if failed_tasks:
         alerts.append(
@@ -590,10 +696,11 @@ def build_alerts(
     total_cost: float,
     now: float,
     agent_snapshots: dict[str, dict[str, Any]] | None = None,
+    tenant_id: str | None = None,
 ) -> list[dict[str, str]]:
-    """Generate alerts for the dashboard."""
+    """Generate alerts for the dashboard, narrowed to *tenant_id* when given."""
     alerts: list[dict[str, str]] = []
-    alerts.extend(_task_status_alerts(store))
+    alerts.extend(_task_status_alerts(store, tenant_id))
     alerts.extend(_agent_health_alerts(alive_agents, now))
     alerts.extend(_snapshot_context_alerts(agent_snapshots))
 
@@ -796,22 +903,35 @@ def _summarise_lineage(sdd_dir: Any) -> dict[str, Any]:
 def status_dashboard(request: Request) -> JSONResponse:
     """Dashboard summary of task counts."""
     from bernstein.core.dependency_scan import read_latest_dependency_scan
+    from bernstein.core.routes.task_crud import _resolve_request_tenant_scope
 
     store = _get_store(request)
-    payload = store.status_summary()
-    runtime = _runtime_summary(request, store)
+    # Every task-derived block below - the summary counts, the task panel, the
+    # completion panel and the alerts - is answered under one scope, so they
+    # describe the same rows as each other rather than three different sets.
+    tenant_id = _resolve_request_tenant_scope(request)
+    payload = store.status_summary(tenant_id=tenant_id)
+    runtime = _runtime_summary(request, store, tenant_id)
     payload["runtime"] = runtime
     now = time.time()
-    tasks = store.list_tasks()
+    tasks = store.list_tasks(tenant_id=tenant_id)
     live_costs = _load_live_costs(request)
     sdd_dir = getattr(request.app.state, "sdd_dir", None)
     agent_snapshots = _read_agents_snapshot(sdd_dir if isinstance(sdd_dir, Path) else None)
     total_cost_by_role = store.cost_by_role()
-    live_agents = [agent for agent in store.agents.values() if str(agent.status) != "dead"]
+    # Copy before hydrating: _populate_agents_from_snapshots writes into the
+    # dict it is given, and store.agents is the live store, not a view.
+    agents = dict(store.agents)
+    if not agents and agent_snapshots:
+        _populate_agents_from_snapshots(agents, agent_snapshots)
+    live_agents = [agent for agent in agents.values() if is_agent_alive(agent)]
     total_spent = float(live_costs.get("spent_usd") or sum(total_cost_by_role.values()))
 
-    # Recently completed tasks still within grace period (visible in panels)
-    recent = store.recently_completed()
+    # Recently completed tasks still within grace period (visible in panels).
+    # Narrowed on the returned rows rather than in the store call: the grace
+    # window is a time cutoff, not a page, so there is no short-page problem
+    # to avoid here and no reason to widen ``recently_completed``'s signature.
+    recent = [task for task in store.recently_completed() if task.tenant_id == tenant_id]
     if recent:
         payload["recently_completed"] = [
             {
@@ -840,6 +960,7 @@ def status_dashboard(request: Request) -> JSONResponse:
         "claimed": payload["claimed"],
         "done": payload["done"],
         "failed": payload["failed"],
+        "refused": payload.get("refused", 0),
         "agents": len(live_agents),
         "cost_usd": round(total_spent, 4),
         "max_agents": runtime.get("config_provenance", {}).get("max_agents", {}).get("value", 6),
@@ -848,12 +969,13 @@ def status_dashboard(request: Request) -> JSONResponse:
         "count": len(tasks),
         "items": _status_task_items(tasks, now),
     }
+    agent_items = _status_agent_items(store, agent_snapshots, total_cost_by_role, now)
     payload["agents"] = {
-        "count": len(live_agents) if live_agents else len(agent_snapshots),
-        "items": _status_agent_items(store, agent_snapshots, total_cost_by_role, now),
+        "count": sum(1 for item in agent_items if is_agent_alive(str(item.get("status", "")))),
+        "items": agent_items,
     }
     payload["costs"] = live_costs
-    payload["alerts"] = build_alerts(store, live_agents, total_spent, now, agent_snapshots)
+    payload["alerts"] = build_alerts(store, live_agents, total_spent, now, agent_snapshots, tenant_id)
     try:
         payload["bandit"] = _bandit_state_payload(store)
     # bot-ack: pre-existing-1723 (bandit payload must not break /status)
@@ -896,6 +1018,7 @@ def duration_predictions(request: Request) -> JSONResponse:
     """
 
     from bernstein.core.duration_predictor import get_predictor
+    from bernstein.core.routes.task_crud import _resolve_request_tenant_scope
 
     store = _get_store(request)
     sdd_dir: Any = getattr(request.app.state, "sdd_dir", None)
@@ -913,7 +1036,9 @@ def duration_predictions(request: Request) -> JSONResponse:
             return f"{m}m {sec}s"
         return f"{sec}s"
 
-    tasks = store.list_tasks()
+    # One prediction row per active task, each carrying that task's id and
+    # title, so the read is narrowed to the caller's tenant scope.
+    tasks = store.list_tasks(tenant_id=_resolve_request_tenant_scope(request))
     active_statuses = {"open", "claimed", "in_progress"}
     predictions: list[dict[str, Any]] = []
     for task in tasks:
@@ -966,21 +1091,6 @@ def bandit_routing_stats(request: Request) -> JSONResponse:
         )
 
 
-# ---------------------------------------------------------------------------
-# Dashboard
-# ---------------------------------------------------------------------------
-
-
-@router.get("/dashboard", response_class=HTMLResponse)
-def dashboard_page() -> HTMLResponse:
-    """Serve the single-page web dashboard."""
-    from bernstein.dashboard import TEMPLATE_DIR
-
-    html_path = TEMPLATE_DIR / "index.html"
-    html = html_path.read_text(encoding="utf-8")
-    return HTMLResponse(content=html)
-
-
 def _populate_agents_from_snapshots(agents: dict[str, Any], agent_snapshots: dict[str, dict[str, Any]]) -> None:
     """Hydrate *agents* dict from on-disk agent snapshots."""
     from bernstein.core.models import AbortReason, AgentSession, TransitionReason
@@ -1018,7 +1128,7 @@ def _build_single_agent_detail(
 ) -> dict[str, Any]:
     """Build a single agent detail dict for the dashboard data endpoint."""
     runtime_s = int(now - a.spawn_ts)
-    model_name = a.model_config.model if hasattr(a.model_config, "model") else "sonnet"
+    model_name = _agent_model_label(a)
     context_window_tokens = int(getattr(a, "context_window_tokens", 0) or snapshot.get("context_window_tokens", 0) or 0)
     context_utilization_pct = float(
         getattr(a, "context_utilization_pct", 0.0) or snapshot.get("context_utilization_pct", 0.0) or 0.0
@@ -1026,6 +1136,8 @@ def _build_single_agent_detail(
     context_utilization_alert = bool(
         getattr(a, "context_utilization_alert", False) or snapshot.get("context_utilization_alert", False)
     )
+    transition_reason = getattr(a, "transition_reason", None)
+    abort_reason = getattr(a, "abort_reason", None)
     return {
         "id": a.id,
         "role": a.role,
@@ -1043,14 +1155,12 @@ def _build_single_agent_detail(
         "context_utilization_pct": context_utilization_pct,
         "context_utilization_alert": context_utilization_alert,
         "transition_reason": (
-            getattr(a, "transition_reason", None).value  # pyright: ignore[reportOptionalMemberAccess]
-            if getattr(a, "transition_reason", None) is not None
+            transition_reason.value
+            if transition_reason is not None
             else str(snapshot.get("transition_reason", "") or "")
         ),
         "abort_reason": (
-            getattr(a, "abort_reason", None).value  # pyright: ignore[reportOptionalMemberAccess]
-            if getattr(a, "abort_reason", None) is not None
-            else str(snapshot.get("abort_reason", "") or "")
+            abort_reason.value if abort_reason is not None else str(snapshot.get("abort_reason", "") or "")
         ),
         "abort_detail": str(getattr(a, "abort_detail", "") or snapshot.get("abort_detail", "") or ""),
         "finish_reason": str(getattr(a, "finish_reason", "") or snapshot.get("finish_reason", "") or ""),
@@ -1090,10 +1200,19 @@ def dashboard_data(request: Request) -> JSONResponse:
     Includes stats, tasks with timeline data, agent details with costs,
     file ownership map, cost history, and alerts.
     """
+    from bernstein.core.routes.task_crud import _resolve_request_tenant_scope
+
     store = _get_store(request)
-    summary = store.status_summary()
-    tasks = store.list_tasks()
-    agents = store.agents
+    # The Gantt timeline, the file-ownership map and the alerts are all built
+    # from ``tasks`` below, and the summary counts have to agree with them, so
+    # one scope answers the whole payload.
+    tenant_id = _resolve_request_tenant_scope(request)
+    summary = store.status_summary(tenant_id=tenant_id)
+    tasks = store.list_tasks(tenant_id=tenant_id)
+    # Copy for the same reason as above: the hydration below writes into this
+    # dict, and store.agents is the live store. Without the copy, reading
+    # /status injects snapshot-reconstructed sessions into the running store.
+    agents = dict(store.agents)
     now = time.time()
     sdd_dir = getattr(request.app.state, "sdd_dir", None)
     agent_snapshots = _read_agents_snapshot(sdd_dir if isinstance(sdd_dir, Path) else None)
@@ -1102,8 +1221,8 @@ def dashboard_data(request: Request) -> JSONResponse:
     if not agents:
         _populate_agents_from_snapshots(agents, agent_snapshots)
 
-    all_agents = agents.values()
-    alive_agents = [a for a in all_agents if a.status != "dead"]
+    all_agents = list(agents.values())
+    alive_agents = [a for a in all_agents if is_agent_alive(a)]
     cost_by_role = store.cost_by_role()
     total_cost = sum(cost_by_role.values())
     agent_count = len(alive_agents)
@@ -1122,7 +1241,7 @@ def dashboard_data(request: Request) -> JSONResponse:
     cost_history = _read_cost_history(store)
 
     # -- Alerts --------------------------------------------------------------
-    alerts = build_alerts(store, alive_agents, total_cost, now, agent_snapshots)
+    alerts = build_alerts(store, alive_agents, total_cost, now, agent_snapshots, tenant_id)
 
     # -- Merge queue snapshot ------------------------------------------------
     merge_queue = _read_merge_queue(request)
@@ -1151,7 +1270,7 @@ def dashboard_data(request: Request) -> JSONResponse:
     )
 
     live_spent = float(live_costs.get("spent_usd") or total_cost)
-    runtime = _runtime_summary(request, store)
+    runtime = _runtime_summary(request, store, tenant_id)
     return JSONResponse(
         content={
             "ts": now,
@@ -1161,6 +1280,7 @@ def dashboard_data(request: Request) -> JSONResponse:
                 "claimed": summary["claimed"],
                 "done": summary["done"],
                 "failed": summary["failed"],
+                "refused": summary.get("refused", 0),
                 "agents": agent_count,
                 "cost_usd": round(live_spent, 4),
                 "max_agents": runtime.get("config_provenance", {}).get("max_agents", {}).get("value", 6),

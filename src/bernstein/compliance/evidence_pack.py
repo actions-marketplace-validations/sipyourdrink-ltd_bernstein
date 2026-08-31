@@ -6,11 +6,11 @@ regulatory standard.
 
 Sources read:
 
-* ``.sdd/audit/*.jsonl`` — HMAC-chained audit log (RFC 2104 chain).
-* ``.sdd/lineage/log.jsonl`` — per-artefact transparency log (Sigstore-style).
-* ``.sdd/metrics/cost_history.jsonl`` — daily cost ledger snapshots.
-* ``.sdd/policy/`` (optional) — recorded operator policy decisions.
-* ``.sdd/attestations/`` (optional) — operator-supplied signed assertions.
+* ``.sdd/audit/*.jsonl`` - HMAC-chained audit log (RFC 2104 chain).
+* ``.sdd/lineage/log.jsonl`` - per-artefact transparency log (Sigstore-style).
+* ``.sdd/metrics/cost_history.jsonl`` - daily cost ledger snapshots.
+* ``.sdd/policy/`` (optional) - recorded operator policy decisions.
+* ``.sdd/attestations/`` (optional) - operator-supplied signed assertions.
 
 This module is intentionally read-only: it does not mutate or rotate
 the audit chain. The output zip is byte-deterministic for a given input
@@ -18,10 +18,11 @@ so an auditor can re-derive the SHA-256 of the bundle and compare.
 
 The mapping from regulatory ``control_id`` to a record selector is
 declarative and lives inside this module (see ``_STANDARD_MAPS``). At
-MVP only the EU AI Act mapping is fleshed out; DORA and FINOS AIGF
-are stubbed with TODO links to the published standards so the bundle
-still emits, but the ``controls.json`` artefact carries explicit
-``status: "todo"`` markers per unmapped control.
+MVP only the EU AI Act mapping is fleshed out. DORA and FINOS AIGF
+control maps are tracked under issue #1316 and are not selectable
+until the underlying clause mappings are reviewed by subject-matter
+experts; attempting to build a pack for an unsupported standard
+raises ``ValueError``.
 
 Usage:
 
@@ -38,8 +39,8 @@ Usage:
 Out of scope for the MVP (tracked in #1316):
 
 * PDF/Markdown narrative report generation.
-* Real DORA Articles 8-15 evidence templates.
-* Real FINOS AIGF control catalogue mapping.
+* DORA Articles 8-15 evidence templates (selector not yet defined).
+* FINOS AIGF control catalogue mapping (selector not yet defined).
 """
 
 from __future__ import annotations
@@ -62,13 +63,18 @@ logger = logging.getLogger(__name__)
 #: change to layout, file names, or hash inputs.
 SCHEMA_VERSION: str = "1.0.0"
 
-#: Supported standards at MVP. Only ``ai-act`` has a fleshed-out
-#: control map; the others ship as stubs (see ``_STANDARD_MAPS``).
-Standard = Literal["ai-act", "dora", "finos-aigf"]
+#: Supported standards. ``ai-act`` maps the EU AI Act Article 12/13/15
+#: clauses; ``owasp-asi`` and ``owasp-skills`` map the OWASP Top 10 for
+#: Agentic Applications (ASI01-ASI10) and the Agentic Skills Top 10
+#: (AST01-AST10) onto the same audit-chain artefacts. DORA and FINOS
+#: AIGF are tracked under #1316 and are not selectable until their
+#: clause maps are reviewed by subject-matter experts; emitting
+#: TODO-only bundles would mislead operators.
+Standard = Literal["ai-act", "owasp-asi", "owasp-skills"]
 
-SUPPORTED_STANDARDS: tuple[str, ...] = ("ai-act", "dora", "finos-aigf")
+SUPPORTED_STANDARDS: tuple[str, ...] = ("ai-act", "owasp-asi", "owasp-skills")
 
-#: Fixed mtime for every entry in the produced zip — required for
+#: Fixed mtime for every entry in the produced zip - required for
 #: byte-deterministic output. Zip cannot store dates before 1980.
 _FIXED_ZIP_DT: tuple[int, int, int, int, int, int] = (1980, 1, 1, 0, 0, 0)
 
@@ -77,12 +83,12 @@ _FIXED_ZIP_DT: tuple[int, int, int, int, int, int] = (1980, 1, 1, 0, 0, 0)
 # ---------------------------------------------------------------------------
 #
 # Each entry maps a regulatory ``control_id`` to:
-#   * ``requirement`` — short paraphrase of the underlying clause.
-#   * ``artefact``    — bundle file (relative to zip root) that satisfies it.
-#   * ``selector``    — informational: which event attribute carries the
+#   * ``requirement`` - short paraphrase of the underlying clause.
+#   * ``artefact``    - bundle file (relative to zip root) that satisfies it.
+#   * ``selector``    - informational: which event attribute carries the
 #                       primary evidence (``event_type``, ``resource_type``,
 #                       etc). Free-form string; not enforced at MVP.
-#   * ``status``      — ``"mapped"`` or ``"todo"``.
+#   * ``status``      - ``"mapped"`` or ``"todo"``.
 #
 # The ``ai-act`` block intentionally mirrors the structure used by the
 # Article 12 bundle (``article12_bundle.py``) so an auditor switching
@@ -129,14 +135,14 @@ _STANDARD_MAPS: dict[str, dict[str, Any]] = {
             },
             {
                 "control_id": "art-15(1)",
-                "requirement": "Accuracy, robustness and cybersecurity — evidence via lineage chain.",
+                "requirement": "Accuracy, robustness and cybersecurity - evidence via lineage chain.",
                 "artefact": "lineage/log.jsonl",
                 "selector": "content_hash,parent_hashes",
                 "status": "mapped",
             },
             {
                 "control_id": "art-13",
-                "requirement": "Transparency to deployers — cost + model attribution per task.",
+                "requirement": "Transparency to deployers - cost + model attribution per task.",
                 "artefact": "costs/cost_history.jsonl",
                 "selector": "model,task_id,usd",
                 "status": "mapped",
@@ -147,47 +153,18 @@ _STANDARD_MAPS: dict[str, dict[str, Any]] = {
             "Annex IV technical documentation (handled by compliance/eu_ai_act.py)",
         ],
     },
-    "dora": {
-        "regulation": ("Regulation (EU) 2022/2554 (DORA) — Digital Operational Resilience Act"),
-        "controls": [
-            {
-                "control_id": "art-8",
-                "requirement": "ICT risk management framework — TODO: real evidence selector.",
-                "artefact": "audit-chain/events.jsonl",
-                "selector": "TODO",
-                "status": "todo",
-                "see_also": "https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32022R2554",
-            },
-            {
-                "control_id": "art-9-15",
-                "requirement": "ICT third-party risk — TODO: agent + model attribution mapping.",
-                "artefact": "audit-chain/events.jsonl",
-                "selector": "TODO",
-                "status": "todo",
-                "see_also": "https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32022R2554",
-            },
-        ],
-        "deferred": [
-            "Real DORA evidence template (#1316 follow-up).",
-        ],
-    },
-    "finos-aigf": {
-        "regulation": "FINOS AI Governance Framework (AIGF)",
-        "controls": [
-            {
-                "control_id": "AIGF-TODO",
-                "requirement": "FINOS AIGF control catalogue mapping — TODO.",
-                "artefact": "audit-chain/events.jsonl",
-                "selector": "TODO",
-                "status": "todo",
-                "see_also": "https://air-governance-framework.finos.org/",
-            },
-        ],
-        "deferred": [
-            "Full FINOS AIGF control-ID coverage (#1316 follow-up).",
-        ],
-    },
 }
+
+# The OWASP ASI / AST maps live in dedicated modules (one control class per
+# module) and are registered here so ``build_evidence_pack`` reads them the
+# same way it reads ``ai-act``. Registration is a plain assignment - the
+# modules only depend on stdlib, so importing them at module load is cheap
+# and side-effect free.
+from bernstein.compliance import owasp_asi as _owasp_asi  # noqa: E402
+from bernstein.compliance import owasp_skills as _owasp_skills  # noqa: E402
+
+_STANDARD_MAPS[_owasp_asi.STANDARD_ID] = _owasp_asi.control_map()
+_STANDARD_MAPS[_owasp_skills.STANDARD_ID] = _owasp_skills.control_map()
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +185,7 @@ class EvidencePack:
         lineage_count: Number of lineage entries captured.
         cost_count: Number of cost snapshots captured.
         controls_mapped: How many controls have ``status == "mapped"``.
+        controls_partial: How many controls have ``status == "partial"``.
         controls_todo: How many controls remain TODO for the standard.
         archive_path: On-disk path to the written zip (``None`` for dry-run).
         sha256: SHA-256 of the produced zip bytes.
@@ -221,6 +199,7 @@ class EvidencePack:
     lineage_count: int
     cost_count: int
     controls_mapped: int
+    controls_partial: int
     controls_todo: int
     archive_path: Path | None
     sha256: str
@@ -237,6 +216,7 @@ class EvidencePack:
             "lineage_count": self.lineage_count,
             "cost_count": self.cost_count,
             "controls_mapped": self.controls_mapped,
+            "controls_partial": self.controls_partial,
             "controls_todo": self.controls_todo,
             "sha256": self.sha256,
         }
@@ -476,13 +456,13 @@ def _readme_for(standard: str, mapping: dict[str, Any]) -> bytes:
         "",
         "## Layout",
         "",
-        "- `manifest.json`        — bundle metadata + SHA-256 of every artefact.",
-        "- `controls.json`        — control_id -> artefact mapping for this standard.",
-        "- `audit-chain/`         — HMAC-chained audit events + per-resource catalog.",
-        "- `lineage/`             — Sigstore-style transparency log entries.",
-        "- `costs/`               — cost ledger snapshots over the export window.",
-        "- `policy/`              — operator policy snapshot (optional).",
-        "- `attestations/`        — operator-supplied attestations (optional).",
+        "- `manifest.json`        - bundle metadata + SHA-256 of every artefact.",
+        "- `controls.json`        - control_id -> artefact mapping for this standard.",
+        "- `audit-chain/`         - HMAC-chained audit events + per-resource catalog.",
+        "- `lineage/`             - Sigstore-style transparency log entries.",
+        "- `costs/`               - cost ledger snapshots over the export window.",
+        "- `policy/`              - operator policy snapshot (optional).",
+        "- `attestations/`        - operator-supplied attestations (optional).",
         "",
         "## Verification",
         "",
@@ -607,7 +587,7 @@ def build_evidence_pack(
     policy_files = _read_text_directory(policy_dir)
     attestation_files = _read_text_directory(attestations_dir)
 
-    # Assemble the artefact dict — keys are zip paths.
+    # Assemble the artefact dict - keys are zip paths.
     artefacts: dict[str, bytes] = {
         "audit-chain/events.jsonl": events_bytes,
         "audit-chain/data_catalog.json": data_catalog_bytes,
@@ -634,6 +614,7 @@ def build_evidence_pack(
 
     controls = mapping["controls"]
     controls_mapped = sum(1 for c in controls if c.get("status") == "mapped")
+    controls_partial = sum(1 for c in controls if c.get("status") == "partial")
     controls_todo = sum(1 for c in controls if c.get("status") == "todo")
 
     bundle_id = _bundle_id(standard, since, task)
@@ -648,6 +629,7 @@ def build_evidence_pack(
         "lineage_count": len(lineage_entries),
         "cost_count": len(cost_entries),
         "controls_mapped": controls_mapped,
+        "controls_partial": controls_partial,
         "controls_todo": controls_todo,
         "generated_at_utc": "1970-01-01T00:00:00+00:00",  # deterministic, see note below
         "artefacts": dict(sorted(artefact_hashes.items())),
@@ -682,6 +664,7 @@ def build_evidence_pack(
         lineage_count=len(lineage_entries),
         cost_count=len(cost_entries),
         controls_mapped=controls_mapped,
+        controls_partial=controls_partial,
         controls_todo=controls_todo,
         archive_path=archive_path,
         sha256=archive_sha256,

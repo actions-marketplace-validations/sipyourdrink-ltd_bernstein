@@ -21,6 +21,9 @@ class SSEEventType(StrEnum):
     TASK_COMPLETED = "task.completed"
     TASK_FAILED = "task.failed"
     TASK_RETRIED = "task.retried"
+    TASK_ARTIFACT = "task.artifact"
+    TASK_PROGRESS = "task.progress"
+    ARTIFACT_PRODUCED = "artifact.produced"
     AGENT_SPAWNED = "agent.spawned"
     AGENT_EXITED = "agent.exited"
     GATE_RESULT = "gate.result"
@@ -29,6 +32,7 @@ class SSEEventType(StrEnum):
     MERGE_COMPLETED = "merge.completed"
     RUN_STARTED = "run.started"
     RUN_COMPLETED = "run.completed"
+    MISSION_UPDATED = "mission.updated"
     HEARTBEAT = "heartbeat"
 
 
@@ -132,6 +136,95 @@ class SSEEvent:
         )
 
     @classmethod
+    def task_artifact(cls, task_id: str, key: str, artifact_type: str = "", version: int = 1, **extra: Any) -> SSEEvent:
+        """Create a task.artifact event (#2553).
+
+        Emitted when a worker posts a journal-anchored artifact. The payload
+        carries the artifact identity (key, type, version, content hash), never
+        the artifact bytes -- clients fetch and re-verify the content.
+
+        Args:
+            task_id: Task the artifact is bound to.
+            key: The artifact slot key.
+            artifact_type: One of ``report`` / ``table`` / ``link``.
+            version: The 1-based version within the key.
+            **extra: Additional payload fields (e.g. ``content_hash``).
+
+        Returns:
+            SSEEvent instance.
+        """
+        # Identity fields win over ``extra`` so a caller cannot rebind the
+        # task, key, type, or version by passing a colliding keyword.
+        return cls(
+            event=SSEEventType.TASK_ARTIFACT,
+            data=extra
+            | {
+                "task_id": task_id,
+                "key": key,
+                "artifact_type": artifact_type,
+                "version": version,
+            },
+        )
+
+    @classmethod
+    def task_progress(cls, task_id: str, vector_hash: str = "", **extra: Any) -> SSEEvent:
+        """Create a task.progress event (#2553).
+
+        Emitted when a task's chain-computed progress vector advances. Progress
+        is never self-reported: the payload is a projection of journaled work,
+        identified by ``vector_hash``.
+
+        Args:
+            task_id: Task whose progress advanced.
+            vector_hash: Stable hash of the canonical progress vector.
+            **extra: The progress vector fields (checkpoints, earned_steps, ...).
+
+        Returns:
+            SSEEvent instance.
+        """
+        # Identity fields win over ``extra`` so a caller cannot rebind the task
+        # or forge the vector hash by passing a colliding keyword.
+        return cls(
+            event=SSEEventType.TASK_PROGRESS,
+            data=extra
+            | {
+                "task_id": task_id,
+                "vector_hash": vector_hash,
+            },
+        )
+
+    @classmethod
+    def artifact_produced(cls, uri: str, entry_hash: str, **extra: Any) -> SSEEvent:
+        """Create an artifact.produced event (#2559).
+
+        Emitted from the single lineage write boundary for every artifact that
+        lands in the spine, so a downstream goal fires when the upstream output
+        actually lands instead of guessing on a cron. The payload is the
+        projection of the spine entry -- identity and provenance, never the
+        artifact bytes -- and carries ``verified`` so a consumer can tell a
+        production event apart from one replayed over a tampered chain.
+
+        Args:
+            uri: The canonical artifact key that was produced.
+            entry_hash: Spine entry hash identifying this exact production.
+            **extra: The rest of the projected payload (``content_hash``,
+                ``actor``, ``model``, ``run_id``, ``verified``, ...).
+
+        Returns:
+            SSEEvent instance.
+        """
+        # Identity fields win over ``extra`` so a caller cannot rebind the
+        # artifact or the entry it claims to project from.
+        return cls(
+            event=SSEEventType.ARTIFACT_PRODUCED,
+            data=extra
+            | {
+                "uri": uri,
+                "entry_hash": entry_hash,
+            },
+        )
+
+    @classmethod
     def agent_spawned(cls, agent_id: str, role: str = "", **extra: Any) -> SSEEvent:
         """Create an agent_spawned event.
 
@@ -228,6 +321,33 @@ class SSEEvent:
             event=SSEEventType.RUN_COMPLETED,
             data={
                 "run_id": run_id,
+            }
+            | extra,
+        )
+
+    @classmethod
+    def mission_updated(cls, mission_id: str, status_hash: str, overall: str = "", **extra: Any) -> SSEEvent:
+        """Create a mission_updated event for the timeline screen (#2510).
+
+        Carries the mission's canonical ``status_hash`` so a client can refresh
+        its projection only when the folded state actually changed, and confirm
+        it is rendering the same state two operators would agree on.
+
+        Args:
+            mission_id: Mission identifier.
+            status_hash: The mission projection's canonical status hash.
+            overall: Overall mission state (``active`` / ``complete`` / ...).
+            **extra: Additional payload fields.
+
+        Returns:
+            SSEEvent instance.
+        """
+        return cls(
+            event=SSEEventType.MISSION_UPDATED,
+            data={
+                "mission_id": mission_id,
+                "status_hash": status_hash,
+                "overall": overall,
             }
             | extra,
         )

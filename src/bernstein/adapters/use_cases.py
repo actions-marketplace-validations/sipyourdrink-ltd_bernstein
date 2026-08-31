@@ -53,6 +53,16 @@ class AdapterUseCase:
 # ``bernstein.adapters.registry``. When in doubt about a binary name,
 # cross-reference ``adapter_cmd._BINARY_OVERRIDES``.
 USE_CASES: dict[str, AdapterUseCase] = {
+    "agy": AdapterUseCase(
+        headline="Antigravity CLI (agy) - successor to the non-enterprise Gemini CLI path",
+        binary="agy",
+        details=(
+            "Print-mode headless runs with the terminal sandbox pinned and "
+            "permission prompts auto-approved. Use the gemini adapter for "
+            "the enterprise / API-key lane; see the lane table in the docs."
+        ),
+        docs_path="docs/adapters/agy.md",
+    ),
     "aichat": AdapterUseCase(
         headline="Multi-provider chat CLI with shell command and file context",
         binary="aichat",
@@ -111,10 +121,6 @@ USE_CASES: dict[str, AdapterUseCase] = {
         ),
         docs_path="docs/adapters/clm.md",
     ),
-    "cloudflare": AdapterUseCase(
-        headline="Cloudflare Agents SDK driver via wrangler dev or worker trigger",
-        binary="wrangler",
-    ),
     "codebuff": AdapterUseCase(
         headline="Codebuff CLI integration",
         binary="codebuff",
@@ -136,6 +142,18 @@ USE_CASES: dict[str, AdapterUseCase] = {
         headline="Composio Agent Orchestrator (ao) CLI",
         binary="ao",
     ),
+    "computer_use": AdapterUseCase(
+        headline="Fronts a browser / computer-use agent with per-action lineage",
+        binary="computer-use-agent",
+        details=(
+            "Admits a third-party autonomous browser / computer-use agent that "
+            "owns its own decision loop. Each action the external agent takes "
+            "against a live UI is anchored into a signed, replayable lineage "
+            "chain (pre-action screenshot hashed into a content-addressed "
+            "anchor), and each task runs in an isolated browser profile."
+        ),
+        docs_path="docs/adapters/computer_use.md",
+    ),
     "continue": AdapterUseCase(
         headline="Continue.dev CLI for IDE-style coding agents in the terminal",
         binary="continue",
@@ -143,6 +161,12 @@ USE_CASES: dict[str, AdapterUseCase] = {
     "copilot": AdapterUseCase(
         headline="GitHub Copilot CLI driven headlessly from Bernstein",
         binary="copilot",
+        details=(
+            "Non-interactive print mode runs with -p and -s, plus "
+            "--allow-all-tools and --no-ask-user so the agent works "
+            "autonomously without blocking on permission or clarifying "
+            "prompts. Reuses existing GitHub Copilot auth."
+        ),
     ),
     "cursor": AdapterUseCase(
         headline="Cursor Agent CLI - print mode with workspace trust",
@@ -206,6 +230,10 @@ USE_CASES: dict[str, AdapterUseCase] = {
         headline="Kilo CLI by Stackblitz",
         binary="kilo",
     ),
+    "kimchi": AdapterUseCase(
+        headline="Kimchi CLI for open-weight and Ollama-hosted models",
+        binary="kimchi",
+    ),
     "kimi": AdapterUseCase(
         headline="Kimi CLI for Moonshot models",
         binary="kimi",
@@ -230,6 +258,16 @@ USE_CASES: dict[str, AdapterUseCase] = {
             "conformance harness. Selecting ``mock`` skips real LLM "
             "calls entirely."
         ),
+    ),
+    "muse": AdapterUseCase(
+        headline="Muse Code (Meta) terminal coding agent in headless mode",
+        binary="muse",
+        details=(
+            "Drives the documented non-interactive mode (muse exec) with "
+            "approvals disabled and the vendor sandbox kept on. Auth via "
+            "META_API_KEY; single-model lineup (muse-spark-1.2)."
+        ),
+        docs_path="docs/adapters/muse.md",
     ),
     "ollama": AdapterUseCase(
         headline="Local Ollama / OpenAI-compatible models without cloud keys",
@@ -270,6 +308,19 @@ USE_CASES: dict[str, AdapterUseCase] = {
         headline="Plandex CLI - context-aware planning agent",
         binary="plandex",
     ),
+    "pydantic_ai": AdapterUseCase(
+        headline="Pydantic AI clai one-shot CLI",
+        binary="clai",
+        details=(
+            "Runs the Pydantic AI CLI in one-shot mode (`clai -m <model> "
+            "--no-stream <prompt>`). Models are given as `<provider>:<model>`, "
+            "so OpenAI-compatible local endpoints work alongside hosted "
+            "providers.\n\n"
+            "Built from a declarative capability profile rather than a "
+            "hand-written module - see docs/adapters/capability_profiles.md."
+        ),
+        docs_path="docs/adapters/capability_profiles.md",
+    ),
     "q_dev": AdapterUseCase(
         headline="AWS Q Developer CLI (binary: q)",
         binary="q",
@@ -285,6 +336,20 @@ USE_CASES: dict[str, AdapterUseCase] = {
     "rovo": AdapterUseCase(
         headline="Atlassian Rovo Dev CLI",
         binary="rovo",
+    ),
+    "self-hosted-endpoints": AdapterUseCase(
+        headline="Self-hosted OpenAI-compatible endpoint (vLLM, llama.cpp, TGI, NIM, LM Studio, Ollama)",
+        binary="",
+        details=(
+            "Point the clm or ollama adapter at any OpenAI-compatible "
+            "inference server. Qualify the endpoint with "
+            "`bernstein endpoints certify --base-url <url>` to get a "
+            "signed certification record; merge-critical roles refuse an "
+            "uncertified endpoint at config validation. "
+            "Exercised families: vLLM, llama.cpp server, TGI, NVIDIA NIM, "
+            "LM Studio, Ollama."
+        ),
+        docs_path="docs/operations/self-hosted-endpoints.md",
     ),
 }
 

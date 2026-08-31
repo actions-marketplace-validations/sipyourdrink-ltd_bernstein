@@ -1,15 +1,19 @@
-# Replay & Replay-Filter
+# Replay
 
-`bernstein replay` re-displays the events from a past orchestration run so you can debug, diff, and reproduce. There are two replay surfaces:
+`bernstein replay` re-displays the events from a past orchestration run so you can debug, diff, and reproduce. It has a single command surface with several subcommands:
 
-1. **`bernstein replay`** *(source: `cli/commands/advanced_cmd.py:876`)* — the original replay, optionally with task-trace re-submission.
-2. **`bernstein replay-filter`** (registered as `replay`'s filter wrapper) *(source: `cli/commands/replay_filter_cmd.py:164`)* — adds `--filter`, `--event-type`, `--agent`, `--search`.
+- **`bernstein replay <RUN_ID>`** - the original replay, optionally with task-trace re-submission.
+- **`bernstein replay diff RUN_A RUN_B`** - localise the first divergence between two recorded runs.
+- **`bernstein replay export <AGENT_ID> [OUT]`** - write a portable per-step receipt.
+- **`bernstein replay publish <AGENT_ID> [OUT]`** - write a redacted receipt for publishing (needs `--yes-i-want-to-publish`).
+- **`bernstein replay verify <RECEIPT>`** - offline verifier for an exported or published receipt.
+- **`bernstein replay diff-journal A B`** - per-step divergence finder across two journals.
 
-Both read from the same underlying log on disk; the filter command is a strict superset of the basic command for read-only inspection. The basic command additionally supports **task-trace replay**, which re-creates a new task from a stored task trace and (optionally) compares the replay's `result_summary` against the original via a colour diff.
+All subcommands read from the same underlying journal on disk. The base command additionally supports **task-trace replay**, which re-creates a new task from a stored task trace and (optionally) compares the replay's `result_summary` against the original via a colour diff.
 
 ## What replay does (and doesn't do)
 
-Replay is **deterministic re-display** of a past run's recorded events. Every event the orchestrator emitted — `run_started`, `agent_spawned`, `task_claimed`, `task_completed`, `task_verification_failed`, `agent_reaped`, `run_completed` — is replayed in order with its original timing offsets.
+Replay is **deterministic re-display** of a past run's recorded events. Every event the orchestrator emitted - `run_started`, `agent_spawned`, `task_claimed`, `task_completed`, `task_verification_failed`, `agent_reaped`, `run_completed` - is replayed in order with its original timing offsets.
 
 What replay **does not** do:
 
@@ -17,7 +21,7 @@ What replay **does not** do:
 - State mutations to remote services (a PR opened, a Slack message sent, a row inserted into your database) are **not** rolled back or repeated.
 - It does not re-create branches or worktrees. The git state is whatever your repo currently is.
 
-For full re-execution of the **same task** with a (potentially different) model, use the task-trace mode: `bernstein replay <task_id> --model opus`. This re-submits the original task description (plus any `--extra-context` you provide) as a new task on the running server and waits for it to finish, then renders a diff between the original and the new `result_summary`. (`cli/commands/advanced_cmd.py:841-873`.)
+For full re-execution of the **same task** with a (potentially different) model, use the task-trace mode: `bernstein replay <task_id> --model opus`. This re-submits the original task description (plus any `--extra-context` you provide) as a new task on the running server and waits for it to finish, then renders a diff between the original and the new `result_summary`. (`cli/commands/advanced_cmd.py`.)
 
 ## Where replay state lives
 
@@ -25,17 +29,25 @@ For full re-execution of the **same task** with a (potentially different) model,
 .sdd/
   runs/
     <run_id>/
-      replay.jsonl           # event log (one JSON event per line)
-      session.json           # session metadata (started_at, git_branch, git_sha, config_hash)
+      journal.jsonl          # canonical Merkle-chained event journal (one JSON event per line)
+      metadata.json          # session metadata (started_at, git_branch, git_sha, config_hash)
+      divergence_report.json # written by `replay --verify` when a step diverges
   traces/
     <task_id>-<timestamp>.json  # per-task traces (used by task-trace replay)
 ```
 
-- The run-event log path constant: `_REPLAY_JSONL = "replay.jsonl"` (`cli/commands/advanced_cmd.py:725`).
+- The canonical run-event journal is `journal.jsonl`, written by the always-on `EventJournal` (`core/replay/journal.py`). Each event chains as `H(prev_hash, event_type, payload_hash, monotonic_index)` and the head hash identifies that surviving journal state. A complete finished-journal identity requires an independent head/count seal.
+- Recording is on by default; `BERNSTEIN_REPLAY_RETENTION=N` bounds how many past run journals survive on disk (oldest run directories are pruned) instead of an on/off gate.
+- Capsule-governed finalization can seal the journal head and count outside the journal, so finished-journal identity and artifact provenance share an independently committed root where that seal exists.
 - Session metadata is parsed by `read_session_replay_metadata()` from `core/runtime_state.py`.
-- Task traces are loaded by `core.traces.TraceStore` (`cli/commands/replay_filter_cmd.py:108-117`).
+- Task traces are loaded by `TraceStore` (`core/observability/traces.py`).
 
-The fingerprint shown after every replay is a SHA-256 hash of the canonicalized event sequence (`core.recorder.compute_replay_fingerprint`); identical event streams produce identical fingerprints, which is how you verify two runs really are the same.
+## Verifying and rebuilding from the journal
+
+- `bernstein replay <RUN_ID> --verify` recomputes the journal's Merkle chain, reports reader coverage and the journal-identity verdict, or names the exact first divergent step index. An unsealed intact journal reports `identity=unverifiable`, not byte-identity. On divergence it writes `divergence_report.json` (`step_index`, `expected_hash`, `actual_hash`) and exits non-zero. An injected non-deterministic tool result surfaces as a precise hash mismatch rather than a silent drift.
+- `bernstein replay <RUN_ID> --from-step N` rebuilds a deterministic state projection by walking events `[0, N)`. Two independent invocations produce byte-identical output, so the reconstruction is reproducible.
+
+The fingerprint shown after a replay is the Merkle head over the journal's event chain; identical decision streams produce identical heads, which proves the compared journal states are the same. It does not prove either journal is complete unless that head also matches an independent seal.
 
 ---
 
@@ -43,7 +55,7 @@ The fingerprint shown after every replay is a SHA-256 hash of the canonicalized 
 
 **Synopsis:** `bernstein replay RUN_ID_OR_TASK_ID [flags]`
 
-**Flags:** *(source: `cli/commands/advanced_cmd.py:876-906`)*
+**Flags:** *(source: `cli/commands/advanced_cmd.py`)*
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -56,10 +68,10 @@ The fingerprint shown after every replay is a SHA-256 hash of the canonicalized 
 
 **Resolution rules:**
 
-- `bernstein replay list` — print every recorded run with timing, branch, SHA, event count, log size.
-- `bernstein replay latest` — replay the most recent run.
-- `bernstein replay <run_id>` — replay a specific run by directory name.
-- `bernstein replay <task_id>` (no run with that ID exists) — falls through to **task-trace replay**: re-submit the task and diff result summaries.
+- `bernstein replay list` - print every recorded run with timing, branch, SHA, event count, log size.
+- `bernstein replay latest` - replay the most recent run.
+- `bernstein replay <run_id>` - replay a specific run by directory name.
+- `bernstein replay <task_id>` (no run with that ID exists) - falls through to **task-trace replay**: re-submit the task and diff result summaries.
 
 The Rich table columns are `TIME` (offset from `run_started`), `EVENT`, `AGENT`, `TASK`, `DETAIL`. Common detail keys: `model`, `role`, `cost_usd`, `fingerprint`, `tick`, `failed_signals`. Events are colour-coded by type (`run_started` / `task_completed` are green; `agent_reaped` and `task_verification_failed` are red).
 
@@ -76,65 +88,135 @@ bernstein replay T-abc123 --model opus --extra-context "Make sure tests pass on 
 
 ---
 
-## `bernstein replay-filter`
+## Machine-readable output (`--as-json`)
 
-A strict superset of `bernstein replay` for read-only inspection. Adds four orthogonal filters that compose with each other.
+The flag is `--as-json`, and every subcommand emits a payload on success:
 
-**Synopsis:** `bernstein replay-filter RUN_ID [flags]`
+| Surface | Emits on success |
+|---|---|
+| `bernstein replay <AGENT_ID>` | `{agent_id, head_hash, steps, entries[]}` |
+| `bernstein replay <RUN_ID> --verify` | chain verdict, head hash, and the divergent step when one exists |
+| `bernstein replay diff-journal A B` | `{diverged, seq, fields_changed[], left_values, right_values, reason}` |
+| `bernstein replay debug ...` | head hash, step count, receipt path, whether it was signed |
+| `bernstein replay export` | `{agent_id, output, head_hash, steps, signed}` |
+| `bernstein replay publish` | the same, **plus `original_head_hash`** |
+| `bernstein replay verify <RECEIPT>` | `{ok, head_hash, steps, errors, signed}` |
 
-**Flags:** *(source: `cli/commands/replay_filter_cmd.py:164-186`)*
+`publish` reporting both hashes is the machine-readable form of what redaction
+means: it rewrites the payloads, so the published head is *not* the exported
+one. A script comparing `head_hash` across an export and a publish of the same
+agent would otherwise reasonably conclude something had been corrupted.
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `RUN_ID` | required | Same as `replay`: run ID, `latest`, `list`, or task ID. |
-| `--sdd-dir PATH` | `.sdd` | Path to the `.sdd` state directory. |
-| `--as-json` | off | Emit raw JSONL. |
-| `--limit N` | none | Show only the first N **filtered** events. |
-| `--filter "k=v,..."` | none | Comma-separated key=value filters; values are regex (case-insensitive). |
-| `--event-type TYPE` | none | Show only events of a specific type. |
-| `--agent ID` | none | Show only events from this agent (substring match). |
-| `--search TEXT` | none | Full-text substring search across all event fields. |
-| `--model NAME` | none | Override model for task-trace replay. |
-| `--extra-context TEXT` | none | Append text to a replayed task description. |
+**Failure paths are still prose**, on every one of these. That matters most on
+`verify`, which has two different failures that both exit `1`:
 
-The four filters compose with AND semantics: an event must match every active filter.
+- the receipt verifies *false* - emits `{ok: false, ..., errors: [...]}`
+- the receipt is *malformed* - prints prose
 
-**Filter expression syntax (`--filter`):** comma-separated `key=value` pairs. Values are regular expressions, applied case-insensitively against the event field's stringified value. So `--filter "role=backend,status=done"` keeps events whose `role` field matches `backend` AND whose `status` field matches `done`.
+Same exit status, one parseable and one not, and no way to tell which you are
+getting before you try. Those route to different people: "this chain does not
+verify" is a finding about the run, "this file is not a receipt" is a finding
+about the invocation. Until that is closed, a scripted caller has to treat a
+parse failure as a third outcome rather than an error. Tracked in
+[#3996](https://github.com/sipyourdrink-ltd/bernstein/issues/3996).
+
+**The exit code is the verdict, not the payload.** This was true when these
+verbs ignored `--as-json` and it stays true now that they honour it: `verify`
+emits a payload *and* exits non-zero on a receipt mismatch, so a caller that
+reads stdout and ignores the exit status still sees a refused chain as a
+success. A payload is not an assertion that the operation succeeded. Check the
+exit code first and treat any payload as detail.
+
+## Subcommands
+
+Beyond the base run/task replay, `bernstein replay` exposes subcommands for diffing runs and for exporting and verifying portable receipts.
+
+### `bernstein replay diff RUN_A RUN_B`
+
+Localises the first divergence between two recorded runs. Walks both event chains in lockstep and reports the first step whose hash differs, so a non-deterministic drift between two runs surfaces as a precise step index rather than a wall of diff.
 
 ```bash
-# Just the agent_spawned events from the latest run
-bernstein replay latest --event-type agent_spawned
-
-# Anything mentioning "fail" in the most recent run, as JSON
-bernstein replay latest --search fail --as-json | jq '.events[]'
-
-# Backend tasks that completed
-bernstein replay latest --filter "role=backend,status=done" --limit 10
-
-# All events from a specific agent session, with full JSON output
-bernstein replay 20260415-143022 --agent backend-abc --as-json
+bernstein replay diff 20260415-143022 20260415-150118
 ```
 
-When `--as-json` is set, the filtered output schema is:
+### `bernstein replay diff-journal A B`
 
-```json
-{
-  "run_id": "<id>",
-  "events": [ /* filtered events, capped to --limit */ ],
-  "total_matched": 42
-}
+Per-step divergence finder across two journals. Like `diff` but operates directly on two journal paths, reporting the first step index where the chains diverge.
+
+`--as-json` emits `{diverged, seq, fields_changed[], left_values, right_values, reason}`, and the command exits `1` when `diverged` is true, so the exit code and the payload agree.
+
+### `bernstein replay export <AGENT_ID> [OUT]`
+
+Writes a portable per-step receipt for an agent's journal. The receipt carries the step chain and its head hash so it can be verified offline by another party.
+
+The destination is an optional **positional** argument, not a flag. Omit it and
+the receipt lands at `.sdd/runtime/receipts/<AGENT_ID>.tar`.
+
+```bash
+# explicit destination
+bernstein replay export backend-abc receipt.tar
+
+# default destination: .sdd/runtime/receipts/backend-abc.tar
+bernstein replay export backend-abc
+```
+
+### `bernstein replay publish <AGENT_ID> [OUT]`
+
+Same as `export`, but produces a redacted receipt suitable for publishing. Sensitive fields are stripped while the head hash still anchors the visible steps. The destination is positional, as for `export`.
+
+**`--yes-i-want-to-publish` is required.** Local-only is the default, and
+`publish` is the only path that writes outside `.sdd/runtime/`. Without the flag
+it refuses and exits 2. The flag is scoped to this verb: passing it to `export`,
+`verify` or any other spelling is **refused by name**, not silently dropped.
+
+```bash
+# explicit destination
+bernstein replay publish backend-abc receipt.public.tar --yes-i-want-to-publish
+
+# default destination: .sdd/runtime/receipts/backend-abc.tar
+bernstein replay publish backend-abc --yes-i-want-to-publish
+```
+
+A published receipt is **not** a drop-in substitute for an exported one, in two
+ways worth knowing before you build a pipeline on it:
+
+- **It verifies against the *published* head, not the original.** Keeping the
+  export's `head_hash` to pin against is the correct instinct everywhere else,
+  but `bernstein replay verify <published> --head <original_head_hash>` fails a
+  perfectly good receipt, and the `ok: false` reads as tampering. Pin against
+  `head_hash` from the publish, and keep `original_head_hash` only for
+  correlating the two.
+- **It drops `blob_refs` and ships `blob_digests: []`**, where an exported
+  receipt keeps them. Redaction rewrites the payloads the chain is computed
+  over; that is what makes the head differ, and it is why the visible steps
+  still anchor while the blobs no longer resolve.
+
+### `bernstein replay verify <RECEIPT>`
+
+Offline verifier for an exported or published receipt. Recomputes the receipt's chain and reports byte-identity or the first divergent step. Exits non-zero on mismatch.
+
+```bash
+bernstein replay verify receipt.json
+```
+
+### `bernstein replay repair <RUN_ID>`
+
+Truncate a crash-torn journal tail so a suspended task can resume. A crash partway through an append can leave the journal with a truncated final line (no trailing newline); the tolerant reader discards that line and `resume` refuses the journal. The repair removes exactly that trailing fragment -- the surviving head is unchanged byte for byte -- and reports a no-op on a clean journal. It refuses (without writing) a discard in the middle of the file (corruption, not a torn write) and a truncation that would contradict an external seal.
+
+```bash
+bernstein replay repair run-20260816-1015
 ```
 
 ---
 
 ## Common use cases
 
-**Reproduce a flaky failure.** Run `bernstein replay-filter latest --event-type task_verification_failed` to see exactly which gate failed and on which agent. The detail column carries the failed signal names; cross-reference with `.sdd/traces/` for the agent's full transcript.
+**Reproduce a flaky failure.** Run `bernstein replay latest` and read the `EVENT` column for `task_verification_failed` rows to see exactly which gate failed and on which agent. The detail column carries the failed signal names; cross-reference with `.sdd/traces/` for the agent's full transcript. For a machine-readable pass, use `bernstein replay latest --as-json | jq '.events[] | select(.event=="task_verification_failed")'`.
 
 **Compare models on the same task.** Find the run where the task succeeded:
 
 ```bash
-bernstein replay-filter latest --search "T-abc123" --event-type task_completed
+bernstein replay latest --as-json | jq '.events[] | select(.event=="task_completed")'
 ```
 
 then re-run with a different model:
@@ -151,10 +233,10 @@ The CLI prints a diff of the two `result_summary` strings.
 
 ## Limits
 
-- Replay does not re-issue HTTP calls. Mocking a remote dependency from the original log is not supported — agents in task-trace replay make **fresh** calls.
+- Replay does not re-issue HTTP calls. Mocking a remote dependency from the original log is not supported - agents in task-trace replay make **fresh** calls.
 - Side effects to remote services (PRs, messages, webhooks, DB rows) from the original run are **not undone** by replay. There is no "rewind" mode.
-- Run-event replay only re-renders what was recorded. If `recorder.py` (`cli/commands/replay_filter_cmd.py:232`) didn't capture an event class, it will not appear.
+- Run-event replay only re-renders what was recorded. If the `EventJournal` (`core/replay/journal.py`) did not capture an event class, it will not appear.
 - Fingerprints depend on the exact recorder version. A replay log written by an older Bernstein may produce a different fingerprint when re-fingerprinted by a newer build.
-- Task-trace replay submits a **new** task — it does not retroactively re-run the original task in place. The original task's record stays in the archive untouched.
+- Task-trace replay submits a **new** task - it does not retroactively re-run the original task in place. The original task's record stays in the archive untouched.
 
 For deeper integrity guarantees, see [`fingerprint`](../cli-reference.md#bernstein-fingerprint) (re-computes the run's SHA-256 and verifies it against a stored reference).

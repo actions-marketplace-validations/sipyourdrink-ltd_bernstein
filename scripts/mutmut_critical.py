@@ -15,7 +15,7 @@ mutations in that file. A module is "passing" when
     kill_rate >= threshold
 
 where ``kill_rate = killed / total`` and ``total = killed + survivors``
-(timeouts count as kills — an infinite loop is a meaningful signal).
+(timeouts count as kills - an infinite loop is a meaningful signal).
 
 CLI:
 
@@ -26,9 +26,9 @@ CLI:
 
 Exit codes:
 
-    0 — every module met its threshold
-    1 — at least one module below threshold (gate failed)
-    2 — baseline tests fail (cannot trust mutation results)
+    0 - every module met its threshold
+    1 - at least one module below threshold (gate failed)
+    2 - baseline tests fail (cannot trust mutation results)
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ class Module:
 
 
 # Fixed critical-path modules. Paths verified against the worktree layout
-# (see CLAUDE.md "Module map"). Thresholds start at 0.70 per TC-D brief —
+# (see CLAUDE.md "Module map"). Thresholds start at 0.70 per TC-D brief -
 # this is the *gate setup* PR, scores get raised once humans backfill
 # tests for any module that falls short.
 MODULES: tuple[Module, ...] = (
@@ -78,11 +78,12 @@ MODULES: tuple[Module, ...] = (
             "tests/unit/test_audit_chain_byteflip_regression.py",
             "tests/unit/test_audit_key.py",
             "tests/unit/test_audit_log_mutation_kill.py",
+            "tests/unit/test_audit_log_chain_verifier_invariants.py",
         ),
         threshold=0.70,
         budget_seconds=1200,
         max_candidates=80,
-        note="HMAC-chained audit log writer.",
+        note=("HMAC-chained audit log writer."),
     ),
     Module(
         key="audit_integrity",
@@ -135,6 +136,21 @@ MODULES: tuple[Module, ...] = (
         max_candidates=80,
         note="bernstein.yaml seed parser + ${ENV} reference resolution.",
     ),
+    Module(
+        key="journal_verify",
+        source="src/bernstein/core/replay/journal.py",
+        tests=(
+            "tests/unit/core/replay/test_journal_identity.py",
+            "tests/unit/core/replay/test_journal_event_count_cache.py",
+            "tests/unit/core/replay/test_journal_tail_repair.py",
+            "tests/unit/core/replay/test_journal_undecodable.py",
+            "tests/unit/core/replay/test_journal_verify_mutation_kill.py",
+        ),
+        threshold=0.70,
+        budget_seconds=1800,
+        max_candidates=120,
+        note="Replay journal verifier (issue #3654): verify_journal / verify_events.",
+    ),
 )
 
 # (search, replace) pairs applied one-at-a-time per line. Mirrors the
@@ -159,6 +175,34 @@ MUTATIONS: tuple[tuple[str, str], ...] = (
     ("return False", "return True"),
     ("len(", "0 * len("),
 )
+
+#: Subset of :data:`MUTATIONS` that flips an English boolean word rather than
+#: a code operator. Excluded on pure f-string-literal lines - see
+#: :func:`_is_fstring_literal_continuation`.
+_PROSE_WORD_MUTATIONS: frozenset[tuple[str, str]] = frozenset({(" and ", " or "), (" or ", " and "), ("not ", "")})
+
+
+def _is_fstring_literal_continuation(line: str) -> bool:
+    """Whether *line* is entirely (part of) an f-string literal, no code.
+
+    A physical source line whose stripped text begins with ``f"`` or ``f'``
+    is, by Python's grammar, one piece of a string-literal token - either a
+    continuation line of a multi-line implicit concatenation (the style this
+    codebase uses for long f-string messages, one literal segment per line
+    inside the enclosing parens) or a lone literal. It cannot carry any other
+    expression or statement on the same line.
+
+    :data:`_PROSE_WORD_MUTATIONS` on such a line therefore only reword the
+    rendered text of a log line or exception message - never program logic -
+    so a mutation gate measuring verifier *behaviour* gains nothing by
+    proposing them, and every caller downstream would otherwise need to pin
+    exact message wording to kill what is really a copy-edit, not a defect.
+    Candidates on every other line (including the ``{expr}`` portions
+    embedded in an f-string, which sit on their own line only when the
+    expression itself is multi-line - rare in this codebase) are unaffected.
+    """
+    stripped = line.lstrip()
+    return stripped.startswith(('f"', "f'"))
 
 
 @dataclass
@@ -233,8 +277,11 @@ def _candidates(target: Path, limit: int) -> list[tuple[int, str, str, str]]:
             continue
         if line.rstrip().endswith(",") and "=" in line and "(" not in line:
             continue
+        is_fstring_line = _is_fstring_literal_continuation(line)
         for search, replace in MUTATIONS:
             if search in line and search != replace:
+                if is_fstring_line and (search, replace) in _PROSE_WORD_MUTATIONS:
+                    continue
                 out.append((i, line, search, replace))
         if len(out) >= limit:
             break
@@ -252,7 +299,7 @@ def _mutate_module(mod: Module, *, verbose: bool = True) -> ModuleResult:
     if verbose:
         print(f"[{mod.key}] baseline tests: {mod.tests}", flush=True)
     if not _run_tests(mod.tests):
-        print(f"[{mod.key}] baseline fails — cannot trust mutation run", file=sys.stderr)
+        print(f"[{mod.key}] baseline fails - cannot trust mutation run", file=sys.stderr)
         res.baseline_ok = False
         return res
 

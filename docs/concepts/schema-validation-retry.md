@@ -26,23 +26,28 @@ from bernstein.core.tasks.schema_retry import (
 )
 from pydantic import BaseModel
 
+
 class PlannerOutput(BaseModel):
     tasks: list[str]
     rationale: str
 
+
 ctx = SchemaRetryContext()
+
 
 def validate(raw: str) -> PlannerOutput:
     # raise ValueError on bad input; the retry loop catches it
     return PlannerOutput.model_validate_json(raw)
 
+
 def ask_again(prompt_with_errors: str) -> str:
     # call your spawned agent / model with the augmented prompt
     return run_agent(prompt_with_errors)
 
+
 result = validate_with_retry(
-    raw_text,             # initial_response (positional)
-    validate,             # parses-or-raises ValueError
+    raw_text,  # initial_response (positional)
+    validate,  # parses-or-raises ValueError
     ctx,
     ask_again=ask_again,
     max_attempts=3,
@@ -75,7 +80,7 @@ prior validation failure, not just the most recent.
 
 - This is a **wrapper** around existing validation, not a replacement
   for Pydantic. Models still own field constraints.
-- The agent itself is the repair loop — there is no LLM-based schema
+- The agent itself is the repair loop - there is no LLM-based schema
   repair sitting between the validator and the agent.
 - Token cost of retries is captured by the existing `cost_tracker`,
   not by this module.

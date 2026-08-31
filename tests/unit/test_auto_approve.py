@@ -1,4 +1,4 @@
-"""Tests for bernstein.core.auto_approve — smart command classification."""
+"""Tests for bernstein.core.auto_approve - smart command classification."""
 
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ class TestDecomposeCommand:
 
 
 # ---------------------------------------------------------------------------
-# classify_command — safe commands (APPROVE)
+# classify_command - safe commands (APPROVE)
 # ---------------------------------------------------------------------------
 
 
@@ -123,6 +123,17 @@ class TestClassifyCommandApprove:
         result = classify_command("head -n 1 pyproject.toml | grep version")
         assert result.decision == Decision.APPROVE
 
+    def test_task_complete_cli_is_as_approvable_as_the_curl_it_replaces(self) -> None:
+        """The completion CLI must classify the same as the request it replaces.
+
+        Agents mark work done with ``bernstein task complete`` instead of
+        hand-building a POST to the localhost task server. Both reach the same
+        endpoint, so the CLI form must not drop to ASK and strand an unattended
+        run at an approval prompt it has no operator to answer.
+        """
+        cmd = 'bernstein task complete T-010 --summary "Completed: Implement feature"'
+        assert classify_command(cmd).decision == Decision.APPROVE
+
     def test_curl_bernstein_server(self) -> None:
         cmd = (
             "curl -s --retry 3 --retry-delay 2 -X POST "
@@ -135,7 +146,7 @@ class TestClassifyCommandApprove:
 
 
 # ---------------------------------------------------------------------------
-# classify_command — dangerous commands (DENY)
+# classify_command - dangerous commands (DENY)
 # ---------------------------------------------------------------------------
 
 
@@ -192,7 +203,7 @@ class TestClassifyCommandDeny:
 
 
 # ---------------------------------------------------------------------------
-# classify_command — ambiguous commands (ASK)
+# classify_command - ambiguous commands (ASK)
 # ---------------------------------------------------------------------------
 
 
@@ -200,9 +211,9 @@ class TestClassifyCommandAsk:
     @pytest.mark.parametrize(
         "cmd",
         [
-            # curl to an external URL (not localhost) — unknown intent
+            # curl to an external URL (not localhost) - unknown intent
             "curl https://api.github.com/repos/owner/repo",
-            # git push without --force — write op, needs review.
+            # git push without --force - write op, needs review.
             # (Destructive variants like --mirror / --delete now hard-DENY;
             # see audit-045.)
             "git push origin main",
@@ -259,6 +270,13 @@ class TestClassifyToolCall:
         result = classify_tool_call("Write", {"file_path": "foo.py", "content": "..."})
         assert result.decision == Decision.ASK
 
+    def test_notebook_edit_asks(self) -> None:
+        # NotebookEdit is a write-capable tool (see traces.py _EDIT_TOOLS and
+        # this module's own fall-through policy), so it must ASK like
+        # Edit/Write rather than auto-approve (issue #1850).
+        result = classify_tool_call("NotebookEdit", {"notebook_path": "x.ipynb"})
+        assert result.decision == Decision.ASK
+
     def test_unknown_tool_asks(self) -> None:
         result = classify_tool_call("SomeFancyTool", {})
         assert result.decision == Decision.ASK
@@ -296,7 +314,7 @@ class TestApprovalResult:
 
 
 # ---------------------------------------------------------------------------
-# normalize_command — evasion technique coverage
+# normalize_command - evasion technique coverage
 # ---------------------------------------------------------------------------
 
 
@@ -348,7 +366,7 @@ class TestNormalizeCommand:
 
 
 # ---------------------------------------------------------------------------
-# classify_command — evasion techniques should still DENY
+# classify_command - evasion techniques should still DENY
 # ---------------------------------------------------------------------------
 
 
@@ -400,7 +418,7 @@ class TestAudit045TightenedAllowList:
     @pytest.mark.parametrize(
         "cmd",
         [
-            # Bare `python <arbitrary_script>` — caller-controlled path.
+            # Bare `python <arbitrary_script>` - caller-controlled path.
             "python /tmp/pwn.py",
             "python /var/tmp/evil.py",
             "python /dev/shm/loader.py",
@@ -444,7 +462,7 @@ class TestAudit045TightenedAllowList:
         ],
     )
     def test_formerly_approved_now_blocked(self, cmd: str) -> None:
-        """Each must either DENY or ASK — never auto-approve."""
+        """Each must either DENY or ASK - never auto-approve."""
         result = classify_command(cmd)
         assert result.decision in (Decision.DENY, Decision.ASK), (
             f"audit-045 regression: {cmd!r} returned {result.decision}"
@@ -528,7 +546,7 @@ class TestAudit045ExtraAllowList:
         assert classify_command("make build").decision == Decision.ASK
 
     def test_extra_pattern_cannot_override_deny(self) -> None:
-        """Deny always wins — extras cannot unlock `rm -rf`."""
+        """Deny always wins - extras cannot unlock `rm -rf`."""
         set_extra_allow_patterns([r".*"])  # tries to allow everything
         result = classify_command("rm -rf /tmp/foo")
         assert result.decision == Decision.DENY, result

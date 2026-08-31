@@ -1,4 +1,4 @@
-"""Tests for bernstein.core.traces — TraceStep, parse_agent_log, replay payload."""
+"""Tests for bernstein.core.traces - TraceStep, parse_agent_log, replay payload."""
 
 from __future__ import annotations
 
@@ -157,6 +157,37 @@ class TestParseAgentLog:
 
 
 class TestTraceStore:
+    def test_write_redacts_credentials_in_persisted_bytes(self, tmp_path: Path) -> None:
+        traces_dir = tmp_path / "traces"
+        store = TraceStore(traces_dir)
+        trace = new_trace("sess-secret", ["task-secret"], "backend", "sonnet", "high")
+        canary = "gho_0123456789abcdefghijklmnopqrstuv"
+        private_key_body = "U2VjcmV0VHJhY2VDYW5hcnlWYWx1ZQ=="
+        sha256 = "a3" * 32
+        trace.steps.append(
+            TraceStep(
+                type="verify",
+                timestamp=1.0,
+                detail=(
+                    f"Authorization: Bearer {canary}\n"
+                    "-----BEGIN PRIVATE KEY-----\n"
+                    f"{private_key_body}\n"
+                    "-----END PRIVATE KEY-----\n"
+                    f"sha256={sha256}"
+                ),
+            )
+        )
+
+        store.write(trace)
+
+        direct_bytes = (traces_dir / f"trace-{trace.trace_id}.json").read_bytes()
+        task_bytes = (traces_dir / "task-secret.jsonl").read_bytes()
+        for persisted in (direct_bytes, task_bytes):
+            assert canary.encode() not in persisted
+            assert private_key_body.encode() not in persisted
+            assert persisted.count(b"[REDACTED]") == 2
+            assert sha256.encode() in persisted
+
     def test_write_and_read_by_trace_id(self, tmp_path: Path) -> None:
         store = TraceStore(tmp_path / "traces")
         trace = new_trace("sess-1", ["task-abc"], "backend", "sonnet", "high")
@@ -524,3 +555,38 @@ def test_record_compaction_boundary_zero_savings() -> None:
     assert step.tokens == 0  # no savings
     assert step.compaction_tokens_before == 5000
     assert step.compaction_tokens_after == 5000
+
+
+def test_record_compaction_boundary_with_content_hashes() -> None:
+    """Compaction boundary records and serializes source and referenced hashes."""
+    from bernstein.core.traces import record_compaction_boundary
+
+    trace = AgentTrace(
+        trace_id="t4",
+        session_id="s-4",
+        task_ids=["task-4"],
+        agent_role="dev",
+        model="sonnet",
+        effort="high",
+        spawn_ts=0.0,
+    )
+    step = record_compaction_boundary(
+        trace,
+        correlation_id="comp-004",
+        tokens_before=15000,
+        tokens_after=4000,
+        reason="token_budget",
+        source_content_hash="sha256:abc1234",
+        referenced_content_hashes={"src/foo.py": "sha256:def5678"},
+    )
+    assert step.compaction_source_content_hash == "sha256:abc1234"
+    assert step.compaction_referenced_content_hashes == {"src/foo.py": "sha256:def5678"}
+    assert "src/foo.py" in step.files
+
+    data = step.to_dict()
+    assert data["compaction_source_content_hash"] == "sha256:abc1234"
+    assert data["compaction_referenced_content_hashes"] == {"src/foo.py": "sha256:def5678"}
+
+    restored = TraceStep.from_dict(data)
+    assert restored.compaction_source_content_hash == "sha256:abc1234"
+    assert restored.compaction_referenced_content_hashes == {"src/foo.py": "sha256:def5678"}

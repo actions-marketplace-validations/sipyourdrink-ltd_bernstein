@@ -275,7 +275,7 @@ class TestPlanBeforeApply:
         assert "-auto-approve" in script
 
     def test_script_body_is_prompt_independent(self) -> None:
-        # Regression: the script body MUST be a fixed literal — prompts
+        # Regression: the script body MUST be a fixed literal - prompts
         # used to be f-string interpolated, letting shell metachars
         # (``"``, ``$()``, ``;``, backticks) either break the script or
         # execute arbitrary commands inside ``bash -euo pipefail``.
@@ -335,7 +335,7 @@ class TestIaCAdapterName:
 
 
 # ---------------------------------------------------------------------------
-# is_alive() and kill() — inherited from CLIAdapter base
+# is_alive() and kill() - inherited from CLIAdapter base
 # ---------------------------------------------------------------------------
 
 
@@ -354,7 +354,7 @@ class TestIaCIsAlive:
 class TestIaCKill:
     def test_calls_killpg_with_pid_as_pgid(self) -> None:
         adapter = IaCAdapter()
-        with patch("bernstein.adapters.base.kill_process_group_graceful") as mock_killpg:
+        with patch("bernstein.adapters.base.reap_process_group") as mock_killpg:
             adapter.kill(555)
         mock_killpg.assert_called_once_with(555)
 

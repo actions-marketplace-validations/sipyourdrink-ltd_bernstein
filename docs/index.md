@@ -1,30 +1,40 @@
 ---
-title: Bernstein — Open-Source Multi-Agent Orchestration Platform
+title: Bernstein - The Open-Source Governance Layer for AI Agents
 description: >-
-  Bernstein is the open-source multi-agent orchestrator for AI coding agents.
-  Run Claude Code, Codex, Gemini CLI, and the OpenAI Agents SDK in parallel.
-  Deterministic scheduling, 44 adapters, pluggable sandbox backends,
-  cloud artifact storage, progressive skills, zero vendor lock-in.
+  The open-source governance layer for AI agents. No model in the coordination
+  loop, so parallel runs in per-task git worktrees replay byte-identically.
+  Signed lineage plus an opt-in HMAC audit chain a reviewer checks offline,
+  without rerunning it. Run Claude Code, Codex, Gemini CLI, and 40+ more behind
+  one governance surface, for any deliverable, with zero vendor lock-in.
 tags:
   - orchestration
   - multi-agent
+  - AI governance
   - AI coding agents
+search:
+  boost: 2
 ---
 
 # Bernstein
 
-**Orchestrate any AI coding agent. Any model. One command.**
+**Reproducible multi-agent runs. Verifiable results. Any agent, any deliverable.**
+
+<a href="https://deepwiki.com/sipyourdrink-ltd/bernstein"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 
 <figure markdown>
-  ![Bernstein in action — parallel AI agents orchestrated in real time](assets/in-action-small.gif){ loading=lazy width="700" }
-  <figcaption>Bernstein in action — parallel AI agents orchestrated in real time</figcaption>
+  ![A real bernstein demo run - mock agents fix four seeded bugs, ending on the run's signed receipt verifying offline](assets/demo-run/demo.gif){ loading=lazy width="820" }
+  <figcaption>A real recorded run - its signed receipt and public key ship next to this recording, and CI re-verifies them on every push</figcaption>
 </figure>
 
 ---
 
-Bernstein takes a goal, breaks it into tasks, assigns them to AI coding agents running in parallel, verifies the output, and merges the results. You come back to working code, passing tests, and a clean git history.
+Bernstein takes a goal, breaks it into tasks, assigns them to AI agents running in parallel, verifies the output, and merges the results. You come back to working code, passing tests, and a clean git history - or, when a task declares an artifact contract, to a signed deliverable: a research dossier, a dataset, an audit evidence pack.
 
-No framework to learn. No vendor lock-in. Agents are interchangeable workers — swap any agent, any model, any provider. The orchestrator itself is deterministic Python code. Zero LLM tokens on scheduling.
+No framework to learn. No vendor lock-in. Agents are interchangeable workers - swap any agent, any model, any provider. The orchestrator itself is deterministic Python code. Zero LLM tokens on scheduling.
+
+Results stay checkable after the run ends: an always-on lineage spine and replay journal record what happened, and an opt-in HMAC-chained audit log (`BERNSTEIN_AUDIT=1`) adds receipts you can verify offline.
+
+What "offline" means, precisely. `bernstein artifact verify` and `bernstein audit verify --merkle-only` need only the on-disk artefacts: the Ed25519 signature on every lineage entry, the parent-hash chain, the re-derived content hash, and the Merkle seal over the daily audit files all check without any secret. Replaying the per-line HMAC chain is different: `bernstein audit verify`, `--hmac-only`, `audit verify-hmac` and `audit verify --receipt` all need the install's audit key, which by design lives outside the audit volume. To hand a reviewer who does not hold that key something they can still authenticate, export a pack with `bernstein audit export --signature-kind hmac-chain+pubkey`; it signs the chain head with the lineage Ed25519 key, so the bundle verifies against a public key alone.
 
 ## Install
 
@@ -59,6 +69,12 @@ Then run:
 bernstein -g "Add JWT auth with refresh tokens, tests, and API docs"
 ```
 
+A run in flight is watchable from either operator surface. Both read the same task API, so neither is a lagging mirror of the other.
+
+| ![A three-column terminal dashboard: agents with their live logs on the left, the task board on the right, an activity feed and a cost line underneath](assets/tui-agents.png) | ![A browser dashboard listing sixty-two tasks with eleven running, one of them opened to its working-tree diff](assets/webui-agents-diffs.png) |
+|:---:|:---:|
+| `bernstein live` — the terminal dashboard | `bernstein gui serve` — the same run in a browser |
+
 ## Why Bernstein?
 
 <div class="grid cards" markdown>
@@ -67,21 +83,30 @@ bernstein -g "Add JWT auth with refresh tokens, tests, and API docs"
 
     ---
 
-    Pure Python orchestration — zero LLM tokens on coordination.
+    Pure Python orchestration - zero LLM tokens on coordination.
     Every decision is auditable code, not a model response.
+
+- :material-check-decagram:{ .lg .middle } **Verifiable results**
+
+    ---
+
+    An always-on lineage spine and replay journal record every run.
+    Set `BERNSTEIN_AUDIT=1` (or pass `--audit` to `bernstein run`) for an
+    HMAC-chained audit log and receipts you can verify offline.
 
 - :material-swap-horizontal:{ .lg .middle } **Any agent, any model**
 
     ---
 
-    44 CLI adapters: Claude Code, Codex, OpenAI Agents SDK v2, Gemini, Cursor, Aider, Cloudflare Agents, GitHub Copilot, Devin Terminal, CLM gateway, AWS Q Developer, and more.
+    40+ CLI adapters: Claude Code, Codex, OpenAI Agents SDK v2, Gemini, Cursor, Aider, GitHub Copilot, Devin Terminal, CLM gateway, AWS Q Developer, and more.
     Mix cheap local models with cloud models in the same run.
 
 - :material-source-branch:{ .lg .middle } **Git worktree isolation**
 
     ---
 
-    Each agent works in its own git worktree.
+    Each coding agent works in its own git worktree
+    (artifact-mode tasks get an isolated plain directory).
     No merge conflicts. Clean history. Parallel by default.
 
 - :material-shield-check:{ .lg .middle } **Built-in verification**
@@ -97,9 +122,9 @@ bernstein -g "Add JWT auth with refresh tokens, tests, and API docs"
 
 Bernstein is built for the forward-deployed engineering pattern:
 parachute onto a client repo and stand up an AI engineering crew in
-minutes. State lives in `.sdd/` — no server to provision. Per-agent
+minutes. State lives in `.sdd/` - no server to provision. Per-agent
 credential scoping keeps your keys out of the client's environment.
-The 44-adapter spread means the swarm runs on whichever CLI agent
+The broad adapter spread means the swarm runs on whichever CLI agent
 the client already trusts (Claude Code, Codex, Gemini CLI, Aider,
 and more). Every step is an HMAC-signed audit record, replayable
 for client compliance review.
@@ -115,8 +140,8 @@ for client compliance review.
 | :material-api: [API Reference](reference/openapi-reference.md) | Task server REST API |
 | :material-sitemap: [Architecture](architecture/ARCHITECTURE.md) | How Bernstein works under the hood |
 | :material-state-machine: [Lifecycle FSM](architecture/LIFECYCLE.md) | Task and agent state machines with transition tables |
-| :material-text-box-check: [What's New](whats-new.md) | Summary of recent releases (1.9 → 1.10) |
-| :material-history: [Changelog](CHANGELOG.md) | Full release history |
+| :material-text-box-check: [What's New](whats-new.md) | Pointer to per-release notes under `docs/release-notes/` |
+| :material-history: [Release notes](release-notes/unreleased.md) | One page per tagged version, plus what has landed since the newest tag |
 | :material-shield-lock: [Air-gap installation](installation/air-gap.md) | Wheelhouse build, signed verification, `--profile airgap`, deny-all egress |
 
 ## Links

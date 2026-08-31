@@ -11,7 +11,7 @@ Covers:
 - ``--profile airgap`` defaults the policy to deny-all and propagates the
   profile mode via the environment
 
-Tests don't actually fetch from PyPI — they construct a minimal fixture
+Tests don't actually fetch from PyPI - they construct a minimal fixture
 wheelhouse so the round-trip works without network. The build script
 itself is exercised separately when uv is available.
 """
@@ -222,14 +222,14 @@ def test_mcp_sse_transport_allowed_under_loopback_policy(monkeypatch: pytest.Mon
     transport.disconnect()
 
 
-def test_cloudflare_adapter_refused_under_airgap(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_claude_adapter_refused_under_airgap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ENV_NETWORK_POLICY, "none")
-    from bernstein.adapters.cloudflare_agents import CloudflareAgentsAdapter
+    from bernstein.adapters.claude import ClaudeCodeAdapter
 
-    adapter = CloudflareAgentsAdapter()
+    adapter = ClaudeCodeAdapter()
     with pytest.raises(NetworkPolicyDenied) as excinfo:
         adapter.enforce_network_policy()
-    assert "api.cloudflare.com" in str(excinfo.value)
+    assert "api.anthropic.com" in str(excinfo.value)
 
 
 def test_claude_adapter_declares_anthropic_endpoint() -> None:
@@ -340,6 +340,24 @@ def test_sign_script_present() -> None:
     contents = script.read_text()
     assert "cosign" in contents
     assert "MANIFEST" in contents
+
+
+def test_sign_script_keeps_cosign_v3_offline_flags() -> None:
+    """Offline keyed signing must stay compatible with cosign v3.
+
+    cosign v3 defaults ``--use-signing-config`` and
+    ``--new-bundle-format`` to true, which rejects the
+    ``--tlog-upload=false`` + ``--output-signature`` invocation the
+    air-gap path relies on. Dropping either opt-out silently breaks
+    signing on any host with cosign v3 while still passing on v2.4.x,
+    so pin the requirement here rather than only in the real-cosign
+    integration test (which skips when cosign is absent).
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    contents = (repo_root / "scripts" / "sign_airgap_wheelhouse.sh").read_text()
+    assert "--use-signing-config=false" in contents
+    assert "--new-bundle-format=false" in contents
+    assert "--tlog-upload=false" in contents
 
 
 # ---------------------------------------------------------------------------

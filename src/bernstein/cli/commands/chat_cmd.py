@@ -43,17 +43,28 @@ __all__ = ["chat_group"]
 logger = logging.getLogger(__name__)
 
 _DEFAULT_WORKDIR = Path.cwd
-_PLATFORM_CHOICES = ("telegram", "discord", "slack")
+_PLATFORM_CHOICES = ("telegram", "discord", "slack", "teams")
 _ENV_TOKEN_MAP = {
     "telegram": "BERNSTEIN_TELEGRAM_TOKEN",
     "discord": "BERNSTEIN_DISCORD_TOKEN",
     "slack": "BERNSTEIN_SLACK_TOKEN",
+    "teams": "BERNSTEIN_TEAMS_TOKEN",
 }
+
+#: Slack Socket Mode app-level token env var. Bot token (``xoxb-...``) goes
+#: in ``BERNSTEIN_SLACK_TOKEN``; the Socket Mode app token (``xapp-...``)
+#: lives separately so operators can rotate the two independently.
+_SLACK_APP_TOKEN_ENV = "BERNSTEIN_SLACK_APP_TOKEN"
+
+#: Microsoft Teams app-password env var. The app id (``MicrosoftAppId``) goes
+#: in ``BERNSTEIN_TEAMS_TOKEN``; the client secret lives here so operators can
+#: rotate the two independently.
+_TEAMS_APP_PASSWORD_ENV = "BERNSTEIN_TEAMS_APP_PASSWORD"
 
 
 @click.group("chat")
 def chat_group() -> None:
-    """Drive Bernstein agents from Telegram, Discord, or Slack."""
+    """Drive Bernstein agents from Telegram, Discord, Slack, or Microsoft Teams."""
 
 
 @chat_group.command("serve")
@@ -81,12 +92,20 @@ def chat_serve(platform: str, token: str | None, allow: str | None) -> None:
         raise click.UsageError(
             "Telegram requires `bernstein connect telegram`, --token, or $BERNSTEIN_TELEGRAM_TOKEN.",
         )
+    if platform == "discord" and not resolved_token:
+        raise click.UsageError(
+            "Discord requires `--token` or $BERNSTEIN_DISCORD_TOKEN.",
+        )
+    if platform == "teams" and not resolved_token:
+        raise click.UsageError(
+            "Teams requires `--token` (the app id) or $BERNSTEIN_TEAMS_TOKEN.",
+        )
 
     overrides = _split_allow(allow)
     allow_list = load_allow_list(workdir / "bernstein.yaml", cli_override=overrides)
     bindings = BindingStore(workdir)
     driver_cls: Any = load_driver(platform)
-    bridge: BridgeProtocol = driver_cls(resolved_token)
+    bridge: BridgeProtocol = _instantiate_bridge(driver_cls, platform, resolved_token)
     session = ChatSession(bridge, bindings, allow_list, workdir)
     session.install_handlers()
 
@@ -95,9 +114,6 @@ def chat_serve(platform: str, token: str | None, allow: str | None) -> None:
         asyncio.run(session.run_forever())
     except KeyboardInterrupt:
         click.echo("chat: interrupted, shutting down.")
-    except NotImplementedError as exc:
-        click.echo(f"chat: {exc}", err=True)
-        raise SystemExit(2) from exc
 
 
 @chat_group.command("status")
@@ -330,11 +346,11 @@ class ChatSession:
         await self.bridge.send_message(msg.thread_id, "Stop requested. Session will wind down gracefully.")
 
     async def _on_handoff(self, msg: ChatMessage) -> None:
-        """Handle ``/handoff [<token>]`` — emit or claim a resume token (op-005).
+        """Handle ``/handoff [<token>]`` - emit or claim a resume token (op-005).
 
         With no argument, freezes the current thread's binding and emits
         a token. With a token argument, claims it and rebinds this
-        thread to the same session — the live stream will continue to
+        thread to the same session - the live stream will continue to
         flow into the new thread without interrupting any in-flight
         tool calls because the session id is preserved.
         """
@@ -563,14 +579,20 @@ class _ChatTaskRequest:
 
 
 def _write_approval_decision(workdir: Path, approval_id: str, decision: str) -> None:
-    """Write ``<approval_id>.approved`` or ``.rejected`` for the security gate."""
-    approvals_dir = workdir / ".sdd" / "runtime" / "approvals"
-    approvals_dir.mkdir(parents=True, exist_ok=True)
-    suffix = "approved" if decision == "approve" else "rejected"
-    (approvals_dir / f"{approval_id}.{suffix}").write_text(
-        "via chat bridge\n",
-        encoding="utf-8",
-    )
+    """Write ``<approval_id>.approved`` or ``.rejected`` for the security gate.
+
+    The id arrives over a chat bridge, so it goes through the same identifier
+    rule and containment check as every other approvals sink.
+
+    Raises:
+        UnsafeApprovalIdError: The id would escape the approvals directory.
+    """
+    from bernstein.core.orchestration.approval_gate import approval_path
+
+    suffix = ".approved" if decision == "approve" else ".rejected"
+    target = approval_path(workdir, approval_id, suffix)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("via chat bridge\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +628,32 @@ def _resolve_chat_token(platform: str) -> str:
         if resolution.found:
             return resolution.secret
     return os.environ.get(_ENV_TOKEN_MAP[platform], "")
+
+
+def _instantiate_bridge(driver_cls: Any, platform: str, token: str) -> BridgeProtocol:
+    """Construct the driver with platform-appropriate kwargs.
+
+    Telegram and Discord take a single ``token`` positional; Slack
+    additionally needs the Socket Mode app token from
+    ``BERNSTEIN_SLACK_APP_TOKEN``. Surface a clear error rather than
+    instantiating with an empty app token (the driver itself rejects it,
+    but the CLI's message is more actionable).
+    """
+    if platform == "slack":
+        app_token = os.environ.get(_SLACK_APP_TOKEN_ENV, "")
+        if not app_token:
+            raise click.UsageError(
+                f"Slack requires the Socket Mode app token in ${_SLACK_APP_TOKEN_ENV} (in addition to the bot token).",
+            )
+        return driver_cls(token=token, app_token=app_token)
+    if platform == "teams":
+        app_password = os.environ.get(_TEAMS_APP_PASSWORD_ENV, "")
+        if not app_password:
+            raise click.UsageError(
+                f"Teams requires the app password in ${_TEAMS_APP_PASSWORD_ENV} (in addition to the app id).",
+            )
+        return driver_cls(token=token, app_password=app_password)
+    return driver_cls(token)
 
 
 def _extract_quoted_goal(msg: ChatMessage) -> str:

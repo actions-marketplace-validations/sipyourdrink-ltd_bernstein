@@ -1,4 +1,4 @@
-"""Unit tests for ``bernstein.core.replay`` — gateway + diff.
+"""Unit tests for ``bernstein.core.replay`` - gateway + diff.
 
 Covers the MVP slice of issue #1319:
 
@@ -10,8 +10,9 @@ Covers the MVP slice of issue #1319:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
-import threading
+import os
 from pathlib import Path
 
 import pytest
@@ -92,7 +93,7 @@ def test_off_mode_is_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 # ---------------------------------------------------------------------------
-# Record/replay round-trip — mock adapter shape
+# Record/replay round-trip - mock adapter shape
 # ---------------------------------------------------------------------------
 
 
@@ -133,10 +134,12 @@ def test_record_then_replay_produces_identical_outputs(
     assert rec.path.exists()
     lines = rec.path.read_text().splitlines()
     assert len(lines) == 4
-    # Each line is valid JSON with the expected fields.
+    # Each line is valid JSON with the expected fields; keys are scheme-prefixed.
     for raw in lines:
         row = json.loads(raw)
         assert {"seq", "ts", "kind", "key", "response"} <= row.keys()
+        assert isinstance(row["key"], str) and row["key"].startswith("v1:")
+        assert len(row["key"]) == 3 + 64
 
     # --- replay phase ---------------------------------------------------
     monkeypatch.delenv(RECORD_ENV_VAR, raising=False)
@@ -311,11 +314,19 @@ def test_record_is_thread_safe_under_concurrent_dispatch(
             invoke=lambda i=i: {"i": i, "body": big},
         )
 
-    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(40)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    # A bounded pool rather than 40 raw threads: a loaded runner refuses to
+    # start that many, which fails the run for a reason that has nothing to
+    # do with the gateway. Several writers on the lock at once is what the
+    # invariant needs, and the pool still delivers that.
+    workers = min(40, (os.cpu_count() or 2) * 4)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_worker, i) for i in range(40)]
+
+    # result() re-raises a worker's exception here. Without it a failing
+    # worker would surface only as the line-count mismatch below, which
+    # names neither the failure nor the thread it happened on.
+    for fut in futures:
+        fut.result()
 
     # Every line must parse and every seq must be unique + monotonic.
     raw_lines = gw.path.read_text(encoding="utf-8").splitlines()

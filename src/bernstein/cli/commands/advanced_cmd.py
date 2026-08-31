@@ -6,7 +6,7 @@ This module contains advanced/specialized commands (excluding eval/benchmark whi
   mcp_server
   quarantine_group (list, clear)
   completions, live, dashboard
-  ideate, install_hooks, plugins_cmd, doctor, recap, help_all, retro
+  install_hooks, plugins_cmd, doctor, recap, help_all, retro
 
 All commands and groups are registered with the main CLI group in main.py.
 """
@@ -23,10 +23,9 @@ from pathlib import Path
 from typing import Any
 
 import click
-import httpx
 
 from bernstein.cli.helpers import (
-    SERVER_URL,
+    ServerAuthError,
     console,
     find_seed_file,
     print_banner,
@@ -35,6 +34,7 @@ from bernstein.cli.helpers import (
 )
 from bernstein.cli.mcp_cmd import mcp_server as mcp_server  # re-exported for main.py
 from bernstein.core.runtime_state import read_session_replay_metadata
+from bernstein.core.security.sanitize import sanitize_log
 from bernstein.core.traces import TraceStore, build_replay_task_request, render_replay_diff
 from bernstein.core.visual_config import VisualConfig, resolve_visual_config
 
@@ -69,8 +69,8 @@ _STYLE_BOLD_CYAN = "bold cyan"
 def live(interval: float, classic: bool, no_splash: bool) -> None:
     """Live dashboard: active agents, task events, and stats (Ctrl+C to exit).
 
-    Launches the 3-column interactive Textual TUI by default:
-    Agents | Tasks | Activity feed + sparkline + chat input.
+    Launches the two-column interactive Textual TUI by default:
+    Agents | Tasks, with a full-width activity feed + sparkline + chat input below.
     Mouse + keyboard. Pass --classic for the simpler Rich Live display.
     """
     seed_path = find_seed_file()
@@ -109,7 +109,8 @@ def live(interval: float, classic: bool, no_splash: bool) -> None:
 
     (
         LiveView(
-            server_url=SERVER_URL,
+            # No explicit URL: the view resolves the server per request, so a
+            # run on a non-default port is followed rather than missed.
             interval=interval,
         )
     ).run()
@@ -175,37 +176,16 @@ def _build_live_splash_context(seed_path: Path | None, seed_cfg: Any) -> dict[st
 # ---------------------------------------------------------------------------
 
 
-@click.command("dashboard")
-@click.option("--port", default=8052, show_default=True, help="Server port.")
-@click.option("--no-open", is_flag=True, default=False, help="Do not open browser.")
-def dashboard(port: int, no_open: bool) -> None:
-    """Open the web dashboard in your browser.
-
-    Requires the Bernstein server to be running. If it is not,
-    prints instructions on how to start it.
-    """
-    import webbrowser
-
-    url = f"http://localhost:{port}/dashboard"
-    # Check if server is alive
-    try:
-        resp = httpx.get(f"http://localhost:{port}/health", timeout=2.0)
-        if resp.status_code != 200:
-            console.print(
-                f"[red]Server returned {resp.status_code}.[/red]\nStart the server first: [cyan]bernstein run[/cyan]"
-            )
-            sys.exit(1)
-    except httpx.ConnectError:
-        console.print(
-            "[red]Cannot connect to Bernstein server.[/red]\n"
-            f"Start the server first: [cyan]bernstein run[/cyan]\n"
-            f"Then open: [link={url}]{url}[/link]"
-        )
-        sys.exit(1)
-
-    console.print(f"[green]Dashboard:[/green] [link={url}]{url}[/link]")
-    if not no_open:
-        webbrowser.open(url)
+@click.command("dashboard", hidden=True)
+def dashboard() -> None:
+    """The legacy dashboard has been removed in favor of 'bernstein gui serve' (#4395)."""
+    console.print(
+        "[yellow]'bernstein dashboard' has been removed in favor of the GUI surface.[/yellow]\n"
+        "Run [cyan]bernstein gui serve[/cyan] to open the maintained web UI at [cyan]/ui[/cyan].\n"
+        "Note: Requires the GUI extra: [cyan]pip install 'bernstein\\[gui]'[/cyan]\n"
+        "(or [cyan]uv add 'bernstein\\[gui]'[/cyan])."
+    )
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -382,61 +362,6 @@ def help_all(ctx: click.Context) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ideate
-# ---------------------------------------------------------------------------
-
-
-@click.command("ideate")
-@click.option(
-    "--count",
-    "-c",
-    type=int,
-    default=3,
-    show_default=True,
-    help="Number of improvement ideas to generate.",
-)
-@click.option(
-    "--focus",
-    "-f",
-    default=None,
-    help="Focus area (e.g. 'performance', 'testing', 'docs').",
-)
-@click.option(
-    "--as-json",
-    "as_json",
-    is_flag=True,
-    default=False,
-    help="Output raw JSON.",
-)
-def ideate(count: int, focus: str | None, as_json: bool) -> None:
-    """Generate improvement ideas for the project.
-
-    Scans the codebase and generates N actionable improvement proposals.
-    """
-    data = server_get("/ideate")
-    if data is None:
-        from bernstein.cli.errors import server_unreachable
-
-        server_unreachable().print()
-        raise SystemExit(1)
-
-    ideas = data.get("ideas", [])
-    if as_json:
-        console.print_json(json.dumps(ideas[:count]))
-        return
-
-    from rich.panel import Panel
-
-    for i, idea in enumerate(ideas[:count], 1):
-        panel = Panel(
-            idea.get("description", ""),
-            title=f"Idea {i}: {idea.get('title', '')}",
-            border_style="cyan",
-        )
-        console.print(panel)
-
-
-# ---------------------------------------------------------------------------
 # install-hooks
 # ---------------------------------------------------------------------------
 
@@ -481,6 +406,14 @@ exit 0
 # ---------------------------------------------------------------------------
 
 
+_TRUST_COLOURS: dict[str, str] = {
+    "trusted": "green",
+    "verified": "blue",
+    "community": "yellow",
+    "unknown": "red",
+}
+
+
 @click.command("plugins")
 @click.option(
     "--workdir",
@@ -488,11 +421,23 @@ exit 0
     show_default=True,
     help="Project root directory.",
 )
-def plugins_cmd(workdir: str) -> None:
+@click.option(
+    "--trust-details",
+    is_flag=True,
+    default=False,
+    help="Print the full trust assessment panel for every plugin.",
+)
+def plugins_cmd(workdir: str, trust_details: bool) -> None:
     """List and manage Bernstein plugins.
 
     Plugins extend Bernstein with custom agents, roles, and integrations.
+    Each row carries a trust assessment derived from the plugin's own
+    signals - signature file, packaging metadata, README, tests - so an
+    unreviewed plugin is visible before it is loaded.  ``--trust-details``
+    prints the full signal breakdown for each one.
     """
+    from bernstein.plugins.plugin_trust import check_plugin_trust, format_trust_warning
+
     plugins_dir = Path(workdir) / ".bernstein" / "plugins"
     if not plugins_dir.exists():
         console.print("[dim]No plugins directory found.[/dim]")
@@ -504,24 +449,54 @@ def plugins_cmd(workdir: str) -> None:
     table.add_column("Name")
     table.add_column("Version")
     table.add_column("Type")
+    table.add_column("Trust")
+    table.add_column("Score")
+
+    low_trust: list[Any] = []
 
     for plugin_dir in sorted(plugins_dir.glob("*")):
-        if plugin_dir.is_dir():
-            meta_file = plugin_dir / "meta.json"
-            if meta_file.exists():
-                try:
-                    import json as _json
+        if not plugin_dir.is_dir():
+            continue
+        meta_file = plugin_dir / "meta.json"
+        if not meta_file.exists():
+            continue
 
-                    meta = _json.loads(meta_file.read_text())
-                    table.add_row(
-                        plugin_dir.name,
-                        meta.get("version", "?"),
-                        meta.get("type", "custom"),
-                    )
-                except Exception:
-                    table.add_row(plugin_dir.name, "?", "custom")
+        try:
+            meta = json.loads(meta_file.read_text())
+            version = meta.get("version", "?")
+            plugin_type = meta.get("type", "custom")
+        except Exception:
+            version, plugin_type = "?", "custom"
+
+        try:
+            trust = check_plugin_trust(plugin_dir)
+        except OSError as exc:
+            _LOGGER.debug("Trust check failed for %s: %s", plugin_dir.name, exc)
+            table.add_row(plugin_dir.name, version, plugin_type, "[dim]n/a[/dim]", "-")
+            continue
+
+        colour = _TRUST_COLOURS.get(trust.risk_level, "white")
+        table.add_row(
+            plugin_dir.name,
+            version,
+            plugin_type,
+            f"[{colour}]{trust.risk_level}[/{colour}]",
+            f"{trust.trust_score}/100",
+        )
+        if trust.risk_level in ("unknown", "community"):
+            low_trust.append(trust)
 
     console.print(table)
+
+    if trust_details:
+        for trust in low_trust:
+            console.print(format_trust_warning(trust))
+    elif low_trust:
+        names = ", ".join(t.plugin_name for t in low_trust)
+        console.print(
+            f"[yellow]WARNING:[/yellow] limited trust signals for: {names}. "
+            "Review the source before loading; run with --trust-details for the breakdown."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +507,7 @@ def plugins_cmd(workdir: str) -> None:
 @click.group(
     name="doctor",
     invoke_without_command=True,
-    subcommand_metavar="[airgap|sonar|glitchtip|...]",
+    subcommand_metavar="[airgap|observe|...]",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Output raw JSON.")
 @click.option("--fix", "auto_fix", is_flag=True, default=False, help="Attempt to auto-fix issues.")
@@ -543,21 +518,103 @@ def plugins_cmd(workdir: str) -> None:
     default=False,
     help="Print the top curated documentation gaps and exit.",
 )
+@click.option(
+    "--endpoint",
+    "endpoint",
+    default=None,
+    help="Certify an OpenAI-compatible endpoint (base URL, e.g. http://127.0.0.1:11434/v1).",
+)
+@click.option(
+    "--endpoint-model",
+    "endpoint_model",
+    default=None,
+    help="Model id to certify; defaults to the first entry of the endpoint's /models listing.",
+)
+@click.option(
+    "--endpoint-engine",
+    "endpoint_engine",
+    default="",
+    help="Runtime label recorded in the receipt (e.g. ollama, lmstudio, mlx).",
+)
+@click.option(
+    "--endpoint-api-key-env",
+    "endpoint_api_key_env",
+    default=None,
+    help="NAME of the environment variable holding the endpoint's API key (never the key itself).",
+)
+@click.option(
+    "--endpoint-timeout",
+    "endpoint_timeout",
+    type=float,
+    default=60.0,
+    show_default=True,
+    help="Per-probe response budget in seconds; exceeding it fails the probe.",
+)
+@click.option(
+    "--role",
+    "roles",
+    multiple=True,
+    help="Role(s) to evaluate against --endpoint (repeatable). Defaults to the low-stakes local tier.",
+)
+@click.option(
+    "--failover-drill",
+    "failover_drill",
+    is_flag=True,
+    default=False,
+    help="Exercise every declared provider fallback chain; exit non-zero on any broken chain.",
+)
 @click.pass_context
-def doctor(ctx: click.Context, as_json: bool, auto_fix: bool, suggest_docs: bool) -> None:
+def doctor(
+    ctx: click.Context,
+    as_json: bool,
+    auto_fix: bool,
+    suggest_docs: bool,
+    endpoint: str | None,
+    endpoint_model: str | None,
+    endpoint_engine: str,
+    endpoint_api_key_env: str | None,
+    endpoint_timeout: float,
+    roles: tuple[str, ...],
+    failover_drill: bool,
+) -> None:
     """Run self-diagnostics: check Python, adapters, API keys, port, and workspace.
 
     \b
-      bernstein doctor                # print diagnostic report
-      bernstein doctor --json         # machine-readable output
-      bernstein doctor --fix          # attempt to auto-fix issues
-      bernstein doctor --suggest-docs # surface top curated documentation gaps
-      bernstein doctor airgap         # battery of checks for an air-gapped run
-      bernstein doctor sonar          # surface SonarQube insights for the project
-      bernstein doctor glitchtip      # surface GlitchTip issue counts and top unresolved
+      bernstein doctor                  # print diagnostic report
+      bernstein doctor --json           # machine-readable output
+      bernstein doctor --fix            # attempt to auto-fix issues
+      bernstein doctor --suggest-docs   # surface top curated documentation gaps
+      bernstein doctor --endpoint http://127.0.0.1:11434/v1
+                                        # certify a local OpenAI-compatible endpoint per role
+      bernstein doctor --failover-drill # probe every declared provider fallback chain
+      bernstein doctor airgap           # battery of checks for an air-gapped run
     """
     if ctx.invoked_subcommand is not None:
         ctx.obj = {"as_json": as_json, "auto_fix": auto_fix}
+        return
+
+    if endpoint is not None:
+        from bernstein.cli.commands.doctor_cmd import _run_endpoint_certification
+
+        exit_code = _run_endpoint_certification(
+            endpoint=endpoint,
+            model=endpoint_model,
+            engine=endpoint_engine,
+            api_key_env=endpoint_api_key_env,
+            timeout=endpoint_timeout,
+            roles=roles,
+            as_json=as_json,
+        )
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
+    if failover_drill:
+        from bernstein.cli.commands.doctor.failover_drill import run_failover_drill_cli
+
+        exit_code = run_failover_drill_cli(workdir=Path.cwd(), as_json=as_json)
+        if exit_code:
+            raise SystemExit(exit_code)
         return
 
     if suggest_docs:
@@ -569,8 +626,6 @@ def doctor(ctx: click.Context, as_json: bool, auto_fix: bool, suggest_docs: bool
 
         topics = load_unanswered_topics()
         render_suggestions(console, topics, limit=DEFAULT_TOP_N)
-        _maybe_print_sonar_nudge(as_json=as_json)
-        _maybe_print_glitchtip_nudge(as_json=as_json)
         return
 
     from bernstein.cli.doctor.suggest_docs import hint_line
@@ -582,80 +637,14 @@ def doctor(ctx: click.Context, as_json: bool, auto_fix: bool, suggest_docs: bool
     exit_code = 0
     try:
         ctx.invoke(_doctor_impl, as_json=as_json, auto_fix=auto_fix)
-    except SystemExit as exc:
+    except SystemExit as exc:  # NOSONAR python:S5754 - captured to add a hint, re-raised below
         exit_code = int(exc.code or 0)
 
     if not as_json:
         console.print(f"[dim]{hint_line()}[/dim]")
-        _maybe_print_sonar_nudge(as_json=as_json)
-        _maybe_print_glitchtip_nudge(as_json=as_json)
 
     if exit_code:
         raise SystemExit(exit_code)
-
-
-def _maybe_print_sonar_nudge(*, as_json: bool) -> None:
-    """Print a single-line Sonar nudge when thresholds are crossed.
-
-    No-op when Sonar is not configured, the snapshot could not be
-    fetched, or when ``--json`` was requested (the nudge is advisory
-    and must not contaminate machine-readable output). All failures
-    here are swallowed so the doctor never crashes because of a side
-    integration.
-    """
-    if as_json:
-        return
-    try:
-        from bernstein.core.observability.sonar import (
-            collect_insights,
-            evaluate_nudge,
-            load_baseline,
-            load_config,
-        )
-    except Exception:  # pragma: no cover - defensive
-        return
-    config = load_config()
-    if config is None:
-        return
-    try:
-        insights = collect_insights(config)
-    except Exception:  # pragma: no cover - defensive
-        return
-    if not insights.fetched:
-        return
-    nudge = evaluate_nudge(insights, load_baseline())
-    if not nudge.should_nudge:
-        return
-    summary = "; ".join(nudge.reasons)
-    console.print(
-        f"[dim yellow]Sonar nudge: {summary}. Run `bernstein doctor sonar` for the full surface.[/dim yellow]"
-    )
-
-
-def _maybe_print_glitchtip_nudge(*, as_json: bool) -> None:
-    """Print a single-line GlitchTip nudge when new unresolved issues exist.
-
-    No-op when ``--json`` was requested (advisory output must not leak
-    into machine-readable streams), when ``BERNSTEIN_GLITCHTIP_TOKEN``
-    is not set, or when there is no delta against the cached baseline.
-    All exceptions are swallowed so the doctor command never crashes
-    because of a side integration.
-    """
-    if as_json:
-        return
-    try:
-        from bernstein.cli.commands.doctor.glitchtip import suggest_nudge_line
-    except ImportError:  # pragma: no cover - defensive
-        return
-    try:
-        line = suggest_nudge_line()
-    except Exception:  # pragma: no cover - defensive
-        # Log unexpected failures so we can diagnose regressions, but never
-        # raise: the nudge is advisory and must not crash `bernstein doctor`.
-        _LOGGER.warning("GlitchTip nudge failed", exc_info=True)
-        return
-    if line:
-        console.print(f"[dim yellow]{line}[/dim yellow]")
 
 
 @doctor.command("airgap")
@@ -680,6 +669,33 @@ def doctor_airgap_cmd(ctx: click.Context) -> None:
     parent = ctx.obj if isinstance(ctx.obj, dict) else {}
     as_json = bool(parent.get("as_json", False))
     raise SystemExit(run_doctor_airgap(workdir=Path.cwd(), as_json=as_json))
+
+
+@doctor.command("sovereign")
+@click.pass_context
+def doctor_sovereign_cmd(ctx: click.Context) -> None:
+    """Run the battery of sovereign-profile self-checks.
+
+    \b
+    Checks the composed residency posture activated by --profile sovereign:
+      - sovereign profile is the active entry point
+      - network egress denies every destination by default (airgap posture)
+      - runtime socket guard is active
+      - storage backend keeps artifacts on local disk
+      - catalog is offline (no enabled sources)
+      - residency enforcement is strict and EU-only
+      - every gated remote endpoint carries a verified certification receipt
+      - the posture is attested and the live posture has not drifted
+      - audit chain HMAC is intact
+
+    Renders the live posture hash against the chain-anchored attestation.
+    Exit code is 0 only when every check passes.
+    """
+    from bernstein.cli.commands.doctor_sovereign_cmd import run_doctor_sovereign
+
+    parent = ctx.obj if isinstance(ctx.obj, dict) else {}
+    as_json = bool(parent.get("as_json", False))
+    raise SystemExit(run_doctor_sovereign(workdir=Path.cwd(), as_json=as_json))
 
 
 @doctor.command("scoping")
@@ -712,7 +728,7 @@ def doctor_scoping_cmd(ctx: click.Context, agent_id: str, role: str) -> None:
     parent = ctx.obj if isinstance(ctx.obj, dict) else {}
     as_json = bool(parent.get("as_json", False))
 
-    # Resolve without installing — doctor must not mutate process state.
+    # Resolve without installing - doctor must not mutate process state.
     policy = resolve_default_policy(workdir=Path.cwd(), install=False)
     inherited = [k for k in os.environ if "API" in k or "TOKEN" in k or "KEY" in k]
     snapshot = explain_policy_for_agent(
@@ -890,80 +906,66 @@ def doctor_promptware_scan_cmd(
     )
 
 
-@doctor.command("sonar")
-@click.option(
-    "--json",
-    "as_json_flag",
-    is_flag=True,
-    default=False,
-    help="Emit JSON instead of the Rich table.",
-)
-@click.option(
-    "--smell-threshold",
-    "smell_threshold",
-    type=int,
-    default=None,
-    help="Override the default code-smell nudge threshold (50).",
-)
-@click.option(
-    "--no-update-baseline",
-    "no_update_baseline",
-    is_flag=True,
-    default=False,
-    help="Do not write the current snapshot to the baseline file.",
-)
-@click.pass_context
-def doctor_sonar_cmd(
-    ctx: click.Context,
-    as_json_flag: bool,
-    smell_threshold: int | None,
-    no_update_baseline: bool,
-) -> None:
-    """Surface SonarQube insights for the current project.
-
-    \b
-    Reads SONAR_HOST_URL and SONAR_TOKEN from the environment, then
-    fetches:
-      - coverage % (line coverage as reported by Sonar)
-      - code smells total and counts by severity
-      - bugs, vulnerabilities, security hotspots
-      - cognitive complexity hotspots (top 5 files)
-
-    \b
-    Soft-fails (exit 0) when env vars are not set or the server is
-    unreachable. Use --json to pipe the snapshot into other tools.
-    """
-    from bernstein.cli.commands.doctor_sonar_cmd import (
-        DEFAULT_SMELL_NUDGE,
-        run_doctor_sonar,
-    )
-
-    parent = ctx.obj if isinstance(ctx.obj, dict) else {}
-    inherited_json = bool(parent.get("as_json", False))
-    threshold = smell_threshold if smell_threshold is not None else DEFAULT_SMELL_NUDGE
-    raise SystemExit(
-        run_doctor_sonar(
-            as_json=as_json_flag or inherited_json,
-            smell_threshold=threshold,
-            update_baseline=not no_update_baseline,
-        )
-    )
-
-
-# Attach the GlitchTip insights subcommand to the existing ``doctor`` group.
-# Registration runs at import time so ``bernstein doctor glitchtip`` is
-# wired without circular imports between the per-backend module and the
-# group definition above.
-from bernstein.cli.commands.doctor.glitchtip import (  # noqa: E402
-    register as _register_doctor_glitchtip,
-)
-
-_register_doctor_glitchtip(doctor)
-
-
 # ---------------------------------------------------------------------------
 # recap
 # ---------------------------------------------------------------------------
+
+_DURATION_UNITS: dict[str, int] = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(spec: str) -> float:
+    """Parse a duration like ``90s``, ``45m``, ``6h``, ``2d`` into seconds.
+
+    A bare number is read as minutes, matching how operators usually phrase
+    "how long was I away".
+
+    Args:
+        spec: Duration string.
+
+    Returns:
+        Duration in seconds.
+
+    Raises:
+        click.BadParameter: If *spec* is not a positive duration.
+    """
+    text = spec.strip().lower()
+    if not text:
+        raise click.BadParameter("duration cannot be empty")
+    unit = _DURATION_UNITS.get(text[-1])
+    number = text[:-1] if unit is not None else text
+    multiplier = unit if unit is not None else 60
+    try:
+        value = float(number)
+    except ValueError:
+        raise click.BadParameter(f"not a duration: {spec!r} (try 45m, 6h, 2d)") from None
+    if value <= 0:
+        raise click.BadParameter(f"duration must be positive: {spec!r}")
+    return value * multiplier
+
+
+def _recap_since(since: str, workdir: str, *, as_json: bool) -> None:
+    """Render the workspace-local "since you were away" report."""
+    from bernstein.tui.away_summary import format_away_report, generate_away_summary
+
+    seconds = parse_duration(since)
+    root = Path(workdir).resolve()
+    summary = generate_away_summary(time.time() - seconds, root)
+
+    if as_json:
+        console.print_json(
+            json.dumps(
+                {
+                    "completed_tasks": summary.completed_tasks,
+                    "failed_tasks": summary.failed_tasks,
+                    "cost_spent": summary.cost_spent,
+                    "duration_s": summary.duration_s,
+                    "events": summary.events,
+                }
+            )
+        )
+        return
+
+    console.print(format_away_report(summary))
 
 
 @click.command("recap")
@@ -974,18 +976,44 @@ _register_doctor_glitchtip(doctor)
     help="Path to task archive.",
 )
 @click.option(
+    "--since",
+    default=None,
+    help="Report only what happened in the last DURATION (e.g. 45m, 6h, 2d) from workspace files, without a server.",
+)
+@click.option(
+    "--workdir",
+    default=".",
+    show_default=True,
+    type=click.Path(),
+    help="Project root (parent of .sdd/); used with --since.",
+)
+@click.option(
     "--as-json",
     "as_json",
     is_flag=True,
     default=False,
     help="Output raw JSON.",
 )
-def recap(archive: str, as_json: bool) -> None:
+def recap(archive: str, since: str | None, workdir: str, as_json: bool) -> None:
     """Post-run summary: tasks, pass/fail, cost.
 
     Reads the task archive and prints a summary of what happened.
+
+    With ``--since`` the summary is built from the workspace's own
+    ``.sdd/`` metrics and task journal instead of the task server, so it
+    still answers "what happened while I was away" after the run has ended.
     """
-    data = server_get("/recap")
+    if since is not None:
+        _recap_since(since, workdir, as_json=as_json)
+        return
+
+    try:
+        data = server_get("/recap", raise_on_auth_error=True)
+    except ServerAuthError:
+        from bernstein.cli.errors import server_rejected_credentials
+
+        server_rejected_credentials().print()
+        raise SystemExit(1) from None
     if data is None:
         from bernstein.cli.errors import server_unreachable
 
@@ -1222,11 +1250,380 @@ def trace_reindex_cmd(ctx: click.Context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# trace project / verify-projection -- signed OTel span set from the journal
+# ---------------------------------------------------------------------------
+
+#: Default local JSONL store for projected OTLP spans. The projection emits
+#: here even with no OTLP endpoint set (issue #2300, AC5).
+_OTEL_PROJECTION_SUFFIX = ".otel.json"
+
+
+def _journal_path_for_run(root: Path, run_id: str) -> Path:
+    from bernstein.core.replay.journal import run_journal_path
+
+    return run_journal_path(root / ".sdd", run_id)
+
+
+def _projection_dest(root: Path, run_id: str) -> Path:
+    return root / ".sdd" / "runs" / run_id / f"projection{_OTEL_PROJECTION_SUFFIX}"
+
+
+@trace_cmd.command("project")
+@click.argument("run_id")
+@click.option(
+    "--workdir",
+    "-w",
+    type=click.Path(file_okay=False, exists=True),
+    default=".",
+    show_default=True,
+    help="Project root containing .sdd/.",
+)
+@click.option(
+    "--no-genai-stability",
+    "no_stability",
+    is_flag=True,
+    default=False,
+    help="Omit the (Development-stage) GenAI convention attributes; ids stay journal-anchored.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit the signed projection to stdout as JSON instead of writing a file.",
+)
+def trace_project_cmd(run_id: str, workdir: str, no_stability: bool, as_json: bool) -> None:
+    """Project ``RUN_ID``'s event journal into a signed OTel span set.
+
+    Span ids are derived from journal entry hashes, so two replays export a
+    byte-identical id tree; the set is signed with the install identity. The
+    projection is written to the local JSONL store even with no OTLP endpoint
+    set (issue #2300).
+
+    Exit codes: 0 = written, 1 = no journal / bad input.
+    """
+    from bernstein.cli.commands.credential_cmd import (
+        _load_or_create_install_key,
+        _signing_key_path,
+    )
+    from bernstein.core.observability.otel_projection import (
+        ProjectionError,
+        canonical_projection_bytes,
+        project_spans,
+        projection_to_dict,
+        sign_projection,
+    )
+    from bernstein.core.replay.journal import load_events
+
+    root = Path(workdir).resolve()
+    journal_path = _journal_path_for_run(root, run_id)
+    events = load_events(journal_path).events
+    if not events:
+        raise click.ClickException(
+            f"no event journal for run {sanitize_log(run_id)} at {sanitize_log(str(journal_path))}",
+        )
+
+    key = _load_or_create_install_key(_signing_key_path(root))
+    from bernstein.core.security.audit_dsse import keyid_from_public_key
+
+    try:
+        projection = project_spans(
+            events,
+            run_id=run_id,
+            genai_stability=not no_stability,
+            keyid=keyid_from_public_key(key.public_key()),
+        )
+    except ProjectionError as exc:
+        raise click.ClickException(sanitize_log(str(exc))) from exc
+
+    signed = sign_projection(projection, signing_key=key)
+    doc = json.dumps(projection_to_dict(signed), sort_keys=True, indent=2)
+
+    if as_json:
+        click.echo(doc)
+        return
+
+    _record_otel_projection_event(
+        root,
+        run_id=run_id,
+        journal_head=str(events[-1].get("event_hash", "")),
+        trace_id=signed.trace_id,
+        span_count=len(signed.spans),
+        projection_bytes=canonical_projection_bytes(signed),
+    )
+
+    dest = _projection_dest(root, run_id)
+    dest.write_text(doc, encoding="utf-8")
+    console.print(
+        f"[green]OK[/green] -- wrote signed OTel projection {sanitize_log(str(dest))} "
+        f"(trace {signed.trace_id[:16]}, {len(signed.spans)} spans)"
+    )
+
+
+@trace_cmd.command("export")
+@click.argument("run_id", required=False)
+@click.option(
+    "--out",
+    "-o",
+    "output",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the trust record to PATH instead of stdout.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit the canonical JSON form (same as default output).",
+)
+@click.option(
+    "--last",
+    "latest",
+    is_flag=True,
+    default=False,
+    help="Use the most recently finished run in .sdd/runs/.",
+)
+@click.option(
+    "--sdd-dir",
+    "sdd_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Path to .sdd/ directory.",
+)
+def trace_export_cmd(
+    run_id: str | None,
+    output: str | None,
+    as_json: bool,
+    latest: bool,
+    sdd_dir: str | None,
+) -> None:
+    """Export ``RUN_ID``'s execution evidence as a TRACE 0.2 Trust Record.
+
+    \b
+    bernstein trace export <RUN_ID> [--out PATH] [--json] [--last]
+
+    The record is a signed JWT-style JSON blob (Ed25519) proving the
+    journal chain is intact and binding the run to the install identity.
+    It is generated entirely offline using local signing keys.
+
+    \b
+    --last: find the newest finished run in .sdd/runs/ (a directory with
+            a non-empty journal.jsonl), sorted by modification time.
+    --out: write the canonical JSON string to a file. Default is stdout.
+    --json: emit the canonical JSON form (identical to the default).
+    --sdd-dir: explicit .sdd/ path; defaults to ./.sdd/ or ./.
+
+    Exit codes: 0 = exported, 1 = run not found / chain broken / emit error.
+    """
+    # Gate on trace extra
+    try:
+        import agentrust_trace as _trace_lib  # type: ignore[import-untyped,unused-ignore]
+
+        del _trace_lib
+    except ImportError:
+        console.print("[red]The trace extra is required:[/red] pip install bernstein[trace]")
+        raise SystemExit(1) from None
+
+    # Resolve SDD_DIR
+    if sdd_dir:
+        sdd_path = Path(sdd_dir)
+    else:
+        cwd = Path.cwd()
+        sdd_path = cwd / ".sdd" if (cwd / ".sdd").exists() else Path(".sdd")
+
+    # Resolve run_id
+    if latest:
+        runs_dir = sdd_path / "runs"
+        if not runs_dir.exists():
+            console.print(f"[red]No runs directory:[/red] {runs_dir}")
+            raise SystemExit(1)
+
+        candidate_dirs: list[Path] = []
+        from bernstein.core.replay.journal import contained_run_journal
+
+        for item in runs_dir.iterdir():
+            if item.is_dir():
+                journal_file = contained_run_journal(runs_dir, item.name, "journal.jsonl")
+                if journal_file is not None and journal_file.exists() and journal_file.stat().st_size > 0:
+                    candidate_dirs.append(item)
+
+        if not candidate_dirs:
+            console.print(f"[yellow]No finished runs found under[/yellow] {runs_dir}")
+            raise SystemExit(1)
+
+        latest_dir = max(candidate_dirs, key=lambda p: p.stat().st_mtime_ns)
+        target_run_id = latest_dir.name
+    else:
+        if not run_id:
+            console.print("[red]Usage:[/red] bernstein trace export <RUN_ID> [--out PATH] [--json] [--last]")
+            raise SystemExit(2)
+        target_run_id = run_id
+
+    # Locate and verify the journal
+    from bernstein.core.replay.journal import JournalPathError, run_journal_path, verify_journal
+
+    try:
+        journal_path = run_journal_path(sdd_path, target_run_id)
+    except JournalPathError:
+        console.print(f"[red]No such run:[/red] {target_run_id}")
+        raise SystemExit(1) from None
+
+    if not journal_path.exists():
+        console.print(f"[red]No such run:[/red] {target_run_id}")
+        raise SystemExit(1)
+
+    try:
+        verification = verify_journal(journal_path)
+    except Exception as e:
+        console.print(f"[red]Failed to verify journal:[/red] {e}")
+        raise SystemExit(1) from e
+
+    if not verification.chain_consistent:
+        console.print(f"[red]Journal chain does not verify:[/red] {target_run_id}")
+        raise SystemExit(1)
+
+    # Emit the trust record
+    from bernstein.core.observability.trust_record import TrustRecordEmitter
+
+    emitter = TrustRecordEmitter()
+    try:
+        trust_record_json = emitter.emit_trust_record(
+            journal_path=journal_path,
+            run_id=target_run_id,
+            exec_id=target_run_id,
+        )
+    except Exception as e:
+        console.print(f"[red]Failed to emit trust record:[/red] {e}")
+        raise SystemExit(1) from e
+
+    # Output
+    if output:
+        Path(output).write_text(trust_record_json, encoding="utf-8")
+        console.print(f"[green]Exported trace to:[/green] {output}")
+    else:
+        click.echo(trust_record_json)
+
+
+@trace_cmd.command("verify-projection")
+@click.argument("run_id")
+@click.option(
+    "--workdir",
+    "-w",
+    type=click.Path(file_okay=False, exists=True),
+    default=".",
+    show_default=True,
+    help="Project root containing .sdd/.",
+)
+@click.option(
+    "--projection",
+    "projection_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Projection path (defaults to .sdd/runs/<run>/projection.otel.json).",
+)
+def trace_verify_projection_cmd(run_id: str, workdir: str, projection_path: str | None) -> None:
+    """Verify ``RUN_ID``'s signed projection and authenticated audit binding.
+
+    Rejects a span whose id was altered or whose journal entry hash is absent
+    from the chain, confirms the install signature, and authenticates the full
+    projection digest against the ``otel.projection`` audit event.
+
+    Exit codes: 0 = OK, 1 = could not be evaluated, 2 = verification failed.
+    """
+    from bernstein.cli.commands._otel_projection_audit import verify_and_render_projection
+    from bernstein.cli.commands.credential_cmd import (
+        _load_or_create_install_key,
+        _signing_key_path,
+    )
+    from bernstein.core.observability.otel_projection import (
+        ProjectionError,
+        projection_from_dict,
+    )
+    from bernstein.core.replay.journal import JournalParseError, load_events
+
+    root = Path(workdir).resolve()
+    try:
+        events = load_events(_journal_path_for_run(root, run_id), strict=True).events
+    except JournalParseError as exc:
+        # A verifier attests over the journal on disk, not a filtered
+        # sequence: a malformed row is exactly the corruption a verifier
+        # exists to surface, so refuse rather than verify a partial view.
+        console.print(f"[red]Journal corrupted:[/red] {sanitize_log(str(exc))}; refusing to verify a filtered sequence")
+        raise SystemExit(1) from exc
+    if not events:
+        console.print(f"[red]No event journal for run[/red] {sanitize_log(run_id)}")
+        raise SystemExit(1)
+
+    mpath = Path(projection_path) if projection_path is not None else _projection_dest(root, run_id)
+    if not mpath.exists():
+        console.print(f"[red]No projection at[/red] {sanitize_log(str(mpath))}")
+        raise SystemExit(1)
+
+    try:
+        payload = json.loads(mpath.read_text(encoding="utf-8"))
+        projection = projection_from_dict(payload)
+    except (OSError, ValueError, ProjectionError) as exc:
+        console.print(f"[red]Cannot read projection:[/red] {sanitize_log(str(exc))}")
+        raise SystemExit(1) from exc
+
+    public_key = _load_or_create_install_key(_signing_key_path(root)).public_key()
+    exit_code = verify_and_render_projection(
+        console,
+        root,
+        run_id=run_id,
+        projection=projection,
+        journal_events=events,
+        public_key=public_key,
+    )
+    raise SystemExit(exit_code)
+
+
+def _record_otel_projection_event(
+    root: Path,
+    *,
+    run_id: str,
+    journal_head: str,
+    trace_id: str,
+    span_count: int,
+    projection_bytes: bytes,
+) -> None:
+    """Best-effort append of an ``otel.projection`` audit-chain event.
+
+    A verifier holding the journal reprojects byte-identically and confirms the
+    exported spans faithfully project the chain. Failure to record must not
+    abort the emit -- the projection file is the primary artifact.
+    """
+    import hashlib
+
+    try:
+        from bernstein.core.security.audit import load_or_create_audit_key
+        from bernstein.core.security.audit_chain import (
+            AuditChainStore,
+            record_otel_projection,
+        )
+
+        chain = AuditChainStore(root / ".sdd" / "audit", key=load_or_create_audit_key())
+        record_otel_projection(
+            chain=chain,
+            run_id=run_id,
+            journal_head=journal_head,
+            trace_id=trace_id,
+            span_count=span_count,
+            projection_sha256=hashlib.sha256(projection_bytes).hexdigest(),
+        )
+    except Exception as exc:  # pragma: no cover - defensive; emit is primary
+        _LOGGER.warning("otel projection audit record failed: %s", sanitize_log(str(exc)))
+
+
+# ---------------------------------------------------------------------------
 # replay
 # ---------------------------------------------------------------------------
 
 
-_REPLAY_JSONL = "replay.jsonl"
+#: Canonical per-run event journal filename (issue #2293). The old
+#: ``replay.jsonl`` recorder was consolidated into ``journal.jsonl``.
+_REPLAY_JSONL = "journal.jsonl"
 
 
 def _replay_print_header(
@@ -1266,8 +1663,14 @@ def _replay_find_run_dirs(runs_dir: Path) -> list[Path]:
     """Return sorted list of run directories that contain replay logs."""
     if not runs_dir.exists():
         return []
+    from bernstein.core.replay.journal import contained_run_journal
+
+    def _has_journal(d: Path) -> bool:
+        journal = contained_run_journal(runs_dir, d.name, _REPLAY_JSONL)
+        return journal is not None and journal.exists()
+
     return sorted(
-        (d for d in runs_dir.iterdir() if d.is_dir() and (d / _REPLAY_JSONL).exists()),
+        (d for d in runs_dir.iterdir() if d.is_dir() and _has_journal(d)),
         key=lambda d: d.name,
         reverse=True,
     )
@@ -1291,18 +1694,22 @@ def _replay_list_runs(runs_dir: Path) -> None:
     table.add_column("SHA")
     table.add_column("Events", justify="right")
     table.add_column("Size", justify="right")
+    from bernstein.core.replay.journal import contained_run_journal
+
     for d in run_dirs:
-        replay_file = d / _REPLAY_JSONL
+        replay_file = contained_run_journal(runs_dir, d.name, _REPLAY_JSONL)
+        if replay_file is None:
+            continue
         event_count = sum(1 for line in replay_file.read_text().splitlines() if line.strip())
         size_kb = replay_file.stat().st_size / 1024
         metadata = read_session_replay_metadata(d)
-        started = "—"
-        branch = "—"
-        sha = "—"
+        started = "-"
+        branch = "-"
+        sha = "-"
         if metadata is not None:
             started = dt.datetime.fromtimestamp(metadata.started_at).strftime("%Y-%m-%d %H:%M")
-            branch = metadata.git_branch or "—"
-            sha = metadata.git_sha[:8] if metadata.git_sha else "—"
+            branch = metadata.git_branch or "-"
+            sha = metadata.git_sha[:8] if metadata.git_sha else "-"
         table.add_row(d.name, started, branch, sha, str(event_count), f"{size_kb:.1f} KB")
     console.print(table)
 
@@ -1319,8 +1726,19 @@ def _replay_resolve_latest(runs_dir: Path) -> str:
 
 
 def _should_use_run_replay(run_id: str, runs_dir: Path) -> bool:
-    """Return whether replay should use the legacy run-event mode."""
-    return run_id in {"list", "latest"} or (runs_dir / run_id / _REPLAY_JSONL).exists()
+    """Return whether replay should use the legacy run-event mode.
+
+    A run id that escapes ``runs_dir`` is reported as absent rather than
+    probed, so the traversal never reaches the filesystem.
+    """
+    from bernstein.core.security.path_containment import PathContainmentError, contained_path
+
+    if run_id in {"list", "latest"}:
+        return True
+    try:
+        return contained_path(runs_dir, run_id, _REPLAY_JSONL, label="run id").exists()
+    except PathContainmentError:
+        return False
 
 
 def _wait_for_replay_completion(
@@ -1385,7 +1803,7 @@ def _replay_run_impl(
     model: str | None,
     extra_context: str | None,
 ) -> None:
-    """Body of ``bernstein replay <run_id>`` — replay one run.
+    """Body of ``bernstein replay <run_id>`` - replay one run.
 
     Extracted so the new ``replay`` :class:`click.Group` can dispatch to
     it from its top-level invocation while also exposing subcommands
@@ -1406,7 +1824,7 @@ def _replay_run_impl(
     if run_id == "latest":
         run_id = _replay_resolve_latest(runs_dir)
 
-    replay_path = runs_dir / run_id / _REPLAY_JSONL
+    replay_path = _resolve_journal_path(run_id, runs_dir)
     if not replay_path.exists():
         console.print(f"[red]Replay log not found:[/red] {replay_path}")
         console.print("[dim]Use 'bernstein replay list' to see available runs.[/dim]")
@@ -1497,6 +1915,19 @@ def _replay_run_impl(
             detail_parts.append(f"failed: {', '.join(ev['failed_signals'][:3])}")
         if ev.get("tick"):
             detail_parts.append(f"tick #{ev['tick']}")
+        # Add endpoint identity for agent_spawned events
+        if event_name == "agent_spawned":
+            adapter = ev.get("endpoint_adapter_name")
+            model = ev.get("endpoint_model")
+            base_url = ev.get("endpoint_base_url")
+            profile = ev.get("endpoint_profile_name")
+            if adapter and model:
+                adapter_model = f"{adapter} {model}"
+                if base_url:
+                    adapter_model += f"  {base_url}"
+                if profile:
+                    adapter_model += f"  {profile}"
+                detail_parts.append(adapter_model)
         detail = "  ".join(detail_parts)
 
         table.add_row(
@@ -1512,6 +1943,253 @@ def _replay_run_impl(
     # Footer with fingerprint
     console.print(f"\n[dim]SHA-256 fingerprint:[/dim] [bold]{fingerprint}[/bold]")
     console.print("[dim]This fingerprint proves the exact sequence of events in this run.[/dim]")
+
+
+def _resolve_journal_path(run_id: str, runs_dir: Path) -> Path:
+    """Resolve a run id (or ``latest``) to its canonical journal path.
+
+    Contained under ``runs_dir``: the id reaches here straight from argv.
+    """
+    from bernstein.core.security.path_containment import contained_path
+
+    if run_id == "latest":
+        run_id = _replay_resolve_latest(runs_dir)
+    return contained_path(runs_dir, run_id, _REPLAY_JSONL, label="run id")
+
+
+def _replay_sealed_journal_head(*, run_id: str, sdd_dir: str) -> str | None:
+    """Look up the run's journal-head seal from the lineage spine, if any.
+
+    A finalized run writes its journal head into the lineage spine at
+    completion (``seal_journal_into_spine``, issue #2293 AC5); a fresh run's
+    single spine entry *is* that seal. Returns the sealed head hash, or
+    ``None`` when the run has no spine, the spine's HMAC chain does not
+    verify (so nothing it carries can be trusted), or the audit key needed to
+    check that chain is not configured -- every one of those is exactly the
+    "no seal to check against" case, so callers fall back to the existing
+    ``unverifiable`` verdict rather than erroring (issue #4203).
+    """
+    from bernstein.core.lineage.spine import JOURNAL_SEAL_STEP_PREFIX, LineageSpine, SpineStatus
+    from bernstein.core.security.audit import AuditKeyMissingError, load_audit_key
+
+    lineage_root = Path(sdd_dir) / "lineage"
+    spine_path = lineage_root / run_id / "spine.jsonl"
+    if not spine_path.exists():
+        return None
+    try:
+        hmac_key = load_audit_key()
+    except AuditKeyMissingError:
+        return None
+
+    spine = LineageSpine(lineage_root, run_id=run_id, hmac_key=hmac_key)
+    if spine.verify().status is SpineStatus.TAMPERED:
+        return None
+
+    head = ""
+    for entry in spine.iter_entries():
+        if entry.step_id.startswith(JOURNAL_SEAL_STEP_PREFIX):
+            head = entry.step_id.removeprefix(JOURNAL_SEAL_STEP_PREFIX)
+    return head or None
+
+
+def _replay_verify_journal(*, run_id: str, sdd_dir: str, as_json: bool) -> None:
+    """Recompute the journal head and report the first divergent step.
+
+    On an intact journal, reports chain consistency, reader coverage, and the
+    external-identity verdict. When a sealed run's spine records a
+    journal-head seal, the recomputed head and event count are checked
+    against it and the identity verdict is ``verified`` or a loud
+    ``mismatched`` -- never the weaker ``unverifiable``, which stays reserved
+    for a run with no seal to check against (issue #4203). When a step
+    diverges, writes a ``divergence_report.json`` artifact listing
+    ``(step_index, expected_hash, actual_hash)`` and exits non-zero
+    (issue #2293, AC2).
+
+    Flagged provider-side mutation entries (a mutation that arrived in
+    deterministic mode despite suppression being requested) fail
+    verification closed even when the chain itself is intact
+    (issue #2507).
+    """
+    from bernstein.core.replay.journal import JournalIdentityStatus, JournalSeal, verify_journal
+
+    runs_dir = Path(sdd_dir) / "runs"
+    journal_path = _resolve_journal_path(run_id, runs_dir)
+    if not journal_path.exists():
+        console.print(f"[red]Journal not found:[/red] {journal_path}")
+        raise SystemExit(1)
+
+    resolved_run_id = _replay_resolve_latest(runs_dir) if run_id == "latest" else run_id
+    sealed_head = _replay_sealed_journal_head(run_id=resolved_run_id, sdd_dir=sdd_dir)
+    seal = None
+    if sealed_head is not None:
+        # The seal records only the head (in the spine entry's step_id), not
+        # an event count. A head recomputed over the journal's Merkle chain
+        # folds each step's index into its hash, so a head match already
+        # cryptographically commits to the exact event count it was computed
+        # over -- there is no journal state that reaches the sealed head with
+        # a different count. Feeding the just-recomputed count back in as the
+        # seal's count is therefore sound: the comparison that actually does
+        # the work is the head, not this.
+        seal = JournalSeal(head=sealed_head, event_count=verify_journal(journal_path).count)
+
+    result = verify_journal(journal_path, seal=seal)
+    if result.chain_consistent and not result.discarded_line_indices:
+        _fail_on_flagged_provider_mutations(run_id=run_id, journal_path=journal_path, as_json=as_json)
+        if result.identity is JournalIdentityStatus.MISMATCHED:
+            _print_identity_mismatch(run_id=run_id, result=result, as_json=as_json)
+            return
+        if as_json:
+            console.print_json(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "chain_consistent": True,
+                        "coverage": result.coverage.value,
+                        "identity": result.identity.value,
+                        "count": result.count,
+                        "unauthenticated_fields": result.unauthenticated_fields,
+                    }
+                )
+            )
+        else:
+            console.print(
+                f"[green]CHAIN INTACT[/green] for [bold]{run_id}[/bold] ({result.count} steps); "
+                f"identity={result.identity.value}"
+            )
+            if result.unauthenticated_fields:
+                console.print(f"unauthenticated fields: {', '.join(result.unauthenticated_fields)}")
+        return
+
+    report = {
+        "run_id": run_id,
+        "step_index": result.divergent_index,
+        "expected_hash": result.expected_hash,
+        "actual_hash": result.actual_hash,
+    }
+    report_path = journal_path.parent / "divergence_report.json"
+    with contextlib.suppress(OSError):
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    _print_verify_divergence(run_id=run_id, result=result, report=report, report_path=report_path, as_json=as_json)
+
+
+def _fail_on_flagged_provider_mutations(*, run_id: str, journal_path: Path, as_json: bool) -> None:
+    """Exit non-zero when the journal holds flagged mutation entries (#2507).
+
+    A flagged ``provider_state_mutation`` entry records a provider-side
+    context rewrite that arrived in deterministic mode after suppression
+    was requested. The chain is intact (the mutation was pinned before
+    anything built on it), but the run is not the deterministic run the
+    operator asked for, so verification fails closed instead of silently
+    accepting it.
+    """
+    from bernstein.core.replay.provider_state import verify_provider_state
+
+    state = verify_provider_state(journal_path)
+    if state.ok:
+        return
+    payload = {
+        "run_id": run_id,
+        "verified": False,
+        "reason_code": "provider_state_mutation",
+        "flagged_steps": state.flagged_indices,
+        "errors": state.errors,
+    }
+    if as_json:
+        console.print_json(json.dumps(payload))
+    else:
+        console.print(
+            f"[red]PROVIDER STATE[/red] run [bold]{run_id}[/bold] recorded "
+            f"{len(state.flagged_indices)} flagged provider-side mutation(s) in deterministic mode"
+        )
+        for err in state.errors:
+            console.print(f"[dim]{err}[/dim]")
+    raise SystemExit(1)
+
+
+def _print_identity_mismatch(*, run_id: str, result: Any, as_json: bool) -> None:
+    """Render a sealed run's identity mismatch and exit non-zero (issue #4203).
+
+    The parsed chain still recomputes cleanly from genesis here -- this is a
+    different failure than :func:`_print_verify_divergence` -- but it does
+    not reach the head (and event count) an independent seal committed to,
+    so the run's identity cannot be trusted and must not be reported as the
+    weaker ``unverifiable``.
+    """
+    if as_json:
+        console.print_json(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "chain_consistent": True,
+                    "coverage": result.coverage.value,
+                    "identity": result.identity.value,
+                    "count": result.count,
+                    "errors": result.errors,
+                }
+            )
+        )
+    else:
+        console.print(
+            f"[red]IDENTITY MISMATCH[/red] for [bold]{run_id}[/bold] ({result.count} steps); "
+            "journal does not match its sealed head"
+        )
+        for err in result.errors:
+            console.print(f"  - {err}")
+    raise SystemExit(1)
+
+
+def _print_verify_divergence(
+    *,
+    run_id: str,
+    result: Any,
+    report: dict[str, Any],
+    report_path: Path,
+    as_json: bool,
+) -> None:
+    """Render the chain-divergence outcome and exit non-zero."""
+
+    if as_json:
+        # Add unauthenticated fields to JSON output for consistency.
+        json_report = dict(report)
+        json_report["unauthenticated_fields"] = result.unauthenticated_fields
+        console.print_json(json.dumps(json_report))
+    else:
+        console.print(
+            f"[red]DIVERGENCE[/red] first divergent step [bold]{result.divergent_index}[/bold] "
+            f"in run [bold]{run_id}[/bold]"
+        )
+        console.print(f"[dim]expected:[/dim] {result.expected_hash}")
+        console.print(f"[dim]actual:  [/dim] {result.actual_hash}")
+        console.print(f"[dim]Divergence report written to:[/dim] {report_path}")
+        if result.unauthenticated_fields:
+            console.print(f"unauthenticated fields: {', '.join(result.unauthenticated_fields)}")
+    raise SystemExit(1)
+
+
+def _replay_from_step(*, run_id: str, sdd_dir: str, from_step: int, as_json: bool) -> None:
+    """Rebuild deterministic run state by walking the journal to ``from_step``.
+
+    Two independent invocations produce byte-identical output, so the
+    reconstruction is reproducible (issue #2293, AC4).
+    """
+    from bernstein.core.replay.journal import rebuild_state
+
+    runs_dir = Path(sdd_dir) / "runs"
+    journal_path = _resolve_journal_path(run_id, runs_dir)
+    if not journal_path.exists():
+        console.print(f"[red]Journal not found:[/red] {journal_path}")
+        raise SystemExit(1)
+
+    state = rebuild_state(journal_path, from_step=from_step)
+    if as_json:
+        # Sorted keys + no run-id envelope keeps the output byte-stable
+        # across invocations so replay reconstruction is reproducible.
+        console.print(json.dumps(state, sort_keys=True))
+        return
+    console.print(f"[bold]Rebuilt state for {run_id} through step {state['step_count']}[/bold]")
+    console.print(f"[dim]head:[/dim] {state['head_hash']}")
+    console.print(f"[dim]events:[/dim] {', '.join(state['events'])}")
 
 
 @click.command("replay")
@@ -1541,6 +2219,56 @@ def _replay_run_impl(
     default=None,
     help="Append additional hint text to the replayed task description.",
 )
+@click.option(
+    "--verify",
+    "verify",
+    is_flag=True,
+    default=False,
+    help="Recompute the journal head and report the first divergent step.",
+)
+@click.option(
+    "--from-step",
+    "from_step",
+    type=int,
+    default=None,
+    help="Rebuild deterministic run state by walking the journal to step N.",
+)
+@click.option(
+    "--yes-i-want-to-publish",
+    "yes_i_want_to_publish",
+    is_flag=True,
+    default=False,
+    help="replay publish: confirm writing a redacted receipt outside .sdd/runtime/. "
+    "Only valid with the 'publish' verb; any other verb rejects it.",
+)
+@click.option(
+    "--fork-from",
+    "fork_from",
+    type=int,
+    default=None,
+    help="replay debug: fork-and-reproduce a worktree anchored at parent step N.",
+)
+@click.option(
+    "--jump-to-failure",
+    "jump_to_failure",
+    is_flag=True,
+    default=False,
+    help="replay debug: position output at the diverging seq.",
+)
+@click.option(
+    "--sign",
+    "sign_key",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="replay debug: Ed25519 key path to sign the debug receipt.",
+)
+@click.option(
+    "--full",
+    "full",
+    is_flag=True,
+    default=False,
+    help="replay debug: emit the unbounded step projection (default is capped).",
+)
 def replay_cmd(
     run_id: tuple[str, ...],
     sdd_dir: str,
@@ -1548,11 +2276,18 @@ def replay_cmd(
     limit: int | None,
     model: str | None,
     extra_context: str | None,
+    verify: bool,
+    from_step: int | None,
+    yes_i_want_to_publish: bool,
+    fork_from: int | None,
+    jump_to_failure: bool,
+    sign_key: str | None,
+    full: bool,
 ) -> None:
     """Replay a past orchestration run step-by-step.
 
     \b
-    Reads .sdd/runs/{run_id}/replay.jsonl and displays events in a
+    Reads .sdd/runs/{run_id}/journal.jsonl and displays events in a
     Rich table showing timing, event type, agent, task, and details.
 
     \b
@@ -1564,21 +2299,110 @@ def replay_cmd(
       bernstein replay list                       # list available runs
       bernstein replay latest                     # replay most recent run
       bernstein replay 20240315-143022            # replay a specific run
+      bernstein replay <RUN_ID> --verify          # recompute head, find divergence
+      bernstein replay <RUN_ID> --from-step N     # rebuild state to step N
       bernstein replay diff RUN_A RUN_B           # first-divergence finder
+      bernstein replay <AGENT_ID>                 # per-step journal view (#1799)
+      bernstein replay export <AGENT_ID> [OUT]                          # portable receipt (#1799)
+      bernstein replay publish <AGENT_ID> [OUT] --yes-i-want-to-publish # redacted publish (#1799)
+      bernstein replay verify <RECEIPT>           # offline verifier (#1799)
+      bernstein replay diff-journal A B           # per-step divergence finder
+      bernstein replay repair <RUN_ID>            # truncate a crash-torn tail (#3910)
+      bernstein replay debug <RUN>                # forensic single-chain walk (#2605)
+      bernstein replay debug <LEFT> <RIGHT>       # two-run time-travel path diff
+      bernstein replay debug <RUN> --fork-from N  # fork-and-reproduce at step N
     """
     # ``nargs=-1`` lets us implement the pseudo-subcommand ``diff`` without
     # converting ``replay`` to a full :class:`click.Group` (which would
     # break the back-compat ``bernstein replay <RUN_ID>`` shape).
     args = list(run_id)
+
+    # --yes-i-want-to-publish is declared command-wide (click has no way to
+    # scope an option to one pseudo-subcommand here), so it is reachable on
+    # every verb. Honour it only for ``publish``; anywhere else it is a
+    # named error rather than a silent no-op -- the whole point of this
+    # fix is that an accepted flag must never be quietly ignored (#3976).
+    if yes_i_want_to_publish and not (args and args[0] == "publish"):
+        # Routed through _fail so this refusal is machine-readable too. It is
+        # a refusal the flag fix itself introduced (#3991), and it had no
+        # JSON form at all -- a caller passing --as-json got prose for the
+        # one error most likely to be produced by a script (#3996).
+        from bernstein.cli.commands.replay_cmd import ReplayError, _fail
+
+        raise SystemExit(
+            _fail(
+                as_json=as_json,
+                error=ReplayError["FLAG_NOT_APPLICABLE"],
+                prose=(
+                    "[red]Error:[/red] --yes-i-want-to-publish only applies to "
+                    "'bernstein replay publish'; refusing rather than silently "
+                    "ignoring it here."
+                ),
+                detail=("--yes-i-want-to-publish only applies to 'bernstein replay publish'"),
+                code=2,
+            )
+        )
+
     if args and args[0] == "diff":
         _replay_diff_dispatch(args[1:], sdd_dir=sdd_dir, as_json=as_json)
+        return
+    if args and args[0] == "debug":
+        _replay_debug_dispatch(
+            args[1:],
+            sdd_dir=sdd_dir,
+            as_json=as_json,
+            fork_from=fork_from,
+            jump_to_failure=jump_to_failure,
+            sign_key=sign_key,
+            full=full,
+            limit=limit,
+        )
+        return
+    if args and args[0] in {"export", "publish", "verify", "diff-journal", "repair"}:
+        _replay_journal_dispatch(
+            args,
+            sdd_dir=sdd_dir,
+            as_json=as_json,
+            yes_i_want_to_publish=yes_i_want_to_publish,
+        )
         return
 
     if len(args) != 1:
         console.print(
-            "[red]Usage:[/red] bernstein replay <RUN_ID | latest | list> OR bernstein replay diff RUN_A RUN_B",
+            "[red]Usage:[/red] bernstein replay <RUN_ID | AGENT_ID | latest | list> "
+            "OR bernstein replay diff RUN_A RUN_B "
+            "OR bernstein replay export|publish|verify|diff-journal ...",
         )
         raise SystemExit(2)
+
+    # --verify / --from-step operate on the canonical run event journal
+    # (issue #2293): recompute the Merkle head and locate divergence, or
+    # rebuild a deterministic state projection for a prefix of the run.
+    if verify:
+        _replay_verify_journal(run_id=args[0], sdd_dir=sdd_dir, as_json=as_json)
+        return
+    if from_step is not None:
+        _replay_from_step(run_id=args[0], sdd_dir=sdd_dir, from_step=from_step, as_json=as_json)
+        return
+
+    # When an agent journal exists for this id, prefer the per-step view
+    # over the run-trace view. The journal directory naming is unambiguous
+    # because it always sits under ``.sdd/runtime/journal/`` (a path the
+    # legacy run recorder never wrote to).
+    sdd_path = Path(sdd_dir)
+    journal_dir = sdd_path / "runtime" / "journal" / args[0]
+    if journal_dir.exists():
+        from bernstein.cli.commands.replay_cmd import replay_agent_view
+
+        rc = replay_agent_view(
+            agent_id=args[0],
+            sdd_dir=sdd_path,
+            as_json=as_json,
+            limit=limit,
+        )
+        if rc != 0:
+            raise SystemExit(rc)
+        return
 
     _replay_run_impl(
         run_id=args[0],
@@ -1588,6 +2412,161 @@ def replay_cmd(
         model=model,
         extra_context=extra_context,
     )
+
+
+def _replay_debug_dispatch(
+    args: list[str],
+    *,
+    sdd_dir: str,
+    as_json: bool,
+    fork_from: int | None,
+    jump_to_failure: bool,
+    sign_key: str | None,
+    full: bool,
+    limit: int | None,
+) -> None:
+    """Dispatch ``bernstein replay debug`` (#2605).
+
+    Forensic time-travel debugger over the per-step journal. Local-only by
+    default under ``.sdd/runtime/``; it never re-executes anything.
+    """
+    from bernstein.cli.commands.replay_cmd import replay_debug
+
+    rc = replay_debug(
+        args,
+        Path(sdd_dir),
+        as_json=as_json,
+        fork_from=fork_from,
+        jump_to_failure=jump_to_failure,
+        sign_key_path=Path(sign_key) if sign_key else None,
+        full=full,
+        limit=limit,
+        repo_root=Path.cwd(),
+    )
+    if rc != 0:
+        raise SystemExit(rc)
+
+
+def _replay_journal_dispatch(
+    args: list[str],
+    *,
+    sdd_dir: str,
+    as_json: bool,
+    yes_i_want_to_publish: bool = False,
+) -> None:
+    """Dispatch the new ``export | publish | verify | diff-journal`` verbs.
+
+    These touch only the per-step journal under ``.sdd/runtime/journal/``
+    and never the legacy ``.sdd/runs/`` directory; the run-trace replay
+    flow is unchanged.
+    """
+    verb = args[0]
+    sdd_path = Path(sdd_dir)
+
+    if verb == "export":
+        if len(args) < 2:
+            console.print("[red]Usage:[/red] bernstein replay export <AGENT_ID> [OUT]")
+            raise SystemExit(2)
+        agent_id = args[1]
+        # Output path can be passed as the third positional or default beside .sdd.
+        output: Path = Path(args[2]) if len(args) >= 3 else sdd_path / "runtime" / "receipts" / f"{agent_id}.tar"
+
+        from bernstein.cli.commands.replay_cmd import replay_export
+
+        rc = replay_export(
+            agent_id=agent_id,
+            sdd_dir=sdd_path,
+            output=output,
+            as_json=as_json,
+        )
+        if rc != 0:
+            raise SystemExit(rc)
+        return
+
+    if verb == "publish":
+        # Publish requires the explicit --yes-i-want-to-publish confirmation
+        # (declared on the ``replay`` command and gated to this verb by the
+        # caller) so operators cannot accidentally publish from a script
+        # that just adds a verb name.
+        if len(args) < 2:
+            console.print("[red]Usage:[/red] bernstein replay publish <AGENT_ID> [OUT] --yes-i-want-to-publish")
+            raise SystemExit(2)
+        agent_id = args[1]
+        positional_tail = [a for a in args[2:] if not a.startswith("--")]
+        output = (
+            Path(positional_tail[0])
+            if positional_tail
+            else sdd_path / "runtime" / "receipts" / f"{agent_id}.redacted.tar"
+        )
+
+        from bernstein.cli.commands.replay_cmd import replay_publish
+
+        rc = replay_publish(
+            agent_id=agent_id,
+            sdd_dir=sdd_path,
+            output=output,
+            opt_in=yes_i_want_to_publish,
+            as_json=as_json,
+        )
+        if rc != 0:
+            raise SystemExit(rc)
+        return
+
+    if verb == "verify":
+        if len(args) < 2:
+            console.print("[red]Usage:[/red] bernstein replay verify <RECEIPT> [--head HEX]")
+            raise SystemExit(2)
+        receipt = Path(args[1])
+        expected_head: str | None = None
+        for i, token in enumerate(args[2:], start=2):
+            if token == "--head" and i + 1 < len(args):
+                expected_head = args[i + 1]
+
+        from bernstein.cli.commands.replay_cmd import replay_verify
+
+        rc = replay_verify(
+            receipt_path=receipt,
+            expected_head=expected_head,
+            public_key_path=None,
+            as_json=as_json,
+        )
+        if rc != 0:
+            raise SystemExit(rc)
+        return
+
+    if verb == "diff-journal":
+        if len(args) != 3:
+            console.print(
+                "[red]Usage:[/red] bernstein replay diff-journal <LEFT_AGENT_ID> <RIGHT_AGENT_ID>",
+            )
+            raise SystemExit(2)
+
+        from bernstein.cli.commands.replay_cmd import replay_diff_journals
+
+        rc = replay_diff_journals(
+            left_agent_id=args[1],
+            right_agent_id=args[2],
+            sdd_dir=sdd_path,
+            as_json=as_json,
+        )
+        if rc != 0:
+            raise SystemExit(rc)
+        return
+
+    if verb == "repair":
+        if len(args) != 2:
+            console.print("[red]Usage:[/red] bernstein replay repair <RUN_ID>")
+            raise SystemExit(2)
+
+        from bernstein.cli.commands.replay_cmd import replay_repair
+
+        rc = replay_repair(run_id=args[1], sdd_dir=sdd_path, as_json=as_json)
+        if rc != 0:
+            raise SystemExit(rc)
+        return
+
+    console.print(f"[red]Unknown replay verb:[/red] {verb}")
+    raise SystemExit(2)
 
 
 def _replay_diff_dispatch(
@@ -1622,6 +2601,8 @@ def _replay_diff_dispatch(
             "diverged": result.diverged,
             "index": result.index,
             "reason": result.reason,
+            "reason_code": result.reason_code,
+            "mutation_kind": result.mutation_kind,
             "a_event": result.a_event,
             "b_event": result.b_event,
         }
@@ -1720,58 +2701,102 @@ def completions(ctx: click.Context, shell: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+_QUARANTINE_REL_PATH = Path(".sdd") / "runtime" / "quarantine.json"
+
+
+def quarantine_store_path(workdir: str | Path = ".") -> Path:
+    """Return the quarantine state file the orchestrator writes.
+
+    Args:
+        workdir: Project root (parent of ``.sdd/``).
+
+    Returns:
+        Absolute path to ``.sdd/runtime/quarantine.json``.
+    """
+    return Path(workdir).resolve() / _QUARANTINE_REL_PATH
+
+
 @click.group("quarantine")
 def quarantine_group() -> None:
-    """Manage quarantined tasks (failed, blocked, etc.)."""
+    """Inspect and clear cross-run task quarantine.
+
+    Quarantine state lives in the workspace at ``.sdd/runtime/quarantine.json``
+    and is written by the orchestrator, so these commands read and write it
+    directly and do not need a running task server.
+    """
 
 
 @quarantine_group.command("list")
-def _quarantine_list() -> None:  # type: ignore[reportUnusedFunction]
+@click.option(
+    "--workdir",
+    default=".",
+    show_default=True,
+    type=click.Path(),
+    help="Project root (parent of .sdd/).",
+)
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include expired entries.")
+def _quarantine_list(workdir: str, show_all: bool) -> None:  # type: ignore[reportUnusedFunction]
     """List quarantined tasks."""
-    data = server_get("/quarantine")
-    if data is None:
-        from bernstein.cli.errors import server_unreachable
+    from bernstein.core.security.quarantine import QUARANTINE_THRESHOLD, QuarantineStore
 
-        server_unreachable().print()
-        raise SystemExit(1)
-
-    tasks = data.get("tasks", [])
-    if not tasks:
+    store = QuarantineStore(quarantine_store_path(workdir))
+    entries = store.load() if show_all else store.get_all()
+    if not entries:
         console.print("[dim]No quarantined tasks.[/dim]")
         return
 
     from rich.table import Table
 
     table = Table(show_header=True, header_style="bold red")
-    table.add_column("ID", style="dim")
-    table.add_column("Title")
+    table.add_column("Task", style="dim")
+    table.add_column("Failures")
+    table.add_column("Last failure")
+    table.add_column("Action")
     table.add_column("Reason")
 
-    for t in tasks:
-        table.add_row(t.get("id", "?"), t.get("title", "?"), t.get("reason", "?"))
+    for entry in entries:
+        fail_style = "bold red" if entry.fail_count >= QUARANTINE_THRESHOLD else "yellow"
+        table.add_row(
+            entry.task_title,
+            f"[{fail_style}]{entry.fail_count}[/{fail_style}]",
+            entry.last_failure,
+            entry.action,
+            entry.reason,
+        )
 
     console.print(table)
 
 
 @quarantine_group.command("clear")
 @click.option(
+    "--workdir",
+    default=".",
+    show_default=True,
+    type=click.Path(),
+    help="Project root (parent of .sdd/).",
+)
+@click.option("--task", "task_title", default=None, help="Clear only this task title.")
+@click.option(
     "--confirm",
     is_flag=True,
     default=False,
     help="Skip confirmation prompt.",
 )
-def _quarantine_clear(confirm: bool) -> None:  # type: ignore[reportUnusedFunction]
-    """Clear all quarantined tasks."""
-    if not confirm and not click.confirm("Clear all quarantined tasks?"):
+def _quarantine_clear(workdir: str, task_title: str | None, confirm: bool) -> None:  # type: ignore[reportUnusedFunction]
+    """Clear quarantine entries."""
+    from bernstein.core.security.quarantine import QuarantineStore
+
+    store = QuarantineStore(quarantine_store_path(workdir))
+    before = store.load()
+    target = [e for e in before if task_title is None or e.task_title == task_title]
+    if not target:
+        console.print("[dim]No quarantined tasks.[/dim]")
+        return
+
+    prompt = "Clear all quarantined tasks?" if task_title is None else f"Clear quarantine for {task_title!r}?"
+    if not confirm and not click.confirm(prompt):
         console.print("[dim]Cancelled.[/dim]")
         return
 
-    result = server_post("/quarantine/clear", {})
-    if result is None:
-        from bernstein.cli.errors import server_unreachable
-
-        server_unreachable().print()
-        raise SystemExit(1)
-
-    count = result.get("cleared", 0)
-    console.print(f"[green]Cleared {count} task(s).[/green]")
+    store.clear(task_title)
+    console.print(f"[green]Cleared {len(target)} task(s).[/green]")

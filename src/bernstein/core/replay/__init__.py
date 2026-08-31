@@ -6,18 +6,24 @@ recorded fixtures instead of live providers.
 
 Public surface:
 
-* :class:`ReplayGateway` — record/replay adapter around LLM + tool calls.
-* :data:`RECORD_ENV_VAR` — env-var that opts-in to recording.
-* :func:`diff_event_logs` — line-by-line first-divergence locator.
+* :class:`EventJournal` - the single always-on Merkle-chained per-run
+  event recorder whose head identifies the surviving journal state
+  (issue #2293).
+* :class:`ReplayGateway` - fixture-replay adapter around LLM + tool calls.
+* :func:`derive_replay_key` - scheme-prefixed digest written at the store boundary.
+* :exc:`ReplayKeySchemeMismatchError` - corpus recorded under another key scheme.
+* :data:`RECORD_ENV_VAR` - env-var that opts the *gateway* into recording.
+* :func:`diff_event_logs` - line-by-line first-divergence locator.
 
-The existing ``RunRecorder`` in :mod:`bernstein.core.persistence.recorder`
-already handles orchestrator-level lifecycle events. This package adds a
-second, finer-grained log dedicated to LLM/tool I/O so replay can reproduce
-adapter responses byte-for-byte.
+The :class:`EventJournal` is the canonical run recorder: it records by
+default into ``.sdd/runs/<run_id>/journal.jsonl`` and its head hash identifies
+the surviving journal state. An independent seal is required to establish the
+complete finished-journal identity. It replaced the old orchestrator
+``RunRecorder``.
 
-The gateway is OFF by default. Set ``BERNSTEIN_RECORD=1`` or pass
-``record=True`` explicitly to enable recording — we don't want to grow
-``.sdd/`` on every casual user invocation.
+The :class:`ReplayGateway` is a distinct concern - it captures LLM/tool
+I/O so a run can be re-executed against recorded fixtures. It is OFF by
+default; set ``BERNSTEIN_RECORD=1`` or pass ``record=True`` to enable it.
 """
 
 from __future__ import annotations
@@ -29,13 +35,64 @@ from bernstein.core.replay.diff import (
     diff_event_logs,
     load_events,
 )
+from bernstein.core.replay.fork import (
+    ForkError,
+    ForkResult,
+    fork_run,
+    record_snapshot_event,
+)
 from bernstein.core.replay.gateway import (
     EVENTS_FILENAME,
     RECORD_ENV_VAR,
     GatewayMode,
     ReplayGateway,
+    ReplayKeySchemeMismatchError,
     ReplayMissError,
     is_recording_enabled,
+)
+from bernstein.core.replay.journal import (
+    JOURNAL_FILENAME,
+    RETENTION_ENV_VAR,
+    EventJournal,
+    JournalVerifyResult,
+    rebuild_state,
+    repair_journal_tail,
+    seal_journal_into_spine,
+    verify_events,
+    verify_journal,
+)
+from bernstein.core.replay.key_scheme import (
+    CURRENT_KEY_SCHEME,
+    derive_replay_key,
+    parse_stored_key,
+)
+from bernstein.core.replay.provider_state import (
+    CAPABILITY_DECLARED_BLIND,
+    CAPABILITY_OBSERVED,
+    MUTATION_CAPABILITY_EVENT,
+    PROVIDER_STATE_CAPTURE_FAILED_EVENT,
+    PROVIDER_STATE_MUTATION_EVENT,
+    ProviderStateMutation,
+    ProviderStateVerifyResult,
+    record_agent_mutations,
+    record_capture_failure,
+    record_mutation_capability,
+    record_provider_state_mutation,
+    verify_provider_state,
+)
+from bernstein.core.replay.read_paths import (
+    ReadPathDerivationError,
+    ReadPathSet,
+    derive_read_paths,
+)
+from bernstein.core.replay.run_receipt import (
+    RUN_RECEIPT_FILENAME,
+    RunReceipt,
+    RunReceiptError,
+    RunReceiptVerifyResult,
+    build_run_receipt,
+    verify_run_receipt,
+    write_run_receipt_if_configured,
 )
 
 if TYPE_CHECKING:
@@ -70,15 +127,54 @@ def record_run(sdd_dir: Path, conversation_id: str, adapter_name: str, run_id: s
 
 
 __all__ = [
+    "CAPABILITY_DECLARED_BLIND",
+    "CAPABILITY_OBSERVED",
+    "CURRENT_KEY_SCHEME",
     "EVENTS_FILENAME",
+    "JOURNAL_FILENAME",
+    "MUTATION_CAPABILITY_EVENT",
+    "PROVIDER_STATE_CAPTURE_FAILED_EVENT",
+    "PROVIDER_STATE_MUTATION_EVENT",
     "RECORD_ENV_VAR",
+    "RETENTION_ENV_VAR",
+    "RUN_RECEIPT_FILENAME",
     "DivergenceResult",
+    "EventJournal",
+    "ForkError",
+    "ForkResult",
     "GatewayMode",
+    "JournalVerifyResult",
+    "ProviderStateMutation",
+    "ProviderStateVerifyResult",
+    "ReadPathDerivationError",
+    "ReadPathSet",
     "ReplayGateway",
+    "ReplayKeySchemeMismatchError",
     "ReplayMissError",
+    "RunReceipt",
+    "RunReceiptError",
+    "RunReceiptVerifyResult",
+    "build_run_receipt",
+    "derive_read_paths",
+    "derive_replay_key",
     "diff_event_logs",
+    "fork_run",
     "is_recording_enabled",
     "load_events",
     "locate_run",
+    "parse_stored_key",
+    "rebuild_state",
+    "record_agent_mutations",
+    "record_capture_failure",
+    "record_mutation_capability",
+    "record_provider_state_mutation",
     "record_run",
+    "record_snapshot_event",
+    "repair_journal_tail",
+    "seal_journal_into_spine",
+    "verify_events",
+    "verify_journal",
+    "verify_provider_state",
+    "verify_run_receipt",
+    "write_run_receipt_if_configured",
 ]

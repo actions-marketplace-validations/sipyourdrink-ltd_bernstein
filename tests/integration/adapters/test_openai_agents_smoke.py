@@ -23,17 +23,41 @@ from bernstein.core.models import ModelConfig
 
 from bernstein.adapters.openai_agents import OpenAIAgentsAdapter
 
-# Gate on the API key — this keeps the test skipped in CI and any
+# Gate on the API key - this keeps the test skipped in CI and any
 # environment that has not explicitly opted into real OpenAI calls.
 pytestmark = pytest.mark.skipif(
     not os.getenv("OPENAI_API_KEY"),
-    reason="OPENAI_API_KEY not set — smoke test requires real OpenAI credentials",
+    reason="OPENAI_API_KEY not set - smoke test requires real OpenAI credentials",
 )
 
 
 def _sdk_installed() -> bool:
     """Return True when the optional ``openai-agents`` SDK is importable."""
-    return importlib.util.find_spec("agents") is not None
+    spec = importlib.util.find_spec("agents")
+    if spec is None:
+        return False
+    # Check if the spec has an origin (file-based package, not just a directory)
+    # Real openai-agents SDK will have a proper module structure with __init__.py
+    if spec.origin is None:
+        # This is likely a directory/namespace package like the local "agents/"
+        # that shadows the real SDK. Check if it's the local repo agents/ dir.
+        # The local agents/ directory doesn't have __init__.py, but the real
+        # SDK will have it and importable submodules like 'agents.Agent'.
+        try:
+            # Try to import and see if it has the Agent class
+            import agents
+
+            return hasattr(agents, "Agent") and hasattr(agents, "Runner")
+        except (ImportError, AttributeError):
+            return False
+    # Has an origin - check if it looks like a real SDK package by trying to
+    # import and see if it has the expected classes
+    try:
+        import agents
+
+        return hasattr(agents, "Agent") and hasattr(agents, "Runner")
+    except (ImportError, AttributeError):
+        return False
 
 
 @pytest.mark.skipif(
@@ -49,7 +73,7 @@ def test_smoke_agent_runs_end_to_end(tmp_path: Path) -> None:
     * the log contains at least one ``completion`` event.
 
     We deliberately do **not** assert on tool-call accuracy or the exact
-    summary — those are properties of the model, not the adapter.
+    summary - those are properties of the model, not the adapter.
     """
     adapter = OpenAIAgentsAdapter()
     session_id = f"smoke-{int(time.time())}"
@@ -74,7 +98,7 @@ def test_smoke_agent_runs_end_to_end(tmp_path: Path) -> None:
 
     log_contents = result.log_path.read_text(encoding="utf-8", errors="replace")
     # The runner always emits a "start" event; "completion" appears on
-    # success.  A rate-limit exit is also acceptable — we don't want this
+    # success.  A rate-limit exit is also acceptable - we don't want this
     # smoke test to be flaky on quota exhaustion.
     assert '"type": "start"' in log_contents
     assert '"type": "completion"' in log_contents or '"kind": "rate_limit"' in log_contents

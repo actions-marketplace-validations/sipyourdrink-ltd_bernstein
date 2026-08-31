@@ -7,9 +7,10 @@ import io
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -21,30 +22,210 @@ from bernstein.cli.helpers import (
 from bernstein.cli.run import render_run_summary_from_dict
 from bernstein.cli.ui import make_console
 from bernstein.core.cost import estimate_run_cost
+from bernstein.core.cost.model_prices import is_free_route
 from bernstein.core.cost.preflight import CostBand, compute_band, format_band
 from bernstein.core.plan_loader import load_plan_from_yaml
 from bernstein.core.runtime_state import directory_size_bytes
 
+if TYPE_CHECKING:
+    from rich.console import Console
+
+    from bernstein.core.config.seed import SeedConfig
+
 logger = logging.getLogger(__name__)
+
+
+def validate_seed_or_exit(seed_file: str | None) -> SeedConfig | None:
+    """Parse and validate the seed file with the same rules the real run uses.
+
+    Resolves the seed path (falling back to :func:`find_seed_file` when
+    ``seed_file`` is ``None``) and parses it through
+    :func:`bernstein.core.seed.parse_seed` -- the single shared validation
+    boundary. A :class:`~bernstein.core.seed.SeedError` is surfaced as the
+    same structured CLI error the real run raises and aborts the process, so
+    ``--dry-run`` can no longer report success on a seed the run would reject
+    (issue #2785).
+
+    Args:
+        seed_file: Explicit seed path, or ``None`` to auto-discover one.
+
+    Returns:
+        The parsed :class:`SeedConfig` when a seed file exists and validates,
+        or ``None`` when no seed file is present (inline-goal and empty-backlog
+        modes validate elsewhere).
+
+    Raises:
+        SystemExit: When the seed file exists but fails validation.
+    """
+    from bernstein.core.config.seed import SeedError, parse_seed
+
+    seed_path = Path(seed_file) if seed_file is not None else find_seed_file()
+    if seed_path is None or not seed_path.exists():
+        return None
+    try:
+        return parse_seed(seed_path)
+    except SeedError as exc:
+        from bernstein.cli.utils.errors import seed_parse_error
+
+        seed_parse_error(exc).print()
+        raise SystemExit(1) from exc
+
+
+#: When this module was imported, which is when the CLI process started.
+#: Used to ignore merge-refusal journal entries left over from previous runs
+#: when surfacing refusals in the end-of-run summary.
+_CLI_RUN_EPOCH = time.time()
 
 # ---------------------------------------------------------------------------
 # Post-run summary helper
 # ---------------------------------------------------------------------------
 
 
+def _abort_if_default_branch_merge_target(workdir: Path) -> None:
+    """Abort before any agent spawns when merges would land on the default branch.
+
+    The spawner merge guard (``spawner_merge._run_merge_and_push``) refuses to
+    merge agent work onto the repository's protected default branch. When the
+    run starts with that branch checked out and the override env var unset,
+    every agent would do its work and then have it silently discarded at
+    merge time (gh-2756). Detect that state up front and abort with the
+    remedy instead.
+
+    Only wired into run modes that merge agent work back into the checked-out
+    branch; ``--dry-run`` and ``--plan-only`` never reach this check.
+
+    Args:
+        workdir: Repository root the run would merge agent work into.
+
+    Raises:
+        SystemExit: When the checked-out branch is a protected default branch
+            and ``BERNSTEIN_ALLOW_MERGE_TO_DEFAULT_BRANCH`` is not set.
+    """
+    from bernstein.core.agents.spawner_merge import (
+        ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH,
+        _allow_merge_to_default_branch,
+    )
+    from bernstein.core.git_ops import current_branch, protected_default_branches
+
+    branch = current_branch(workdir)
+    if branch is None:
+        # Detached HEAD or not a git repo: mirror the merge guard, which only
+        # refuses when a named protected branch is checked out.
+        return
+    if branch not in protected_default_branches(workdir):
+        return
+    if _allow_merge_to_default_branch():
+        return
+    console.print(
+        f"[bold red]Refusing to start:[/bold red] the checked-out branch {branch!r} is the "
+        "repository default branch, so every agent's work would be refused by the merge "
+        "guard and discarded instead of merged."
+    )
+    console.print(
+        "Fix: check out a working branch first (git checkout -b <branch>), or set "
+        f"{ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH}=1 to explicitly allow merging to the default branch."
+    )
+    raise SystemExit(1)
+
+
+def _surface_merge_refusals(workdir: Path, *, since_ts: float, console: Console) -> None:
+    """Print a loud warning for agent merges the merge guard refused this run.
+
+    The spawner merge guard refuses to land agent work on the repository's
+    protected default branch and records each refusal to
+    ``.sdd/runtime/refused_merges.jsonl``. Without this warning the refusal
+    is only visible in the spawner log, so the run ends looking clean while
+    the work was discarded (gh-2756).
+
+    Args:
+        workdir: Repository root of the run.
+        since_ts: Only refusals recorded at or after this timestamp are
+            shown, filtering out journal entries from previous runs.
+        console: Console to print the warning to.
+    """
+    from bernstein.core.agents.spawner_merge import ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH
+    from bernstein.core.quality.retrospective import read_merge_refusals
+
+    refusals = read_merge_refusals(workdir / ".sdd" / "runtime", since_ts=since_ts)
+    if not refusals:
+        return
+    branches = sorted({r.branch for r in refusals if r.branch})
+    branch_note = f" onto default branch {', '.join(repr(b) for b in branches)}" if branches else ""
+    console.print(
+        f"[bold red]Merge refused:[/bold red] agent work from {len(refusals)} session(s) was NOT "
+        f"merged{branch_note} and was discarded (details: .sdd/runtime/refused_merges.jsonl)."
+    )
+    console.print(
+        "Check out a working branch first (git checkout -b <branch>), or set "
+        f"{ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH}=1 and re-run."
+    )
+
+
 def _show_run_summary() -> None:
     """Fetch final status from the task server and render a summary.
 
-    Silently returns if the server is unreachable (e.g. already stopped).
+    Silently skips the status table when the server is unreachable (e.g.
+    already stopped). Merge refusals recorded during this run are surfaced
+    even then -- a run whose work was discarded must not end with a clean,
+    silent summary (gh-2756).
     """
     from bernstein.cli.helpers import server_get
 
-    data = server_get("/status")
-    if data is None:
-        return
     force_no_color = not sys.stdout.isatty()
     con = make_console(no_color=force_no_color)
-    render_run_summary_from_dict(data, console=con)
+    data = server_get("/status")
+    if data is not None:
+        render_run_summary_from_dict(data, console=con)
+    _surface_merge_refusals(Path.cwd(), since_ts=_CLI_RUN_EPOCH, console=con)
+
+
+def _exit_nonzero_on_unhealthy_run(status_payload: object) -> None:
+    """Set ``bernstein run``'s exit code from the final run-health verdict.
+
+    A run that completes but did not honestly meet its goal -- a task failed,
+    or a declared task never terminated (e.g. the manager agent produced no
+    model output and was reaped) -- must not exit 0, so an operator scripting
+    ``bernstein run && deploy`` never deploys on a run that accomplished
+    nothing (issue #3010).
+
+    The verdict is applied ONLY when the run actually reached a terminal state.
+    ``_wait_for_run_completion`` returns a payload for both terminal states --
+    quiescence, and "orchestrator gone while declared tasks are still
+    non-terminal" (the issue #3010 shape) -- and ``None`` for every "no
+    verdict" case (deadline expired with the run still in flight, or the
+    server unreachable). This function maps ``None`` to exit 0 rather than
+    guessing: a long-running-but-healthy run must never be reported as a
+    failure just for outliving the CLI's wait deadline.
+
+    Note that the discriminator between "ended with work unfinished" and
+    "still starting up" is orchestrator liveness, not the task counts -- both
+    show work outstanding. See ``_wait_for_run_completion``.
+
+    The counts are read from the full per-status histogram when the wait
+    attached one (``task_counts``), because a ``/status`` payload has no bucket
+    for ``in_progress`` or ``orphaned`` -- a run left with a task stuck in
+    either would otherwise read as "nothing outstanding" and exit 0.
+    """
+    if not isinstance(status_payload, dict):
+        return
+    from bernstein.core.quality.retrospective import (
+        run_health_exit_code,
+        run_healthy_from_status_counts,
+    )
+
+    counts: dict[str, object] = status_payload
+    for key in ("task_counts", "summary"):
+        candidate = status_payload.get(key)
+        if isinstance(candidate, dict):
+            counts = candidate
+            break
+    if run_healthy_from_status_counts(counts):  # type: ignore[arg-type]
+        return
+    console.print(
+        "[red]Run did not meet its goal[/red] -- a declared task never completed or a task "
+        "failed. See .sdd/runtime/retrospective.md for the run-health breakdown."
+    )
+    raise SystemExit(run_health_exit_code(healthy=False))
 
 
 def _drain_completed_backlog_files() -> None:
@@ -82,30 +263,44 @@ class RunCostEstimate:
     """Preflight cost estimate for a pending run.
 
     Attributes:
-        task_count: Number of tasks the run will spawn.
+        task_count: Number of tasks the run will spawn, or ``None`` when the
+            count is not yet known (inline goal that the manager agent plans
+            after startup). ``low_usd``/``high_usd`` are then per-task rates.
         model: Display label for the model (``"adapter/model"`` or model).
         low_usd: Legacy single-point low estimate (kept for back-compat).
         high_usd: Legacy single-point high estimate (kept for back-compat).
         band: Optional calibrated p50/p90 band. Populated for new callers;
             legacy callers can leave it unset.
+        free_route: True when the resolved model is a zero-cost route (a
+            ``:free`` id or a model the run's own metering prices at $0). The
+            estimate is then a hard $0 rather than a phantom fixed rate
+            (issue #3013).
     """
 
-    task_count: int
+    task_count: int | None
     model: str
     low_usd: float
     high_usd: float
     band: CostBand | None = None
+    free_route: bool = False
 
 
-def _estimate_task_count(workdir: Path, plan_file: Path | None, goal: str | None) -> int:
-    """Estimate the number of tasks from plan file or backlog."""
+def _estimate_task_count(workdir: Path, plan_file: Path | None, goal: str | None) -> int | None:
+    """Count tasks from the plan file or the synced backlog.
+
+    Returns:
+        The task count when it is knowable (explicit plan file or non-empty
+        backlog), or ``None`` when planning has not happened yet (inline
+        goal, unreadable plan file, empty backlog). ``None`` means unknown;
+        callers must not substitute a made-up number for display.
+    """
     if plan_file is not None:
         try:
             return max(1, len(load_plan_from_yaml(plan_file)))
         except Exception:
-            return 5
+            return None
     if goal is not None:
-        return 5
+        return None
     count = 0
     for subdir in ("open", "issues"):
         backlog_dir = workdir / ".sdd" / "backlog" / subdir
@@ -113,14 +308,25 @@ def _estimate_task_count(workdir: Path, plan_file: Path | None, goal: str | None
             count += len(list(backlog_dir.glob("*.md")))
             count += len(list(backlog_dir.glob("*.yaml")))
             count += len(list(backlog_dir.glob("*.yml")))
-    return max(1, count)
+    return count if count > 0 else None
 
 
 def _resolve_model_and_cli(
     seed_file: str | None,
     model_override: str | None,
+    seed: SeedConfig | None = None,
 ) -> tuple[str, str, str]:
     """Resolve model, CLI adapter, and dominant role from seed or defaults.
+
+    Args:
+        seed_file: Explicit seed path, or ``None`` to auto-discover one.
+        model_override: Explicit ``--model`` override; short-circuits seed
+            inspection when set.
+        seed: A seed already parsed by the shared validation boundary
+            (:func:`validate_seed_or_exit`). When supplied it is used
+            directly, so the estimate reflects the seed's effective default
+            model instead of falling back to the sonnet heuristic on a
+            re-parse failure (issue #2785).
 
     Returns:
         Tuple of ``(model, cli, role)``. ``role`` defaults to ``"backend"``
@@ -132,15 +338,20 @@ def _resolve_model_and_cli(
     if model_override is not None:
         return est_model, est_cli, est_role
 
-    seed_path = Path(seed_file) if seed_file is not None else find_seed_file()
-    if seed_path is None or not seed_path.exists():
-        return est_model, est_cli, est_role
+    if seed is None:
+        seed_path = Path(seed_file) if seed_file is not None else find_seed_file()
+        if seed_path is None or not seed_path.exists():
+            return est_model, est_cli, est_role
+        try:
+            from bernstein.core.config.seed import parse_seed
+
+            seed = parse_seed(seed_path)
+        except Exception:
+            return "sonnet", est_cli, est_role
 
     try:
         from bernstein.core.cost.cost import _model_cost
-        from bernstein.core.seed import parse_seed
 
-        seed = parse_seed(seed_path)
         if seed.model:
             est_model = seed.model
         if seed.role_model_policy:
@@ -186,6 +397,7 @@ def _estimate_run_preview(
     goal: str | None,
     seed_file: str | None,
     model_override: str | None,
+    seed: SeedConfig | None = None,
 ) -> RunCostEstimate:
     """Estimate run cost before bootstrapping the orchestrator.
 
@@ -202,14 +414,28 @@ def _estimate_run_preview(
         goal: Optional inline goal.
         seed_file: Optional seed path override.
         model_override: Optional CLI ``--model`` override.
+        seed: Seed already parsed by the shared validation boundary. When
+            supplied, the estimate reflects the seed's effective default
+            model rather than re-parsing (issue #2785).
 
     Returns:
         Cost estimate using the best available task count and model hint.
     """
     est_task_count = _estimate_task_count(workdir, plan_file, goal)
-    est_model, est_cli, est_role = _resolve_model_and_cli(seed_file, model_override)
+    # Unknown count: compute a per-task rate (count of 1) but keep
+    # ``task_count=None`` so display code says "unknown" instead of a number.
+    billable_count = est_task_count if est_task_count is not None else 1
+    est_model, est_cli, est_role = _resolve_model_and_cli(seed_file, model_override, seed=seed)
 
-    if est_cli in _FREE_ADAPTERS:
+    # A run is free either because the adapter runs models locally at $0
+    # (ollama/qwen/gemini) or because the *resolved model* is a zero-cost
+    # route -- a ``:free`` id or a model the run's own metering
+    # (``price_model_usage``) prices at $0.  Keying the estimate on the
+    # resolved model, not a fixed Anthropic rate, keeps the pre-run banner
+    # and the final ``total_cost`` drawn from the same pricing source, so a
+    # free route is never quoted a phantom estimate (issue #3013).
+    free_route = est_cli in _FREE_ADAPTERS or is_free_route(est_model)
+    if free_route:
         low_usd, high_usd = 0.0, 0.0
         band = CostBand(
             p50=0.0,
@@ -221,12 +447,12 @@ def _estimate_run_preview(
             model=est_model,
         )
     else:
-        low_usd, high_usd = estimate_run_cost(est_task_count, est_model)
+        low_usd, high_usd = estimate_run_cost(billable_count, est_model)
         band = compute_band(
             role=est_role,
             adapter=est_cli,
             model=est_model,
-            task_count=est_task_count,
+            task_count=billable_count,
             metrics_dir=workdir / ".sdd" / "metrics",
         )
     display_model = f"{est_cli}/{est_model}" if est_cli != "claude" else est_model
@@ -236,6 +462,7 @@ def _estimate_run_preview(
         low_usd=low_usd,
         high_usd=high_usd,
         band=band,
+        free_route=free_route,
     )
 
 
@@ -270,19 +497,34 @@ def _emit_preflight_runtime_warnings(
     disk_usage_gb = directory_size_bytes(sdd_dir) / (1024**3)
     band = estimate.band
     if not quiet:
+        # Only print a count that came from the plan/backlog; when the count
+        # is unknown (planning happens after startup) say so explicitly
+        # instead of substituting a made-up number.
+        if estimate.task_count is not None:
+            basis = f"based on {estimate.task_count} task(s) at {estimate.model} pricing"
+        else:
+            basis = f"per task at {estimate.model} pricing, task count not yet planned"
+        if estimate.free_route:
+            # A zero-cost route (:free / unpriced) must not be quoted a
+            # phantom rate: the real run meters it at $0 (issue #3013).
+            if estimate.task_count is not None:
+                basis = f"free route - no cost ({estimate.model}), based on {estimate.task_count} task(s)"
+            else:
+                basis = f"free route - no cost ({estimate.model}), task count not yet planned"
         if band is not None:
             console.print(f"[bold yellow]{format_band(band)}[/bold yellow]")
-            samples_note = (
-                f"{band.samples} historical sample(s)" if not band.cold_start else "no history yet — using heuristic"
-            )
-            console.print(
-                f"[dim]based on {estimate.task_count} task(s) at {estimate.model} pricing, {samples_note}[/dim]"
-            )
+            if estimate.free_route:
+                console.print(f"[dim]{basis}[/dim]")
+            else:
+                samples_note = (
+                    f"{band.samples} historical sample(s)"
+                    if not band.cold_start
+                    else "no history yet - using heuristic"
+                )
+                console.print(f"[dim]{basis}, {samples_note}[/dim]")
         else:
             console.print(
-                "[bold yellow]Estimated cost:[/bold yellow] "
-                f"${estimate.low_usd:.2f}-${estimate.high_usd:.2f} "
-                f"based on {estimate.task_count} task(s) at {estimate.model} pricing"
+                f"[bold yellow]Estimated cost:[/bold yellow] ${estimate.low_usd:.2f}-${estimate.high_usd:.2f} {basis}"
             )
         if disk_usage_gb >= 1.0:
             console.print(
@@ -304,7 +546,7 @@ def _emit_preflight_runtime_warnings(
             raise SystemExit(1)
 
     # Cost confirmation is skipped when the plan approval prompt follows
-    # (it already shows cost and asks Y/N — no need to ask twice).
+    # (it already shows cost and asks Y/N - no need to ask twice).
     if (
         not auto_approve
         and not plan_approval_follows
@@ -362,7 +604,49 @@ def _make_profile_ctx(profile: bool, workdir: Path) -> contextlib.AbstractContex
     return contextlib.nullcontext()
 
 
-def _finalize_run_output(*, quiet: bool) -> None:
+def _raise_if_no_plan_after_spawn(*, narrate_wait: bool = True) -> None:
+    """Diagnose a spawned-then-dead agent before a display branch's own wait.
+
+    The non-interactive detach path (issue #3528, #4246) briefly confirms the
+    first agent spawn and takes one poll to see whether that agent already
+    died before the goal was ever decomposed -- the reproduced shape where a
+    run leaves its one root task stuck ``claimed``/``in_progress``/``orphaned``
+    forever with no live agent and no plan. The TTY dashboard, the Rich
+    fallback, and ``--quiet`` all reproduce the same silence: none of them
+    checks for this shape, so they detach (or keep waiting) exactly as if the
+    run were healthy.
+
+    Called at the start of each of those three branches, before the branch's
+    own longer-running work begins, so the check lands close to the failure
+    window described in the reproduction (the agent dies almost immediately
+    after spawn) rather than after a dashboard session or a multi-hour quiet
+    wait have already moved past it.
+
+    Raises the same ``BernsteinFirstRunError``/``NO_PLAN_PRODUCED`` pair the
+    non-interactive branch raises, so this is the single producer of the
+    diagnosis text across every surface -- no renderer composes its own
+    message. A spawn refusal is left untouched here; each branch's existing
+    terminal-state check already accounts for it once the refused task
+    reaches a terminal status.
+
+    Args:
+        narrate_wait: When True, the first-spawn wait shows a transient Rich
+            status ("waiting for the first agent") while it polls, so a slow
+            start reads as progress instead of a hang. ``--quiet`` passes
+            False to keep its promise of no progress chatter.
+    """
+    from bernstein.cli.run_bootstrap import _await_first_spawn_outcome, _poll_no_plan_after_spawn
+    from bernstein.core.errors import BernsteinFirstRunError, ErrorCategory
+
+    outcome, _reason = _await_first_spawn_outcome(narrate_wait=narrate_wait)
+    if outcome == "spawned" and _poll_no_plan_after_spawn() is not None:
+        raise BernsteinFirstRunError(
+            "Spawned agent exited before producing a work plan",
+            category=ErrorCategory.NO_PLAN_PRODUCED,
+        )
+
+
+def _finalize_run_output(*, quiet: bool, wait: float | None = None) -> None:
     """Render either the interactive dashboard or the final summary.
 
     Uses terminal capability detection (TUI-003) to choose between the
@@ -377,15 +661,61 @@ def _finalize_run_output(*, quiet: bool) -> None:
     pre-drain state, and (b) it keeps cleanup correct even when the renderer
     raises ``SystemExit`` or ``KeyboardInterrupt``.
 
+    Exit-code mapping applies on EVERY branch, not only ``--quiet``. Nothing
+    turns ``--quiet`` on automatically and no documented workflow passes it, so
+    binding the outcome signal to that one flag left the ordinary invocations
+    -- the dashboard, the Rich fallback, and the non-interactive detach --
+    exiting 0 on a run that did not meet its goal (issue #3010, whose own
+    reproduction went down the non-interactive branch).
+
+    What each branch can honestly report differs, because they observe
+    different things:
+
+    * ``--quiet`` waits for a terminal state, so it reports both of them:
+      quiescence, and an orchestrator confirmed gone with work outstanding.
+    * The other three do not wait. They check ONCE, after their own work is
+      done, and report only an already-quiescent run. The "orchestrator gone"
+      verdict is an inference from absence that needs a confirmation window
+      across several observations (see ``_wait_for_run_completion``), which a
+      single poll cannot supply.
+
+    The non-interactive branch in particular detaches by design after roughly
+    one spawner tick, so its check usually finds the run still in flight and
+    changes nothing. It fires when a run reached a terminal state inside that
+    window, which is the fast-failure case.
+
+    A spawned-then-dead agent that never produced a plan (issue #3528) is
+    diagnosed the same way on every branch via ``_raise_if_no_plan_after_spawn``,
+    called before each branch's own wait so the check lands near the failure
+    window instead of after it.
+
     Args:
         quiet: When True, wait for quiescence and print only the terminal summary.
+        wait: Seconds to wait for quiescence, keeping the progress output;
+            None detaches as before.
     """
-    from bernstein.cli.run_bootstrap import _wait_for_run_completion, exec_restart
+    from bernstein.cli.run_bootstrap import (
+        _RUN_WAIT_DEFAULT_S,
+        _poll_quiescent_status,
+        _wait_for_run_completion,
+        exec_restart,
+    )
 
     try:
-        if quiet:
-            _wait_for_run_completion()
+        if quiet or wait is not None:
+            # `--quiet` means "no progress chatter", not "swallow the reason
+            # the run produced nothing" -- run the same fast diagnosis every
+            # other branch runs before falling back to the slower, general
+            # terminal-state wait below (issue #3528).
+            #
+            # `--wait` asks for the same terminal-state wait without giving up
+            # the progress output, and takes this branch even on a TTY: a
+            # caller that wants an exit code wants the run's outcome, not a
+            # dashboard it has to close.
+            _raise_if_no_plan_after_spawn(narrate_wait=not quiet)
+            final_status = _wait_for_run_completion(timeout_s=_RUN_WAIT_DEFAULT_S if wait is None else wait)
             _show_run_summary()
+            _exit_nonzero_on_unhealthy_run(final_status)
             return
 
         from bernstein.cli.terminal_caps import detect_capabilities
@@ -393,6 +723,7 @@ def _finalize_run_output(*, quiet: bool) -> None:
         caps = detect_capabilities()
 
         if caps.supports_textual:
+            _raise_if_no_plan_after_spawn()
             try:
                 from bernstein.cli.dashboard import BernsteinApp as DashboardApp
 
@@ -406,11 +737,44 @@ def _finalize_run_output(*, quiet: bool) -> None:
             except Exception:
                 # Textual failed at runtime -- fall through to fallback
                 _try_fallback_display()
+            # The operator watched the run to its end in the dashboard, so a
+            # finished run is the common case here, not the edge one.
+            _exit_nonzero_on_unhealthy_run(_poll_quiescent_status())
         elif caps.is_tty:
             # TTY but Textual not supported -- use Rich fallback (TUI-003)
+            _raise_if_no_plan_after_spawn()
             _try_fallback_display()
+            _exit_nonzero_on_unhealthy_run(_poll_quiescent_status())
         else:
+            # Non-interactive output detaches from the run immediately, so a
+            # spawn refusal in the background orchestrator would never reach
+            # the terminal (gh-2744).  Wait briefly for the first spawn
+            # outcome and surface a refusal as a non-zero exit.
+            from bernstein.cli.run_bootstrap import _await_first_spawn_outcome
+
+            outcome, reason = _await_first_spawn_outcome()
             _show_run_summary()
+            if outcome == "refused":
+                console.print(f"[red]Run failed before any work started:[/red] {reason}")
+                console.print("Details: run 'bernstein status' or read .sdd/runtime/retrospective.md")
+                raise SystemExit(1)
+            if outcome == "spawned":
+                # An agent was confirmed alive at least once, so an empty
+                # agent count now is a death, not "hasn't spawned yet". A run
+                # whose spawned agent died before decomposing the goal must
+                # say so instead of detaching silently (issue #3528).
+                from bernstein.cli.run_bootstrap import _poll_no_plan_after_spawn
+                from bernstein.core.errors import BernsteinFirstRunError, ErrorCategory
+
+                if _poll_no_plan_after_spawn() is not None:
+                    raise BernsteinFirstRunError(
+                        "Spawned agent exited before producing a work plan",
+                        category=ErrorCategory.NO_PLAN_PRODUCED,
+                    )
+            # A run that already reached a terminal state within the detach
+            # window must not report success on its way out.
+            _exit_nonzero_on_unhealthy_run(_poll_quiescent_status())
+            console.print("Run continues in the background (check: bernstein status).")
     finally:
         _drain_completed_backlog_files()
 

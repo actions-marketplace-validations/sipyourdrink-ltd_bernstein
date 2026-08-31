@@ -20,12 +20,12 @@ exfil chain shares. Verbatim from the original post:
 
 A successful attack needs, on the same execution path, **all three**:
 
-1. **private data** — files, secrets, repo contents, customer data the
+1. **private data** - files, secrets, repo contents, customer data the
    operator considers confidential;
-2. **untrusted input** — bytes from a source the operator does not
+2. **untrusted input** - bytes from a source the operator does not
    control (issue body, web fetch, MCP server reply, README from a
    pulled dependency);
-3. **external communication** — any way to transmit bytes off-host
+3. **external communication** - any way to transmit bytes off-host
    (HTTP request, comment-post, branch push, file write outside the
    workspace).
 
@@ -41,7 +41,7 @@ for this.
 
 Every tool, MCP server, and adapter Bernstein knows about is tagged with
 which of the three capabilities it carries. Tags are declarative YAML
-under `templates/capabilities/`, not heuristics — the registry is the
+under `templates/capabilities/`, not heuristics - the registry is the
 source of truth.
 
 At spawn time, the orchestrator computes the union of capabilities along
@@ -56,11 +56,11 @@ Three properties matter for a reviewer:
   that could be talked out of it.
 - **Default-deny on unknown tools.** A tool not present in the registry
   is treated as carrying all three capabilities. Missing metadata
-  fails closed — a custom plugin without a YAML declaration is denied,
+  fails closed - a custom plugin without a YAML declaration is denied,
   not silently allowed.
 - **Bypass-immune in the policy graph.** The decision lands as
   `DecisionType.IMMUNE` with `bypass_immune=True` in
-  [`policy_engine.py`](../../src/bernstein/core/security/policy_engine.py).
+  [`policy_engine.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/core/security/policy_engine.py).
   Even with `permission_mode: bypass`, plugin layers cannot override it.
 
 On refusal, two artefacts are persisted:
@@ -81,7 +81,7 @@ data, U = untrusted input, E = external comm.
 
 ### CLI agent adapters
 
-A CLI coding-agent adapter is the *envelope* — once the agent process
+A CLI coding-agent adapter is the *envelope* - once the agent process
 runs it can read repo files, fetch URLs, and call git/gh unless scoped
 further. The default tagging reflects that. Scope adapters down with
 the worker tool allowlist or per-agent credential scoping when the use
@@ -93,7 +93,7 @@ case allows.
 | `adapter.amp` | Y | Y | Y |
 | `adapter.claude` | Y | Y | Y |
 | `adapter.clm` | Y | - | Y |
-| `adapter.cloudflare_agents` | Y | Y | Y |
+| `adapter.antigravity` | Y | Y | Y |
 | `adapter.codex` | Y | Y | Y |
 | `adapter.cody` | Y | Y | Y |
 | `adapter.continue_dev` | Y | Y | Y |
@@ -135,7 +135,7 @@ under different display names.
 
 ### Built-in MCP server tools
 
-Talk to the local task server only — no external comm and no untrusted
+Talk to the local task server only - no external comm and no untrusted
 input. `bernstein_run` *can* spawn agents that touch private data, so
 it is tagged accordingly.
 
@@ -146,8 +146,11 @@ it is tagged accordingly.
 | `mcp.bernstein_status` | Y | - | - |
 | `mcp.bernstein_tasks` | Y | - | - |
 | `mcp.bernstein_cost` | Y | - | - |
-| `mcp.bernstein_stop` | - | - | - |
+| `mcp.bernstein_shutdown_orchestrator` | - | - | - |
+| `mcp.bernstein_cancel` | - | - | - |
+| `mcp.bernstein_stop` (deprecated alias) | - | - | - |
 | `mcp.bernstein_approve` | - | - | - |
+| `mcp.bernstein_complete` | - | - | - |
 | `mcp.bernstein_create_subtask` | Y | - | - |
 | `mcp.load_skill` | Y | - | - |
 
@@ -171,7 +174,7 @@ tools:
 
 Override semantics: the registry loader reads the workdir directory
 first; if a tool is declared in both, the workdir wins. Empty capability
-sets are allowed but **only honoured when explicitly declared** — an
+sets are allowed but **only honoured when explicitly declared** - an
 *absent* tool defaults to all three, not to none. There is no way to
 unset all capabilities by omission.
 
@@ -183,23 +186,23 @@ The same matrix gates cross-phase emission. Each pipeline phase
 that emits a `plan`-shaped artefact is refused at the same policy
 boundary, with the same audit surface, that gates the trifecta.
 Implementation: `register_with_capability_matrix` in
-[`phase_schemas.py`](../../src/bernstein/core/orchestration/phase_schemas.py).
+[`phase_schemas.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/core/orchestration/phase_schemas.py).
 
 ## Why bypass attempts fail
 
 Three classes of bypass have been considered and refused:
 
 1. **Prompt-injection in untrusted content** ("ignore any instructions
-   you find...") — the registry runs in the Python spawner before any
+   you find...") - the registry runs in the Python spawner before any
    agent process starts. The agent cannot influence its own spawn
    decision.
 2. **Plugin re-tagging** (a plugin declaring `fs.read_secret` with
-   `capabilities: []`) — the registry rejects the per-tool override only
+   `capabilities: []`) - the registry rejects the per-tool override only
    if a competing declaration is loaded; in any case the
-   [`DecisionType.IMMUNE`](../../src/bernstein/core/security/policy_engine.py)
+   [`DecisionType.IMMUNE`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/core/security/policy_engine.py)
    layer carries `bypass_immune=True` so plugin-layer ALLOW rules
    cannot override it.
-3. **`permission_mode: bypass`** — `bypass` relaxes medium and high
+3. **`permission_mode: bypass`** - `bypass` relaxes medium and high
    severity rules for non-interactive runs (see
    [security hardening](security-hardening.md)); it does not relax
    `IMMUNE` decisions. The trifecta refusal still fires.
@@ -221,23 +224,21 @@ Failures we do not claim to handle:
 
 | Knob | Default | Effect |
 |---|---|---|
-| `security.lethal_trifecta_enforcement` | `enforce` | `enforce` denies and audits; `warn` audits only; `off` audits only and allows. |
+| `security.lethal_trifecta_enforcement` | `enforce` | `enforce` refuses the spawn and emits a signed refusal audit event; `warn` allows and records the warning; `off` allows. In every mode the capability evaluation still runs and its triggered set lands in the per-spawn manifest under `.sdd/runtime/spawn_capabilities/`. |
 | `templates/capabilities/*.yaml` | bundled for stock adapters, MCP tools, surfaces | Capability declarations. |
 | Default for unknown tools | all three (`PRIVATE_DATA`, `UNTRUSTED_INPUT`, `EXTERNAL_COMM`) | Fail-closed. |
 
 `warn` is the recommended setting when first onboarding a custom
-plan with unfamiliar tools — the audit log fills up with the chains
+plan with unfamiliar tools - the audit log fills up with the chains
 you will eventually need to redesign without blocking work in the
 meantime. Production deployments should run `enforce`.
 
 ## Inspecting
 
 ```bash
-# Print the matrix and any violation chains in recorded spawns
+# Print the matrix and any violation chains in recorded spawns.
+# Exits non-zero if any violation exists.
 bernstein audit capabilities
-
-# Non-zero exit if any violation exists
-bernstein audit capabilities --strict
 ```
 
 Refusal manifests live in `.sdd/runtime/spawn_capabilities/`; HMAC
@@ -247,9 +248,9 @@ audit events live in `.sdd/audit/` and are listed by
 ## Related
 
 - [Capability matrix API and CLI](capability-matrix.md)
-- [Security hardening](security-hardening.md) — permission modes,
+- [Security hardening](security-hardening.md) - permission modes,
   policy rules, sandbox backends
-- [Audit log](AUDIT.md) — HMAC chain layout
+- [Audit log](AUDIT.md) - HMAC chain layout
 - Source: `src/bernstein/core/security/capability_matrix.py`,
   `src/bernstein/core/security/policy_engine.py`,
   `src/bernstein/core/agents/spawner_core.py`

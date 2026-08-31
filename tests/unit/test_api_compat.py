@@ -122,13 +122,27 @@ def test_task_response_fields_stable() -> None:
     assert not missing, f"TaskResponse is missing expected fields: {missing}"
 
 
-def test_task_complete_request_result_summary_required() -> None:
-    """TaskCompleteRequest.result_summary must remain required."""
+def test_task_complete_request_requires_summary_or_payload() -> None:
+    """TaskCompleteRequest accepts legacy result_summary or a contract payload.
+
+    Reviewed API change with the worker completion contract: result_summary
+    stays accepted unchanged for existing clients, payload carries the typed
+    completion or refusal, and a body with neither key must be rejected so a
+    bare {} can never register as a worker outcome.
+    """
+    import pytest
+    from pydantic import ValidationError
+
     from bernstein.core.server import TaskCompleteRequest
 
     fields = TaskCompleteRequest.model_fields
     assert "result_summary" in fields
-    assert fields["result_summary"].is_required(), "result_summary must not get a default value"
+    assert "payload" in fields
+    # Legacy clients keep working: summary-only body validates.
+    assert TaskCompleteRequest(result_summary="done").result_summary == "done"
+    # A body with neither key is malformed, not a worker outcome.
+    with pytest.raises(ValidationError):
+        TaskCompleteRequest()
 
 
 def test_heartbeat_request_fields_stable() -> None:
@@ -146,7 +160,7 @@ def test_task_fail_request_fields_stable() -> None:
 
     fields = TaskFailRequest.model_fields
     assert "reason" in fields
-    # reason should have a default (empty string) — changing this to required is breaking
+    # reason should have a default (empty string) - changing this to required is breaking
     assert not fields["reason"].is_required(), "TaskFailRequest.reason must keep its default"
 
 
@@ -187,14 +201,14 @@ def test_keyword_only_to_positional_only_is_breaking() -> None:
 
     from bernstein.core.api_compat import ChangeKind, compare_signatures
 
-    # before: def f(a: int, b: str) — b is POSITIONAL_OR_KEYWORD
+    # before: def f(a: int, b: str) - b is POSITIONAL_OR_KEYWORD
     before_params = [
         inspect.Parameter("a", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=int),
         inspect.Parameter("b", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
     ]
     before_sig = inspect.Signature(before_params)
 
-    # after: def f(a: int, b: str, /) — b is POSITIONAL_ONLY
+    # after: def f(a: int, b: str, /) - b is POSITIONAL_ONLY
     after_params = [
         inspect.Parameter("a", inspect.Parameter.POSITIONAL_ONLY, annotation=int),
         inspect.Parameter("b", inspect.Parameter.POSITIONAL_ONLY, annotation=str),

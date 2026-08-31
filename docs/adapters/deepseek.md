@@ -1,4 +1,4 @@
-# DeepSeek V4 (Flash + Pro) — self-hosted
+# DeepSeek V4 (Flash + Pro) - self-hosted
 
 Bernstein routes DeepSeek's MIT-licensed V4 family through the
 `ollama` adapter and an OpenAI-compatible HTTP endpoint. Both models
@@ -14,7 +14,7 @@ when residency mode is active.
 Both names round-trip through `model_config.model` and through the
 adapter's `_MODEL_MAP` (see `src/bernstein/adapters/ollama.py`).
 Because both endpoints expose the OpenAI-compatible `/v1/chat/completions`
-surface, aider/litellm treats Ollama and vLLM interchangeably — the
+surface, aider/litellm treats Ollama and vLLM interchangeably - the
 only operator choice is whether to point `OLLAMA_API_BASE` at the
 local Ollama daemon or at the vLLM tensor-parallel server.
 
@@ -43,7 +43,7 @@ refusal at spawn time, before any prompt bytes leave the orchestrator.
 
 Earlier residency checks used `host.startswith("10.")` style prefix
 matching, which silently accepted attacker-controlled FQDNs that begin
-with the same characters as a private range — `10.example.com`,
+with the same characters as a private range - `10.example.com`,
 `192.168.evil.tld`, `172.20.foo.com`. The current implementation
 parses the host through `ipaddress.ip_address` and falls back to the
 explicit FQDN-suffix allowlist only when the host is not a literal
@@ -66,9 +66,9 @@ local model:
 from bernstein.adapters.ollama import OllamaAdapter
 
 adapter = OllamaAdapter(
-    base_url="http://10.0.0.5:11434",   # Ollama on a private node
-    eu_residency=True,                   # belt-and-braces; the model
-                                         # alone already pins the guard
+    base_url="http://10.0.0.5:11434",  # Ollama on a private node
+    eu_residency=True,  # belt-and-braces; the model
+    # alone already pins the guard
 )
 ```
 
@@ -80,7 +80,7 @@ export OLLAMA_HOST=http://10.0.0.5:11434
 ```
 
 For `deepseek-v4-pro`, point `OLLAMA_API_BASE` at the vLLM `/v1`
-endpoint instead — same env variable, same wire format:
+endpoint instead - same env variable, same wire format:
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
@@ -104,14 +104,24 @@ For the full Article-12 evidence story, combine it with
 
 ```python
 from bernstein.core.security.data_residency import (
-    DataResidencyController, EU_WEST, EU_CENTRAL,
+    DataResidencyController,
+    Region,
+    ResidencyPolicy,
 )
 
-residency = DataResidencyController(
-    allowed_regions={EU_WEST, EU_CENTRAL},
-    enforce_strict=True,
+residency = DataResidencyController(node_region=Region.EU_WEST)
+residency.set_policy(
+    ResidencyPolicy(
+        tenant_id="acme",
+        allowed_regions=frozenset({Region.EU_WEST, Region.EU_CENTRAL}),
+        primary_region=Region.EU_WEST,
+        enforce_strict=True,
+    )
 )
 ```
+
+Regions are members of the `Region` enum, and the allowed set is
+per-tenant policy state rather than a controller constructor argument.
 
 The two layers are orthogonal: the adapter guard pins the *endpoint*,
 the controller pins the *region the workload may reach*.
@@ -144,7 +154,7 @@ endpoint host (already redacted of credentials) so an evaluator can
 prove which infrastructure served the call.
 
 The `network_policy` check still fires at spawn time so a misconfigured
-allowlist refuses the connection before the subprocess starts —
+allowlist refuses the connection before the subprocess starts -
 residency guard and network policy are independent gates and both must
 pass.
 

@@ -1,7 +1,7 @@
 """Shared constants, data classes, and helpers for the evolution loop modules.
 
-Extracted from cycle_runner.py and loop.py to eliminate code duplication.
-Both modules import from here instead of redefining the same symbols.
+Extracted from loop.py to eliminate code duplication; importers take the
+symbols from here instead of redefining them.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ AUTO_RISK_LEVELS: frozenset[str] = frozenset(
     }
 )
 
-# Focus area rotation — creative_vision runs every 4th cycle.
+# Focus area rotation - creative_vision runs every 4th cycle.
 # Agents write proposals to .sdd/evolution/creative/pending_proposals.jsonl;
 # the loop picks them up on creative_vision turns.
 FOCUS_ROTATION: tuple[str, ...] = (

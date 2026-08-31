@@ -6,7 +6,7 @@ Bernstein-specific terms used throughout the codebase and documentation.
 
 ### Bulletin Board
 
-An append-only communication channel where agents post findings, blockers, and status updates visible to all other agents in the same run. Implemented in `src/bernstein/core/bulletin.py`.
+An append-only communication channel where agents post findings, blockers, and status updates visible to all other agents in the same run. Implemented in `src/bernstein/core/communication/bulletin.py`.
 
 ### CAS Store
 
@@ -14,7 +14,7 @@ A content-addressed store that deduplicates artifact content by SHA-256 hash. Wh
 
 ### Cascade Router
 
-The cost-aware, bandit-driven model escalator that picks the cheapest viable Claude tier for a given task and escalates on failure. Default chain is `haiku -> sonnet -> opus`; high-stakes roles (manager, architect, security) start at `sonnet -> opus`. Escalation triggers on (1) explicit task failure, (2) janitor verification rejection, or (3) low-confidence regex scan over the agent's last 2000 chars (e.g., "I'm not sure", "TODO: escalate"). Per-(role, model) success rates persist to `.sdd/metrics/bandit_state.json`; chain reports to `.sdd/metrics/cascade_chains.jsonl`. Implemented in `src/bernstein/core/routing/cascade_router.py`.
+The cost-aware, bandit-driven model escalator that picks the cheapest viable Claude tier for a given task and escalates on failure. Default chain is `sonnet -> opus` (the earlier `haiku` tier was retired). Escalation triggers on (1) explicit task failure, (2) janitor verification rejection, or (3) low-confidence regex scan over the agent's last 2000 chars (e.g., "I'm not sure", "TODO: escalate"). Per-(role, model) success rates persist to `.sdd/metrics/bandit_state.json`; chain reports to `.sdd/metrics/cascade_chains.jsonl`. Implemented in `src/bernstein/core/routing/cascade_router.py`.
 
 ### Cross-Model Verifier
 
@@ -26,7 +26,7 @@ A wrapper adapter that intercepts spawn calls to enable prompt prefix deduplicat
 
 ### Circuit Breaker
 
-A state machine (CLOSED → OPEN → HALF_OPEN) that prevents infinite retry loops when an agent or provider repeatedly fails. After N consecutive failures, the breaker "opens" and blocks further attempts until a recovery probe succeeds. Implemented in `src/bernstein/core/circuit_breaker.py`.
+A state machine (CLOSED → OPEN → HALF_OPEN) that prevents infinite retry loops when an agent or provider repeatedly fails. After N consecutive failures, the breaker "opens" and blocks further attempts until a recovery probe succeeds. Implemented in `src/bernstein/core/observability/circuit_breaker.py`.
 
 ### Conformance Harness
 
@@ -38,11 +38,11 @@ A diagnostic archive containing logs, state files, configuration, and runtime me
 
 ### Drain
 
-Stop accepting new work and wait for active agents to finish their current tasks. Used during graceful shutdown or rolling upgrades. Implemented in `src/bernstein/core/drain.py`.
+Stop accepting new work and wait for active agents to finish their current tasks. Used during graceful shutdown or rolling upgrades. Implemented in `src/bernstein/core/orchestration/drain.py`.
 
 ### Fast Path
 
-An optimization that skips full planning for simple, single-file tasks. Instead of decomposing into subtasks, the agent handles the work directly. Implemented in `src/bernstein/core/fast_path.py`.
+An optimization that skips full planning for simple, single-file tasks. Instead of decomposing into subtasks, the agent handles the work directly. Implemented in `src/bernstein/core/quality/fast_path.py`.
 
 ### Lethal Trifecta
 
@@ -58,7 +58,7 @@ for the threat model and default capability table; implementation in
 
 ### Janitor
 
-The verification system that checks whether an agent's work is correct — runs lint, type-checks, tests, and other quality gates before accepting work. Distinct from the **Cross-Model Verifier** (which double-checks output by re-running on a second model) and the **Reviewer** (which performs LLM-based review). Implemented in `src/bernstein/core/quality/janitor.py`.
+The verification system that checks whether an agent's work is correct - runs lint, type-checks, tests, and other quality gates before accepting work. Distinct from the **Cross-Model Verifier** (which double-checks output by re-running on a second model) and the **Reviewer** (which performs LLM-based review). Implemented in `src/bernstein/core/quality/janitor.py`.
 
 The janitor also has a maintenance role: it periodically reaps orphaned worktrees and stale agent state. The cleanup interval is governed by `janitor.worktree_cleanup_interval_s` and `janitor.max_orphan_age_s` in `bernstein.yaml`.
 
@@ -68,31 +68,27 @@ The process of filtering environment variables before spawning agents to prevent
 
 ### Nudge
 
-A message sent to a stalled agent to prompt it to continue working. Part of the heartbeat and idle detection system. Implemented in `src/bernstein/core/nudge_manager.py`.
-
-### Peak-Hour Router
-
-A cost-aware scheduling component that routes tasks to cheaper providers or defers non-urgent work during peak pricing hours. Implemented in `src/bernstein/core/cost/peak_hour_router.py`.
+A message sent to a stalled agent to prompt it to continue working. Part of the heartbeat and idle detection system. Implemented in `src/bernstein/core/orchestration/nudge_manager.py`.
 
 ### Protocol Negotiation
 
-Runtime handshake that determines which protocol version (MCP, A2A, ACP) a connected client or agent supports, ensuring compatibility is verified at connection time rather than at failure time. Implemented in `src/bernstein/core/protocols/protocol_negotiation.py`.
+Runtime handshake that determines which protocol version (MCP, A2A, ACP) a connected client or agent supports. Compatibility is verified at connection time, not at failure time. Implemented in `src/bernstein/core/protocols/protocol_negotiation.py`.
 
 ### Quality Gate
 
-Automated checks (lint, type-check, tests, coverage) that must pass before work is accepted or merged. Gates run in sequence and any failure blocks the pipeline. Implemented in `src/bernstein/core/quality_gates.py`.
+Automated checks (lint, type-check, tests, coverage) that must pass before work is accepted or merged. Gates run in sequence and any failure blocks the pipeline. Implemented in `src/bernstein/core/quality/quality_gates.py`.
 
 ### Reap
 
-Killing or collecting agents that have exceeded their timeout or become unresponsive. Part of the agent lifecycle management. Implemented in `src/bernstein/core/agent_lifecycle.py`.
+Killing or collecting agents that have exceeded their timeout or become unresponsive. Part of the agent lifecycle management. Implemented in `src/bernstein/core/agents/agent_lifecycle.py`.
 
 ### SDD
 
-Software-Defined Development — the `.sdd/` directory where all runtime state lives: worktrees, sessions, task logs, and agent data. Initialized in `src/bernstein/core/bootstrap.py`.
+Software-Defined Development - the `.sdd/` directory where all runtime state lives: worktrees, sessions, task logs, and agent data. Initialized in `src/bernstein/core/orchestration/bootstrap.py`.
 
 ### Schema Registry
 
-A versioned catalog of message schemas for MCP, A2A, and ACP protocols, enabling forward/backward compatibility checks and migration paths. Implemented in `src/bernstein/core/protocols/schema_registry.py`.
+A versioned catalog of message schemas for MCP, A2A, and ACP protocols. Backs forward/backward compatibility checks and migration paths. Implemented in `src/bernstein/core/protocols/schema_registry.py`.
 
 ### Skills Injector
 
@@ -100,11 +96,11 @@ Writes role-specific Claude Code skills (`.claude/skills/*.md`) into the agent's
 
 ### Spawn
 
-Creating a short-lived agent process for a task batch. The spawner handles prompt construction, worktree setup, and process management. Implemented in `src/bernstein/core/spawner.py`.
+Creating a short-lived agent process for a task batch. The spawner handles prompt construction, worktree setup, and process management. Implemented in `src/bernstein/core/agents/spawner.py`.
 
 ### Tick
 
-The orchestrator's polling cycle (approximately 3 seconds). Each tick fetches pending tasks, spawns agents, checks heartbeats, and evaluates quality gates. Implemented in `src/bernstein/core/orchestrator.py`.
+The orchestrator's polling cycle (approximately 3 seconds). Each tick fetches pending tasks, spawns agents, checks heartbeats, and evaluates quality gates. Implemented in `src/bernstein/core/orchestration/orchestrator.py`.
 
 ### WAL
 
@@ -116,7 +112,7 @@ A pre-spawn pool of agent processes kept idle so newly-claimed tasks see lower s
 
 ### Worktree
 
-An isolated git worktree per agent, located at `.sdd/worktrees/{session_id}`. Each agent works in its own branch without interfering with others. Implemented in `src/bernstein/core/worktree.py`.
+An isolated git worktree per agent, located at `.sdd/worktrees/{session_id}`. Each agent works in its own branch without interfering with others. Implemented in `src/bernstein/core/git/worktree.py`.
 
 ---
 

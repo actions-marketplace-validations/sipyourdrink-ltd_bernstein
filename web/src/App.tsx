@@ -10,10 +10,10 @@ import {
   Route,
   Navigate,
   useLocation,
-} from 'react-router-dom';
+} from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import AppShell from './components/AppShell';
-import { ThemeProvider } from './components/ThemeProvider';
+import { DEFAULT_THEME, DEFAULT_THEME_STORAGE_KEY, ThemeProvider } from './components/ThemeProvider';
 import { ApiError } from './lib/api';
 import Tasks from './routes/Tasks';
 import Agents from './routes/Agents';
@@ -21,10 +21,12 @@ import Approvals from './routes/Approvals';
 import Audit from './routes/Audit';
 import Costs from './routes/Costs';
 import Fleet from './routes/Fleet';
+import Missions from './routes/Missions';
 import Settings from './routes/Settings';
+import Vocabulary from './routes/Vocabulary';
 
 // ── QueryClient ────────────────────────────────────────────────────────────
-// - retry: skip 4xx (operator error / unauth — never recovers); only retry on
+// - retry: skip 4xx (operator error / unauth - never recovers); only retry on
 //   transport / 5xx, and cap at 2 attempts.
 // - refetchOnWindowFocus: keep the React Query default of `true` so screens
 //   that observe live state (Approvals, Tasks) refresh when the operator
@@ -54,15 +56,17 @@ const ROUTE_TITLES: Record<string, string> = {
   '/approvals': 'Approvals',
   '/audit': 'Audit',
   '/costs': 'Costs',
+  '/missions': 'Missions',
   '/fleet': 'Fleet',
   '/settings': 'Settings',
+  '/vocabulary': 'Vocabulary',
 };
 
 function RouteEffects() {
   const { pathname } = useLocation();
 
   useEffect(() => {
-    // Title — fall back to the bare app name on unknown routes.
+    // Title - fall back to the bare app name on unknown routes.
     const root = `/${pathname.split('/').filter(Boolean)[0] ?? ''}`;
     const label = ROUTE_TITLES[root];
     document.title = label ? `${label} · Bernstein` : 'Bernstein';
@@ -134,7 +138,7 @@ function RouteCrashFallback({
       >
         <h2 className="text-h3 text-foreground">Screen crashed</h2>
         <p className="mt-2 text-body text-muted-foreground">
-          A runtime error broke this view. The rest of the app is still up —
+          A runtime error broke this view. The rest of the app is still up -
           retry to remount the screen, or reload the page if it keeps failing.
         </p>
         <pre className="mt-3 max-h-40 overflow-auto rounded-sm border border-border-subtle bg-card p-2 font-mono text-[11px] text-muted-foreground">
@@ -188,31 +192,39 @@ function NotFound() {
   );
 }
 
+function DashboardRoutes() {
+  const { pathname } = useLocation();
+  const routes = (
+    <RouteErrorBoundary>
+      <Routes>
+        <Route path="/" element={<Navigate to="/tasks" replace />} />
+        <Route path="/tasks" element={<Tasks />} />
+        <Route path="/agents" element={<Agents />} />
+        <Route path="/approvals" element={<Approvals />} />
+        <Route path="/audit" element={<Audit />} />
+        <Route path="/costs" element={<Costs />} />
+        <Route path="/missions" element={<Missions />} />
+        <Route path="/fleet" element={<Fleet />} />
+        <Route path="/settings" element={<Settings />} />
+        <Route path="/vocabulary" element={<Vocabulary />} />
+        <Route path="*" element={<NotFound />} />
+      </Routes>
+    </RouteErrorBoundary>
+  );
+
+  return pathname === '/vocabulary' ? routes : <AppShell>{routes}</AppShell>;
+}
+
 export default function App() {
   return (
-    <ThemeProvider defaultTheme="system" storageKey="bernstein-theme">
+    <ThemeProvider defaultTheme={DEFAULT_THEME} storageKey={DEFAULT_THEME_STORAGE_KEY}>
       <QueryClientProvider client={queryClient}>
-        {/* basename normalizes both `/ui` and `/ui/` — RR strips the prefix
+        {/* basename normalizes both `/ui` and `/ui/` - RR strips the prefix
             internally before matching, so the index route fires exactly once
             in either case. */}
         <BrowserRouter basename="/ui">
           <RouteEffects />
-          <AppShell>
-            <RouteErrorBoundary>
-              <Routes>
-                <Route path="/" element={<Navigate to="/tasks" replace />} />
-                <Route path="/tasks" element={<Tasks />} />
-                <Route path="/agents" element={<Agents />} />
-                <Route path="/approvals" element={<Approvals />} />
-                <Route path="/audit" element={<Audit />} />
-                <Route path="/costs" element={<Costs />} />
-                {/* Fleet + Settings live in topbar / user-menu but stay deep-linkable. */}
-                <Route path="/fleet" element={<Fleet />} />
-                <Route path="/settings" element={<Settings />} />
-                <Route path="*" element={<NotFound />} />
-              </Routes>
-            </RouteErrorBoundary>
-          </AppShell>
+          <DashboardRoutes />
         </BrowserRouter>
       </QueryClientProvider>
     </ThemeProvider>

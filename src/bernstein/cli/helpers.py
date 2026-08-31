@@ -8,12 +8,14 @@ import sys
 import time
 from contextlib import suppress
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import click
 import httpx
-from rich.console import Console
 
+from bernstein.cli.ui import make_console
+from bernstein.core.defaults import SDD_SERVER_PORT
 from bernstein.core.platform_compat import kill_process, kill_process_group
 from bernstein.core.process_utils import is_process_alive as _shared_is_process_alive
 
@@ -62,7 +64,10 @@ STATUS_COLORS: dict[str, str] = {
     "cancelled": "red",
 }
 
-console = Console()
+# Built through the factory rather than as a bare ``Console()`` so the stream
+# tolerates glyphs a legacy code page cannot encode (#3901). This is the
+# console ``run_confirm.py`` prints the demo's check marks through.
+console = make_console()
 
 
 # ---------------------------------------------------------------------------
@@ -70,42 +75,232 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 
+def adapter_cli_choice() -> click.Choice[str]:
+    """Build the ``--cli`` option type from the live adapter registry.
+
+    Returns a :class:`click.Choice` whose options are every selectable
+    adapter (:func:`bernstein.adapters.registry.selectable_adapter_names`)
+    plus the ``auto`` auto-detection sentinel, so ``--cli`` accepts any
+    registered adapter instead of a stale hardcoded subset (issue #2781).
+    The adapters package is imported lazily here so importing this helper
+    module does not pull it in.
+
+    Returns:
+        A case-insensitive ``click.Choice`` over the selectable adapter
+        names plus ``"auto"``.
+    """
+    from bernstein.adapters.registry import selectable_adapter_names
+
+    return click.Choice(sorted({*selectable_adapter_names(), "auto"}), case_sensitive=False)
+
+
 def print_banner() -> None:
     console.print(f"[blue]{BANNER}[/blue]")
 
 
-def auth_headers() -> dict[str, str]:
-    """Return Authorization header dict if BERNSTEIN_AUTH_TOKEN is set."""
+def print_startup_banner() -> None:
+    """Show the program-load banner: the block-art ASCII wordmark on an
+    interactive terminal, the compact box banner otherwise.
+
+    The compact splash renders the full block-art logo on a real TTY; on
+    non-interactive output (CI, pipes, captured test output) it collapses to a
+    dense one-liner, so we fall through to the box banner there. That keeps CI
+    logs terse and preserves the ``Agent Orchestra`` marker the run-banner
+    regression guard asserts, while interactive operators get the wordmark back
+    at ``bernstein run`` time (the premium splash only fires on the bare
+    ``bernstein`` invocation).
+    """
+    if console.is_terminal:
+        try:
+            from bernstein.cli.display.splash import splash as _compact_splash
+
+            _compact_splash(console, skip_animation=True)
+            return
+        except Exception:
+            pass
+    print_banner()
+
+
+def auth_headers(workdir: Path | None = None) -> dict[str, str]:
+    """Return the Authorization header dict for talking to the local server.
+
+    Resolution order (issue #2794):
+
+    1. The ``BERNSTEIN_AUTH_TOKEN`` env var, when the caller inherited it.
+    2. The persisted run token file under ``.sdd/runtime`` (written by the
+       launcher when it auto-generates a token), so a monitor invoked from a
+       shell that never inherited the launcher env still authenticates.
+
+    Args:
+        workdir: Workspace to resolve the token file against. Defaults to the
+            current working directory - the workspace the monitor runs in.
+
+    Returns:
+        ``{"Authorization": "Bearer <token>"}`` when a token is found, else an
+        empty dict.
+    """
     token = os.environ.get("BERNSTEIN_AUTH_TOKEN")
+    if not token:
+        from bernstein.core.run_auth_token import read_run_auth_token
+
+        token = read_run_auth_token(workdir or Path.cwd())
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
 
 
-def server_get(path: str) -> dict[str, Any] | None:
-    """GET from the task server.  Returns None if server is unreachable."""
+def resolve_server_url(workdir: Path | None = None) -> str:
+    """Resolve the task server URL from env, the active workspace, or default."""
+    configured = os.environ.get("BERNSTEIN_SERVER_URL")
+    if configured:
+        return configured.rstrip("/")
+
+    port_path = (workdir or Path.cwd()) / SDD_SERVER_PORT
     try:
-        resp = httpx.get(f"{SERVER_URL}{path}", timeout=5.0, headers=auth_headers())
+        port = int(port_path.read_text().strip())
+        if 1 <= port <= 65535:
+            return f"http://127.0.0.1:{port}"
+    except (OSError, ValueError):
+        pass
+    return "http://127.0.0.1:8052"
+
+
+def persist_server_port(port: int, workdir: Path | None = None) -> Path:
+    """Persist the effective run port for follow-up CLI commands."""
+    if not 1 <= port <= 65535:
+        raise ValueError(f"server port must be between 1 and 65535, got {port}")
+    path = (workdir or Path.cwd()) / SDD_SERVER_PORT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        stream.write(f"{port}\n")
+        temporary = Path(stream.name)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+class ServerAuthError(Exception):
+    """The task server is reachable but rejected the request's credentials.
+
+    Raised by :func:`server_get` / :func:`server_post` (opt-in via
+    ``raise_on_auth_error``) when the server answers ``401``/``403``. It lets a
+    monitor command distinguish "server up, bad creds" from "server
+    unreachable" and print a credentials-specific diagnostic instead of the
+    misleading "Is Bernstein running?" (issue #2794).
+    """
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"server rejected credentials (HTTP {status_code})")
+
+
+def server_get(path: str, *, raise_on_auth_error: bool = False) -> dict[str, Any] | None:
+    """GET from the task server.  Returns None if server is unreachable.
+
+    Args:
+        path: Request path appended to the resolved server URL.
+        raise_on_auth_error: When ``True``, a ``401``/``403`` from a reachable
+            server raises :class:`ServerAuthError` instead of returning
+            ``None``, so callers can report a credentials problem distinctly
+            from an unreachable server. Defaults to ``False`` to preserve the
+            ``None``-on-any-error contract existing callers rely on.
+    """
+    try:
+        resp = httpx.get(f"{resolve_server_url()}{path}", timeout=5.0, headers=auth_headers())
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
     except httpx.ConnectError:
+        return None
+    except httpx.HTTPStatusError as exc:
+        if raise_on_auth_error and exc.response.status_code in (401, 403):
+            raise ServerAuthError(exc.response.status_code) from exc
+        console.print(f"[red]Server error:[/red] {exc}")
         return None
     except Exception as exc:
         console.print(f"[red]Server error:[/red] {exc}")
         return None
 
 
-def server_post(path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    """POST to the task server.  Returns None if server is unreachable."""
+def server_post(
+    path: str,
+    payload: dict[str, Any],
+    *,
+    raise_on_auth_error: bool = False,
+    connect_retries: int = 0,
+    retry_delay: float = 0.0,
+) -> dict[str, Any] | None:
+    """POST to the task server.  Returns None if server is unreachable.
+
+    Args:
+        path: Request path appended to the resolved server URL.
+        payload: JSON body to send.
+        raise_on_auth_error: When ``True``, a ``401``/``403`` from a reachable
+            server raises :class:`ServerAuthError` instead of returning
+            ``None``. Defaults to ``False`` to preserve the existing contract.
+        connect_retries: Extra attempts made **only** on a connection refused /
+            transient network error (``httpx.ConnectError``). The task server
+            can briefly restart during hot-reload (evolve mode), so a completion
+            POST fired in that window should retry rather than fail. A ``4xx``
+            such as ``409`` is never retried - the task state changed and a
+            retry would not help (mirrors ``--retry-connrefused``, never
+            ``--retry-all-errors``). Defaults to ``0`` (no retry).
+        retry_delay: Seconds to sleep between connect retries.
+    """
+    attempts = max(0, connect_retries) + 1
+    for attempt in range(attempts):
+        try:
+            resp = httpx.post(f"{resolve_server_url()}{path}", json=payload, timeout=5.0, headers=auth_headers())
+            resp.raise_for_status()
+            return resp.json()  # type: ignore[no-any-return]
+        except httpx.ConnectError:
+            if attempt < attempts - 1:
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
+                continue
+            return None
+        except httpx.HTTPStatusError as exc:
+            if raise_on_auth_error and exc.response.status_code in (401, 403):
+                raise ServerAuthError(exc.response.status_code) from exc
+            console.print(f"[red]Server error:[/red] {exc}")
+            return None
+        except Exception as exc:
+            console.print(f"[red]Server error:[/red] {exc}")
+            return None
+    return None
+
+
+def require_server_reachable() -> None:
+    """Gate a monitor command behind a usable ``/status`` probe.
+
+    Distinguishes an unreachable server from one that is up but rejecting the
+    caller's credentials (issue #2794), printing the matching diagnostic and
+    exiting with status ``1`` in either failure case. Returns normally when the
+    server answers ``/status`` successfully.
+
+    Raises:
+        SystemExit: With code ``1`` when the server is unreachable or rejects
+            the request's credentials.
+    """
     try:
-        resp = httpx.post(f"{SERVER_URL}{path}", json=payload, timeout=5.0, headers=auth_headers())
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
-    except httpx.ConnectError:
-        return None
-    except Exception as exc:
-        console.print(f"[red]Server error:[/red] {exc}")
-        return None
+        reachable = server_get("/status", raise_on_auth_error=True)
+    except ServerAuthError:
+        console.print(
+            "[red]Server is running but rejected credentials.[/red] "
+            "Run [bold]bernstein[/bold] in this workspace, or set BERNSTEIN_AUTH_TOKEN to match the server."
+        )
+        raise SystemExit(1) from None
+    if reachable is None:
+        console.print("[red]Cannot reach task server.[/red] Is Bernstein running? Run [bold]bernstein[/bold] to start.")
+        raise SystemExit(1)
 
 
 def read_pid(path: str) -> int | None:
@@ -226,6 +421,15 @@ def print_dry_run_table(workdir: Path) -> None:
         bt = parse_backlog_file(backlog_file)
         if bt is not None:
             tasks.append(bt)
+        else:
+            # A backlog file that is not the expected frontmatter/markdown
+            # format (e.g. plain YAML with no `---` block and no `# ` title)
+            # would otherwise be silently skipped (issue #2785). Surface it so
+            # the operator can see the ticket will not be picked up.
+            console.print(
+                f"[yellow]Warning:[/yellow] {backlog_file.name} could not be parsed as a backlog ticket "
+                "(expected YAML frontmatter delimited by '---' or a Markdown '# ' title); skipping."
+            )
 
     console.print("\n[bold cyan][DRY RUN] Planned task spawns:[/bold cyan]")
 
@@ -285,14 +489,26 @@ def print_dry_run_table(workdir: Path) -> None:
 
 
 _SEED_FILENAMES = ("bernstein.yaml", "bernstein.yml")
+_DOT_BERNSTEIN_SEED_FILENAMES = (
+    ".bernstein/bernstein.yaml",
+    ".bernstein/bernstein.yml",
+)
 
 
 def find_seed_file() -> Path | None:
     """Look for a bernstein.yaml in the current directory.
 
+    Checks the project-local ``.bernstein/`` directory first (e.g.
+    ``.bernstein/bernstein.yaml``), then falls back to the root-level
+    ``bernstein.yaml``/``bernstein.yml`` for backward compatibility.
+
     Returns:
         Path to the seed file if found, None otherwise.
     """
+    for name in _DOT_BERNSTEIN_SEED_FILENAMES:
+        p = Path(name)
+        if p.is_file():
+            return p
     for name in _SEED_FILENAMES:
         p = Path(name)
         if p.is_file():
@@ -373,14 +589,26 @@ def output_option(fn: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def print_success(message: str) -> None:
-    """Print a success message in green with a check mark prefix."""
-    console.print(f"[green]✓[/green] {message}")
+def print_success(message: str, *, soft_wrap: bool = False) -> None:
+    """Print a success message in green with a check mark prefix.
+
+    Set ``soft_wrap=True`` for verdict lines that embed an unbounded value
+    (e.g. a filesystem path) so the human-readable verdict phrase is never
+    fragmented by terminal soft-wrapping. Without it a long path can push a
+    trailing phrase past the console width and split it across a newline,
+    breaking copy-paste and substring consumers. ``soft_wrap`` emits the
+    full text without inserting hard line breaks (the terminal still wraps
+    visually), unlike ``no_wrap`` which would crop the line to the width.
+    """
+    console.print(f"[green]✓[/green] {message}", soft_wrap=soft_wrap)
 
 
-def print_error(message: str) -> None:
-    """Print an error message in red with an x prefix."""
-    console.print(f"[red]✗[/red] {message}")
+def print_error(message: str, *, soft_wrap: bool = False) -> None:
+    """Print an error message in red with an x prefix.
+
+    See :func:`print_success` for the ``soft_wrap`` rationale.
+    """
+    console.print(f"[red]✗[/red] {message}", soft_wrap=soft_wrap)
 
 
 def print_warning(message: str) -> None:

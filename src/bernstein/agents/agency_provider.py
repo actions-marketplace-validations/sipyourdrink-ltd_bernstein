@@ -1,4 +1,4 @@
-"""AgencyProvider — loads CatalogAgent instances from msitarzewski/agency-agents format.
+"""AgencyProvider - loads CatalogAgent instances from msitarzewski/agency-agents format.
 
 Agency repos use one Markdown file per agent, organised into division
 subdirectories. Each file has YAML frontmatter (name, description, …)
@@ -8,10 +8,13 @@ followed by the system-prompt body.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import subprocess
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +23,23 @@ import yaml
 from bernstein.agents.catalog import CatalogAgent
 
 logger = logging.getLogger(__name__)
+
+
+class AgentCatalogTamperedError(Exception):
+    """Raised when an agent catalog's content digest fails lockfile verification."""
+
+
+def compute_catalog_digest(target: Path) -> str:
+    """Compute a deterministic SHA-256 digest over all markdown files in *target*."""
+    hasher = hashlib.sha256()
+    if not target.exists():
+        return hasher.hexdigest()
+    for file_path in sorted(target.glob("**/*.md")):
+        rel_path = file_path.relative_to(target).as_posix()
+        hasher.update(rel_path.encode("utf-8"))
+        hasher.update(file_path.read_bytes())
+    return hasher.hexdigest()
+
 
 # Maps Agency division names (or their base component) to Bernstein role names.
 _DIVISION_ROLE_MAP: dict[str, str] = {
@@ -31,7 +51,7 @@ _DIVISION_ROLE_MAP: dict[str, str] = {
     "specialized": "backend",
 }
 
-# Divisions that are clearly NOT software engineering — agents from these
+# Divisions that are clearly NOT software engineering - agents from these
 # divisions are skipped entirely to avoid polluting the catalog with
 # irrelevant matches (e.g. "Brand Guardian" for an architect role).
 _NON_SOFTWARE_DIVISIONS: frozenset[str] = frozenset(
@@ -340,12 +360,18 @@ class AgencyProvider:
         agent_id = f"agency:{_slugify(name)}"
 
         # Extract capabilities list (e.g. [api-design, authentication, jwt])
-        raw_caps: list[Any] = list(fm.get("capabilities") or [])
-        capabilities: list[str] = [str(c) for c in raw_caps]
+        raw_caps: Any = fm.get("capabilities") or []
+        if isinstance(raw_caps, str):
+            capabilities: list[str] = [c.strip() for c in raw_caps.split(",") if c.strip()]
+        else:
+            capabilities = [str(c) for c in raw_caps]
 
         # Extract preferred tools list (e.g. [pytest, ruff, mypy])
-        raw_tools: list[Any] = list(fm.get("tools") or [])
-        tools: list[str] = [str(t) for t in raw_tools]
+        raw_tools: Any = fm.get("tools") or []
+        if isinstance(raw_tools, str):
+            tools: list[str] = [t.strip() for t in raw_tools.split(",") if t.strip()]
+        else:
+            tools = [str(t) for t in raw_tools]
 
         # Infer role from agent metadata instead of relying solely on division
         role = _infer_role(name, description, capabilities, division_role)
@@ -377,6 +403,29 @@ class AgencyProvider:
         await asyncio.sleep(0)  # Async interface requirement
         if not self.is_available():
             return []
+
+        # Verify lockfile provenance if present
+        lock_file = self._local_path / "agents.lock"
+        if lock_file.is_file():
+            try:
+                data = json.loads(lock_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                raise AgentCatalogTamperedError(
+                    f"Agent catalog at {self._local_path} has an unreadable agents.lock"
+                ) from exc
+
+            expected_digest = data.get("content_digest", "") if isinstance(data, dict) else ""
+            if not expected_digest:
+                raise AgentCatalogTamperedError(
+                    f"Agent catalog at {self._local_path} lockfile records no content_digest"
+                )
+
+            actual_digest = compute_catalog_digest(self._local_path)
+            if actual_digest != expected_digest:
+                raise AgentCatalogTamperedError(
+                    f"Agent catalog at {self._local_path} content digest mismatch "
+                    f"(expected {expected_digest[:8]}, got {actual_digest[:8]})"
+                )
 
         agents: list[CatalogAgent] = []
         for division_dir in sorted(self._local_path.iterdir()):
@@ -436,15 +485,18 @@ class AgencyProvider:
         if target is None:
             target = cls.default_cache_path()
 
-        # TTL check — skip if synced recently
+        from bernstein.core.persistence.atomic_write import write_atomic_json
+
+        # TTL check - skip if synced recently and lockfile exists
         marker = target.parent / f".{target.name}.synced"
-        if not force and marker.exists():
+        lock_file = target / "agents.lock"
+        if not force and marker.exists() and lock_file.is_file():
             age = time.time() - marker.stat().st_mtime
             if age < _SYNC_TTL_SECONDS:
                 return True, f"up to date (synced {age / 3600:.1f}h ago)"
 
         if target.exists() and (target / ".git").exists():
-            # Existing clone — just pull
+            # Existing clone - just pull
             result = subprocess.run(
                 ["git", "-C", str(target), "pull", "--ff-only", "--quiet"],
                 capture_output=True,
@@ -474,6 +526,16 @@ class AgencyProvider:
             if result.returncode != 0:
                 return False, f"git clone failed: {result.stderr.strip()}"
             action = "cloned"
+
+        digest = compute_catalog_digest(target)
+        target.mkdir(parents=True, exist_ok=True)
+        lock_payload = {
+            "url": url,
+            "content_digest": digest,
+            "synced_at": datetime.now(UTC).isoformat(),
+            "signature_present": False,
+        }
+        write_atomic_json(lock_file, lock_payload)
 
         marker.touch()
         return True, f"Agency catalog {action} from {url}"

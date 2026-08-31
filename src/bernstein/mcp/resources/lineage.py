@@ -13,7 +13,7 @@ Per ADR-009 §7:
       and that the canonical bytes still hash to the recorded ``entry_hash``.
 
 Default-off in remote/SSE MCP, on for local stdio. Callers pass
-``enabled=False`` for the remote registrar — the function then returns
+``enabled=False`` for the remote registrar - the function then returns
 ``False`` without touching the FastMCP instance.
 """
 
@@ -30,6 +30,7 @@ from mcp.server.fastmcp.resources.templates import ResourceTemplate
 
 from bernstein.core.lineage.entry import canonicalise, entry_hash
 from bernstein.core.lineage.store import LineageStore
+from bernstein.mcp.input_validation import validate_or_error, validation_error_response
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -54,6 +55,48 @@ class _SlashTolerantResourceTemplate(ResourceTemplate):
         if match:
             return match.groupdict()
         return None
+
+
+def lineage_artefact_body(root: Path, artefact_path: str) -> str:
+    """JSONL chain of lineage entries for ``artefact_path``.
+
+    Shared by the FastMCP resource below and the streamable HTTP transport's
+    ``resources/read`` (#3084), so both surfaces serve the same bytes.
+    """
+    store = LineageStore(root)
+    lines: list[str] = []
+    for entry, _jws in store.read_log():
+        if entry.artefact_path != artefact_path:
+            continue
+        lines.append(canonicalise(entry).decode("utf-8"))
+    return "\n".join(lines)
+
+
+def lineage_stats_body(root: Path) -> str:
+    """JSON summary counts over the entire lineage log (shared, see above)."""
+    store = LineageStore(root)
+    total = 0
+    artefacts: set[str] = set()
+    agents: set[str] = set()
+    last_24h = 0
+    now_ns = time.time_ns()
+    cutoff = now_ns - 24 * 3_600 * 1_000_000_000
+    # Track open forks by counting artefacts whose tip_set has >1 open.
+    for entry, _jws in store.read_log():
+        total += 1
+        artefacts.add(entry.artefact_path)
+        agents.add(entry.agent_id)
+        if entry.ts_ns >= cutoff:
+            last_24h += 1
+    open_forks = sum(1 for path in artefacts if len(store.tip_set(path).get("open", [])) > 1)
+    payload = {
+        "total_entries": total,
+        "artefacts": len(artefacts),
+        "open_forks": open_forks,
+        "agents_seen": sorted(agents),
+        "last_24h_entries": last_24h,
+    }
+    return json.dumps(payload, sort_keys=True)
 
 
 def register_lineage_resources(
@@ -83,13 +126,7 @@ def register_lineage_resources(
 
     def lineage_artefact(artefact_path: str) -> str:
         """JSONL chain of lineage entries for ``artefact_path``."""
-        store = LineageStore(root)
-        lines: list[str] = []
-        for entry, _jws in store.read_log():
-            if entry.artefact_path != artefact_path:
-                continue
-            lines.append(canonicalise(entry).decode("utf-8"))
-        return "\n".join(lines)
+        return lineage_artefact_body(root, artefact_path)
 
     # Bypass the FastMCP decorator for this template because the default
     # placeholder regex (``[^/]+``) rejects path segments containing ``/``.
@@ -112,38 +149,39 @@ def register_lineage_resources(
         mime_type="application/json",
     )
     def lineage_stats() -> str:  # pyright: ignore[reportUnusedFunction]
-        store = LineageStore(root)
-        total = 0
-        artefacts: set[str] = set()
-        agents: set[str] = set()
-        last_24h = 0
-        now_ns = time.time_ns()
-        cutoff = now_ns - 24 * 3_600 * 1_000_000_000
-        # Track open forks by counting artefacts whose tip_set has >1 open.
-        for entry, _jws in store.read_log():
-            total += 1
-            artefacts.add(entry.artefact_path)
-            agents.add(entry.agent_id)
-            if entry.ts_ns >= cutoff:
-                last_24h += 1
-        open_forks = sum(1 for path in artefacts if len(store.tip_set(path).get("open", [])) > 1)
-        payload = {
-            "total_entries": total,
-            "artefacts": len(artefacts),
-            "open_forks": open_forks,
-            "agents_seen": sorted(agents),
-            "last_24h_entries": last_24h,
-        }
-        return json.dumps(payload, sort_keys=True)
+        return lineage_stats_body(root)
 
     @mcp.tool(
-        name="verify_chain",
+        name="bernstein_verify_lineage",
         description="Verify the lineage chain of a single artefact path.",
     )
-    def verify_chain(artefact_path: str) -> str:  # pyright: ignore[reportUnusedFunction]
+    def bernstein_verify_lineage(artefact_path: str) -> str:  # pyright: ignore[reportUnusedFunction]
+        err = validate_or_error("bernstein_verify_lineage", {"artefact_path": artefact_path})
+        if err is not None:
+            return validation_error_response(err)
         store = LineageStore(root)
         ok, reason = _verify_chain(store, artefact_path)
         return json.dumps({"ok": ok, "reason": reason})
+
+    from bernstein.core.protocols.mcp.tool_tiers import deprecated_aliases_enabled
+
+    if deprecated_aliases_enabled():
+        # Deprecated alias (#3087): callable, never advertised, removed in
+        # ALIAS_REMOVAL_RELEASE. Registered here rather than with the other
+        # aliases because it needs the lineage store root.
+        @mcp.tool(
+            name="verify_chain",
+            description="Deprecated alias of bernstein_verify_lineage.",
+        )
+        def verify_chain(artefact_path: str) -> str:  # pyright: ignore[reportUnusedFunction]
+            from bernstein.mcp.server import _deprecated_alias_payload  # pyright: ignore[reportPrivateUsage]
+
+            err = validate_or_error("verify_chain", {"artefact_path": artefact_path})
+            if err is not None:
+                return validation_error_response(err)
+            store = LineageStore(root)
+            ok, reason = _verify_chain(store, artefact_path)
+            return _deprecated_alias_payload("verify_chain", json.dumps({"ok": ok, "reason": reason}))
 
     return True
 
@@ -168,10 +206,10 @@ def _verify_chain(store: LineageStore, artefact_path: str) -> tuple[bool, str | 
             entries.append((h, list(entry.parent_hashes), entry.artefact_path))
 
     if not entries:
-        return True, None  # nothing recorded for this artefact — trivially valid
+        return True, None  # nothing recorded for this artefact - trivially valid
 
     # The canonical-bytes byte-equality check needs raw bytes from the log,
-    # not the parsed entry — re-read the raw lines and verify each one
+    # not the parsed entry - re-read the raw lines and verify each one
     # round-trips through canonicalise().
     log_path = store.log_path
     if log_path.exists():
@@ -198,4 +236,4 @@ def _verify_chain(store: LineageStore, artefact_path: str) -> tuple[bool, str | 
     return True, None
 
 
-__all__ = ["register_lineage_resources"]
+__all__ = ["lineage_artefact_body", "lineage_stats_body", "register_lineage_resources"]

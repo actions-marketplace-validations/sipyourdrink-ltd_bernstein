@@ -1,14 +1,14 @@
-"""Approval routes — list, approve, and reject pending approval requests.
+"""Approval routes - list, approve, and reject pending approval requests.
 
 Provides a TUI-friendly API over the file-based approval gate handshake:
 - Lists pending approvals from ``.sdd/runtime/pending_approvals/``
 - Approves or rejects by writing decision files to ``.sdd/runtime/approvals/``
 
 op-002 adds the interactive tool-call endpoints:
-- ``GET /approvals?session_id=...`` — list pending tool-call approvals.
-- ``POST /approvals/{id}/resolve`` — record an ``allow|reject|always``
+- ``GET /approvals?session_id=...`` - list pending tool-call approvals.
+- ``POST /approvals/{id}/resolve`` - record an ``allow|reject|always``
   decision for a specific approval id.
-- ``GET /approvals/live-fragment?session_id=...`` — HTML fragment that
+- ``GET /approvals/live-fragment?session_id=...`` - HTML fragment that
   the live-session page embeds so operators can resolve approvals from
   the web UI.
 """
@@ -34,6 +34,10 @@ from bernstein.core.approval.models import (
 from bernstein.core.approval.models import PendingApproval as QueuedApproval
 from bernstein.core.approval.queue import get_default_queue, promote_to_always_allow
 from bernstein.core.sanitize import sanitize_log
+from bernstein.core.security.path_containment import (
+    PathContainmentError,
+    contained_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +50,21 @@ router = APIRouter(prefix="/approvals", tags=["approvals"])
 
 
 class PendingApproval(BaseModel):
-    """A single pending approval request."""
+    """A single pending approval request (task-level or pre-spawn)."""
 
     task_id: str
     task_title: str
     session_id: str
     diff: str = ""
     test_summary: str = ""
+    mechanism: str = "task_review"
+    prompt: str = ""
+    default_action: str = ""
+    timeout_at_iso: str = ""
+    created_iso: str = ""
+    timeout_seconds: int | None = None
+    unblocks: str = "task completion and merge"
+    resolution_endpoint: str = ""
 
 
 class ListApprovalsResponse(BaseModel):
@@ -102,10 +114,12 @@ def _safe_child(base: Path, filename: str) -> Path:
 
     Raises HTTPException(400) if the resolved path escapes the directory.
     """
-    resolved = (base / filename).resolve()
-    if not resolved.is_relative_to(base.resolve()):
-        raise HTTPException(status_code=400, detail="Invalid task_id")
-    return resolved
+    try:
+        return contained_path(base, filename, label="task_id")
+    except PathContainmentError as exc:
+        # The API's own wording is kept so the response shape is unchanged;
+        # the barrier's message omits the base, and so must this one.
+        raise HTTPException(status_code=400, detail="Invalid task_id") from exc
 
 
 def _load_pending(filepath: Path) -> PendingApproval | None:
@@ -133,16 +147,51 @@ def _load_pending(filepath: Path) -> PendingApproval | None:
 
 @router.get("")
 def list_approvals() -> ListApprovalsResponse:
-    """List all pending approval requests."""
-    pending_dir = _pending_dir()
-    if not pending_dir.exists():
-        return ListApprovalsResponse(pending=[])
-
+    """List all pending approval requests across task-review and pre-spawn gates."""
     results: list[PendingApproval] = []
-    for fpath in sorted(pending_dir.glob("*.json")):
-        approval = _load_pending(fpath)
-        if approval is not None:
-            results.append(approval)
+
+    # 1. Task-level review pending entries (.sdd/runtime/pending_approvals/*.json)
+    pending_dir = _pending_dir()
+    if pending_dir.exists():
+        for fpath in sorted(pending_dir.glob("*.json")):
+            approval = _load_pending(fpath)
+            if approval is not None:
+                approval.mechanism = "task_review"
+                approval.unblocks = "task completion and merge"
+                approval.resolution_endpoint = f"/approvals/{approval.task_id}/approve"
+                results.append(approval)
+
+    # 2. Pre-spawn gate pending entries (.sdd/runtime/approvals/*.pending)
+    approvals_dir = _approvals_dir()
+    if approvals_dir.exists():
+        for sentinel in sorted(approvals_dir.glob("*.pending")):
+            try:
+                data = json.loads(sentinel.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.debug("approval routes: skipping unreadable sentinel %s: %s", sentinel.name, exc)
+                continue
+            if not isinstance(data, dict):
+                continue
+            task_id = str(data.get("task_id") or sentinel.stem)
+            prompt = str(data.get("prompt", ""))
+            timeout_seconds_raw = data.get("timeout_seconds")
+            timeout_seconds = int(timeout_seconds_raw) if isinstance(timeout_seconds_raw, (int, float)) else None
+            pre_spawn_approval = PendingApproval(
+                task_id=task_id,
+                task_title=prompt or task_id,
+                session_id=str(data.get("session_id", "")),
+                diff="",
+                test_summary="",
+                mechanism="pre_spawn",
+                prompt=prompt,
+                default_action=str(data.get("default_action", "reject")),
+                timeout_at_iso=str(data.get("timeout_at_iso", "")),
+                created_iso=str(data.get("created_iso", "")),
+                timeout_seconds=timeout_seconds,
+                unblocks="agent spawn and task execution",
+                resolution_endpoint=f"/approvals/{task_id}/approve",
+            )
+            results.append(pre_spawn_approval)
 
     return ListApprovalsResponse(pending=results)
 
@@ -170,16 +219,18 @@ def approve_task(task_id: str, body: ApprovalDecisionRequest) -> dict[str, str]:
     safe_id = Path(task_id).name  # Strip any directory components
     approvals_dir = _approvals_dir()
     pending_path = _safe_child(_pending_dir(), f"{safe_id}.json")
+    pre_spawn_pending = _safe_child(approvals_dir, f"{safe_id}.pending")
     approved_path = _safe_child(approvals_dir, f"{safe_id}.approved")
 
-    if not pending_path.exists():
+    if not pending_path.exists() and not pre_spawn_pending.exists():
         raise HTTPException(status_code=404, detail=f"No pending approval for task {task_id}")
 
     # Write decision
     approved_path.write_text(json.dumps({"reason": body.reason}, indent=2))
 
-    # Remove pending file
+    # Remove pending files
     pending_path.unlink(missing_ok=True)
+    pre_spawn_pending.unlink(missing_ok=True)
 
     logger.info("Approval routes: task %r approved via TUI/API", task_id.replace("\n", "\\n").replace("\r", "\\r"))
     return {"status": "approved", "task_id": task_id}
@@ -208,16 +259,18 @@ def reject_task(task_id: str, body: ApprovalDecisionRequest) -> dict[str, str]:
     safe_id = Path(task_id).name  # Strip any directory components
     approvals_dir = _approvals_dir()
     pending_path = _safe_child(_pending_dir(), f"{safe_id}.json")
+    pre_spawn_pending = _safe_child(approvals_dir, f"{safe_id}.pending")
     rejected_path = _safe_child(approvals_dir, f"{safe_id}.rejected")
 
-    if not pending_path.exists():
+    if not pending_path.exists() and not pre_spawn_pending.exists():
         raise HTTPException(status_code=404, detail=f"No pending approval for task {task_id}")
 
     # Write decision
     rejected_path.write_text(json.dumps({"reason": body.reason}, indent=2))
 
-    # Remove pending file
+    # Remove pending files
     pending_path.unlink(missing_ok=True)
+    pre_spawn_pending.unlink(missing_ok=True)
 
     logger.info("Approval routes: task %r rejected via TUI/API", task_id.replace("\n", "\\n").replace("\r", "\\r"))
     return {"status": "rejected", "task_id": task_id}

@@ -148,6 +148,9 @@ def _make_orch(tmp_path: Path, router: _RouterStub) -> Any:
             _worktree_mgr=_WorktreeManagerStub(tmp_path / "batch-worktree"),
             _worktree_paths={},
             reap_completed_agent=MagicMock(return_value=None),
+            # Routing refuses to guess a model; batch submission reads the
+            # run's default from the spawner.
+            _default_model="mock-model",
         ),
         _batch_sessions={},
         _task_to_session={},
@@ -289,6 +292,48 @@ def test_poll_failure_marks_task_for_realtime_fallback(tmp_path: Path, make_task
     assert retry.submitted is False
 
 
+def test_try_submit_refuses_artifact_mode_task_naming_supported_path(tmp_path: Path, make_task: Any) -> None:
+    """Provider batch is git-diff-only: an artifact-mode task is refused before
+    routing, worktree creation, or any provider call, with the refusal naming
+    the supported path - it can never end in a silent git commit (#2996).
+
+    The task is otherwise fully batch-eligible (keyword match, enabled config,
+    reachable provider), so the mode gate is the only thing standing between it
+    and a submission that would commit by construction.
+    """
+    from bernstein.core.tasks.artifacts import ArtifactKind, ArtifactSpec
+
+    router = _RouterStub()
+    provider_client = _ProviderClientStub()
+    manager = ProviderBatchManager(
+        tmp_path,
+        BatchConfig(enabled=True, eligible=["docs"]),
+        provider_clients={"openai": provider_client},
+    )
+    manager._trace_store = MagicMock()
+    collector = _CollectorStub()
+    orch = _make_orch(tmp_path, router)
+    task = make_task(id="T-artifact-report", title="Update docs report", description="Summarize the API docs.")
+    task.artifact_spec = ArtifactSpec(kind=ArtifactKind.REPORT, output_path="reports/summary.md")
+
+    with patch("bernstein.core.tasks.batch_api.get_collector", return_value=collector):
+        result = manager.try_submit(orch, task)
+
+    # Refused, and the refusal names the supported path.
+    assert result.handled is False
+    assert result.submitted is False
+    assert "git-diff-only" in result.reason
+    assert "artifact completion path" in result.reason
+
+    # Nothing git-shaped happened: no provider call, no job record, no
+    # worktree, no session claim.
+    assert provider_client.submissions == []
+    assert not (tmp_path / ".sdd" / "runtime" / "batch_jobs").exists()
+    assert not (tmp_path / "batch-worktree").exists()
+    assert orch._task_to_session == {}
+    assert orch._spawner._worktree_paths == {}
+
+
 def test_try_submit_uses_anthropic_provider_for_claude_batch_task(tmp_path: Path, make_task: Any) -> None:
     """Claude-model non-urgent work should submit through the Anthropic batch path."""
     router = _RouterStub(provider="anthropic")
@@ -380,3 +425,45 @@ def test_anthropic_batch_client_poll_fetches_results_url() -> None:
     assert "diff --git" in result.output_text
     assert result.input_tokens == 50
     assert result.output_tokens == 25
+
+
+def test_batch_claim_infers_paths_like_the_main_claim_path(make_task: Any) -> None:
+    """A task with no explicit owned_files but a path-bearing title still gets
+    a lock through the batch claim path.
+
+    task_lifecycle._claim_file_ownership unions infer_affected_paths(task)
+    into the claimed set (CRITICAL-007); before issue #3398 the batch mirror
+    gated on ``task.owned_files`` being truthy and never inferred, so batch
+    sessions for such tasks claimed nothing.
+    """
+    from bernstein.core.tasks.batch_api import _claim_file_ownership
+
+    task = make_task(
+        title="Harden src/bernstein/core/tasks/batch_api.py against timeouts",
+        owned_files=[],
+    )
+    lock_manager = MagicMock()
+    orch = SimpleNamespace(_lock_manager=lock_manager, _file_ownership={})
+
+    _claim_file_ownership(orch, "agent-1", [task])
+
+    lock_manager.acquire.assert_called_once()
+    claimed = lock_manager.acquire.call_args[0][0]
+    assert "src/bernstein/core/tasks/batch_api.py" in claimed
+    assert orch._file_ownership["src/bernstein/core/tasks/batch_api.py"] == "agent-1"
+
+
+def test_batch_claim_still_skips_tasks_with_no_paths_at_all(make_task: Any) -> None:
+    """Prose-only tasks with no explicit or inferable paths claim nothing -
+    the empty union stays a valid "no scope declared", matching the main path.
+    """
+    from bernstein.core.tasks.batch_api import _claim_file_ownership
+
+    task = make_task(title="Improve overall reliability", description="Prose only.", owned_files=[])
+    lock_manager = MagicMock()
+    orch = SimpleNamespace(_lock_manager=lock_manager, _file_ownership={})
+
+    _claim_file_ownership(orch, "agent-1", [task])
+
+    lock_manager.acquire.assert_not_called()
+    assert orch._file_ownership == {}

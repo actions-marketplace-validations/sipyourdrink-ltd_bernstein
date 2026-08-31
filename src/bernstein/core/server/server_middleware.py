@@ -19,11 +19,11 @@ if TYPE_CHECKING:
     from starlette.responses import Response as StarletteResponse
 
 # ---------------------------------------------------------------------------
-# Auth middleware — bearer token validation
+# Auth middleware - bearer token validation
 # ---------------------------------------------------------------------------
 
 # Paths that are always accessible without auth (health checks, agent card,
-# API docs, and auth/discovery endpoints).  Keep this list minimal — anything
+# API docs, and auth/discovery endpoints).  Keep this list minimal - anything
 # that mutates state or exposes operational data must go through bearer auth
 # (or HMAC alternative auth, for webhook-style endpoints whose handlers
 # verify their own shared secret).
@@ -36,16 +36,40 @@ _PUBLIC_PATHS = frozenset(
         "/ready",
         "/alive",
         "/.well-known/agent.json",
+        "/.well-known/agent-card.json",
         "/.well-known/agent.json/keys",
+        "/.well-known/http-message-signatures-directory",
         "/.well-known/acp.json",
         "/.well-known/mcp-tools",
         "/acp/v0/agents",
+        # A2A JSON-RPC surface - handlers enforce their own card-declared auth
+        # (#2609). Disabled by default (handler returns 404 when off).
+        "/a2a/v1",
+        "/a2a/v1/oauth/token",
         "/docs",
         "/redoc",
         "/openapi.json",
         "/openapi.yaml",
+        # Static operator GUI shell + PWA assets. The SPA bundle carries no
+        # run data and authenticates its own API calls with a Bearer token,
+        # so serving the shell anonymously does not expose state. Kept in
+        # sync with ``AUTH_PUBLIC_PATHS`` in
+        # ``bernstein.core.security.auth_middleware`` (the middleware
+        # ``create_app`` actually installs); mirrored here so the re-exported
+        # ``BearerAuthMiddleware`` does not dead-end /ui on a bare 401.
+        "/ui",
+        "/favicon.ico",
+        "/manifest.webmanifest",
+        "/sw.js",
+        "/offline.html",
     }
 )
+
+# Public path prefixes: static GUI shell assets under ``/ui/`` (hashed
+# bundles, PWA icons, service worker, offline page). Matches ``/ui/...`` but
+# not the bare ``/ui`` (an exact ``_PUBLIC_PATHS`` entry) nor siblings like
+# ``/uitasks``.
+_PUBLIC_PATH_PREFIXES = ("/ui/",)
 
 # HMAC-authenticated paths: handler verifies a shared-secret HMAC and rejects
 # unsigned requests with 401.  Listed here so the bearer middleware does not
@@ -87,7 +111,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return response
 
         path = request.url.path
-        if path in _PUBLIC_PATHS or path in _HMAC_AUTH_PATHS or path.startswith(_HMAC_AUTH_PATH_PREFIXES):
+        if (
+            path in _PUBLIC_PATHS
+            or path in _HMAC_AUTH_PATHS
+            or path.startswith(_HMAC_AUTH_PATH_PREFIXES)
+            or path.startswith(_PUBLIC_PATH_PREFIXES)
+        ):
             response = await call_next(request)
             return response
 
@@ -145,6 +174,15 @@ def _is_sse_request(request: Request) -> bool:
     if "text/event-stream" in accept.lower():
         return True
     path = request.url.path
+    # The SSE routes are served both at the root and under the /api/v1
+    # version prefix. Strip the prefix so the versioned aliases
+    # (/api/v1/events, /api/v1/events/cost) are detected the same as
+    # their unprefixed forms - otherwise the crash guard wraps their
+    # never-ending stream and turns a transport-level disconnect into a
+    # spurious 500. A non-SSE route that merely ends in "/events" (e.g.
+    # /webhooks/slack/events) still returns False.
+    if path.startswith("/api/v1/"):
+        path = path[len("/api/v1") :]
     return path == "/events" or path.startswith("/events/")
 
 
@@ -169,7 +207,7 @@ class CrashGuardMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: Callable[[Request], Any],
     ) -> StarletteResponse:
-        # Do not wrap streaming responses — re-raising lets Uvicorn close
+        # Do not wrap streaming responses - re-raising lets Uvicorn close
         # the SSE connection without corrupting the wire format.
         if _is_sse_request(request):
             return await call_next(request)

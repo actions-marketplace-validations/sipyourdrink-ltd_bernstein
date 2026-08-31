@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from starlette.responses import StreamingResponse
+
+from bernstein.core.routes._sse import SSE_RESPONSES
 
 _SDD_NOT_CONFIGURED = "sdd_dir not configured"
 
@@ -48,7 +51,7 @@ def _get_workdir(request: Request) -> Path:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/events")
+@router.get("/events", response_class=StreamingResponse, responses=SSE_RESPONSES)
 def sse_events(request: Request) -> StreamingResponse:
     """Server-Sent Events stream for real-time dashboard updates.
 
@@ -58,7 +61,7 @@ def sse_events(request: Request) -> StreamingResponse:
     sse_bus = _get_sse_bus(request)
     queue = sse_bus.subscribe()
 
-    # Timeout for individual queue.get() calls — if no message arrives
+    # Timeout for individual queue.get() calls - if no message arrives
     # within this window (including heartbeats), the connection is dead.
     _READ_TIMEOUT_S = 60.0
 
@@ -74,7 +77,7 @@ def sse_events(request: Request) -> StreamingResponse:
                 try:
                     message = await asyncio.wait_for(queue.get(), timeout=_READ_TIMEOUT_S)
                 except TimeoutError:
-                    # No message (not even a heartbeat) in _READ_TIMEOUT_S — client likely disconnected
+                    # No message (not even a heartbeat) in _READ_TIMEOUT_S - client likely disconnected
                     logger.debug("SSE client timed out after %.0fs, closing", _READ_TIMEOUT_S)
                     break
                 sse_bus.mark_read(queue)
@@ -133,13 +136,16 @@ def get_badge(request: Request) -> JSONResponse:
     """
     from bernstein.core.cost_tracker import CostTracker
     from bernstein.core.models import TaskStatus
+    from bernstein.core.routes.task_crud import _resolve_request_tenant_scope
 
     store = _get_store(request)
     workdir = _get_workdir(request)
     sdd_dir = workdir / ".sdd"
 
-    # Task counts
-    tasks = store.list_tasks()
+    # Task counts.  The badge publishes a figure rather than a row, but the
+    # figure is still computed over whichever rows this reads, so the read is
+    # narrowed to the caller's tenant scope.
+    tasks = store.list_tasks(tenant_id=_resolve_request_tenant_scope(request))
     completed = sum(1 for t in tasks if t.status == TaskStatus.DONE)
     failed = sum(1 for t in tasks if t.status == TaskStatus.FAILED)
 
@@ -232,8 +238,21 @@ def memory_audit(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+class BroadcastRequest(BaseModel):
+    """Body for ``POST /broadcast``.
+
+    Typing the body with a model lets FastAPI reject non-object or
+    malformed JSON with a ``422`` instead of letting ``dict.get`` (or a
+    ``JSONDecodeError``) raise an unhandled exception. ``message``
+    defaults to an empty string so a missing field still funnels into
+    the existing ``400 message is required`` path.
+    """
+
+    message: str = ""
+
+
 @router.post("/broadcast")
-async def broadcast_command(request: Request) -> JSONResponse:
+async def broadcast_command(request: Request, payload: BroadcastRequest) -> JSONResponse:
     """Send a message to all running agents via fastest available channel.
 
     Uses stdin pipe where available (sub-second delivery), falls back
@@ -243,8 +262,7 @@ async def broadcast_command(request: Request) -> JSONResponse:
     """
     from bernstein.core.agent_ipc import broadcast_message
 
-    body: Any = await request.json()
-    message: str = body.get("message", "")
+    message = payload.message
     if not message:
         return JSONResponse(content={"error": "message is required"}, status_code=400)
 

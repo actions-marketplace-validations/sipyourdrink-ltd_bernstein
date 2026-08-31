@@ -85,11 +85,16 @@ def _clean_stale_runtime(workdir: Path) -> None:
             lock_file.unlink(missing_ok=True)
 
 
-def ensure_sdd(workdir: Path) -> bool:
+def ensure_sdd(workdir: Path, *, model: str | None = None) -> bool:
     """Create .sdd/ workspace structure if it does not exist.
 
     Args:
         workdir: Project root directory.
+        model: Default model name for the workspace config. Bernstein has no
+            built-in default - when ``None``, no ``default_model`` line is
+            written and routing must be configured explicitly elsewhere
+            (task/role_model_policy/adapter default) or it will refuse to
+            spawn rather than silently bill Claude Sonnet/Opus.
 
     Returns:
         True if the workspace was newly created, False if it already existed.
@@ -114,22 +119,33 @@ def ensure_sdd(workdir: Path) -> bool:
     # Write default config if missing
     config_path = workdir / ".sdd" / "config.yaml"
     if not config_path.exists():
+        if model:
+            model_line = f"default_model: {model}\n"
+        else:
+            model_line = ""
+            logger.info(
+                "ensure_sdd: no model configured for %s - omitting default_model from "
+                "config.yaml. Configure one explicitly (role_model_policy/seed/adapter "
+                "default) or task spawning will refuse rather than default to Claude.",
+                workdir,
+            )
         config_path.write_text(
-            "# Bernstein workspace config\n"
-            "server_port: 8052\n"
-            "max_workers: 4\n"
-            "default_model: opus\n"
-            "default_effort: max\n"
+            f"# Bernstein workspace config\nserver_port: 8052\nmax_workers: 4\n{model_line}default_effort: max\n"
         )
 
-    # .gitignore for runtime dir — ensure session.json is always listed.
+    # .gitignore for runtime dir - ensure secret/state files are always
+    # listed. ``auth.token`` holds the run's Bearer credential (issue #2794)
+    # and must never be committed (secret-at-rest, #2762).
     gi_path = workdir / ".sdd" / "runtime" / ".gitignore"
+    _runtime_gitignore_required = ("*.pid", "*.log", "tasks.jsonl", "session.json", "auth.token")
     if not gi_path.exists():
-        gi_path.write_text("*.pid\n*.log\ntasks.jsonl\nsession.json\n")
+        gi_path.write_text("\n".join(_runtime_gitignore_required) + "\n")
     else:
         existing = gi_path.read_text()
-        if "session.json" not in existing:
-            gi_path.write_text(existing.rstrip("\n") + "\nsession.json\n")
+        existing_lines = {line.strip() for line in existing.splitlines()}
+        missing = [entry for entry in _runtime_gitignore_required if entry not in existing_lines]
+        if missing:
+            gi_path.write_text(existing.rstrip("\n") + "\n" + "\n".join(missing) + "\n")
 
     # Apply any pending on-disk state migrations on load. On a fresh install
     # this stamps the latest schema version; on an existing install it walks
@@ -186,7 +202,7 @@ def _discover_catalog(workdir: Path) -> None:
 
     Loads the agent catalog from cache (if fresh) or re-fetches from providers.
     Also attempts to sync the Agency GitHub catalog (TTL-protected, 24h).
-    On failure the error is logged and startup continues — catalog is optional.
+    On failure the error is logged and startup continues - catalog is optional.
 
     Args:
         workdir: Project root directory.
@@ -201,7 +217,7 @@ def _discover_catalog(workdir: Path) -> None:
     except Exception:
         logger.warning("Catalog auto-discovery failed (non-fatal)", exc_info=True)
 
-    # Auto-sync Agency catalog (TTL = 24h — skipped if synced recently)
+    # Auto-sync Agency catalog (TTL = 24h - skipped if synced recently)
     try:
         from bernstein.agents.agency_provider import AgencyProvider
 
@@ -219,7 +235,7 @@ def _build_codebase_index(workdir: Path) -> None:
 
     Uses SQLite FTS5 for BM25-ranked full-text search so agents can find
     relevant code without trial-and-error grepping.  On failure the error
-    is logged and startup continues — the index is optional.
+    is logged and startup continues - the index is optional.
 
     Args:
         workdir: Project root directory.
@@ -296,7 +312,7 @@ def _start_server(
     if existing is not None and _is_alive(existing):
         raise RuntimeError(f"Server already running (PID {existing}). Run `bernstein stop` first.")
 
-    # Build env for the server subprocess — inherit parent env and overlay
+    # Build env for the server subprocess - inherit parent env and overlay
     # cluster-specific and storage vars so the server's module-level app
     # factory picks them up.
     env = os.environ.copy()
@@ -348,7 +364,7 @@ def _start_server(
             )
     # ``--reload`` was removed 2026-04-17 per / incident
     # 2026-04-11.  Bernstein agents continuously edit src/bernstein/*.py,
-    # so auto-reload causes a uvicorn restart on every write — in-flight
+    # so auto-reload causes a uvicorn restart on every write - in-flight
     # requests drop, the bind port races, and WAL replay produces
     # duplicate task claims.  evolve_mode is preserved in the signature
     # for back-compat but no longer toggles reload.
@@ -356,7 +372,7 @@ def _start_server(
 
     log_path = workdir / ".sdd" / "runtime" / "server.log"
     rotate_log_file(log_path)
-    # Keep the log file open — child inherits the fd via fork().
+    # Keep the log file open - child inherits the fd via fork().
     # Closing it prematurely can cause the child's stdout to break.
     log_fh = log_path.open("a")
     proc = subprocess.Popen(
@@ -367,7 +383,7 @@ def _start_server(
         start_new_session=True,
         cwd=str(workdir),
     )
-    # Safe to close in parent after Popen — child has its own fd copy
+    # Safe to close in parent after Popen - child has its own fd copy
     log_fh.close()
     pid_path.write_text(str(proc.pid))
     return proc.pid
@@ -426,7 +442,7 @@ def _inject_manager_task(
         "priority": 1,
         "scope": "large",
         "complexity": "high",
-        "model": "opus",
+        "model": seed.model,
         "effort": "max",
     }
 
@@ -448,6 +464,65 @@ def _inject_manager_task(
     return str(data.get("id", "unknown"))
 
 
+def _inject_worker_task(
+    seed: SeedConfig,
+    workdir: Path,
+    port: int,
+    *,
+    role: str,
+    server_url: str | None = None,
+    auth_token: str | None = None,
+) -> str:
+    """Create a single worker task that works the seed goal directly.
+
+    Unlike the manager task, the worker skips decomposition and tackles the
+    goal in the given *role* (e.g. ``backend``, ``qa``, ``frontend``).
+
+    Args:
+        seed: Parsed seed configuration.
+        workdir: Project root for resolving context files.
+        port: Server port (used if server_url is None).
+        role: Agent role name (e.g. "backend", "qa").
+        server_url: Explicit base URL of the task server.
+        auth_token: Bearer token for authenticated requests.
+
+    Returns:
+        The task ID assigned by the server.
+
+    Raises:
+        RuntimeError: If the server rejects the task.
+    """
+    task = seed_to_initial_task(seed, workdir=workdir)
+
+    payload: dict[str, Any] = {
+        "title": f"[{role}] {seed.goal[:70]}",
+        "role": role,
+        "description": task.description,
+        "priority": 1,
+        "scope": "large",
+        "complexity": "high",
+        "model": seed.model,
+        "effort": "max",
+    }
+
+    base = server_url or f"http://127.0.0.1:{port}"
+    headers: dict[str, str] = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    resp = httpx.post(
+        f"{base}/tasks",
+        json=payload,
+        headers=headers,
+        timeout=5.0,
+    )
+    if resp.status_code != 201:
+        raise RuntimeError(f"Failed to create {role} task: {resp.status_code} {resp.text}")
+
+    data: dict[str, Any] = resp.json()
+    return str(data.get("id", "unknown"))
+
+
 def _start_spawner(
     workdir: Path,
     port: int,
@@ -457,6 +532,8 @@ def _start_spawner(
     cluster_enabled: bool = False,
     ab_test: bool = False,
     adapter: str | None = None,
+    model: str | None = None,
+    seed_path: Path | None = None,
 ) -> int:
     """Launch the spawner process in the background.
 
@@ -466,6 +543,19 @@ def _start_spawner(
     ``--adapter claude``.  This closes a long-standing GUI-smoke bug where
     ``bernstein run --idle`` would burn real tokens because the orchestrator
     subprocess defaulted to Claude regardless of the resolved adapter.
+
+    ``model`` (e.g. from ``bernstein run --model MiniMax-M3``) is threaded
+    through the same way so the orchestrator subprocess -- which never sees
+    the CLI's own argv -- can coerce Claude tier names (opus/sonnet/haiku)
+    emitted by the heuristic model selector for manager-spawned child tasks
+    into a model the resolved non-Claude adapter actually understands.
+
+    ``seed_path`` (the resolved bernstein.yaml the bootstrap process actually
+    parsed) is threaded through the same way. Without it, the orchestrator
+    subprocess independently re-derives ``workdir / "bernstein.yaml"``, which
+    silently loses ``role_model_policy`` (and every other seed setting)
+    whenever the real seed lives at a different path -- agents then spawn
+    with the default model instead of the configured one, with no error.
     """
     pid_path = workdir / ".sdd" / "runtime" / "spawner.pid"
     log_path = workdir / ".sdd" / "runtime" / "spawner.log"
@@ -486,6 +576,11 @@ def _start_spawner(
         # Propagate via env too so any nested resolve_adapter() callers (and
         # the orchestrator __main__'s argparse default-override) honour it.
         env["BERNSTEIN_ADAPTER"] = adapter
+    if model:
+        env["BERNSTEIN_MODEL"] = model
+    if seed_path:
+        env["BERNSTEIN_SEED_PATH"] = str(seed_path)
+        logger.info("_start_spawner: propagating seed_path=%s via BERNSTEIN_SEED_PATH + --seed-path", seed_path)
 
     argv = [
         sys.executable,
@@ -498,6 +593,10 @@ def _start_spawner(
     ]
     if adapter:
         argv.extend(["--adapter", adapter])
+    if model:
+        argv.extend(["--model", model])
+    if seed_path:
+        argv.extend(["--seed-path", str(seed_path)])
 
     log_fh = log_path.open("a")
     proc = subprocess.Popen(
@@ -529,7 +628,7 @@ def _resolve_bind_host() -> str:
     return os.environ.get("BERNSTEIN_BIND_HOST", "127.0.0.1")
 
 
-def _resolve_auth_token() -> str | None:
+def _resolve_auth_token(workdir: Path | None = None) -> str | None:
     """Resolve the Bearer token used by bootstrap to talk to its own server.
 
     Precedence:
@@ -537,14 +636,26 @@ def _resolve_auth_token() -> str | None:
         2. Ephemeral auto-generated token when auth is enabled but no token is
            set and no opt-out is active. The generated token is written into
            ``os.environ`` so both the server subprocess (which inherits env in
-           ``_start_server``) and the bootstrap client see the same value.
-        3. ``None`` when ``BERNSTEIN_AUTH_DISABLED=1`` — the middleware
+           ``_start_server``) and the bootstrap client see the same value, and
+           - when *workdir* is given - also persisted to a ``0600`` file under
+           ``.sdd/runtime`` so out-of-process CLI monitors (``status`` /
+           ``recap`` / ``checkpoint``) and the TUI poller can authenticate
+           without inheriting the launcher env (issue #2794).
+        3. ``None`` when ``BERNSTEIN_AUTH_DISABLED=1`` - the middleware
            short-circuits in that mode so no header is required.
+
+    Args:
+        workdir: Project root whose ``.sdd/runtime`` receives the persisted
+            token file. When ``None`` the token is kept in the environment
+            only (back-compat with callers that cannot supply a workspace).
+
+    Returns:
+        The resolved Bearer token, or ``None`` when auth is disabled.
     """
     existing = os.environ.get("BERNSTEIN_AUTH_TOKEN")
     if existing:
         return existing
-    # Honour the explicit opt-out — the middleware will accept anonymous
+    # Honour the explicit opt-out - the middleware will accept anonymous
     # requests, so we do not auto-generate a token that no one will check.
     if os.environ.get("BERNSTEIN_AUTH_DISABLED", "").strip().lower() in ("1", "true", "yes"):
         return None
@@ -552,9 +663,19 @@ def _resolve_auth_token() -> str | None:
 
     token = secrets.token_urlsafe(32)
     os.environ["BERNSTEIN_AUTH_TOKEN"] = token
+    persisted = False
+    if workdir is not None:
+        from bernstein.core.run_auth_token import persist_run_auth_token
+
+        # Best-effort: the token also lives in os.environ, so a persistence
+        # failure never blocks the run - it only degrades out-of-process
+        # monitor auth back to the pre-#2794 behaviour.
+        persisted = persist_run_auth_token(workdir, token) is not None
+    where = "persisted 0600 to .sdd/runtime for local CLI monitors" if persisted else "kept in this process env only"
     logger.info(
-        "Auto-generated BERNSTEIN_AUTH_TOKEN for this session (not persisted; "
+        "Auto-generated BERNSTEIN_AUTH_TOKEN for this session (%s; "
         "set BERNSTEIN_AUTH_TOKEN to pin or BERNSTEIN_AUTH_DISABLED=1 to opt out).",
+        where,
     )
     return token
 
@@ -623,7 +744,7 @@ def auto_write_bernstein_yaml(workdir: Path) -> None:
     constraints = _constraints_for_project_type(project_type)
 
     lines = [
-        "# Bernstein orchestration config — auto-generated",
+        "# Bernstein orchestration config - auto-generated",
         "# Uncomment 'goal' to run from this file: bernstein (without -g)",
         '# goal: "Describe what you want to build"',
         "",

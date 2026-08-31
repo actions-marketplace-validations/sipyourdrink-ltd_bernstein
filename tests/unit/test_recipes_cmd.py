@@ -181,7 +181,7 @@ nodes:
 
 
 def test_reserved_name_goal_is_rejected() -> None:
-    """``goal`` is reserved — collisions would silently shadow CLI input."""
+    """``goal`` is reserved - collisions would silently shadow CLI input."""
     yaml = """\
 name: reserved
 description: "Param named goal."
@@ -358,6 +358,26 @@ def test_cli_run_missing_required_exits_1(isolated_workdir: Path) -> None:
     assert "version" in result.output
 
 
+@pytest.mark.parametrize("bad_param", ["no-equals-here", "dup=1", "=empty-key"])
+def test_cli_run_malformed_param_syntax_exits_1(isolated_workdir: Path, bad_param: str) -> None:
+    """A ``--param`` syntax error (no ``=`` / empty / duplicate key) exits 1 cleanly.
+
+    Regression: the refusal handler reads ``overrides`` while sealing a receipt,
+    but a ``parse_param_overrides`` syntax error raises before ``overrides`` is
+    assigned. The handler must still land on a clean operator-input exit (1) with
+    the "Invalid --param" message, never an ``UnboundLocalError``.
+    """
+    _ = isolated_workdir
+    runner = CliRunner()
+    args = ["run", "bump-dependency", "--param", bad_param]
+    if bad_param == "dup=1":
+        args += ["--param", "dup=2"]
+    result = runner.invoke(recipes_group, args)
+    assert result.exit_code == 1, result.output
+    assert "Invalid --param" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
 def test_cli_run_unknown_recipe_exits_2(isolated_workdir: Path) -> None:
     """A bad recipe name produces the manifest-error exit code (2)."""
     _ = isolated_workdir
@@ -381,7 +401,7 @@ def test_cli_run_dry_run_for_every_seed(recipe_name: str, isolated_workdir: Path
 
 
 # ---------------------------------------------------------------------------
-# CLI: run (command-only, no agents) — mock-adapter-equivalent smoke
+# CLI: run (command-only, no agents) - mock-adapter-equivalent smoke
 # ---------------------------------------------------------------------------
 
 
@@ -389,7 +409,7 @@ def test_cli_run_command_only_recipe_executes(isolated_workdir: Path) -> None:
     """A command-only recipe runs end-to-end via the standard runner.
 
     This is the CI smoke equivalent of "mock adapter": no agent-typed
-    nodes, no API keys, no network — proves the run path is wired
+    nodes, no API keys, no network - proves the run path is wired
     correctly from param resolution through WorkflowRunner.run().
     """
     # Place a project-local recipe and let `recipes run` find it by name.
@@ -499,7 +519,7 @@ def test_resolve_recipe_missing_path_raises_clean() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Golden traces — pin recipe shape against drift
+# Golden traces - pin recipe shape against drift
 # ---------------------------------------------------------------------------
 
 
@@ -518,7 +538,7 @@ def test_golden_trace_matches_resolved_workflow_shape(recipe_name: str) -> None:
 
     Catches accidental drift in node order, kinds, agent roles, or
     command bodies after a refactor.  Prompt wording is intentionally
-    not pinned — that's expected to evolve.
+    not pinned - that's expected to evolve.
     """
     import yaml
 

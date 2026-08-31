@@ -185,7 +185,7 @@ class TestJanitorPipeline:
         await asyncio.to_thread(subprocess.run, ["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
         await asyncio.to_thread(
             subprocess.run,
-            ["git", "commit", "-m", "add output"],
+            ["git", "commit", "-m", "T-E2E-001: add output"],
             cwd=tmp_path,
             check=True,
             capture_output=True,
@@ -230,12 +230,21 @@ class TestJanitorPipeline:
         assert results[0].passed is False
 
     @pytest.mark.asyncio
-    async def test_janitor_skips_tasks_without_signals(self, tmp_path: Path) -> None:
+    async def test_janitor_judges_a_signalless_task_in_a_git_repo(self, tmp_path: Path) -> None:
+        """A signal-less task is skipped only where nothing can be checked.
+
+        This used to assert the opposite - that no verdict was produced - which
+        is what let a crash-recovery orphan auto-completion stand with no
+        evidence anything had been built (#4562). The workdir here is a real
+        repo, so attribution can run and the empty-diff guard decides.
+        """
         _init_git_repo(tmp_path)
         task = _make_task(status=TaskStatus.DONE, signals=[])
 
         results = await run_janitor([task], tmp_path)
-        assert len(results) == 0  # Skipped — no signals
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert any(name == "attribution:empty_diff" for name, _, _ in results[0].signal_results)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +450,7 @@ class TestFullSpawnExecuteVerifyMergePipeline:
         assert all_passed is False
         assert len(failed) > 0
 
-        # Task should NOT be closed — re-open for retry
+        # Task should NOT be closed - re-open for retry
         transition_task(task, TaskStatus.FAILED, actor="janitor")
         assert task.status == TaskStatus.FAILED
 
@@ -475,7 +484,7 @@ class TestFullSpawnExecuteVerifyMergePipeline:
         )
         await asyncio.to_thread(
             subprocess.run,
-            ["git", "commit", "-m", "agent: create result.py"],
+            ["git", "commit", "-m", "T-FULL-003: agent: create result.py"],
             cwd=tmp_path,
             check=True,
             capture_output=True,

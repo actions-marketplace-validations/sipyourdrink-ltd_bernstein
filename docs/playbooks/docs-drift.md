@@ -26,7 +26,7 @@ Drift remediation paths used by the rows below:
 | Remediation token | What it runs |
 |-------------------|--------------|
 | `agents-md-sync` | `uv run bernstein agents-md sync` then `uv run bernstein agents-md verify` |
-| `gen-agents-md` | `uv run python scripts/gen_agents_md.py --update` (legacy detailed module map; do not run if `agents-md-sync` is the active source of truth) |
+| `gen-agents-md` | `uv run python scripts/gen_agents_md.py --update` (legacy detailed module map). Self-guarding since #4019: when `agents-md-sync` is the active source of truth it prints a note and exits 0 without writing. `--force` overrides. |
 | `manual-prose` | Re-read the source-of-truth module and adjust the prose by hand; no script generates this content |
 | `manual-cmd` | The doc lists a CLI command surface; re-run `bernstein <cmd> --help` and reconcile |
 | `gen-benchmarks` | `uv run python scripts/generate_benchmark_docs.py` |
@@ -44,8 +44,8 @@ Drift remediation paths used by the rows below:
 | `CONVENTIONS.md` | Mirror of canonical IR for Aider via `bernstein agents-md sync` | Drift versus AGENTS.md canonical | `agents-md-sync` |
 | `CODE_OF_CONDUCT.md` | None (Contributor Covenant 2.1 verbatim) | Repo URL change, contact email change | `static` |
 | `CONTRIBUTING.md` | `src/bernstein/adapters/registry.py`, `src/bernstein/adapters/base.py`, `templates/roles/`, `scripts/run_tests.py`, `.importlinter` | New adapter contract method, new role added under `templates/roles/`, change to lint / type-check pipeline | `manual-prose` |
-| `SECURITY.md` | `pyproject.toml` version, security policy contacts | Bounty program changes, scope changes, new in-scope target | `manual-prose` |
-| `CHANGELOG.md` | Release-please managed (`release-please-config.json`, `release-please-manifest.json`) plus hand-curated `## Unreleased` section | New release tag, manual entry needed for behaviour-visible code change | `manual-prose` |
+| `SECURITY.md` | `pyproject.toml` version, security policy contacts | Disclosure policy changes, scope changes, new in-scope target | `manual-prose` |
+| `CHANGELOG.md` | Pointer document; release history lives in `docs/release-notes/` and release tags are cut by `.github/workflows/auto-release.yml` | The release-notes location moves, or the tag-cutting workflow changes | `manual-prose` |
 | `CONTRIBUTORS.md` | None (hand-curated list of named contributors) | New contributor merged a PR | `static` |
 
 ### `docs/` top-level
@@ -55,12 +55,15 @@ Drift remediation paths used by the rows below:
 | `docs/index.md` | All docs subdirs (each linked entry must resolve) | Linked page renamed / deleted, getting-started / installation / operations / reference / architecture path moved | `manual-prose` |
 | `docs/adapter-deferred.md` | `src/bernstein/adapters/registry.py` (negative-space: agents NOT integrated) | A previously-deferred agent now has a stable CLI binary | `manual-prose` |
 | `docs/agents-md.md` | `src/bernstein/cli/commands/agents_md_cmd.py`, `src/bernstein/core/knowledge/agents_md_bridge.py`, `src/bernstein/core/knowledge/agents_md_generator.py` | New target format added to the canonical IR, sync command options change | `manual-prose` |
-| `docs/CHANGELOG.md` | Mirror of root `CHANGELOG.md` for mkdocs | Root changelog edited | `manual-prose` |
+| `docs/playbooks/readme-l10n.md` | `src/bernstein/core/knowledge/readme_l10n.py`, `src/bernstein/cli/commands/readme_l10n_cmd.py`, `pyproject.toml` (`[tool.bernstein.readme-l10n]`) | Binding format change, verify/sync surface change, language config change | `manual-prose` |
+| `docs/CHANGELOG.md` | Pointer document for mkdocs; release history lives in `docs/release-notes/` | The release-notes location moves | `manual-prose` |
 | `docs/CODE_REVIEW.md` | `src/bernstein/core/quality/`, `src/bernstein/core/review/`, `src/bernstein/core/review_responder/` | Review pipeline stage added, reviewer-role policy change | `manual-prose` |
-| `docs/competitors.md` | None (memo summarising external projects) | Star-count or feature-table refresh requested | `static` |
 | `docs/ENTERPRISE.md` | `src/bernstein/core/compliance/`, `src/bernstein/core/security/`, audit / lineage / air-gap surface | New regulator mapping, new compliance pack target, audit export schema change | `manual-prose` |
 | `docs/lineage.md` | `src/bernstein/core/lineage/`, `src/bernstein/core/persistence/lineage.py`, `src/bernstein/cli/commands/lineage_cmd.py` | Lineage record schema change, signature algorithm change, new verify CLI subcommand | `manual-prose` |
 | `docs/llm-citation-surface.md` | None (positioning note about how the project surfaces in LLM citations) | External citation pattern audited | `static` |
+| `docs/mentions.md` | None (hand-curated external coverage and list entries) | A listed link goes dead or moves | `static` |
+| `docs/reference/capabilities.md` | `src/bernstein/` capability surfaces; scoped claims guarded by `tests/unit/test_docs_capability_reachability.py` | Capability added / removed, scoped reachability note lands or goes stale | `manual-prose` |
+| `docs/reference/receipt.md` | `src/bernstein/cli/commands/receipt_cmd.py`, `src/bernstein/core/security/result_receipt_bundle.py`; flag surface guarded by `tests/unit/test_receipt_reference_docs_drift.py` | Flag added / removed / renamed on `bernstein receipt create` or `verify`, verdict shape changes (new field on `BundleVerification`) | `manual-cmd` |
 | `docs/routine-scenarios.md` | `src/bernstein/core/planning/routine_bridge.py`, `src/bernstein/cli/commands/routine_cmd.py`, `src/bernstein/mcp/routine_tools.py` | Routine <-> Scenario bridge surface change | `manual-prose` |
 | `docs/telemetry.md` | `src/bernstein/core/telemetry/`, `src/bernstein/cli/commands/telemetry_cmd.py` | New telemetry event, opt-out matrix change, retention policy change | `manual-prose` |
 | `docs/use-cases.md` | `src/bernstein/cli/main.py` (command list) plus operator workflow CLIs | New operator workflow command (`autofix`, `review-responder`, `dep-impact`, etc.) | `manual-prose` |
@@ -91,7 +94,7 @@ been moved, renamed, deleted, or its public surface changed."
 | `spec-as-test.md` | `src/bernstein/core/planning/spec_assertions.py`, `src/bernstein/core/orchestration/drain.py`, `src/bernstein/cli/run_cmd.py` | Spec-assertion schema change, drain-hook signature change | `manual-prose` |
 | `swarm-migration.md` | `src/bernstein/core/tasks/swarm_migration.py`, `src/bernstein/cli/commands/migrate_cmd.py` | Migration entry point change, CLI flag change | `manual-prose` |
 | `task-budgets.md` | `src/bernstein/core/cost/budget_countdown.py` | Budget-format function renamed | `manual-prose` |
-| `team-hub.md` | `src/bernstein/core/plugins_core/team_hub_loader.py`, `src/bernstein/core/plugins_core/team_hub_manifest.py` | Manifest schema change | `manual-prose` |
+| `team-hub.md` | `src/bernstein/core/plugins_core/team_hub_manifest.py` | Manifest schema change | `manual-prose` |
 | `wiki-build.md` | `src/bernstein/cli/commands/wiki_cmd.py`, `src/bernstein/core/knowledge/ast_symbol_graph.py`, `src/bernstein/core/knowledge/wiki_renderer.py` | Wiki-build CLI flag change, renderer output schema change | `manual-prose` |
 
 ### `docs/gui/`
@@ -108,30 +111,6 @@ Source of truth for this group is `src/bernstein/gui/` (FastAPI + SPA), `web/`
 | `playground.md` | `src/bernstein/adapters/mock.py`, `src/bernstein/cli/run_bootstrap.py` (`--idle`) | Mock-idle option change | `manual-prose` |
 | `troubleshooting.md` | `src/bernstein/gui/cli.py` (`_check_gui_extras`), static-assets gating | Error-message change in the extras check | `manual-prose` |
 | `mobile.md` | `web/` responsive breakpoints | Layout breakpoint change | `manual-prose` |
-
-### `docs/compare/`
-
-Pre-existing comparison memos. Treated as static for the drift gate; the gate
-only verifies that the linked files exist and that the entry in
-`docs/index.md` (if any) still resolves. Do not rewrite competitor content
-here from a drift-check pass.
-
-| Doc | Source of truth | Drift signal | Remediation |
-|-----|-----------------|--------------|-------------|
-| `README.md` | None (index of the comparison memos in this folder) | A memo is renamed or removed | `static` |
-| `bernstein-vs-agentsmesh.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-claude-flow.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-claude-squad.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-conductor.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-crystal.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-dorothy.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-github-agent-hq.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-paperclip.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-parallel-code.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-single-agent.md` | None | Manual refresh by operator | `static` |
-| `bernstein-vs-stoneforge.md` | None | Manual refresh by operator | `static` |
-| `deterministic-vs-llm-orchestration.md` | None | Manual refresh by operator | `static` |
-| `openai-agents.md` | None | Manual refresh by operator | `static` |
 
 ### `docs/sdd/`
 
@@ -165,11 +144,6 @@ The current inventory is:
 |------|-----------------------------|-------------|-----------------|
 | `README.md` (intro line) | `as of YYYY-MM-DD: N stars, N forks, ~N pypi downloads/day (~Nk/month)` | GitHub API, PyPI | `gh api repos/sipyourdrink-ltd/bernstein --jq '{stargazers_count, forks_count}'` and `curl -sS https://pypistats.org/api/packages/bernstein/recent \| jq .data` |
 | `README.md` (regulatory anchors) | `### regulatory anchors (as of YYYY-MM-DD)` | Regulator publications | Manual review of cited regulations |
-| `README.md` (comparison table) | `\| Stars (YYYY-MM-DD) \| ...` | GitHub API per row | `gh api repos/<owner>/<repo> --jq .stargazers_count` for each linked competitor repo |
-| `docs/adapter-deferred.md` | `## <Tool> - <STATUS> (YYYY-MM-DD)` | Vendor announcements | Manual review of each named tool's release notes |
-| `docs/llm-citation-surface.md` | `"as of YYYY-MM-DD: ..."` example string | Self-reference to README line | Refresh together with the README intro line above |
-| `docs/compare/bernstein-vs-github-agent-hq.md` | `as of YYYY-MM-DD` qualifier on absent published numbers | GitHub-published benchmarks | Manual review of GitHub Agent HQ release notes |
-| `docs/compare/index.html` | `(YYYY-MM-DD)` pilot-run date | Internal pilot snapshot | Manual update when a new pilot is run |
 
 ### Refresh commands
 
@@ -180,41 +154,83 @@ gh api repos/sipyourdrink-ltd/bernstein --jq '{stargazers_count, forks_count}'
 curl -sS https://pypistats.org/api/packages/bernstein/recent | jq .data
 ```
 
-For each competitor row in the comparison table (substitute the repo from the
-link target in the table header):
-
-```bash
-gh api repos/<owner>/<repo> --jq .stargazers_count
-```
-
 ### Staleness policy
 
 - An `as of YYYY-MM-DD` marker older than 30 days is considered stale and
   emits a soft warning from `scripts/check_data_freshness.py`.
-- A marker older than 60 days is a hard fail on push to `main`; the workflow
-  job `docs-data-freshness` exits with status 1.
+- A marker older than 60 days is a hard fail only on the weekly scheduled run
+  of the `docs-data-freshness` job. Instead of failing pushes to `main`, the
+  scheduled run opens or updates a single marker-tagged tracking issue so a
+  stale marker never reddens unrelated main pushes.
+- Pushes to `main` still run the checker in soft (non-strict) mode for the
+  inline warning, but never fail on staleness.
 - The `docs-data-freshness` check is advisory and is not part of the canary
   list of required checks.
 
+## Context-file staleness (curated context files vs their subtrees)
+
+The two gates above check *internal consistency* (`bernstein agents-md
+verify`) and *referential integrity* (source-of-truth paths still exist).
+Neither can notice a subtree churning for weeks while the curated context
+file that describes it stays byte-identical. `scripts/check_context_staleness.py`
+covers that third failure mode with a report derived from git history alone.
+
+What it computes, per curated context file (nested `AGENTS.md` under `src/`
+and `tests/`, plus `.sdd/agents-md/*.md` overlays when committed):
+
+- the last commit that touched the file;
+- the net diff under the file's scope since that commit (files changed,
+  insertions + deletions, `*.py` modules added or removed);
+- the commits in that range ranked by churn, so every flag names the exact
+  commits that aged the file.
+
+Flag rules (named constants at the top of the script):
+
+| Context file kind | Scope | Flags when |
+|-------------------|-------|------------|
+| Nested `AGENTS.md` | its directory subtree | net churn >= 200 lines, or any `*.py` module added/removed |
+| Committed `.sdd/agents-md` overlay | whole repository | net churn >= 2000 lines (module events alone never flag repo-wide prose) |
+
+The computation is a pure function of the repository state: two runs on the
+same repo state produce byte-identical output. Rename detection is disabled
+explicitly (`--no-renames`), so a rename surfaces as one module-removed plus
+one module-added event and the verdict cannot vary with git version or local
+diff configuration. The checker refuses to run on a shallow clone (exit 2)
+rather than emit silently truncated numbers.
+
+Where it surfaces (`.github/workflows/docs-drift.yml`):
+
+- **Pull requests**: a non-blocking comment (marker tag
+  `<!-- context-staleness-report -->`), posted only when the PR itself pushes
+  a scope over threshold — the PR base sha is passed as `--baseline` and only
+  newly flagged files count.
+- **Weekly schedule**: accumulated flags are upserted into a single tracking
+  issue titled `context-file staleness: curated context files lag their
+  subtrees` (updated in place, never duplicated).
+- It never fails a push to `main`: staleness accrues from ordinary merges and
+  is a review prompt, not a merge gate.
+- The `drift-check` job that executes the checker scripts is read-only
+  (`contents: read`); the PR comments and tracking-issue upserts run in the
+  separate `drift-publish` job, which only downloads the report artifacts and
+  never executes repository code — on pull requests the checked-out scripts
+  are PR-controlled, so they must never share a job with a write token.
+
+To clear a flag, review the context file against its scope and touch it in a
+commit — update the prose, or make a reconfirmation-only edit if everything
+still holds. Either way the "is this still true?" review leaves a commit that
+resets the file's clock.
+
+Run it locally:
+
+```bash
+uv run python scripts/check_context_staleness.py           # markdown report
+uv run python scripts/check_context_staleness.py --json    # machine-readable
+uv run python scripts/check_context_staleness.py --strict  # exit 1 on any flag
+```
+
 ## Cross-repo
 
-The public website and several long-form pages live in
-[`sipyourdrink-ltd/bernstein-landing`](https://github.com/sipyourdrink-ltd/bernstein-landing).
-These pages mirror or extend the bernstein docs; when bernstein docs change,
-the landing copy may need a follow-up edit.
-
-| Landing page | Mirrors / extends |
-|--------------|-------------------|
-| `app/cli-quickstart/page.tsx` | `README.md` install + first-run, `docs/getting-started/install.md`, `docs/getting-started/first-run.md` |
-| `app/docs/cli/page.tsx` | `README.md` operator-commands table, `docs/reference/cli/` |
-| `app/why-bernstein/page.tsx` | `README.md` "at a glance" + capabilities, `docs/whats-new.md` |
-| `app/compare/` | `docs/compare/` comparison memos |
-| Blog (`app/blog/`) | Long-form essays that may cite `docs/concepts/` or `docs/architecture/` |
-
-The CI drift gate dispatches a `docs-mirror-sync` workflow in bernstein-landing
-on every push to `main` (only if the `LANDING_REPO_PAT` secret is set). The
-landing-side workflow is responsible for opening its own follow-up PR with the
-mirrored content.
+The public website mirrors some docs pages.
 
 ## Adding a new doc
 

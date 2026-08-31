@@ -10,8 +10,8 @@ from bernstein.core.server.sse_events import SSEEvent, SSEEventType
 
 
 class TestSSEEventType:
-    def test_has_14_members(self) -> None:
-        assert len(SSEEventType) == 14
+    def test_has_18_members(self) -> None:
+        assert len(SSEEventType) == 18
 
     def test_event_type_values_are_dotted(self) -> None:
         for member in SSEEventType:
@@ -26,6 +26,9 @@ class TestSSEEventType:
             "TASK_COMPLETED",
             "TASK_FAILED",
             "TASK_RETRIED",
+            "TASK_ARTIFACT",
+            "TASK_PROGRESS",
+            "ARTIFACT_PRODUCED",
             "AGENT_SPAWNED",
             "AGENT_EXITED",
             "GATE_RESULT",
@@ -34,10 +37,43 @@ class TestSSEEventType:
             "MERGE_COMPLETED",
             "RUN_STARTED",
             "RUN_COMPLETED",
+            "MISSION_UPDATED",
             "HEARTBEAT",
         }
         actual = {m.name for m in SSEEventType}
         assert expected == actual
+
+    def test_artifact_produced_factory(self) -> None:
+        evt = SSEEvent.artifact_produced(
+            uri="pkg://pypi/bernstein/3.9.0",
+            entry_hash="sha256:abc",
+            content_hash="sha256:def",
+            actor="agent-release",
+            verified=True,
+        )
+        assert evt.event == SSEEventType.ARTIFACT_PRODUCED
+        assert evt.data["uri"] == "pkg://pypi/bernstein/3.9.0"
+        assert evt.data["entry_hash"] == "sha256:abc"
+        assert evt.data["verified"] is True
+        assert json.loads(evt.to_sse().split("data: ", 1)[1].split("\n", 1)[0])["actor"] == "agent-release"
+
+    def test_artifact_produced_carries_no_artifact_bytes(self) -> None:
+        """The payload is identity and provenance; clients re-verify the content."""
+        evt = SSEEvent.artifact_produced(
+            uri="pkg://pypi/bernstein/3.9.0",
+            entry_hash="sha256:abc",
+            content_hash="sha256:def",
+        )
+        assert "content" not in evt.data
+        assert set(evt.data) == {"uri", "entry_hash", "content_hash"}
+
+    def test_mission_updated_factory(self) -> None:
+        evt = SSEEvent.mission_updated("m-1", status_hash="abc", overall="active")
+        assert evt.event == SSEEventType.MISSION_UPDATED
+        assert evt.data["mission_id"] == "m-1"
+        assert evt.data["status_hash"] == "abc"
+        assert evt.data["overall"] == "active"
+        assert json.loads(evt.to_sse().split("data: ", 1)[1].split("\n", 1)[0])["mission_id"] == "m-1"
 
 
 class TestSSEEvent:

@@ -43,7 +43,7 @@ class WALEntry:
 
     All fields are immutable. ``committed=False`` signals that the
     corresponding action had not yet been confirmed when this entry
-    was written — useful for crash-recovery inspection.
+    was written - useful for crash-recovery inspection.
     """
 
     seq: int
@@ -60,7 +60,7 @@ class WALEntry:
 def _compute_entry_hash(payload: dict[str, Any]) -> str:
     """Return SHA-256 of the canonical JSON of *payload*.
 
-    *payload* must NOT contain the ``entry_hash`` key — the hash is
+    *payload* must NOT contain the ``entry_hash`` key - the hash is
     computed over all other fields so it can be stored alongside them.
     """
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -87,7 +87,7 @@ class UncommittedIndex:
     The index is a *secondary cache*: if it is missing, truncated, or
     otherwise corrupt, callers must fall back to a full WAL scan and
     rebuild the index from the scan result. Loss of the index therefore
-    only costs one slow boot — never correctness.
+    only costs one slow boot - never correctness.
 
     All mutating operations ``fsync`` the file so a crash cannot leave
     the on-disk form diverging from the in-process state.
@@ -164,7 +164,7 @@ class UncommittedIndex:
     def add(self, run_id: str, seq: int, entry_hash: str) -> None:
         """Append ``(run_id, seq, entry_hash)`` to the index.
 
-        Duplicates are allowed on disk — :meth:`load` is tolerant of them
+        Duplicates are allowed on disk - :meth:`load` is tolerant of them
         as long as each row is individually well-formed.  Callers that
         care about uniqueness should use :meth:`remove` before re-adding.
         """
@@ -257,6 +257,10 @@ class WALWriter:
         fixed-size chunks until a complete non-empty line is recovered
         (or the start of the file is reached). Avoids an O(N) full-file
         read on every construction of a ``WALWriter``.
+
+        When the trailing line is torn (a write interrupted by a crash),
+        the file is rescanned for the last self-consistent entry and the
+        chain resumes from it - see :meth:`_scan_last_valid_entry`.
         """
         if not self._path.exists():
             return -1, GENESIS_HASH
@@ -269,19 +273,42 @@ class WALWriter:
             data = json.loads(last_line)
             return int(data["seq"]), str(data["entry_hash"])
         except (KeyError, ValueError):
-            logger.warning("WAL tail unreadable at %s; chain will continue from truncation point", self._path)
-            # Fall back to a streaming count of non-empty lines so the
-            # next append receives seq = count (matching prior behaviour:
-            # ``len(non_empty) - 1`` → next seq = ``len(non_empty)``).
-            count = 0
-            try:
-                with self._path.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        if line.strip():
-                            count += 1
-            except OSError:
-                return -1, GENESIS_HASH
-            return count - 1, GENESIS_HASH
+            logger.warning("WAL tail unreadable at %s; resuming from the last valid entry", self._path)
+            return self._scan_last_valid_entry()
+
+    def _scan_last_valid_entry(self) -> tuple[int, str]:
+        """Return (seq, entry_hash) of the last self-consistent WAL line.
+
+        Used when the trailing line is torn. Resuming from
+        :data:`GENESIS_HASH` instead would make the next ``append`` chain
+        off genesis rather than off its real predecessor, forking the
+        hash chain at the truncation point. Only entries whose stored
+        ``entry_hash`` matches the SHA-256 of their own payload are
+        eligible, so a partially-written line can never become the anchor.
+
+        Returns ``(-1, GENESIS_HASH)`` when no valid entry exists.
+        """
+        last_seq = -1
+        last_hash = GENESIS_HASH
+        try:
+            with self._path.open("r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        seq = int(data["seq"])
+                        entry_hash = str(data["entry_hash"])
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                        continue
+                    payload = {k: v for k, v in data.items() if k != "entry_hash"}
+                    if _compute_entry_hash(payload) != entry_hash:
+                        continue
+                    last_seq, last_hash = seq, entry_hash
+        except OSError:
+            return -1, GENESIS_HASH
+        return last_seq, last_hash
 
     def _read_last_nonempty_line(self, chunk_size: int = 4096) -> str | None:
         """Return the last non-empty line of the WAL via backward seeking.
@@ -313,14 +340,14 @@ class WALWriter:
                     # the newline that *precedes* the last non-empty line.
                     stripped = buffer.rstrip(b"\r\n \t")
                     if not stripped:
-                        # Entire tail so far is whitespace — keep reading back.
+                        # Entire tail so far is whitespace - keep reading back.
                         continue
                     nl = stripped.rfind(b"\n")
                     if nl != -1:
                         candidate = stripped[nl + 1 :]
                         text = candidate.decode("utf-8", errors="replace").strip()
                         return text or None
-                    # No newline in what we've read yet — if we're already
+                    # No newline in what we've read yet - if we're already
                     # at the file start, the whole buffer is one line.
                     if pos == 0:
                         text = stripped.decode("utf-8", errors="replace").strip()
@@ -386,10 +413,23 @@ class WALWriter:
         entry_hash = _compute_entry_hash(payload)
 
         record = payload | {"entry_hash": entry_hash}
-        with self._path.open("a") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        # Capture the pre-write length so a failed write/flush/fsync can be
+        # rolled back. Without the rollback a durable line can outlive a
+        # failed fsync while self._seq/_prev_hash stay unadvanced, and the
+        # caller's retry then reuses this seq - two lines with the same seq
+        # and a permanently inconsistent chain.
+        try:
+            pre_write_size = self._path.stat().st_size
+        except OSError:
+            pre_write_size = 0
+        try:
+            with self._path.open("a") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            self._rollback_partial_append(pre_write_size)
+            raise
 
         # update the sidecar index after the WAL line has been
         # durably written. Index corruption only degrades startup speed
@@ -416,13 +456,30 @@ class WALWriter:
         self._prev_hash = entry_hash
         return entry
 
+    def _rollback_partial_append(self, size: int) -> None:
+        """Truncate the WAL back to *size* after a failed append.
+
+        Restores the on-disk state the writer's in-memory ``_seq`` and
+        ``_prev_hash`` still describe, so a retry re-appends the same
+        entry instead of adding a duplicate ``seq``. Best-effort: a
+        failure here is logged, never raised, so the caller still sees
+        the original write error.
+        """
+        try:
+            with self._path.open("r+b") as f:
+                f.truncate(size)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            logger.warning("WAL rollback after failed append did not complete at %s", self._path, exc_info=True)
+
     def mark_committed(self, seq: int) -> bool:
         """Remove ``(run_id, seq)`` from the uncommitted index.
 
         The hash-chained WAL is append-only, so the on-disk entry itself
         cannot be mutated from ``committed=False`` to ``committed=True``
         retroactively.  This method only updates the sidecar index used
-        by :meth:`WALRecovery.scan_all_uncommitted` — it signals "a
+        by :meth:`WALRecovery.scan_all_uncommitted` - it signals "a
         follow-up committed entry has been written, stop reporting this
         seq as uncommitted on boot".
 
@@ -460,6 +517,16 @@ class WALReader:
         Raises:
             FileNotFoundError: If the WAL file does not exist.
         """
+        for _, entry in self._iter_parsed():
+            yield entry
+
+    def _iter_parsed(self) -> Iterator[tuple[dict[str, Any], WALEntry]]:
+        """Yield ``(raw_record, entry)`` for every well-formed WAL line.
+
+        The raw record is handed back alongside the parsed entry so
+        callers that need to recompute ``entry_hash`` verify it against
+        the bytes as written rather than a re-serialised approximation.
+        """
         if not self._path.exists():
             raise FileNotFoundError(f"WAL file not found: {self._path}")
 
@@ -475,12 +542,12 @@ class WALReader:
                     continue
                 # Tampered or torn-write lines may parse as JSON but be
                 # missing required fields. Catch the lookup/cast errors
-                # and skip — verify_chain() reports a chain break via
+                # and skip - verify_chain() reports a chain break via
                 # the integrity hash anyway, so we should not crash the
                 # iterator when a downstream caller (e.g. lineage
                 # verifier) walks a corrupted WAL.
                 try:
-                    yield WALEntry(
+                    entry = WALEntry(
                         seq=int(data["seq"]),
                         prev_hash=str(data["prev_hash"]),
                         entry_hash=str(data["entry_hash"]),
@@ -494,6 +561,41 @@ class WALReader:
                 except (KeyError, TypeError, ValueError):
                     logger.warning("WAL line missing/malformed fields at %s; skipping", self._path)
                     continue
+                yield data, entry
+
+    def iter_verified_entries(self) -> Iterator[WALEntry]:
+        """Yield only the entries whose hash chain checks out.
+
+        Applies the same two checks as :meth:`verify_chain` - the stored
+        ``entry_hash`` must equal the SHA-256 of the entry's own payload,
+        and ``prev_hash`` must equal the preceding entry's ``entry_hash``
+        - and drops any entry that fails either one.
+
+        Callers that act on WAL contents without a separate
+        :meth:`verify_chain` pass (crash recovery, orphan reclamation)
+        use this so that a corrupted or foreign WAL cannot drive real
+        actions. Entries are still streamed one at a time, and a single
+        bad entry does not disqualify the ones that follow it - the
+        running hash advances using the stored value, matching
+        :meth:`verify_chain`.
+
+        Raises:
+            FileNotFoundError: If the WAL file does not exist.
+        """
+        prev_hash = GENESIS_HASH
+        for data, entry in self._iter_parsed():
+            payload = {k: v for k, v in data.items() if k != "entry_hash"}
+            hash_ok = entry.entry_hash == _compute_entry_hash(payload)
+            linked = entry.prev_hash == prev_hash
+            prev_hash = entry.entry_hash
+            if not hash_ok or not linked:
+                logger.warning(
+                    "WAL entry at %s seq %s failed chain verification; not trusted",
+                    self._path,
+                    entry.seq,
+                )
+                continue
+            yield entry
 
     def verify_chain(self) -> tuple[bool, list[str]]:
         """Verify hash chain integrity of the entire WAL.
@@ -590,10 +692,14 @@ class WALRecovery:
     def get_uncommitted_entries(self) -> list[WALEntry]:
         """Return all entries with ``committed=False``.
 
+        Only chain-verified entries are returned: recovery acts on these
+        entries, so an entry whose ``entry_hash`` or ``prev_hash`` does
+        not check out must not reach the caller.
+
         Returns an empty list if the WAL file does not exist (fresh start).
         """
         try:
-            return [e for e in self._reader.iter_entries() if not e.committed]
+            return [e for e in self._reader.iter_verified_entries() if not e.committed]
         except FileNotFoundError:
             return []
 
@@ -612,7 +718,7 @@ class WALRecovery:
 
         A closed marker signals that a previous recovery cycle has
         already observed and handled every uncommitted entry in the
-        corresponding WAL — future scans must skip it to prevent
+        corresponding WAL - future scans must skip it to prevent
         unbounded re-scanning of the same entries.
         """
         return WALRecovery._closed_marker_path(run_id, sdd_dir).exists()
@@ -664,6 +770,23 @@ class WALRecovery:
             f.flush()
             os.fsync(f.fileno())
 
+        # Fsyncing the marker's contents does not make its directory entry
+        # durable: POSIX only guarantees a new dirent survives a crash once
+        # the parent directory itself is fsynced. Without this the marker
+        # can be invisible on the next boot and the WAL is re-scanned
+        # forever - exactly what the marker exists to prevent.
+        try:
+            dir_fd = os.open(marker.parent, os.O_RDONLY)
+        except OSError:
+            logger.warning("could not open WAL directory to fsync close marker for %s", run_id, exc_info=True)
+        else:
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                logger.warning("directory fsync for close marker failed for %s", run_id, exc_info=True)
+            finally:
+                os.close(dir_fd)
+
         # drop stale uncommitted-index rows for the now-closed
         # run so future scans do not have to filter them out.
         try:
@@ -682,7 +805,7 @@ class WALRecovery:
 
         Iterates over every ``*.wal.jsonl`` file in the WAL directory, skipping
         *exclude_run_id* (typically the current run) and any WAL whose
-        ``.closed`` sidecar marker is present ( — prevents
+        ``.closed`` sidecar marker is present ( - prevents
         unbounded re-scanning of already-recovered WALs). Returns a flat
         list of ``(run_id, WALEntry)`` pairs for every entry with
         ``committed=False``.
@@ -703,6 +826,8 @@ class WALRecovery:
 
         results: list[tuple[str, WALEntry]] = []
         for wal_file in sorted(wal_dir.glob("*.wal.jsonl")):
+            if wal_file.is_symlink():
+                continue
             run_id = wal_file.name.removesuffix(".wal.jsonl")
             if run_id == exclude_run_id:
                 continue
@@ -732,6 +857,10 @@ class WALRecovery:
         WALs with a ``.closed`` sidecar marker are skipped so
         that orphans handled by a prior recovery are not retried forever.
 
+        Entries are read through :meth:`WALReader.iter_verified_entries`,
+        so a WAL whose ``entry_hash`` or ``prev_hash`` does not check out
+        yields no claims to force-reclaim.
+
         Args:
             sdd_dir: The ``.sdd`` directory root.
             exclude_run_id: Run ID to skip (the in-progress run).
@@ -745,6 +874,8 @@ class WALRecovery:
 
         orphans: list[tuple[str, WALEntry]] = []
         for wal_file in sorted(wal_dir.glob("*.wal.jsonl")):
+            if wal_file.is_symlink():
+                continue
             run_id = wal_file.name.removesuffix(".wal.jsonl")
             if run_id == exclude_run_id:
                 continue
@@ -752,7 +883,7 @@ class WALRecovery:
                 continue
             reader = WALReader(run_id=run_id, sdd_dir=sdd_dir)
             try:
-                entries = list(reader.iter_entries())
+                entries = list(reader.iter_verified_entries())
             except FileNotFoundError:
                 continue
 
@@ -776,11 +907,49 @@ class WALRecovery:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class WALEntryDigest:
+    """Cumulative fingerprint state after one WAL entry.
+
+    ``digest`` is the run's :class:`ExecutionFingerprint` *as of* this entry:
+    ``sha256(state_i).hexdigest()``, the same transform :meth:`ExecutionFingerprint.compute`
+    applies to the final state. Because the underlying state is a rolling
+    hash, the first index at which two runs' digests differ is exactly the
+    first decision at which they diverged - no second fingerprinting scheme
+    is introduced, only a snapshot of the existing one after each entry.
+
+    ``seq`` is the WAL entry's sequence number from the hash chain, so the
+    reported divergence points at a concrete entry an operator can locate.
+    """
+
+    seq: int
+    decision_type: str
+    digest: str
+
+
+def first_divergence(a: list[WALEntryDigest], b: list[WALEntryDigest]) -> int | None:
+    """Return the first index at which two digest streams differ.
+
+    Compares the cumulative per-entry digests of two runs in WAL order.
+    Returns the zero-based index of the first diverging entry, or ``None``
+    when the two streams are identical (same length, equal digests at every
+    position). A length mismatch diverges at the first index present in one
+    stream but not the other.
+    """
+    limit = min(len(a), len(b))
+    for i in range(limit):
+        if a[i].digest != b[i].digest:
+            return i
+    if len(a) != len(b):
+        return limit
+    return None
+
+
 class ExecutionFingerprint:
     """Determinism fingerprint over an ordered sequence of orchestrator decisions.
 
     Two runs with the same fingerprint made identical decisions in identical
-    order — a verifiable proof of determinism usable as a CI gate.
+    order - a verifiable proof of determinism usable as a CI gate.
 
     The fingerprint is a SHA-256 computed iteratively over the sequence::
 
@@ -838,3 +1007,33 @@ class ExecutionFingerprint:
         for entry in reader.iter_entries():
             fp.record(entry.decision_type, entry.inputs, entry.output)
         return fp
+
+    @classmethod
+    def entry_digests(cls, reader: WALReader) -> list[WALEntryDigest]:
+        """Return the cumulative fingerprint digest after each WAL entry.
+
+        Walks the WAL exactly as :meth:`from_wal` does, but snapshots the
+        rolling hash after every entry. The last element's ``digest`` equals
+        ``ExecutionFingerprint.from_wal(reader).compute()`` for the same WAL,
+        so the per-entry stream and the headline fingerprint are guaranteed
+        consistent. Use with :func:`first_divergence` to locate where two
+        runs' decision traces forked.
+
+        Args:
+            reader: A :class:`WALReader` positioned at the start of a WAL.
+
+        Returns:
+            One :class:`WALEntryDigest` per WAL entry, in write order.
+        """
+        fp = cls()
+        digests: list[WALEntryDigest] = []
+        for entry in reader.iter_entries():
+            fp.record(entry.decision_type, entry.inputs, entry.output)
+            digests.append(
+                WALEntryDigest(
+                    seq=entry.seq,
+                    decision_type=entry.decision_type,
+                    digest=fp.compute(),
+                )
+            )
+        return digests

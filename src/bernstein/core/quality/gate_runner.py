@@ -14,11 +14,14 @@ import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from bernstein.core.quality.gate_commands import (
     _module_name_from_path,
     _resolve_import_from,
+)
+from bernstein.core.quality.gate_pipeline import (
+    COMMAND_ERROR_PREFIX as _COMMAND_ERROR_PREFIX,
 )
 from bernstein.core.quality.gate_pipeline import (
     NO_PYTHON_FILES as _NO_PYTHON_FILES,
@@ -38,6 +41,7 @@ from bernstein.core.quality.gate_pipeline import (
 from bernstein.core.quality.gate_pipeline import (
     is_dep_file as _is_dep_file,
 )
+from bernstein.core.quality.run_config_gate import check_paths
 from bernstein.core.telemetry import start_span
 
 if TYPE_CHECKING:
@@ -168,7 +172,17 @@ class GateRunner:
                 span.set_attribute("quality_gate.cached", result.cached)
                 span.set_attribute("quality_gate.duration_ms", result.duration_ms)
 
-        if cache_key is not None and result.status in {"pass", "fail", "skipped"}:
+        # Cache terminal verdicts. ``"inconclusive"`` is also a terminal
+        # verdict (the runner cannot resolve it without operator action),
+        # so the cache key must include it — otherwise a flaky runner
+        # would loop through a re-run cycle without ever converging on a
+        # reproducible verdict (issue #4181).
+        if cache_key is not None and result.status in {
+            "pass",
+            "fail",
+            "skipped",
+            "inconclusive",
+        }:
             await asyncio.to_thread(self._store_cached_result_sync, cache_key, result)
         return result
 
@@ -298,14 +312,31 @@ class GateRunner:
         from bernstein.core import quality_gates as qg
 
         if step.name == "agent_test_mutation":
-            ok, detail, score = await asyncio.to_thread(
+            ok, detail, score, evidence_status = await asyncio.to_thread(
                 qg.run_agent_test_mutation_gate_sync,
                 self._config,
                 task,
                 run_dir,
             )
         else:
-            ok, detail, score = await asyncio.to_thread(qg.run_mutation_gate_sync, self._config, run_dir)
+            ok, detail, score, evidence_status = await asyncio.to_thread(
+                qg.run_mutation_gate_sync, self._config, run_dir
+            )
+
+        # If evidence is missing (tool missing, subprocess died), return inconclusive.
+        if evidence_status is not None:
+            return GateResult(
+                name=step.name,
+                status="inconclusive",
+                reason=evidence_status,
+                required=step.required,
+                blocked=step.required,
+                cached=False,
+                duration_ms=0,
+                details=detail,
+                metadata={"mutation_score": score} if score is not None else {},
+            )
+
         return GateResult(
             name=step.name,
             status="pass" if ok else "fail",
@@ -339,7 +370,7 @@ class GateRunner:
             blocked=step.required and blocked,
             cached=False,
             duration_ms=0,
-            details=f"Intent verdict: {verdict.verdict} — {verdict.reason}",
+            details=f"Intent verdict: {verdict.verdict} - {verdict.reason}",
             metadata={"verdict": verdict.verdict, "model": verdict.model},
         )
 
@@ -372,17 +403,27 @@ class GateRunner:
         try:
             plugin_result = await asyncio.to_thread(plugin.run, changed_files, run_dir, task.title, task.description)
         except Exception as exc:
+            # The plugin died before producing a verdict. Issue #4181 says we
+            # must not coerce an inability-to-evaluate into pass/fail — the
+            # runner cannot honestly say "this gate passed", so return
+            # ``inconclusive`` with the closed-set ``runner-died-before-output``
+            # reason. ``blocked`` semantics stay aligned with ``fail`` at a
+            # required gate (the verdict differs, the outcome does not).
+            logger.warning("Gate plugin %r died before output: %s", step.name, exc)
             return GateResult(
                 name=step.name,
-                status="fail",
+                status="inconclusive",
                 required=step.required,
                 blocked=step.required,
                 cached=False,
                 duration_ms=0,
                 details=f"Gate plugin {step.name!r} failed: {exc}",
                 metadata={},
+                reason="runner-died-before-output",
             )
-        blocked = plugin_result.blocked or (step.required and plugin_result.status == "fail")
+        # ``inconclusive`` blocks at a required gate just like ``fail``; the
+        # verdict differs, the promotion decision does not (issue #4181).
+        blocked = plugin_result.blocked or (step.required and plugin_result.status in {"fail", "inconclusive"})
         return GateResult(
             name=step.name,
             status=plugin_result.status,
@@ -411,12 +452,13 @@ class GateRunner:
             "coverage_delta": self._run_coverage_delta_gate_sync,
             "merge_conflict": self._run_merge_conflict_gate_sync,
             "large_file": self._run_large_file_gate_sync,
+            "run_config": self._run_run_config_gate_sync,
         }
         sync_fn = _sync_cf_gates.get(step.name)
         if sync_fn is not None:
             return await asyncio.to_thread(sync_fn, step, run_dir, changed_files)
 
-        # Threaded sync gates (step, run_dir) — no changed_files
+        # Threaded sync gates (step, run_dir) - no changed_files
         _sync_no_cf_gates: dict[str, Any] = {
             "benchmark": self._run_benchmark_gate_sync,
             "migration_reversibility": self._run_migration_reversibility_gate_sync,
@@ -458,13 +500,19 @@ class GateRunner:
     ) -> GateResult:
         from bernstein.core import quality_gates as qg
 
-        ok, detail = await asyncio.to_thread(qg.run_command_sync, command, run_dir, timeout_s)
+        result = await asyncio.to_thread(qg.run_command_sync, command, run_dir, timeout_s)
+        ok, detail, exit_code = result
         status: GateStatus
         blocked = False
         normalized_detail = detail
         if detail.startswith(_TIMED_OUT_PREFIX):
             status = "timeout"
             blocked = step.required
+        elif exit_code == 127:
+            # Exit code 127 indicates command not found
+            status = "command_not_found"
+            blocked = step.required
+            normalized_detail = f"Command not found: {detail}"
         elif ok:
             status = "pass"
             normalized_detail = pass_detail or detail
@@ -497,7 +545,7 @@ class GateRunner:
         if command is None:
             return self._skipped(step, "No impacted tests detected.")
 
-        ok, detail = await asyncio.to_thread(qg.run_command_sync, command, run_dir, self._config.timeout_s)
+        ok, detail, _exit_code = await asyncio.to_thread(qg.run_command_sync, command, run_dir, self._config.timeout_s)
         metadata: dict[str, Any] = {"command": command}
         if detail.startswith(_TIMED_OUT_PREFIX):
             return GateResult(
@@ -565,9 +613,10 @@ class GateRunner:
         if baseline_score is None:
             return GateResult(
                 name=step.name,
-                status="warn",
+                status="inconclusive",
+                reason="evidence-missing",
                 required=step.required,
-                blocked=False,
+                blocked=step.required,
                 cached=False,
                 duration_ms=0,
                 details=f"Complexity average: {current_score:.2f}; baseline unavailable ({baseline_detail})",
@@ -611,7 +660,7 @@ class GateRunner:
             return self._skipped(step, _NO_PYTHON_FILES)
 
         command = self._dead_code_command(step, python_files)
-        ok, vulture_detail = qg.run_command_sync(command, run_dir, self._config.timeout_s)
+        ok, vulture_detail, _exit_code = qg.run_command_sync(command, run_dir, self._config.timeout_s)
         if vulture_detail.startswith(_TIMED_OUT_PREFIX):
             return GateResult(
                 name=step.name,
@@ -666,16 +715,24 @@ class GateRunner:
                 docstyle=docstyle,
             )
         except Exception as exc:  # pragma: no cover
+            # ``comment_quality.analyse`` died before producing a verdict.
+            # Issue #4181 says we must not coerce an inability-to-evaluate
+            # into pass/fail — the evaluator could not look at the code,
+            # so it cannot honestly say "pass", and "fail" trains operators
+            # to re-run until green. Return ``inconclusive`` with the
+            # closed-set ``runner-died-before-output`` reason; ``blocked``
+            # stays aligned with ``fail`` at a required gate.
             logger.warning("comment_quality.analyse failed: %s", exc)
             return GateResult(
                 name=step.name,
-                status="fail",
+                status="inconclusive",
                 required=step.required,
                 blocked=step.required,
                 cached=False,
                 duration_ms=0,
                 details=f"Comment quality gate error: {exc}",
                 metadata={},
+                reason="runner-died-before-output",
             )
 
         if report.passed and not report.issues:
@@ -722,7 +779,8 @@ class GateRunner:
         if not python_files:
             return self._skipped(step, _NO_PYTHON_FILES)
         if command is not None:
-            ok, detail = self._run_command_and_capture(command, run_dir)
+            result = self._run_command_and_capture(command, run_dir)
+            ok, detail, exit_code = result
             if ok:
                 return GateResult(
                     name=step.name,
@@ -732,6 +790,17 @@ class GateRunner:
                     cached=False,
                     duration_ms=0,
                     details="no import cycles detected",
+                    metadata={"command": command},
+                )
+            if exit_code == 127:
+                return GateResult(
+                    name=step.name,
+                    status="command_not_found",
+                    required=step.required,
+                    blocked=step.required,
+                    cached=False,
+                    duration_ms=0,
+                    details=f"Command not found: {detail}",
                     metadata={"command": command},
                 )
             return self._command_failure_result(step, detail, command)
@@ -763,7 +832,8 @@ class GateRunner:
 
         command = self._optional_command("coverage_delta", step.command_override)
         if command is not None:
-            ok, detail = self._run_command_and_capture(command, run_dir)
+            result = self._run_command_and_capture(command, run_dir)
+            ok, detail, exit_code = result
             if ok:
                 return GateResult(
                     name=step.name,
@@ -775,20 +845,40 @@ class GateRunner:
                     details=detail,
                     metadata={"command": command},
                 )
+            if exit_code == 127:
+                return GateResult(
+                    name=step.name,
+                    status="command_not_found",
+                    required=step.required,
+                    blocked=step.required,
+                    cached=False,
+                    duration_ms=0,
+                    details=f"Command not found: {detail}",
+                    metadata={"command": command},
+                )
             return self._command_failure_result(step, detail, command)
 
         try:
             evaluation = CoverageGate(self._workdir, run_dir, base_ref=self._base_ref).evaluate()
         except Exception as exc:
+            # The CoverageGate constructor / evaluate chain died before
+            # producing a verdict. Issue #4181 says we must not coerce an
+            # inability-to-evaluate into pass/fail — without an evaluation
+            # we cannot honestly say "pass", and "fail" trains operators
+            # to re-run until green. ``inconclusive`` with the closed-set
+            # ``runner-died-before-output`` reason is the honest verdict;
+            # ``blocked`` stays aligned with ``fail`` at a required gate.
+            logger.warning("CoverageGate.evaluate failed: %s", exc)
             return GateResult(
                 name=step.name,
-                status="fail",
+                status="inconclusive",
                 required=step.required,
                 blocked=step.required,
                 cached=False,
                 duration_ms=0,
-                details=str(exc),
+                details=f"Coverage gate evaluator failed: {exc}",
                 metadata={},
+                reason="runner-died-before-output",
             )
         return GateResult(
             name=step.name,
@@ -824,15 +914,24 @@ class GateRunner:
                 threshold=cfg.threshold,
             ).evaluate()
         except Exception as exc:
+            # The BenchmarkGate constructor / evaluate chain died before
+            # producing a verdict. Issue #4181 says we must not coerce an
+            # inability-to-evaluate into pass/fail — without an evaluation
+            # we cannot honestly say "pass", and "fail" trains operators
+            # to re-run until green. ``inconclusive`` with the closed-set
+            # ``runner-died-before-output`` reason is the honest verdict;
+            # ``blocked`` stays aligned with ``fail`` at a required gate.
+            logger.warning("BenchmarkGate.evaluate failed: %s", exc)
             return GateResult(
                 name=step.name,
-                status="fail",
+                status="inconclusive",
                 required=step.required,
                 blocked=step.required,
                 cached=False,
                 duration_ms=0,
-                details=str(exc),
+                details=f"Benchmark gate evaluator failed: {exc}",
                 metadata={},
+                reason="runner-died-before-output",
             )
         regression_names = [r.name for r in evaluation.regressions]
         return GateResult(
@@ -864,7 +963,7 @@ class GateRunner:
         issues = alembic_issues + sql_issues
 
         if migration_count == 0:
-            return self._skipped(step, "No migration files found — skipping reversibility check.")
+            return self._skipped(step, "No migration files found - skipping reversibility check.")
 
         if not issues:
             return GateResult(
@@ -888,6 +987,51 @@ class GateRunner:
             duration_ms=0,
             details=detail,
             metadata={"migration_count": migration_count, "missing_rollback": len(issues)},
+        )
+
+    def _run_run_config_gate_sync(
+        self,
+        step: GatePipelineStep,
+        run_dir: Path,
+        changed_files: list[str],
+    ) -> GateResult:
+        """Block a change that carries one of the run's own configuration files.
+
+        A run resolves its overrides from an untracked overlay, so a
+        configuration path inside a change is never the work that was asked
+        for - it is the run's own state about to be proposed as a rewrite of
+        the repository's configuration for every user of it. The check is a
+        set membership test over the names git already reported, so it costs
+        nothing to run on every task.
+
+        ``run_dir`` is unused: the verdict depends only on which paths the
+        change touches, never on their contents.
+        """
+        del run_dir
+        verdict = check_paths(changed_files)
+        if verdict.ok:
+            return GateResult(
+                name=step.name,
+                status="pass",
+                required=step.required,
+                blocked=False,
+                cached=False,
+                duration_ms=0,
+                details=verdict.details,
+                metadata={"run_config_files": 0},
+            )
+        return GateResult(
+            name=step.name,
+            status="fail",
+            required=step.required,
+            blocked=step.required,
+            cached=False,
+            duration_ms=0,
+            details=verdict.details,
+            metadata={
+                "run_config_files": len(verdict.offending_paths),
+                "paths": list(verdict.offending_paths),
+            },
         )
 
     def _run_large_file_gate_sync(
@@ -929,7 +1073,7 @@ class GateRunner:
 
         lines = [f"  {path}: {count} lines (>{threshold})" for path, count in sorted(oversized)]
         detail = f"{len(oversized)} file(s) exceed {threshold} lines and should be decomposed:\n" + "\n".join(lines)
-        # Always warn; never block — this is a heuristic, not a hard requirement.
+        # Always warn; never block - this is a heuristic, not a hard requirement.
         return GateResult(
             name=step.name,
             status="warn",
@@ -954,7 +1098,7 @@ class GateRunner:
         Go (gofmt) via a pluggable registry.  Custom per-language commands from
         the gate config are injected as overrides.
 
-        The gate always passes — it fixes rather than blocks.  Any files
+        The gate always passes - it fixes rather than blocks.  Any files
         reformatted are reported in the gate details so that the commit/push
         step can stage the changes.
         """
@@ -1018,7 +1162,28 @@ class GateRunner:
             enabled=True,
             block_on_fail=step.required,
         )
-        result = await generate_and_run(task, run_dir, cfg)
+        try:
+            result = await generate_and_run(task, run_dir, cfg)
+        except Exception as exc:
+            # The integration-test generator died before producing a verdict.
+            # Issue #4181 says we must not coerce an inability-to-evaluate
+            # into pass/fail — the generator could not even run, so neither
+            # "pass" nor "fail" is honest. ``inconclusive`` with the
+            # closed-set ``runner-died-before-output`` reason is the honest
+            # verdict; ``blocked`` stays aligned with ``fail`` at a required
+            # gate (the verdict differs, the outcome does not).
+            logger.warning("integration_test_gen gate failed: %s", exc)
+            return GateResult(
+                name=step.name,
+                status="inconclusive",
+                required=step.required,
+                blocked=step.required,
+                cached=False,
+                duration_ms=0,
+                details=f"Integration test generation gate failed: {exc}",
+                metadata={},
+                reason="runner-died-before-output",
+            )
         metadata: dict[str, Any] = {}
         if result.test_path:
             metadata["test_path"] = result.test_path
@@ -1055,6 +1220,7 @@ class GateRunner:
             metadata[dim.name] = dim.score
         if result.errors:
             metadata["errors"] = result.errors[:3]
+        gate_status: Literal["pass", "warn", "fail"]
         if result.passed:
             gate_status = "pass"
         elif not step.required:
@@ -1126,7 +1292,7 @@ class GateRunner:
             metadata={"branch": branch, "base_ref": self._base_ref},
         )
 
-    def _run_command_and_capture(self, command: str, run_dir: Path) -> tuple[bool, str]:
+    def _run_command_and_capture(self, command: str, run_dir: Path) -> tuple[bool, str, int]:
         """Execute a command gate synchronously and capture its output."""
         from bernstein.core import quality_gates as qg
 
@@ -1145,6 +1311,28 @@ class GateRunner:
                 details=detail,
                 metadata={"command": command},
             )
+        if detail.startswith(_COMMAND_ERROR_PREFIX):
+            # The command could not be executed at all (OSError from
+            # subprocess.run: shell unavailable, cwd vanished, ...). No
+            # evidence was produced, so neither "pass" (a bypass) nor
+            # "fail" (a lie that trains operators to re-run until green)
+            # is honest — issue #4181. ``evidence-missing`` is the closed
+            # reason; at a required gate this blocks exactly like ``fail``.
+            return GateResult(
+                name=step.name,
+                status="inconclusive",
+                reason="evidence-missing",
+                required=step.required,
+                blocked=step.required,
+                cached=False,
+                duration_ms=0,
+                details=detail,
+                metadata={"command": command},
+            )
+        # Non-zero exit with captured output: the tool ran and reported a
+        # real failure — that is evidence, and it is unfavourable. ``fail``
+        # is the honest verdict here (distinct from the absent-evidence
+        # cases above, which carry ``inconclusive``).
         return GateResult(
             name=step.name,
             status="fail",
@@ -1172,7 +1360,10 @@ class GateRunner:
 
     def _measure_complexity_sync(self, command: str, cwd: Path) -> tuple[float | None, str]:
         """Execute a complexity command and parse its average score."""
-        ok, detail = self._run_command_and_capture(command, cwd)
+        result = self._run_command_and_capture(command, cwd)
+        ok, detail, exit_code = result
+        if exit_code == 127:
+            return None, f"Command not found: {detail}"
         if not ok:
             return None, detail
         score = self._parse_complexity_average(detail)
@@ -1377,7 +1568,9 @@ class GateRunner:
         if self._changed_files_resolved:
             if not python_files:
                 return None
-            return f"ruff check {self._quote_paths(python_files)}"
+            # Preserve command prefix (e.g., "uv run") from configured lint_command
+            lint_prefix = self._extract_command_prefix(self._config.lint_command, "ruff check")
+            return f"{lint_prefix} {self._quote_paths(python_files)}"
         return self._config.lint_command
 
     def _type_check_command(self, step: GatePipelineStep, changed_files: list[str]) -> str | None:
@@ -1388,7 +1581,9 @@ class GateRunner:
             if not python_files:
                 return None
             expanded = self._expand_type_check_files(python_files)
-            return f"pyright {self._quote_paths(expanded)}"
+            # Preserve command prefix (e.g., "uv run") from configured type_check_command
+            type_check_prefix = self._extract_command_prefix(self._config.type_check_command, "pyright")
+            return f"{type_check_prefix} {self._quote_paths(expanded)}"
         return self._config.type_check_command
 
     def _expand_type_check_files(self, python_files: list[str]) -> list[str]:
@@ -1423,6 +1618,7 @@ class GateRunner:
         from bernstein.core.quality.flaky_detector import FlakyDetector
         from bernstein.core.quality.test_impact import TestImpactAnalyzer
 
+        command: str | None
         if step.command_override is not None:
             command = step.command_override
         elif not self._changed_files_resolved:
@@ -1463,6 +1659,25 @@ class GateRunner:
 
     def _quote_paths(self, paths: list[str]) -> str:
         return shlex.join(paths)
+
+    @staticmethod
+    def _extract_command_prefix(configured_command: str, base_command: str) -> str:
+        """Extract command prefix from a configured command, preserving tool runners like 'uv run'.
+
+        Args:
+            configured_command: The full configured command (e.g., "uv run ruff check .")
+            base_command: The base tool command to find (e.g., "ruff check" or "pyright")
+
+        Returns:
+            The command prefix including any tool runners (e.g., "uv run ruff check")
+        """
+        # Find where the base command starts in the configured command
+        idx = configured_command.find(base_command)
+        if idx == -1:
+            # Base command not found, return it as-is
+            return base_command
+        # Return everything up to and including the base command
+        return configured_command[: idx + len(base_command)]
 
     @staticmethod
     def _find_tests_by_name(run_dir: Path, module_name: str) -> set[str]:
@@ -1710,7 +1925,7 @@ class GateRunner:
         if not source_files:
             return self._skipped(step, "No Python source files changed.")
 
-        # Always pass — this is an advisory gate. Record uncovered files in metadata
+        # Always pass - this is an advisory gate. Record uncovered files in metadata
         # and write needs_coverage.json for downstream consumers.
         if uncovered:
             import json as _json

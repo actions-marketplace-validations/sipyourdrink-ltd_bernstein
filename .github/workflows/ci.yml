@@ -2,6 +2,7 @@ name: CI
 
 on:
   workflow_dispatch:
+  merge_group: {}
   push:
     branches: [main]
     paths-ignore:
@@ -14,6 +15,10 @@ on:
       # filter and the "tag exists?" check inside auto-release.yml.
       # Documentation & prose
       - "docs/**"
+      - "!docs/operations/ci-topology.md"
+      - "!docs/observability/**"
+      - "!docs/skills/**"
+      - "!docs/benchmarks/**"
       - "*.md"
       - "!README.md"
       - "LICENSE"
@@ -25,6 +30,10 @@ on:
       - "packages/vscode/**"
       - "packages/cursor-plugin/**"
       - "packaging/**"
+      # packaging/rpm is NOT ignored: the spec decides whether the shipped
+      # RPM works at all, and `install-smoke-rpm` is its covering test
+      # (#3558). A spec-only diff must run CI.
+      - "!packaging/rpm/**"
       - "Formula/**"
       # Deployment & infra configs
       - "deploy/**"
@@ -33,21 +42,17 @@ on:
       - "Dockerfile"
       - "action.yml"
       - "action/**"
-      # CI tool configs (don't re-run tests for codecov/sonar tweaks)
+      # CI tool configs (don't re-run tests for codecov tweaks)
       - "codecov.yml"
-      - "sonar-project.properties"
-      # GitHub meta (templates, labels, funding — not ci.yml)
+      # GitHub meta (templates, labels, funding - not ci.yml)
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/FUNDING.yml"
       - ".github/CODEOWNERS"
       - ".github/pull_request_template.md"
-      - ".github/dependabot.yml"
       - ".github/labeler.yml"
-      - ".github/release-drafter.yml"
       - ".github/copilot-instructions.md"
       - ".github/codeql/**"
       # Non-code project files
-      - "marketing/**"
       - "benchmarks/**"
       - "examples/**"
       - "plans/**"
@@ -63,6 +68,10 @@ on:
     paths-ignore:
       # Documentation & prose
       - "docs/**"
+      - "!docs/operations/ci-topology.md"
+      - "!docs/observability/**"
+      - "!docs/skills/**"
+      - "!docs/benchmarks/**"
       - "*.md"
       - "!README.md"
       - "LICENSE"
@@ -74,6 +83,10 @@ on:
       - "packages/vscode/**"
       - "packages/cursor-plugin/**"
       - "packaging/**"
+      # packaging/rpm is NOT ignored: the spec decides whether the shipped
+      # RPM works at all, and `install-smoke-rpm` is its covering test
+      # (#3558). A spec-only diff must run CI.
+      - "!packaging/rpm/**"
       - "Formula/**"
       # Deployment & infra configs
       - "deploy/**"
@@ -84,19 +97,15 @@ on:
       - "action/**"
       # CI tool configs
       - "codecov.yml"
-      - "sonar-project.properties"
       # GitHub meta
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/FUNDING.yml"
       - ".github/CODEOWNERS"
       - ".github/pull_request_template.md"
-      - ".github/dependabot.yml"
       - ".github/labeler.yml"
-      - ".github/release-drafter.yml"
       - ".github/copilot-instructions.md"
       - ".github/codeql/**"
       # Non-code project files
-      - "marketing/**"
       - "benchmarks/**"
       - "examples/**"
       - "plans/**"
@@ -109,30 +118,34 @@ on:
       - "scripts/gen_roadmap_*.py"
       - "scripts/generate_benchmark_docs.py"
 
-# Concurrency policy (split PR vs main pushes — see #1273):
+# Concurrency policy for heavy CI (see #1273):
 #
 #   - Pull requests: per-PR group (keyed off pull_request.number, stable
 #     across pushes to the same PR), cancel-in-progress=true. New commits
 #     on the same PR cancel older CI runs so reviewers only ever wait on
 #     the latest push and we don't burn minutes on stale SHAs.
 #
-#   - Pushes to main (incl. squash-merges from auto/bump-* PRs): per-SHA
-#     group, cancel-in-progress=false. Each merged commit gets its own
-#     un-cancellable CI run so the `workflow_run` listener in
-#     auto-release.yml always observes a real success/failure conclusion
-#     for that SHA — never `cancelled`-by-newer-push. This is the v2-merge
-#     unblocker: a tag/publish race that previously dropped the release
-#     when two merges landed in quick succession.
+#   - Pushes to main: branch-wide group, cancel-in-progress=true — the
+#     newest landed commit supersedes queued/running CI for the commits
+#     under it. The per-SHA no-cancel policy this replaces assumed merged
+#     PRs arrive too slowly to matter; on 2026-08-30 the merge queue
+#     landed 8 PRs in 2 hours and the stacked full-matrix main runs
+#     (~36 jobs each) saturated the account-wide concurrent-job ceiling
+#     for over 4 hours — merge_group runs starved and the queue froze.
+#     The per-commit pass/fail signal the old policy protected is carried
+#     by main-sha-marker.yml (per-SHA, never cancelled), so a superseded
+#     heavy run loses nothing that survives anyway.
 #
-# The conditional in `group:` selects the right key per event type, and
-# `cancel-in-progress` fires for both pull_request and push: a rapid
-# wave of merges on `main` (13 commits in 90 min during the May 2026
-# META wave) used to saturate the runner queue because each sha-unique
-# group kept its own full-matrix run alive. Branch-scoped grouping +
-# always-cancel-in-progress lets the latest push supersede stale ones.
+#   - Release bump commits (chore(release)/release: prefixes) keep the
+#     per-SHA group: the auto-release gate keys on the triggering
+#     commit's own successful CI run, so superseding a bump run would
+#     silently drop the tag. Bumps are rare; the exemption costs nothing.
+#
+#   - merge_group / dispatch: per-SHA group, never cancelled — each queue
+#     batch must test its prospective merged SHA to completion.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('branch-{0}', github.ref) }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'chore(release)') && !startsWith(github.event.head_commit.message, 'release:')) && format('branch-{0}', github.ref) || format('branch-{0}-{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'chore(release)') && !startsWith(github.event.head_commit.message, 'release:')) }}
 
 # Default-deny for the workflow token; individual jobs escalate only
 # the scopes they actually need (Scorecard token-permissions, Sonar S8264).
@@ -165,8 +178,18 @@ jobs:
       # macOS hosted-runner pool during burst-merge waves. The nightly
       # workflow (ci-macos-nightly.yml) provides the safety-net coverage.
       macos_sensitive: ${{ steps.classify.outputs.macos_sensitive }}
+      # rpm_relevant_changed: true when the diff touches what
+      # `install-smoke-rpm` exercises - the RPM packaging inputs, the
+      # smoke script, or the job's own definition (#3947). That job
+      # installs the newest *released* PyPI version, not this tree's
+      # source, so it cannot be regressed by an ordinary src/ or tests/
+      # change; gating it on this flag stops a defect in a past release
+      # from red-gating every unrelated PR and queue batch until the next
+      # release ships. install-smoke-rpm-nightly.yml re-runs the same
+      # check daily regardless of this flag.
+      rpm_relevant_changed: ${{ steps.classify.outputs.rpm_relevant_changed }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -175,14 +198,21 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
+          # The merge queue builds a synthetic ref that stacks every entry in
+          # the group on top of `main`. `github.event.before` does not exist on
+          # this event and the group can carry many commits, so the planner
+          # needs the group's own base SHA to see the whole combined diff.
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
-          # On pull_request, diff against the base branch. On push to main
-          # (or any other push event), diff against the previous commit so
-          # the planner stays useful for filter-skipped downstream jobs.
+          # On pull_request, diff against the base branch. On merge_group,
+          # diff against the group's base SHA. On push to main (or any other
+          # push event), diff against the previous commit so the planner stays
+          # useful for filter-skipped downstream jobs.
           #
           # NOTE: checkout above uses fetch-depth: 0, so HEAD has full history.
           # However, origin/${BASE_REF} is NOT fetched by default in the PR
-          # checkout (which is on the merge ref) — we must fetch it explicitly.
+          # checkout (which is on the merge ref) - we must fetch it explicitly.
           # Using --depth=1 here previously caused `...` (merge-base) diffs to
           # fail when the merge-base wasn't in the shallow window, especially
           # after parallel main merges. Fetch the base ref WITHOUT --depth.
@@ -195,7 +225,7 @@ jobs:
             if [ -f "$(git rev-parse --git-dir)/shallow" ]; then
               git fetch --unshallow origin "${BASE_REF}" || git fetch origin "${BASE_REF}" || true
             fi
-            # Diagnostic output — keeps future flakes debuggable in the action log.
+            # Diagnostic output - keeps future flakes debuggable in the action log.
             echo "::group::git diagnostic"
             git remote -v || true
             git log --oneline -5 || true
@@ -207,9 +237,40 @@ jobs:
               echo "diff stderr: $CHANGED"
               diff_failed=true
             fi
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # The queue's ephemeral ref (gh-readonly-queue/main/pr-N-<base>)
+            # stacks every entry in the group on top of main, so `HEAD~1...HEAD`
+            # sees only the tail commit. Classifying the group on that commit
+            # alone is unsafe in both directions: a docs-only tail commit sets
+            # docs_only=true and every Python test job skips, and the roll-up
+            # then reports `CI gate` green for a combination nothing ever ran.
+            # That is precisely the untested-combination hole the queue exists
+            # to close, so the planner must diff against the group's own base.
+            #
+            # `github.event.merge_group.base_sha` is the commit the group was
+            # built on, and checkout above uses fetch-depth: 0, so the range
+            # `<base_sha>...HEAD` is the exact combined diff the queue is
+            # asking CI to validate.
+            if [ -n "$MERGE_GROUP_BASE_SHA" ] && ! git cat-file -e "${MERGE_GROUP_BASE_SHA}^{commit}" 2>/dev/null; then
+              # Normally already present; fetch defensively rather than
+              # silently classifying against a commit git cannot resolve.
+              git fetch --no-tags origin "$MERGE_GROUP_BASE_SHA" || true
+            fi
+            echo "::group::git diagnostic"
+            echo "merge_group base -> ${MERGE_GROUP_BASE_SHA:-UNSET}"
+            echo "HEAD             -> $(git rev-parse HEAD 2>&1 || echo UNRESOLVED)"
+            echo "::endgroup::"
+            if [ -z "$MERGE_GROUP_BASE_SHA" ]; then
+              echo "::warning::merge_group payload carried no base_sha; falling back to safe over-broad result"
+              diff_failed=true
+            elif ! CHANGED=$(git diff --name-only "${MERGE_GROUP_BASE_SHA}...HEAD" 2>&1); then
+              echo "::warning::git diff failed against the merge_group base; falling back to safe over-broad result"
+              echo "diff stderr: $CHANGED"
+              diff_failed=true
+            fi
           else
             # `before` may be 000... on first push of a branch; fall back to HEAD~1.
-            BEFORE="${{ github.event.before }}"
+            BEFORE="$PUSH_BEFORE_SHA"
             if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
               CHANGED=$(git diff --name-only "HEAD~1...HEAD" 2>/dev/null || git ls-files)
             else
@@ -218,7 +279,7 @@ jobs:
           fi
           # Fail-safe fallback: when diff fails for any reason, emit the safe
           # over-broad classification so downstream jobs run anyway. Correctness
-          # wins over efficiency — never fail this job for a clone-shape issue.
+          # wins over efficiency - never fail this job for a clone-shape issue.
           if [ "$diff_failed" = "true" ]; then
             {
               echo "python_changed=true"
@@ -226,19 +287,21 @@ jobs:
               echo "gha_workflows_changed=true"
               echo "docs_only=false"
               echo "macos_sensitive=true"
+              echo "rpm_relevant_changed=true"
             } | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "Changed files:"
           printf '%s\n' "$CHANGED" | sed 's/^/  /'
 
-          # Pure-shell classification — auditable in `actionlint`, no
+          # Pure-shell classification - auditable in `actionlint`, no
           # sub-shell variable round-tripping through python.
           python_changed=false
           tests_changed=false
           gha_workflows_changed=false
           docs_only=true
           macos_sensitive=false
+          rpm_relevant_changed=false
           # Classify each changed path via grep. Using grep instead of
           # bash `case` to avoid linter warnings on overlapping patterns
           # (case-globs cannot cross slashes anyway).
@@ -301,6 +364,19 @@ jobs:
             elif printf '%s\n' "$f" | grep -Eq '^\.github/workflows/ci-macos-nightly\.yml$'; then
               macos_sensitive=true
             fi
+            # rpm_relevant_changed (#3947): the RPM packaging inputs, the
+            # smoke script, or install-smoke-rpm's own definition in this
+            # file. Anything else cannot regress what that job checks (it
+            # installs the newest *released* PyPI version, not this tree).
+            if printf '%s\n' "$f" | grep -Eq '^packaging/rpm/'; then
+              rpm_relevant_changed=true
+            fi
+            if printf '%s\n' "$f" | grep -Eq '^scripts/rpm_install_smoke\.sh$'; then
+              rpm_relevant_changed=true
+            fi
+            if printf '%s\n' "$f" | grep -Eq '^\.github/workflows/ci\.yml$'; then
+              rpm_relevant_changed=true
+            fi
           done <<< "$CHANGED"
           # If nothing changed at all (e.g. workflow_dispatch on a clean ref),
           # treat as "not docs-only" so we don't intentionally skip tests.
@@ -312,6 +388,7 @@ jobs:
           echo "gha_workflows_changed=$gha_workflows_changed" | tee -a "$GITHUB_OUTPUT"
           echo "docs_only=$docs_only"                  | tee -a "$GITHUB_OUTPUT"
           echo "macos_sensitive=$macos_sensitive"      | tee -a "$GITHUB_OUTPUT"
+          echo "rpm_relevant_changed=$rpm_relevant_changed" | tee -a "$GITHUB_OUTPUT"
 
   # ─── Fast checks (never cancelled, <2 min each) ───────────────────────
 
@@ -323,10 +400,10 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           # Full clone so ``bernstein agents-md verify`` can resolve the
@@ -351,6 +428,19 @@ jobs:
             printf '%s\n' "$TRACKED"
             exit 1
           fi
+      - name: Assert no virtualenv is tracked
+        # A worktree that symlinks ``.venv`` at the repo root used to slip
+        # past ``.gitignore`` (``.venv/`` matches directories, not symlinks).
+        # Once committed, every job that runs ``uv venv`` fails with
+        # "failed to create directory .venv: File exists (os error 17)"
+        # before any real check runs.
+        run: |
+          TRACKED="$(git ls-files '.venv' '.venv/**' '**/.venv' '**/.venv/**')"
+          if [ -n "$TRACKED" ]; then
+            echo "::error::a virtualenv must never be committed to git"
+            printf '%s\n' "$TRACKED"
+            exit 1
+          fi
       - name: Check for merge conflict markers in source files
         run: |
           CONFLICTS=""
@@ -363,6 +453,17 @@ jobs:
           if [ -n "$CONFLICTS" ]; then
             exit 1
           fi
+      - name: Reject a UTF-8 BOM in a committed text file (#4500)
+        # Three fragments in a row (#4429, #4430, #4493) arrived BOM-prefixed
+        # and this job passed all three. Pure stdlib and git, so it runs here
+        # ahead of the bootstrap step rather than waiting on the toolchain.
+        run: python3 scripts/check_bom.py
+      - name: Reject an unquoted Python heredoc in a workflow
+        # A workflow step assembled its Python source by shell substitution
+        # and died on NameError the first time it ran after merge, leaving a
+        # red check on every pull request opened afterwards. Pure stdlib, so
+        # it runs here ahead of the bootstrap step.
+        run: python3 scripts/check_workflow_heredocs.py
       - name: Check Python syntax in scripts/
         run: |
           ERRORS=""
@@ -376,11 +477,75 @@ jobs:
             exit 1
           fi
       - uses: ./.github/actions/bootstrap
+      - name: Reject collect-empty test modules (#4834)
+        # A test_*.py whose body was emptied still collects cleanly and exits
+        # 0, so a shrinking suite looks green. Naming-convention scope
+        # (test_*.py / *_test.py) excludes conftest/helpers; AST short-circuits
+        # non-empty modules; pytest --collect-only confirms inheritance /
+        # Hypothesis cases. Needs the bootstrapped env for that collect path.
+        run: uv run python scripts/check_empty_test_modules.py
       - name: AGENTS.md cross-CLI sync drift check
         # Fails if AGENTS.md / CLAUDE.md / CONVENTIONS.md / .aider.conf.yml /
         # .goosehints / .cursor/rules/*.mdc drift from `bernstein agents-md
         # generate`. Run `uv run bernstein agents-md sync` locally to fix.
         run: uv run bernstein agents-md verify --workdir .
+      - name: Translated README drift check (#3425)
+        # Fails if a translated README.<tag>.md binds a stale English section
+        # hash, translated a code block, or altered the verbatim header/footer.
+        # Run `uv run bernstein readme-l10n sync` after editing README.md.
+        run: uv run bernstein readme-l10n verify --workdir .
+      - name: Docs requirements pin drift check (#3995)
+        # Fails if docs/requirements.txt pins a version docs/requirements.in
+        # forbids, or drops a directly-declared requirement. Offline and
+        # deterministic: it reads the committed pins rather than recompiling,
+        # so it can block without ever going red because an index hiccuped.
+        # It does NOT catch a stale transitive pin - see the script docstring.
+        run: uv run python scripts/check_docs_requirements_pins.py
+      - name: Distribution manifest drift check
+        # Fails in under a minute if server.json / .plugin/plugin.json or the
+        # Agent Plugins 1.0.0 root manifests (plugin.json / mcp.json) drift
+        # from `scripts/gen_distribution_manifests.py`, instead of surfacing the
+        # drift much later inside a long test shard. Run
+        # `uv run python scripts/gen_distribution_manifests.py` locally to fix.
+        run: uv run python scripts/gen_distribution_manifests.py --check
+      - name: CLI reference flag-table drift check (#3465)
+        # Fails if docs/reference/cli-reference.md documents a flag a command
+        # rejects (that invocation exits 2 with "No such option" before the
+        # command body runs), or if a command accepts a flag its flag table
+        # does not list. Runs here as well as in the test shards so a
+        # docs-only change cannot land the drift past an affected-tests PR
+        # lane.
+        run: uv run pytest tests/unit/test_cli_command_registration.py -q --no-cov --timeout=120
+      - name: Operator-surface render freshness (#3427)
+        # The published renders of `bernstein live` and `bernstein gui serve`
+        # are generated artefacts, so they get the same treatment as the rest
+        # of this job: CI refuses to let them drift from what the code draws.
+        # The terminal render is re-rendered from a committed fixture and
+        # compared exactly; the browser renders are bound to a hash of the SPA
+        # bundle, which catches a shipped UI change that left them behind.
+        # Fix locally with the --update form of whichever script failed.
+        run: |
+          uv run python scripts/render_tui_snapshot.py
+          uv run python scripts/bind_webui_renders.py
+      - name: Test-count drop vs merge base (#4873)
+        # Catches a touched test module that still collects but lost cases
+        # relative to the merge base. Parametrized consolidation stays green
+        # (collect-only counts). Override via PR body:
+        #   test-count-drop: tests/unit/foo.py -N
+        # Without a base (non-PR / missing ref) the script skips — never fake-green.
+        env:
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          BASE=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" || true
+            BASE="$(git merge-base "origin/${BASE_REF}" HEAD 2>/dev/null || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            BASE="${{ github.event.merge_group.base_sha }}"
+          fi
+          uv run python scripts/check_test_count_drop.py --base "${BASE}"
 
   lint:
     name: Lint
@@ -390,10 +555,10 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -415,13 +580,13 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: crate-ci/typos@aca895bf05aec0cb7dffa6f94495e923224d9f17 # v1
+      - uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1
 
   actionlint:
     name: Workflow lint
@@ -431,13 +596,13 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: reviewdog/action-actionlint@6fb7acc99f4a1008869fa8a0f09cfca740837d9d # v1
+      - uses: reviewdog/action-actionlint@dbe5299849118fd6f099ba563d263d770955a64a # v1
         with:
           reporter: github-check
           level: error
@@ -452,10 +617,9 @@ jobs:
           # `fail_on_error` is deprecated; `fail_level: error` replaces it.
 
   lineage-gate:
-    # ADR-009 Lineage Gate — required check. Verifies the on-disk lineage
-    # log (.sdd/lineage/log.jsonl) is internally consistent: every entry
-    # signature verifies, no unresolved forks, parent_hashes resolve.
-    # No-op PASS when the log does not exist (pre-bootstrap state).
+    # ADR-009 Lineage Gate - required check. CI generates a minimal signed
+    # lineage fixture and verifies it so the job always exercises the gate
+    # logic even when runtime `.sdd/lineage/log.jsonl` is absent.
     name: Lineage Gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -463,25 +627,77 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
       - name: Run lineage gate
         run: |
-          if [ -f .sdd/lineage/log.jsonl ]; then
-            uv run python scripts/check_lineage.py
-          else
-            echo "::notice::No .sdd/lineage/log.jsonl — lineage gate is a no-op PASS."
-          fi
+          set -euo pipefail
+          LINEAGE_FIXTURE="${RUNNER_TEMP}/lineage-fixture"
+          export LINEAGE_FIXTURE
+          uv run python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from bernstein.core.lineage.entry import LineageEntry, canonicalise, entry_hash
+          from bernstein.core.lineage.identity import generate_keypair, sign_detached
+
+          root = Path(os.environ["LINEAGE_FIXTURE"])
+          log = root / "lineage" / "log.jsonl"
+          cards = root / "agents" / "agent:ci"
+          log.parent.mkdir(parents=True, exist_ok=True)
+          cards.mkdir(parents=True, exist_ok=True)
+
+          private_key, public_key = generate_keypair()
+          (cards / "card.json").write_text(
+              json.dumps(
+                  {
+                      "protocolVersion": "a2a/1.0",
+                      "agent_id": "agent:ci",
+                      "kid": "ci-fixture",
+                      "public_key_pem": public_key,
+                  }
+              ),
+              encoding="utf-8",
+          )
+
+          entry = LineageEntry(
+              v=1,
+              artefact_path="ci/lineage-fixture.txt",
+              artefact_kind="file",
+              content_hash="sha256:" + ("1" * 64),
+              parent_hashes=[],
+              agent_id="agent:ci",
+              agent_card_kid="ci-fixture",
+              tool_call_id="ci-lineage-gate",
+              span_id="ci-lineage-gate",
+              ts_ns=1,
+              operator_hmac="0" * 64,
+          )
+          canonical = canonicalise(entry)
+          log.write_bytes(canonical + b"\n")
+
+          jws = sign_detached(canonical, private_key, kid="ci-fixture")
+          path_hash = hashlib.sha256(entry.artefact_path.encode()).hexdigest()
+          entry_digest = entry_hash(entry).replace("sha256:", "")
+          sig_dir = log.parent / "signatures" / path_hash[:2] / path_hash
+          sig_dir.mkdir(parents=True, exist_ok=True)
+          (sig_dir / f"{entry_digest}.jws").write_text(jws, encoding="utf-8")
+          PY
+          uv run python scripts/check_lineage.py \
+            --log "${LINEAGE_FIXTURE}/lineage/log.jsonl" \
+            --cards "${LINEAGE_FIXTURE}/agents"
 
   # ─── Medium checks (cancel old runs, 5-20 min) ────────────────────────
 
   typecheck:
-    name: Type check
+    name: Type check report
     needs: [lint]  # only run if lint passes (fast-fail)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -489,19 +705,80 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
       - name: Run pyright (advisory)
+        # Advisory by design, and this job is not in ci-gate's needs, so it
+        # gates nothing. Its scope is the repo-wide pyright configuration in
+        # pyproject.toml [tool.pyright]; the blocking subset is the separate
+        # pyright-strict-zone job. The error count is echoed as a number so
+        # the advisory backlog moving is observable rather than silent.
+        # Scope and promotion path: docs/operations/type-check-scope.md.
         run: |
-          uv run pyright 2>&1 | tail -1 || true
-          echo "::notice::Typecheck is advisory while module decomposition shims are being typed"
+          log="$RUNNER_TEMP/pyright-advisory.log"
+          uv run pyright >"$log" 2>&1 || true
+          tail -1 "$log"
+          counts="$(grep -E '^[0-9]+ error' "$log" | tail -1 || true)"
+          echo "::notice::Advisory pyright (repo-wide scope, gates nothing): ${counts:-no summary line}"
+          {
+            echo "### Advisory pyright"
+            echo ""
+            echo "| scope | blocking | result |"
+            echo "|---|---|---|"
+            echo "| repo-wide (\`[tool.pyright]\`) | no | ${counts:-unknown} |"
+            echo ""
+            echo "Blocking subset: \`pyrightconfig.strict.json\` (job \`Pyright strict (security + cluster)\`)."
+            echo "Scope reference: \`docs/operations/type-check-scope.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  proto-drift:
+    name: Proto codegen drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      # Pinned to the version that produced the committed files: protoc
+      # stamps its own version into the output, so an unpinned tool would
+      # make this gate red on an unrelated upstream release rather than on
+      # a real drift between proto/ and the checked-in modules.
+      - name: Regenerate and compare
+        run: |
+          uv run --with "grpcio-tools==1.83.0" python -m grpc_tools.protoc \
+            -Iproto \
+            --python_out=src/bernstein/core/grpc_gen \
+            --pyi_out=src/bernstein/core/grpc_gen \
+            --grpc_python_out=src/bernstein/core/grpc_gen \
+            proto/bernstein/v1/tasks.proto proto/bernstein/v1/cluster.proto
+          for f in src/bernstein/core/grpc_gen/*.py; do
+            sed -i 's/^from bernstein\.v1 import/from . import/' "$f"
+          done
+          git diff --exit-code -- src/bernstein/core/grpc_gen || {
+            echo "::error::checked-in gRPC modules differ from proto/. Run scripts/generate_proto.sh and commit the result."
+            exit 1
+          }
 
   dead-code:
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
+    needs: [determine-changes]
     name: Dead code (Vulture)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -509,17 +786,28 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
       - run: uv tool install vulture
-      - run: vulture src/ vulture_whitelist.py --min-confidence 80 --exclude "tests,docs"
+      # grpc_gen holds protoc output. Dead-code analysis of generated code
+      # reports the generator's habits, not ours: protobuf emits imports
+      # its descriptor uses at runtime and vulture cannot see.
+      - run: vulture src/ vulture_whitelist.py --min-confidence 80 --exclude "tests,docs,*/grpc_gen/*"
 
   dist-size:
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
+    needs: [determine-changes]
     name: Package size check
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -527,10 +815,10 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -549,8 +837,8 @@ jobs:
       - name: Upload built wheel for downstream install-smoke jobs
         # Shared artifact consumed by install-smoke-pipx and
         # install-smoke-uv. Building once and reusing avoids running
-        # `uv build` on every matrix cell (6 + 2 = 8 cells today) and
-        # ensures every smoke runs against bit-identical wheels.
+        # `uv build` on every matrix cell (2 cells on PRs, 6 on push)
+        # and ensures every smoke runs against bit-identical wheels.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: install-smoke-wheel
@@ -570,8 +858,15 @@ jobs:
   # and `bernstein doctor --json` to confirm the dominant install path
   # documented first in README still works end to end.
   install-smoke-pipx:
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Install smoke - pipx (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    needs: [dist-size]
+    needs: [determine-changes, dist-size]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     permissions:
@@ -579,19 +874,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # PR and merge-queue lanes install one representative cell
+        # (ubuntu / 3.13): the packaging regression class this job
+        # catches (package-data, console_scripts, entry points) is OS-
+        # and interpreter-agnostic in practice, so one cell is enough
+        # pre-merge signal. The full 4-cell matrix runs on every push
+        # to main and on dispatch, which covers the same commits after
+        # they land without holding a queue slot on a macOS runner.
+        os: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && fromJSON('["ubuntu-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
         # Matrix tracks `requires-python = ">=3.12"` in pyproject.toml.
         # 3.11 is intentionally excluded: pipx / uv install would refuse
         # the wheel for a Python the package does not support, which
         # would just confirm the floor we already pin.
-        python-version: ["3.12", "3.13"]
+        python-version: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && fromJSON('["3.12", "3.13"]') || fromJSON('["3.13"]') }}
     steps:
       - name: Harden runner (audit mode)
         if: runner.os == 'Linux'
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Download built wheel
@@ -628,7 +930,7 @@ jobs:
         # single bootstrap step without a maintained requirements file,
         # so we route the pipx install through SHA-pinned uv instead.
         # `uv tool install pipx` puts pipx on PATH via uv's tool dir.
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
       - name: Install pipx via uv
@@ -695,8 +997,15 @@ jobs:
     # cross-Python combinatorics; uv shares the same wheel and
     # console-scripts entry point, so the marginal coverage of a full
     # 6-cell matrix is not worth the runner spend.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Install smoke - uv tool (${{ matrix.os }})
-    needs: [dist-size]
+    needs: [determine-changes, dist-size]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     permissions:
@@ -704,18 +1013,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # PR lane: ubuntu only; both OS cells run on push to main and on
+        # dispatch (see the install-smoke-pipx matrix note above).
+        os: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && fromJSON('["ubuntu-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Harden runner (audit mode)
         if: runner.os == 'Linux'
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Download built wheel
@@ -788,6 +1099,74 @@ jobs:
           print(f"packaged resources OK: {len(schemas)} MCP schemas")
           '
 
+  install-smoke-rpm:
+    # RPM-channel counterpart of the pipx / uv smokes above (#3558, #3559).
+    # Builds the binary RPM from the SRPM this tree renders - the same
+    # artefact Copr builds - installs it in a container of the target chroot
+    # family, and asserts that `bernstein --version` reports the version the
+    # RPM metadata claims *with networking disabled*. The channel shipped a
+    # launcher that resolved itself from PyPI at run time for four months
+    # because nothing installed the built RPM and ran the binary; this job is
+    # that missing check.
+    #
+    # Unlike the wheel smokes, this installs the newest *released* version:
+    # the RPM packages the PyPI release, so the subject under test here is
+    # the spec, the SRPM renderer, and the smoke harness in this tree - not
+    # the tree's own source code.
+    #
+    # Gated on `rpm_relevant_changed` (#3947): an ordinary src/ or tests/
+    # change cannot regress the released package, so running this job for
+    # one bought nothing but the risk of a stale-release defect red-gating
+    # an unrelated PR or queue batch until the next release ships.
+    # install-smoke-rpm-nightly.yml runs the same check daily so release
+    # coverage does not depend on someone happening to touch these paths.
+    name: Install smoke - RPM (${{ matrix.image }})
+    needs: [lint, determine-changes]
+    if: needs.determine-changes.outputs.rpm_relevant_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # One container per published chroot family. The PR lane runs both
+        # families rather than one representative cell: the spec resolves a
+        # different interpreter on EPEL 9 (`python3.12`) than everywhere
+        # else (`python3`), so a single cell would leave one branch of the
+        # spec untested. The trailing releases of each family run on push
+        # to main and on dispatch; they exercise no additional spec branch.
+        image: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && fromJSON('["fedora:43", "fedora:44", "quay.io/centos/centos:stream9", "quay.io/centos/centos:stream10"]') || fromJSON('["fedora:43", "quay.io/centos/centos:stream9"]') }}
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Resolve the newest released version
+        id: version
+        # `matrix.image` reaches the shell as an environment variable rather
+        # than a template expansion: an expansion is spliced into the script
+        # source before it runs, which is the shape zizmor rejects.
+        env:
+          SMOKE_IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          VERSION="$(curl -fsS --retry 3 https://pypi.org/pypi/bernstein/json | jq -r .info.version)"
+          if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+            echo "::error::could not resolve the newest released version from PyPI"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "smoking bernstein ${VERSION} on ${SMOKE_IMAGE}"
+      - name: Build the RPM, install it, run it offline
+        env:
+          SMOKE_IMAGE: ${{ matrix.image }}
+          SMOKE_VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/rpm_install_smoke.sh "${SMOKE_IMAGE}" "${SMOKE_VERSION}"
+
   # ─── CI hardening 2026 (medium, parallel, ≤8 min each) ───────────────
 
   property-tests:
@@ -795,18 +1174,25 @@ jobs:
     # examples per property) so every file finishes in well under a
     # minute. Catches hash-chain / signature / canonicalisation
     # regressions that escape unit tests' fixed inputs.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Property tests (Hypothesis smoke)
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -819,18 +1205,25 @@ jobs:
     # Syrupy snapshot suite. Locks JSONL field order / shape for the
     # audit log + lineage record so silent wire-format drift is caught
     # before downstream parsers break.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Snapshot tests (syrupy)
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -842,8 +1235,15 @@ jobs:
     # only the critical-surface allow-list (task CRUD, health,
     # openapi.json, metrics) with 5 examples per endpoint and the
     # `not_a_server_error` check. Heavier sweeps live in nightly.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Schemathesis smoke
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
     # Smoke profile wall-clock runs ~7m30s, which raced the previous
     # 8-minute window and got cancelled, failing the CI gate aggregator.
@@ -854,10 +1254,10 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -870,18 +1270,25 @@ jobs:
   semgrep:
     # Project-specific Semgrep rules (.semgrep.yml). ERROR severity
     # fails PR; WARNING is advisory (annotation only).
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Semgrep (custom rules)
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -896,23 +1303,30 @@ jobs:
           uv tool run semgrep --config .semgrep.yml --metrics off --severity ERROR --error src/
 
   bandit:
-    # Bandit static security analyzer. HIGH severity only — there are
+    # Bandit static security analyzer. HIGH severity only - there are
     # ~30 MEDIUM findings on main that are accepted patterns
     # (urlopen with timeout, hardcoded localhost in dev). Fails PR
     # only on new HIGH-severity introductions; pre-existing HIGHs are
     # captured in `.bandit-baseline.json` and tracked as follow-ups.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Bandit (security)
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -928,18 +1342,30 @@ jobs:
     # PyPI CVE scan. Production deps are strict (any vulnerability
     # fails); dev deps are advisory (continue-on-error). The free
     # PyPI advisory DB is updated daily.
+    #
+    # Both audit steps retry transient pypi.org failures rather than
+    # reddening on the first blip - a single read timeout used to eject
+    # otherwise-healthy PRs from the merge queue. The timeout budget below
+    # covers the retry attempts and their backoff.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: pip-audit (deps)
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -952,9 +1378,10 @@ jobs:
       - name: Export dev requirements (no project, hashed)
         run: uv export --no-emit-project --format requirements-txt -o /tmp/req-dev.txt
       - name: Production deps (strict)
-        # `--no-deps` is safe: the exported file is fully pinned and the
-        # transitive closure is resolved by `uv.lock`. `--disable-pip`
-        # avoids spinning up a sub-venv just to run `pip install`.
+        # Both audit steps go through the pip-audit-retry composite, which
+        # retries transient network failures with backoff and raises the
+        # per-request timeout above pip-audit's 15s default. A run that
+        # actually reports an advisory fails immediately without retrying.
         #
         # `--ignore-vuln PYSEC-2025-183` (CVE-2025-45768): disputed advisory
         # against pyjwt that affects all released versions (introduced at 0,
@@ -962,35 +1389,46 @@ jobs:
         # The maintainer disputes it because the key length is chosen by the
         # calling application, not the library. There is nothing to upgrade
         # to, so it is ignored with the rationale recorded here.
-        run: uv run pip-audit -r /tmp/req-prod.txt --strict --disable-pip --no-deps --ignore-vuln PYSEC-2025-183
+        uses: ./.github/actions/pip-audit-retry
+        with:
+          requirements: /tmp/req-prod.txt
       - name: Dev deps (advisory)
         continue-on-error: true
-        run: uv run pip-audit -r /tmp/req-dev.txt --strict --disable-pip --no-deps --ignore-vuln PYSEC-2025-183
+        uses: ./.github/actions/pip-audit-retry
+        with:
+          requirements: /tmp/req-dev.txt
 
   beartype:
     # Runtime type-check enforcement via beartype.claw. Imports the
     # public APIs in core.security / core.agents / core.protocols.cluster
     # under @beartype and runs the unit tests for those modules so any
     # type contract violation surfaces as a test failure.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Beartype (type contracts)
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
       - name: Run lineage-signer tests under beartype claw
         # The beartype-claw allow-list is in tests/_beartype_claw.py.
         # Today only ``bernstein.core.persistence.lineage_signer`` is
-        # in the strict zone — widen as more modules reach
+        # in the strict zone - widen as more modules reach
         # beartype-clean status.
         env:
           BEARTYPE_USE_CLAW: enable
@@ -999,10 +1437,10 @@ jobs:
             -k 'lineage_signer or lineage_record or lineage_export'
 
   mutmut-diff:
-    # Mutation testing on PR-changed files only. Computes a mutation
-    # score over the lines actually touched in this PR. Fails when
-    # the score on changed lines is below 70%.
-    name: Mutation (diff-only)
+    # Mutation testing report on PR-changed files only. Computes a
+    # mutation score over the lines actually touched in this PR.
+    # Advisory until the command is allowed to fail this job.
+    name: Mutation report (diff-only)
     needs: [lint]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1011,10 +1449,10 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -1036,7 +1474,7 @@ jobs:
           echo "Mutating: $CHANGED"
       - name: Run mutmut on changed files
         if: steps.diff.outputs.skip != 'true'
-        continue-on-error: true  # advisory — score reported, not enforced
+        continue-on-error: true  # advisory - score reported, not enforced
         env:
           DIFF_PATHS: ${{ steps.diff.outputs.paths }}
         run: |
@@ -1058,9 +1496,18 @@ jobs:
           uv run mutmut results || true
 
   diff-coverage:
-    # diff-cover gate: lines touched in this PR must have >=80%
-    # coverage. Reuses coverage.xml uploaded by the main test job.
-    name: Diff coverage gate
+    # LEVEL 1 of the coverage ratchet - diff-cover report: lines touched in
+    # this PR are compared with the committed diff-coverage floor. The floor lives
+    # in .coverage-baseline.json (key: diff_coverage_floor_percent) so it
+    # is a single source of truth that the weekly bump workflow nudges up
+    # over time (see docs/operations/coverage-ratchet.md). Reuses the
+    # coverage.xml uploaded by the main test job.
+    #
+    # ADVISORY: the diff-cover step is continue-on-error, so this report's
+    # result stays `success` even when diff coverage is below the floor.
+    # The report is outside the CI-gate `needs` set until PR coverage
+    # artifacts are reliable enough for a blocking threshold.
+    name: Diff coverage report
     needs: [test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1069,10 +1516,10 @@ jobs:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -1082,19 +1529,35 @@ jobs:
         with:
           name: coverage-report
         continue-on-error: true  # main may not have generated coverage on the PR's commit
+      - name: Resolve diff-coverage floor from baseline
+        id: floor
+        # Single source of truth: the floor the weekly bump nudges up.
+        # Falls back to 80 if the baseline file is somehow absent so a
+        # missing file never silently disables the gate.
+        run: |
+          if [ -f .coverage-baseline.json ]; then
+            floor=$(uv run python scripts/coverage_ratchet.py show-floor \
+              --baseline .coverage-baseline.json)
+          else
+            echo "::warning::.coverage-baseline.json missing; defaulting diff floor to 80"
+            floor=80
+          fi
+          echo "value=${floor}" >> "$GITHUB_OUTPUT"
+          echo "Diff-coverage floor: ${floor}%"
       - name: Run diff-cover
         continue-on-error: true  # advisory until all PRs reliably have coverage.xml
         env:
           BASE_REF: ${{ github.base_ref }}
+          FLOOR: ${{ steps.floor.outputs.value }}
         run: |
           if [ -f coverage.xml ]; then
             uv run diff-cover coverage.xml \
               --compare-branch="origin/${BASE_REF}" \
-              --fail-under=80 \
+              --fail-under="${FLOOR}" \
               --markdown-report diff-coverage.md
             cat diff-coverage.md >> "$GITHUB_STEP_SUMMARY" || true
           else
-            echo "::warning::No coverage.xml found — skipping diff-cover"
+            echo "::warning::No coverage.xml found - skipping diff-cover"
           fi
 
   pyright-strict-zone:
@@ -1102,18 +1565,25 @@ jobs:
     # subtrees. The repo-wide pyright run stays advisory (basic mode
     # via tool.pyright); the strict zone fails PR on any new error
     # in the listed packages.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Pyright strict (security + cluster)
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -1122,6 +1592,70 @@ jobs:
         # repo-wide pyright run uses pyproject.toml [tool.pyright]. Add
         # files to the allow-list as they reach strict cleanliness.
         run: uv run pyright --project pyrightconfig.strict.json
+
+  mypy-strict-zone:
+    # mypy strict against the lineage / persistence / evidence / identity
+    # substrate. Same split as the pyright job above: the repo-wide
+    # `uv run mypy src` run stays advisory (pyproject.toml [tool.mypy]),
+    # the gated zone fails PR on any new error in the listed packages.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
+    name: mypy strict (lineage substrate)
+    needs: [determine-changes, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+      - name: Check the whole tree parses
+        # Guards the failure this job was added for: mypy aborting on the
+        # first PEP 695 `type` alias and checking nothing. `uv run mypy`
+        # must resolve the project interpreter (>= 3.12), not a PATH mypy
+        # bound to an older one. Parse-only, so the advisory backlog does
+        # not fail the job - but a syntax abort does.
+        run: |
+          log="$RUNNER_TEMP/mypy-full.log"
+          uv run mypy src >"$log" 2>&1 || true
+          tail -1 "$log"
+          if grep -q 'errors prevented further checking' "$log"; then
+            echo "::error::mypy aborted before checking the tree"
+            tail -20 "$log"
+            exit 1
+          fi
+          # The `|| true` above makes this run advisory. Report its scope and
+          # error count as explicit numbers so the backlog moving in either
+          # direction is observable rather than silent. Only the gated zone
+          # below can fail this job.
+          advisory_errors="$(grep -cE ': error: ' "$log" || true)"
+          echo "::notice::Advisory mypy (scope: src/, gates nothing): ${advisory_errors} error(s)"
+          {
+            echo "### mypy scope"
+            echo ""
+            echo "| run | scope | blocking | errors |"
+            echo "|---|---|---|---|"
+            echo "| advisory | \`src/\` (\`[tool.mypy]\`) | no | ${advisory_errors} |"
+            echo "| gated zone | \`mypy.gate.ini\` \`files\` minus \`exclude\` | yes | must be 0 |"
+            echo ""
+            echo "Advisory tail: \`$(tail -1 "$log")\`"
+            echo "Scope reference: \`docs/operations/type-check-scope.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run mypy strict on the gated zone
+        # The gated zone is defined in mypy.gate.ini. Widen it by removing
+        # entries from `exclude` as each module reaches strict cleanliness.
+        run: uv run mypy --config-file mypy.gate.ini
 
   # ─── Slow checks (cancel old runs, 15-45 min) ─────────────────────────
 
@@ -1137,11 +1671,18 @@ jobs:
     # macOS coverage moved to the adapter-integration-macos job below
     # (gated by determine-changes.outputs.macos_sensitive, the
     # `macos-needed` label, or push events) to relieve the hosted macOS
-    # runner pool during burst-merge waves — see #1468. The
+    # runner pool during burst-merge waves - see #1468. The
     # ci-macos-nightly.yml workflow runs the full macOS matrix daily as
     # the safety-net for regressions that slip past the path gate.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
     name: Adapter integration (fake-CLI)
-    needs: [lint]
+    needs: [determine-changes, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -1152,10 +1693,10 @@ jobs:
         python-version: ["3.13"]
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -1192,10 +1733,10 @@ jobs:
         python-version: ["3.13"]
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -1204,25 +1745,89 @@ jobs:
       - name: Run fake-CLI adapter integration tests
         run: uv run pytest tests/integration/test_adapter_e2e.py -x -q --timeout=60
 
+  adapter-conformance-windows:
+    # Real (non-mocked) adapter conformance for claude/codex/gemini on a real
+    # Windows kernel (#2367). The cross-platform fake-CLI harness installs
+    # ``claude.cmd`` / ``codex.cmd`` / ``gemini.cmd`` shims on PATH and the
+    # adapter launch path resolves them through ``cmd.exe /c``, so each
+    # adapter's spawn / stop (platform process-tree reap) / restart contract is
+    # exercised against a real subprocess. The job also runs the Windows
+    # worktree-isolation contract (clean worktree, junction-into-parent
+    # rejection, robust long-path teardown), so worktree isolation is asserted
+    # on the Windows lane. Required (in the ci-gate needs list), not advisory.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
+    name: Adapter conformance + e2e (windows)
+    needs: [determine-changes, lint]
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13"]
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Adapter conformance (spawn/stop/restart) + Windows worktree isolation
+        shell: pwsh
+        run: |
+          uv run pytest `
+            tests/integration/test_adapter_conformance_lifecycle.py `
+            tests/unit/test_worktree_isolation_windows.py `
+            -x -q --timeout=180
+
   test:
-    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    needs: [lint]  # fast-fail: don't waste 45min if lint fails
+    # Sharded across 4 parallel runners per (os, python) cell. The unit
+    # suite runs each of ~1.4k test files in its own subprocess (the
+    # OOM-avoidance model documented in the coverage step below); per-file
+    # Python startup + full-package import is a fixed ~2.7s/file, so at
+    # 1.4k files / 4 local workers a single runner spent 25+ min purely on
+    # startup churn (the file count crossed a threshold when discovery
+    # widened to rglob). Fanning the file list out over TEST_SHARD_COUNT
+    # runners (each runs `run_tests.py --shard i/N`, a deterministic
+    # disjoint slice) cuts each runner to ~1/4 of the files. The matrix
+    # `.result` ci-gate reads is `failure` if ANY shard cell fails, so all
+    # shards are still required - no shard can silently skip.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
+    needs: [determine-changes, lint]  # fast-fail: don't waste 45min if lint fails
     runs-on: ${{ matrix.os }}
-    # 35 min for the unit suite + 25 min for the coverage re-run on
-    # ubuntu/3.13 = exactly 60 min, which kept clipping the job ceiling
-    # under coverage-step retries; 90 leaves enough headroom for slow
-    # runners without inviting hangs.
+    # Per-shard the unit suite is ~1/4 of the old wall time. Push-time
+    # coverage is collected during the existing ubuntu/3.13 shard runs and
+    # combined by coverage-report below, so no shard performs a serial
+    # full-suite coverage rerun.
     timeout-minutes: 90
     permissions:
       contents: read
-      # Required by mikepenz/action-junit-report to create check-run
-      # annotations surfaced in the PR Checks tab.
-      checks: write
-      # Required by ctrf-io/github-test-reporter to post the test-result
-      # summary comment on the PR that triggered the run. The action no-
-      # ops gracefully on push events; the workflow-level Step Summary
-      # is always populated.
-      pull-requests: write
+    env:
+      # Single source of truth for the shard count. The `--shard i/N`
+      # denominator below and the per-shard slice both key off this; bump
+      # it (and the `shard:` list) together to rescale the fan-out.
+      TEST_SHARD_COUNT: "4"
+      # Main push coverage runs are slower than local file runs; keep the
+      # per-file guard, but allow heavy adapter contract files to finish.
+      BERNSTEIN_TEST_FILE_TIMEOUT_SECONDS: "600"
     strategy:
       fail-fast: false
       matrix:
@@ -1233,17 +1838,29 @@ jobs:
         # the event is a push. ci-macos-nightly.yml provides a daily
         # safety-net run of the full macOS matrix.
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.12", "3.13"]
+        # Only push-to-main runs the full interpreter matrix; PR and
+        # merge-queue lanes run the primary interpreter (3.13) alone. The
+        # queue ran both rows, which doubled its ubuntu shard fan-out to
+        # buy nothing the push run does not already buy: every merged
+        # commit still gets the 3.12 row minutes later on the push event,
+        # so a 3.12-only regression surfaces at most one merge later and
+        # is answered with a revert. dispatch runs the full matrix: an
+        # operator invoking the workflow by hand is asking for coverage,
+        # not queue throughput.
+        python-version: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && fromJSON('["3.12", "3.13"]') || fromJSON('["3.13"]') }}
+        # Fan the per-file suite out across 4 deterministic shards per
+        # cell. Keep this list in sync with TEST_SHARD_COUNT above.
+        shard: [1, 2, 3, 4]
         exclude:
           # Coverage/JUnit upload only on ubuntu; skip duplicate slow jobs on Windows for 3.12
           - os: windows-latest
             python-version: "3.12"
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -1261,165 +1878,193 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
+          PYTHON_VERSION: ${{ matrix.python-version }}
+          SHARD: ${{ matrix.shard }}
+          SHARD_COUNT: ${{ env.TEST_SHARD_COUNT }}
         run: |
+          # `--shard i/N` runs a deterministic disjoint slice of the
+          # discovered (and, on PRs, affected) file list. On PRs the
+          # affected set is sharded too, so each runner runs ~1/N of the
+          # impacted files.
+          coverage_args=()
+          if [ "${EVENT_NAME}" = "push" ] && [ "${RUNNER_OS}" = "Linux" ] && [ "${PYTHON_VERSION}" = "3.13" ]; then
+            coverage_args=(--coverage)
+          fi
           if [ "${EVENT_NAME}" = "pull_request" ] && \
              git rev-parse --verify "refs/remotes/origin/${BASE_REF}" >/dev/null 2>&1; then
-            uv run python scripts/run_tests.py --parallel 4 --affected "refs/remotes/origin/${BASE_REF}"
+            uv run python scripts/run_tests.py --parallel 4 \
+              "${coverage_args[@]}" \
+              --shard "${SHARD}/${SHARD_COUNT}" \
+              --affected "refs/remotes/origin/${BASE_REF}"
           else
-            uv run python scripts/run_tests.py --parallel 4
+            uv run python scripts/run_tests.py --parallel 4 \
+              "${coverage_args[@]}" \
+              --shard "${SHARD}/${SHARD_COUNT}"
           fi
       - name: Run isolated test suite (Windows)
         if: runner.os == 'Windows'
-        continue-on-error: true  # Windows has Unix-only tests (chmod, SIGKILL) that are skipped but some may remain
+        # No blanket continue-on-error mask: the Windows result flows through
+        # scripts/windows_lane_gate.py, which is non-blocking while the lane
+        # has no recorded green baseline (advisory ::warning::) and becomes a
+        # hard gate once the baseline in .github/windows-lane-baseline.json is
+        # flipped to established. Promotion is a one-line data change, not a
+        # workflow edit. See docs/operations/merge-gate.md#windows-lane-promotion.
         shell: pwsh
-        run: uv run python scripts/run_tests.py -x --parallel 4
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARD_COUNT: ${{ env.TEST_SHARD_COUNT }}
+        run: |
+          uv run python scripts/run_tests.py -x --parallel 4 --shard "${env:SHARD}/${env:SHARD_COUNT}"
+          $rc = $LASTEXITCODE
+          uv run python scripts/windows_lane_gate.py --result $rc
+          exit $LASTEXITCODE
       - name: Run capability-matrix spawn-refusal integration tests (Linux/macOS)
-        if: runner.os != 'Windows'
-        # Lethal-trifecta integration coverage: every supported OS/Python
-        # cell exercises the AgentSpawner spawn-refusal path so we catch
-        # regressions in the structural rule before they ship.  See
+        # Pinned to shard 1 so this runs exactly once per (os, python) cell
+        # rather than once per shard - the unit suite is sharded, this
+        # integration probe is not. Lethal-trifecta integration coverage:
+        # every supported OS/Python cell exercises the AgentSpawner
+        # spawn-refusal path so we catch regressions in the structural rule
+        # before they ship.  See
         # tests/integration/test_capability_matrix_spawn_refusal.py.
+        if: runner.os != 'Windows' && matrix.shard == 1
         run: |
           uv run pytest tests/integration/test_capability_matrix_spawn_refusal.py \
             -x -q --tb=short --timeout=120
       - name: Run capability-matrix spawn-refusal integration tests (Windows)
-        if: runner.os == 'Windows'
+        # Pinned to shard 1 (see Linux/macOS counterpart): one run per cell.
+        if: runner.os == 'Windows' && matrix.shard == 1
         shell: pwsh
         run: |
           uv run pytest tests/integration/test_capability_matrix_spawn_refusal.py `
             -x -q --tb=short --timeout=120
-      - name: Generate coverage and JUnit reports (ubuntu, 3.13 only)
+      - name: Prepare coverage shard artifact
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.event_name == 'push'
-        continue-on-error: true
-        timeout-minutes: 25
         run: |
-          # Run each test file in its own process with coverage to avoid OOM.
-          # pytest --cov on 562 files in one process exceeds 7GB runner RAM.
-          # JUnit XML is accumulated across all runs via --junitxml append logic.
-          uv run python -c "
-          import subprocess, sys, os
-          from pathlib import Path
-
-          os.environ['COVERAGE_FILE'] = '.coverage'
-          test_dir = Path('tests/unit')
-          files = sorted(test_dir.glob('test_*.py'))
-          failed = 0
-          junit_parts = []
-          for i, f in enumerate(files):
-              junit_part = f'.junit_part_{i}.xml'
-              cmd = [
-                  sys.executable, '-m', 'coverage', 'run',
-                  '--source=src/bernstein', '--parallel-mode',
-                  '-m', 'pytest', str(f), '-x', '-q', '--tb=no', '--timeout=120', '-s',
-                  '-p', 'no:cacheprovider',
-                  f'--junitxml={junit_part}',
-                  '-o', 'junit_family=legacy',
-              ]
-              r = subprocess.run(cmd, capture_output=True, timeout=180)
-              if r.returncode != 0:
-                  failed += 1
-              if Path(junit_part).exists():
-                  junit_parts.append(junit_part)
-              if (i + 1) % 50 == 0:
-                  print(f'  coverage: {i+1}/{len(files)} files done', flush=True)
-          print(f'Coverage collected from {len(files)} files ({failed} had failures)')
-
-          # Merge JUnit XML parts into a single junit.xml
-          if junit_parts:
-              import xml.etree.ElementTree as ET
-              root = ET.Element('testsuites')
-              for part in junit_parts:
-                  try:
-                      tree = ET.parse(part)
-                      for suite in tree.getroot():
-                          root.append(suite)
-                  except Exception:
-                      pass
-              ET.ElementTree(root).write('junit.xml', encoding='unicode', xml_declaration=True)
-              print(f'Merged {len(junit_parts)} JUnit XML files into junit.xml')
-          "
-          uv run python -m coverage combine || true
-          uv run python -m coverage xml -o coverage.xml || true
-          if [ ! -f coverage.xml ]; then
-            echo "::warning::coverage.xml was not generated"
+          if [ ! -f .coverage ]; then
+            echo "::error::.coverage was not generated for shard ${{ matrix.shard }}"
+            exit 1
           fi
-          if [ ! -f junit.xml ]; then
-            echo "::warning::junit.xml was not generated"
-          fi
-      - name: Publish JUnit + flake summary
-        # Surfaces test results and flaky-test annotations in the PR check
-        # tab. `flaky_summary: true` lists tests that passed on a retry —
-        # pair with `pytest-rerunfailures` (separate PR) for full coverage.
-        # `fail_on_failure: false` so we don't double-fail; the test job
-        # already reports its own non-zero exit.
-        #
-        # Gated to ubuntu/3.13 on push because that is the only matrix cell
-        # currently emitting junit.xml (see the coverage step above).
-        if: always() && !cancelled() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.event_name == 'push'
-        uses: mikepenz/action-junit-report@3a81627bfac62268172037048872e8ebd4207e6d # v6.4.1
-        with:
-          report_paths: '**/junit.xml'
-          flaky_summary: true
-          check_retries: true
-          fail_on_failure: false
-          require_tests: false
-      - name: CTRF test reporter (markdown summary + flaky breakdown)
-        # Renders a markdown test-result summary in the workflow Step
-        # Summary tab and (when the triggering event is a PR) posts the
-        # same content as a PR comment. The action ingests our existing
-        # junit.xml in-place; no extra producer step required. Pairs
-        # with the nightly flake-quarantine.yml workflow which auto-PRs
-        # quarantine markers for tests that flake repeatedly.
-        #
-        # Gated to the same matrix cell as the JUnit producer step so we
-        # only invoke the reporter when junit.xml actually exists.
-        if: always() && !cancelled() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.event_name == 'push'
-        uses: ctrf-io/github-test-reporter@0f299074936c32ccaab5be5230511f6b2b9080aa # v1.0.28
-        with:
-          report-path: junit.xml
-          summary-report: true
-          failed-report: true
-          flaky-report: true
-          test-list-report: false
-          pull-request: true
-          update-comment: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Upload CTRF report artifact
-        # Persist the CTRF JSON the reporter emits so the nightly flake-
-        # quarantine job has a 7-day window of historical reports to
-        # mine. retention-days lines up with the xflaky look-back window.
-        if: always() && !cancelled() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.event_name == 'push'
+          mv .coverage ".coverage.${{ matrix.shard }}"
+      - name: Upload coverage shard artifact
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.event_name == 'push'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ctrf-report
-          path: |
-            ctrf/
-            junit.xml
-          if-no-files-found: ignore
-          retention-days: 7
-      - name: Upload coverage artifact
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.event_name == 'push'
+          name: coverage-data-${{ matrix.shard }}
+          path: .coverage.${{ matrix.shard }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+
+  integration-tests:
+    # `tests/integration/**` (126 files) reached CI only through the
+    # `--affected` slice the `test` job runs on pull_request, which selects
+    # the subset the impact map ties to the changed sources. Nothing selected
+    # the directory on push to `main`, so a break that arrives through a path
+    # the map does not model - a changed default, a role template, a
+    # transitive import - landed with the gate green.
+    #
+    # This job runs on every event, pull_request included. Restricting it to
+    # push and merge_group was considered and rejected: `merge_group` never
+    # fires while the merge-queue ruleset is disabled, so a push-only job
+    # reports on `main` after the merge rather than gating it, and the
+    # required `CI gate` context would still pass on a PR having never run
+    # the directory. The impact map's blind spots are the same on a PR as on
+    # a push, so the lane that decides the merge is the one that needs it.
+    #
+    # Cost: 126 files, 264s wall at `--parallel 4`, 456 MB peak RSS. The
+    # runner runs each file in its own subprocess (same OOM-avoidance model
+    # as the unit shards), so memory is bounded by the widest single file.
+    # This runs concurrently with the `test` shards (90-minute timeout), so
+    # it does not extend the critical path.
+    # Skips only when a merge-queue group's combined diff is docs-only
+    # (determine-changes computes it from the group's base; its failure
+    # mode is over-broad, never over-narrow). The roll-up tolerates the
+    # skip via DOCS_ONLY_SKIPPABLE. pull_request never takes this branch
+    # (paths-ignore keeps docs-only PRs out of this workflow entirely)
+    # and push runs everything, so main keeps the full suite.
+    if: ${{ !(github.event_name == 'merge_group' && needs.determine-changes.outputs.docs_only == 'true') }}
+    name: Integration tests
+    needs: [determine-changes, lint]  # fast-fail: don't burn a runner if lint fails
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # The integration files are slower than unit files (real subprocesses,
+      # loopback servers, git repos); the default 300s per-file cap is too
+      # tight for the widest of them.
+      BERNSTEIN_TEST_FILE_TIMEOUT_SECONDS: "600"
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+        with:
+          python-version: "3.13"
+      - name: Run integration suite
+        run: |
+          uv run python scripts/run_tests.py \
+            --test-dir tests/integration \
+            --parallel 4
+
+  coverage-report:
+    name: Coverage report
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/bootstrap
+        with:
+          python-version: "3.13"
+      - name: Download coverage shard artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-data-*
+          path: coverage-shards
+          merge-multiple: true
+      - name: Merge coverage shards
+        run: |
+          shard_count=$(find coverage-shards -name '.coverage.*' -type f | wc -l | tr -d ' ')
+          if [ "$shard_count" -lt 4 ]; then
+            echo "::error::expected 4 coverage shard files, found $shard_count"
+            find coverage-shards -maxdepth 2 -type f -print
+            exit 1
+          fi
+          uv run python -m coverage combine coverage-shards/.coverage.*
+          uv run python -m coverage xml --ignore-errors -o coverage.xml
+          test -s coverage.xml
+      - name: Upload coverage report artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
-          path: |
-            coverage.xml
-            junit.xml
-          if-no-files-found: warn
-          retention-days: 1
+          path: coverage.xml
+          if-no-files-found: error
+          # The coverage-ratchet workflow pulls this artifact from the most
+          # recent main CI run. Under the cancel-in-progress merge cadence
+          # main can go several days without a new successful run, so
+          # retention must outlive that gap; at 1 day the artifact expires
+          # and the ratchet has no coverage figure to compare against. The
+          # per-shard coverage-data-* artifacts above are consumed within
+          # the same run and keep 1-day retention.
+          retention-days: 14
       - name: Upload coverage to Codecov
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.event_name == 'push'
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: coverage.xml
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
-      - name: Upload test results to Codecov
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.event_name == 'push' && !cancelled()
-        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1
-        with:
-          files: junit.xml
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
@@ -1436,17 +2081,31 @@ jobs:
     #   - the PR carries the `macos-needed` label (operator opt-in for
     #     cross-platform work the path filter cannot detect).
     # Otherwise this job is skipped on the PR and ci-macos-nightly.yml
-    # provides the safety-net coverage at 06:00 UTC each day.
+    # provides the safety-net coverage at 06:00 UTC each day. The merge
+    # queue (merge_group) skips this job entirely (see the ci-gate
+    # MACOS_SKIP_EVENTS handling) - the post-merge push carries the
+    # macOS signal for a queued group.
     #
     # Coverage / JUnit / Codecov uploads are NOT mirrored here; they
     # remain ubuntu-only (matches the previous matrix gating).
-    # Literal job name -- NOT templated. The branch-protection required
-    # context for macOS test runs depends on this exact string; when the
-    # job is skipped via the `if:` gate, GitHub posts the templated form
-    # verbatim, which never matches a required-context rule. The literal
-    # form keeps the name resolvable in every state (success, fail, skip).
-    # required-check-canary.yml asserts this remains literal.
-    name: Test (macos-latest, Python 3.13)
+    #
+    # Sharded across 4 parallel runners, the same shape as the ubuntu/
+    # windows `test` job above (see its header comment for the per-file
+    # startup-cost rationale). This job used to run a fixed deterministic
+    # quarter of the suite per push instead of sharding, because its
+    # `name:` was kept a literal, non-templated string on the assumption
+    # that branch protection's required context depended on it. It does
+    # not: the required contexts are `CI gate` and `shipped bundle matches
+    # the lockfile`, and no `test` cell is among them (the live list lives in
+    # required-check-canary.yml as BRANCH_PROTECTION_CONTEXTS_JSON, which the
+    # scheduled audit compares against `gh api .../rules/branches/main`).
+    # Nothing reads a per-shard job's display name, so it
+    # can template like `test`'s does. required-check-canary.yml still
+    # locks the name branch protection actually depends on
+    # (`ci-gate.name == "CI gate"`). Per-push macOS coverage now shards
+    # the full file list across all 4 cells instead of running a fixed
+    # quarter of it.
+    name: Test (macos-latest, Python 3.13, shard ${{ matrix.shard }})
     needs: [lint, determine-changes]
     if: >-
       github.event_name == 'push' ||
@@ -1456,17 +2115,21 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-      checks: write
+    env:
+      # Single source of truth for the shard count, mirrors
+      # TEST_SHARD_COUNT in the `test` job above.
+      MACOS_SHARD_COUNT: "4"
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.13"]
+        shard: [1, 2, 3, 4]
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/bootstrap
@@ -1483,77 +2146,39 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
+          SHARD: ${{ matrix.shard }}
+          SHARD_COUNT: ${{ env.MACOS_SHARD_COUNT }}
         run: |
+          # On PRs: shard the affected slice (impacted by the diff), same
+          # as the `test` job. On push to main: shard the full file list
+          # across all 4 cells, so per-push macOS coverage is the
+          # complete suite rather than a fixed quarter of it.
           if [ "${EVENT_NAME}" = "pull_request" ] && \
              git rev-parse --verify "refs/remotes/origin/${BASE_REF}" >/dev/null 2>&1; then
-            uv run python scripts/run_tests.py --parallel 4 --affected "refs/remotes/origin/${BASE_REF}"
+            uv run python scripts/run_tests.py --parallel 4 \
+              --shard "${SHARD}/${SHARD_COUNT}" \
+              --affected "refs/remotes/origin/${BASE_REF}"
           else
-            uv run python scripts/run_tests.py --parallel 4
+            uv run python scripts/run_tests.py --parallel 4 \
+              --shard "${SHARD}/${SHARD_COUNT}"
           fi
       - name: Run capability-matrix spawn-refusal integration tests
+        # Pinned to shard 1 (see the `test` job's counterpart above): one
+        # run per cell, not one per shard.
+        if: matrix.shard == 1
         run: |
           uv run pytest tests/integration/test_capability_matrix_spawn_refusal.py \
             -x -q --tb=short --timeout=120
 
   # ─── Post-pipeline (conditional, never cancelled) ──────────────────────
 
-  autofix:
-    name: Auto-fix lint
-    runs-on: ubuntu-latest
-    needs: [lint, repo-hygiene]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'bernstein[bot]' && github.actor != 'bernstein-orchestrator[bot]'
-    continue-on-error: true
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    steps:
-      - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
-        with:
-          egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-          fetch-depth: 5
-      - name: Check for autofix loop
-        id: loop_check
-        run: |
-          RECENT=$(git log --oneline -3 --format='%s' | grep -c "style: auto-fix" || true)
-          if [ "$RECENT" -ge 3 ]; then
-            echo "::warning::Autofix loop detected — last 3 commits are all auto-fix. Skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-      - if: steps.loop_check.outputs.skip != 'true'
-        uses: ./.github/actions/bootstrap
-      - name: Auto-fix ruff
-        if: steps.loop_check.outputs.skip != 'true'
-        run: |
-          uv run ruff check src/ --fix --unsafe-fixes || true
-          uv run ruff format src/
-      - name: Purge tracked .sdd files
-        if: steps.loop_check.outputs.skip != 'true'
-        run: |
-          TRACKED="$(git ls-files '.sdd')"
-          if [ -n "$TRACKED" ]; then
-            echo "$TRACKED" | xargs git rm --cached --
-          fi
-      - name: Commit and push fixes
-        if: steps.loop_check.outputs.skip != 'true'
-        run: |
-          git add src/ tests/ scripts/
-          git diff --cached --quiet && echo "Nothing to fix" && exit 0
-          git config user.name "bernstein[bot]"
-          git config user.email "bernstein-bot@users.noreply.github.com"
-          git commit -m "style: auto-fix ruff lint and format"
-          git push
-
   close-ci-issues:
     name: Close resolved CI issues
     runs-on: ubuntu-latest
-    needs: [repo-hygiene, lint, typecheck, test, spelling, dead-code]
+    needs: [ci-gate]
     if: >
       success() &&
+      needs.ci-gate.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push'
     timeout-minutes: 5
@@ -1562,19 +2187,21 @@ jobs:
       issues: write
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Close ci-fix issues
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          GATE_RESULT="${{ needs.ci-gate.result }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           ISSUES=$(gh issue list --label ci-fix --state open --json number --jq '.[].number' 2>/dev/null || echo "")
           for NUM in $ISSUES; do
-            gh issue close "$NUM" --comment "CI is green again (commit \`${{ github.sha }}\`)." || true
+            gh issue close "$NUM" --comment "CI aggregate gate result: ${GATE_RESULT}. Run: ${RUN_URL}. Commit: \`${{ github.sha }}\`." || true
           done
 
   # Note: the previous `self-heal` issue-creating job was superseded by the
@@ -1582,108 +2209,25 @@ jobs:
   # which on a CI failure first attempts an auto-heal PR and only falls
   # back to opening a `ci-fix` issue when no diff is produced.
 
-  pr-summary:
-    name: PR CI summary
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    needs:
-      - repo-hygiene
-      - lint
-      - typecheck
-      - test
-      - test-macos
-      - spelling
-      - dead-code
-      - actionlint
-      - dist-size
-      - property-tests
-      - snapshot-tests
-      - schemathesis-smoke
-      - semgrep
-      - bandit
-      - pip-audit
-      - beartype
-      - pyright-strict-zone
-    timeout-minutes: 5
-    permissions:
-      pull-requests: write
-    steps:
-      - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
-        with:
-          egress-policy: audit
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            const marker = '<!-- ci-summary -->';
-            const jobs = [
-              { name: 'Repo hygiene', result: '${{ needs.repo-hygiene.result }}' },
-              { name: 'Lint', result: '${{ needs.lint.result }}' },
-              { name: 'Type check', result: '${{ needs.typecheck.result }}' },
-              { name: 'Tests', result: '${{ needs.test.result }}' },
-              { name: 'Tests (macOS)', result: '${{ needs.test-macos.result }}' },
-              { name: 'Spelling', result: '${{ needs.spelling.result }}' },
-              { name: 'Dead code', result: '${{ needs.dead-code.result }}' },
-              { name: 'Workflow lint', result: '${{ needs.actionlint.result }}' },
-              { name: 'Dist size', result: '${{ needs.dist-size.result }}' },
-              { name: 'Property (Hypothesis)', result: '${{ needs.property-tests.result }}' },
-              { name: 'Snapshot (syrupy)', result: '${{ needs.snapshot-tests.result }}' },
-              { name: 'Schemathesis smoke', result: '${{ needs.schemathesis-smoke.result }}' },
-              { name: 'Semgrep custom', result: '${{ needs.semgrep.result }}' },
-              { name: 'Bandit', result: '${{ needs.bandit.result }}' },
-              { name: 'pip-audit', result: '${{ needs.pip-audit.result }}' },
-              { name: 'Beartype', result: '${{ needs.beartype.result }}' },
-              { name: 'Pyright strict zone', result: '${{ needs.pyright-strict-zone.result }}' },
-            ];
-            const icon = (r) => r === 'success' ? '✅' : r === 'failure' ? '❌' : r === 'skipped' ? '⏭️' : '⚠️';
-            let body = `${marker}\n### CI Summary\n\n`;
-            body += '| Check | Result |\n|-------|--------|\n';
-            for (const j of jobs) {
-              body += `| ${j.name} | ${icon(j.result)} ${j.result} |\n`;
-            }
-            body += '\nCoverage and detailed reports are available via Codecov and the Checks tab.';
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find(c => c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
-
   # ─── Aggregator gate (closes #1273) ────────────────────────────────────
   #
   # SINGLE required status check for branch protection.
   #
   # Why this exists:
   #   * `ci.yml` has 20+ jobs (incl. an OS x Python matrix that fans out
-  #     `test (ubuntu-latest, 3.12)` etc.) — listing every contextual name
+  #     `test (ubuntu-latest, 3.12)` etc.) - listing every contextual name
   #     in branch-protection is fragile because matrix names drift with
   #     each matrix change.
   #   * A `skipped` job auto-passes branch protection. So does a job that
   #     was never enqueued because an upstream `needs:` was `cancelled`.
   #     Either condition can let a red commit reach `main`.
   #
-  # This job fails on ANY non-success result — including `cancelled`,
+  # This job fails on ANY non-success result - including `cancelled`,
   # `timed_out`, `action_required`, or a job that never ran. `skipped`
   # passes ONLY when the planner job (``determine-changes``) classified
   # the diff in a way that makes the skip intentional (docs-only PRs,
   # event-gated jobs, etc.). A `skipped` result for a job that should
-  # have run is treated as a failure — pattern borrowed from pypa/pip's
+  # have run is treated as a failure - pattern borrowed from pypa/pip's
   # CI aggregator (see PR #1273 for the discussion).
   #
   # Operator: after this PR merges, replace every required check in
@@ -1691,9 +2235,11 @@ jobs:
   # ``CI gate``). The exact `gh api` invocation is in PR #1273's body.
   #
   # Excluded from `needs:`:
-  #   * `autofix`        — runs only on push to main, mutates the tree
-  #   * `pr-summary`     — cosmetic PR comment, must not gate merges
-  #   * `ci-gate` itself — would deadlock the dependency graph
+  #   * `close-ci-issues` - post-gate issue update, must not gate merges
+  #   * `typecheck`      - advisory report while repo-wide pyright is being typed
+  #   * `mutmut-diff`    - advisory report until mutation score enforcement is enabled
+  #   * `diff-coverage`  - advisory report until PR coverage artifacts are reliable
+  #   * `ci-gate` itself - would deadlock the dependency graph
   ci-gate:
     name: CI gate
     runs-on: ubuntu-latest
@@ -1709,11 +2255,11 @@ jobs:
       - spelling
       - actionlint
       - lineage-gate
-      - typecheck
       - dead-code
       - dist-size
       - install-smoke-pipx
       - install-smoke-uv
+      - install-smoke-rpm
       - property-tests
       - snapshot-tests
       - schemathesis-smoke
@@ -1721,20 +2267,21 @@ jobs:
       - bandit
       - pip-audit
       - beartype
-      - mutmut-diff
-      - diff-coverage
       - pyright-strict-zone
+      - mypy-strict-zone
       - adapter-integration
       - adapter-integration-macos
+      - adapter-conformance-windows
       - test
+      - integration-tests
+      - coverage-report
       - test-macos
-      - close-ci-issues
     timeout-minutes: 3
     permissions:
       contents: read
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
       - id: roll-up
@@ -1758,40 +2305,65 @@ jobs:
           # / tests / workflows touched). Mirrors paths-ignore at the top.
           DOCS_ONLY_SKIPPABLE = {
               "test",
+              # integration-tests and adapter-conformance-windows carry the
+              # same merge_group docs-only guard as the rest of this set: a
+              # queue group whose combined diff is docs-only cannot change
+              # what they exercise, and the post-merge push to main runs
+              # both un-gated.
+              "integration-tests",
+              "adapter-conformance-windows",
               "schemathesis-smoke",
               "snapshot-tests",
               "property-tests",
               "beartype",
               "adapter-integration",
-              "diff-coverage",
-              "mutmut-diff",
               "pyright-strict-zone",
+              "mypy-strict-zone",
               "semgrep",
               "bandit",
               "pip-audit",
-              "typecheck",
               "dead-code",
               "dist-size",
               "install-smoke-pipx",
               "install-smoke-uv",
+              "install-smoke-rpm",
           }
-          # Jobs intentionally gated by `if:` on event / branch — `skipped`
-          # is the expected outcome under these conditions.
-          ALWAYS_SKIPPABLE = {
-              # Only on push to main.
-              "close-ci-issues",
-          }
-          # PR-only jobs: skipped on push events is intentional.
-          PR_ONLY = {"mutmut-diff", "diff-coverage"}
-          # Push-to-main-only jobs: skipped on PRs is intentional.
-          PUSH_ONLY = {"close-ci-issues"}
           # macOS-gated jobs (see #1468): on PRs these are skipped unless
           # the diff is macos_sensitive or the PR carries the
           # `macos-needed` label. Always run on push events.
           MACOS_GATED = {"test-macos", "adapter-integration-macos"}
+          # Push-only jobs are required on native main pushes but skip
+          # intentionally on PR, workflow_dispatch, and merge_group runs.
+          PUSH_ONLY = {"coverage-report"}
+          # install-smoke-rpm installs the newest *released* PyPI version,
+          # not this tree's source (#3947), so an ordinary src/ or tests/
+          # change cannot regress what it checks. It skips whenever the
+          # diff touches none of packaging/rpm/**, the smoke script, or its
+          # own job definition in ci.yml - unlike MACOS_GATED this has no
+          # event-shape branch, since the relevance test is identical on
+          # push, pull_request and merge_group.
+          # install-smoke-rpm-nightly.yml is the safety net that still
+          # exercises the released artifact on days nothing here changes.
+          RPM_SMOKE_SKIPPABLE = {"install-smoke-rpm"}
+          # Events under which a macOS-gated skip is intentional. PRs and
+          # manual dispatch already gate macOS behind macos_sensitive /
+          # label. merge_group must be included too: a merge queue runs CI
+          # on a synthetic merge_group ref where `github.event.pull_request`
+          # is null, so the `macos-needed` label and `push`-only branches of
+          # the job `if:` can never be true there. The remaining branch,
+          # `macos_sensitive`, is computed by `determine-changes` from the
+          # group's combined diff, so a macOS-sensitive group still runs the
+          # macOS jobs in the queue and this tolerance does not apply. A group
+          # that touches nothing macOS-sensitive skips them: the merged commit
+          # still triggers a native `push` to main that runs the full macOS
+          # suite un-gated, and ci-macos-nightly.yml covers regression -- so
+          # tolerating that skip is what keeps the queue from wedging without
+          # losing macOS coverage on what actually lands.
+          MACOS_SKIP_EVENTS = ("pull_request", "workflow_dispatch", "merge_group")
 
           docs_only = plan.get("docs_only") == "true"
           macos_sensitive = plan.get("macos_sensitive") == "true"
+          rpm_relevant_changed = plan.get("rpm_relevant_changed") == "true"
           # Read the PR labels via the event payload. The aggregator
           # runs inside ci.yml so the same event.pull_request.labels
           # array used by the job `if:` is available here too. The
@@ -1813,24 +2385,25 @@ jobs:
               if r == "success":
                   continue
               if r == "skipped":
-                  if name in ALWAYS_SKIPPABLE:
-                      continue
-                  if event == "pull_request" and name in PUSH_ONLY:
-                      continue
-                  if event != "pull_request" and name in PR_ONLY:
+                  if name in PUSH_ONLY and event != "push":
                       continue
                   if docs_only and name in DOCS_ONLY_SKIPPABLE:
+                      continue
+                  if name in RPM_SMOKE_SKIPPABLE and not rpm_relevant_changed:
                       continue
                   # macOS-gated jobs are allowed to skip on:
                   #  - PRs when diff is not macos_sensitive AND no
                   #    `macos-needed` label.
                   #  - workflow_dispatch (manual re-runs from hotfix
                   #    agents) when diff is not macos_sensitive.
+                  #  - merge_group (merge-queue ref) where the label/push
+                  #    branches of the job `if:` cannot be true; the
+                  #    post-merge push to main runs macOS un-gated.
                   # On native push events macOS must run.
                   # Nightly ci-macos-nightly.yml covers regression.
                   if (
                       name in MACOS_GATED
-                      and event in ("pull_request", "workflow_dispatch")
+                      and event in MACOS_SKIP_EVENTS
                       and not macos_sensitive
                       and not macos_labelled
                   ):
@@ -1838,7 +2411,7 @@ jobs:
               bad.append((name, r))
 
           if bad:
-              print("::error::CI gate FAILED — these jobs were not success "
+              print("::error::CI gate FAILED - these jobs were not success "
                     "and not intentionally skipped:")
               for n, r in bad:
                   print(f"  - {n}: result={r}")

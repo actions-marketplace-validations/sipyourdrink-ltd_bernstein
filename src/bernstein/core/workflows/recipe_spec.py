@@ -1,4 +1,4 @@
-"""Recipe manifest schema — parameterised workflows for operators.
+"""Recipe manifest schema - parameterised workflows for operators.
 
 A recipe is a thin wrapper around :class:`WorkflowSpec` that adds an
 operator-facing ``params`` block.  Each parameter declares a name, type
@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -51,6 +51,10 @@ if TYPE_CHECKING:
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from bernstein.core.tasks.param_contract import ParamType as ParamType
+from bernstein.core.tasks.param_contract import (
+    coerce_value as _shared_coerce_value,
+)
 from bernstein.core.workflows.workflow_spec import (
     WorkflowSpec,
     WorkflowSpecError,
@@ -61,13 +65,14 @@ from bernstein.core.workflows.workflow_spec import (
 # Parameter declaration
 # ---------------------------------------------------------------------------
 
-# Parameter names mirror node id constraints — slug-shaped so they round
+# Parameter names mirror node id constraints - slug-shaped so they round
 # trip through YAML keys and CLI flags without escaping.
 _PARAM_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
-# The set of supported scalar types.  Kept small on purpose: recipes are
-# operator-facing, not a general-purpose templating engine.
-ParamType = Literal["string", "int", "float", "bool"]
+# The scalar type vocabulary is owned by
+# :mod:`bernstein.core.tasks.param_contract` and re-exported above so recipes
+# and schedules (#2545) share one declaration.  Kept small on purpose: recipes
+# are operator-facing, not a general-purpose templating engine.
 
 
 class RecipeParam(BaseModel):
@@ -104,7 +109,7 @@ class RecipeParam(BaseModel):
                 f"param name {value!r} must match {_PARAM_NAME_PATTERN.pattern}",
             )
         if value == "goal":
-            # ``goal`` is reserved — it's substituted by the WorkflowRunner
+            # ``goal`` is reserved - it's substituted by the WorkflowRunner
             # itself from the CLI ``--goal`` option, not by the recipe
             # layer.  Collisions silently shadow operator input.
             raise ValueError("param name 'goal' is reserved")
@@ -144,8 +149,8 @@ class RecipeParamError(ValueError):
     """Raised when operator-provided parameter values fail validation.
 
     Distinct from :class:`RecipeSpecError` so the CLI can map manifest
-    errors to one exit code (2 — bad recipe on disk) and operator input
-    errors to a different one (1 — bad ``--param`` value).
+    errors to one exit code (2 - bad recipe on disk) and operator input
+    errors to a different one (1 - bad ``--param`` value).
     """
 
 
@@ -156,6 +161,11 @@ class RecipeParamError(ValueError):
 
 def _coerce_value(raw: str, type_: ParamType) -> str | int | float | bool:
     """Coerce a raw CLI string into the parameter's declared scalar type.
+
+    Delegates to the shared
+    :func:`bernstein.core.tasks.param_contract.coerce_value` (the extracted
+    vocabulary) and re-raises coercion failures as :class:`RecipeParamError` so
+    the recipe layer's exit-code mapping and messages stay byte-identical.
 
     Args:
         raw: Raw string value as it appeared on the command line.
@@ -168,26 +178,10 @@ def _coerce_value(raw: str, type_: ParamType) -> str | int | float | bool:
         RecipeParamError: When ``raw`` does not parse as the declared
             type.  Bool accepts the usual truthy / falsy spellings.
     """
-    if type_ == "string":
-        return raw
-    if type_ == "int":
-        try:
-            return int(raw)
-        except ValueError as exc:
-            raise RecipeParamError(f"expected int, got {raw!r}") from exc
-    if type_ == "float":
-        try:
-            return float(raw)
-        except ValueError as exc:
-            raise RecipeParamError(f"expected float, got {raw!r}") from exc
-    if type_ == "bool":
-        lowered = raw.strip().lower()
-        if lowered in {"true", "1", "yes", "y", "on"}:
-            return True
-        if lowered in {"false", "0", "no", "n", "off"}:
-            return False
-        raise RecipeParamError(f"expected bool, got {raw!r}")
-    raise RecipeParamError(f"unsupported type {type_!r}")  # pragma: no cover
+    try:
+        return _shared_coerce_value(raw, type_)
+    except ValueError as exc:
+        raise RecipeParamError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +216,14 @@ class RecipeSpec(BaseModel):
     version: str = Field(default="1.0.0")
     params: list[RecipeParam] = Field(default_factory=list)
     nodes: list[dict[str, Any]] = Field(min_length=1)
+    # Optional #2546 registration blocks. A manifest without them parses and
+    # behaves exactly as before (zero schedules, zero triggers, empty pool).
+    # They carry the registration surface (schedule kinds, triggers, sandbox
+    # pool, pins) folded into the content-addressed recipe hash.
+    schedules: list[dict[str, Any]] = Field(default_factory=list)
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
+    sandbox_pool: str = Field(default="", max_length=128)
+    pins: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("params")
     @classmethod
@@ -295,7 +297,7 @@ class RecipeSpec(BaseModel):
 
         Args:
             param_values: Result of :meth:`resolve_params`.  When
-                ``None``, all params must have defaults — otherwise
+                ``None``, all params must have defaults - otherwise
                 :class:`RecipeParamError` is raised through the resolver.
 
         Returns:
@@ -326,7 +328,7 @@ class RecipeSpec(BaseModel):
             raise RecipeSpecError(
                 f"recipe {self.name!r} produced an invalid workflow: {exc}",
             ) from exc
-        except WorkflowSpecError as exc:  # pragma: no cover — defensive
+        except WorkflowSpecError as exc:  # pragma: no cover - defensive
             raise RecipeSpecError(str(exc)) from exc
 
 
@@ -335,7 +337,7 @@ def _substitute_node(node: dict[str, Any], values: dict[str, str | int | float |
 
     Substitution targets the two free-text fields (``prompt`` and
     ``command``) plus the loop predicate.  Other fields pass through
-    unchanged — substituting into ``id`` or ``depends_on`` would let a
+    unchanged - substituting into ``id`` or ``depends_on`` would let a
     recipe rewire its own DAG at launch, which the spec deliberately
     forbids.
     """
@@ -390,7 +392,7 @@ def load_recipe_spec_from_text(text: str) -> RecipeSpec:
 
     Returns:
         A validated :class:`RecipeSpec`.  Note: the node DAG is not
-        validated here — placeholders may still be unresolved, so the
+        validated here - placeholders may still be unresolved, so the
         downstream :class:`WorkflowSpec` validator runs only inside
         :meth:`RecipeSpec.to_workflow_spec`.
 
@@ -455,7 +457,7 @@ def discover_recipes(
     """Yield ``(name, path)`` pairs for every reachable recipe manifest.
 
     Lookup order matches :func:`discover_workflows`: project-local,
-    user-home, then bundled.  Names are deduplicated across sources —
+    user-home, then bundled.  Names are deduplicated across sources -
     the first occurrence wins.
     """
     seen: set[str] = set()

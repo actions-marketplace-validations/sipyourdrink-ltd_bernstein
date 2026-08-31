@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import FastAPI
+from starlette.responses import RedirectResponse  # noqa: TC002
 
 from bernstein.core.a2a import A2AHandler
 from bernstein.core.a2a_federation import A2AFederation
@@ -34,6 +35,7 @@ from bernstein.core.models import (
     NodeInfo,
     Task,
 )
+from bernstein.core.protocols.a2a.server_receipts import build_receipt_issuer
 from bernstein.core.server.access_log import StructuredAccessLogMiddleware
 from bernstein.core.server.json_logging import setup_json_logging
 from bernstein.core.server.server_middleware import (
@@ -65,7 +67,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Default cap for request bodies.  Starlette accepts unlimited bodies by
-# default — without a cap, a single POST with a 200MB JSON body will load the
+# default - without a cap, a single POST with a 200MB JSON body will load the
 # full payload into memory before pydantic validation even runs, wedging the
 # server and bloating tasks.jsonl by 200MB per request.
 _DEFAULT_MAX_BODY_BYTES = 1_048_576  # 1 MB
@@ -85,7 +87,7 @@ class ContentLengthMiddleware:
 
     Behaviour:
     - If the ``Content-Length`` header is present and exceeds the cap, reject
-      immediately with 413 — no body bytes are consumed.
+      immediately with 413 - no body bytes are consumed.
     - Streaming / chunked requests without a ``Content-Length`` header are
       tallied on the ASGI receive channel and rejected with 413 the moment
       the cap is crossed.
@@ -158,12 +160,12 @@ class ContentLengthMiddleware:
             nonlocal response_started, response_finished
             if response_finished:
                 # Inner app is still trying to send after we've already
-                # emitted our 413 — drop its messages on the floor.
+                # emitted our 413 - drop its messages on the floor.
                 return
             msg_type = message.get("type")
             if msg_type == "http.response.start":
                 if cap_exceeded:
-                    # Body already crossed the cap — discard the inner app's
+                    # Body already crossed the cap - discard the inner app's
                     # response and emit our 413 instead.
                     await self._send_json(
                         send,
@@ -185,7 +187,7 @@ class ContentLengthMiddleware:
             await self.app(scope, limited_receive, wrapped_send)
         finally:
             if cap_exceeded and not response_started:
-                # Inner app finished without emitting a response — send 413.
+                # Inner app finished without emitting a response - send 413.
                 await self._send_json(
                     send,
                     413,
@@ -216,9 +218,16 @@ class ContentLengthMiddleware:
 # ---------------------------------------------------------------------------
 
 
-def a2a_task_to_response(task: Any) -> A2ATaskResponse:
-    """Convert an A2ATask to its Pydantic response model."""
+def a2a_task_to_response(task: Any, *, receipt: dict[str, Any] | None = None) -> A2ATaskResponse:
+    """Convert an A2ATask to its Pydantic response model.
+
+    Args:
+        task: The A2A task record.
+        receipt: Optional lineage receipt to attach (#2609). Set on the
+            inbound write path; omitted on reads.
+    """
     return A2ATaskResponse(
+        receipt=receipt,
         id=task.id,
         bernstein_task_id=task.bernstein_task_id,
         sender=task.sender,
@@ -306,10 +315,16 @@ def task_to_response(task: Task) -> TaskResponse:
         cli=task.cli,
         batch_eligible=task.batch_eligible,
         completion_signals=[{"type": s.type, "value": s.value} for s in task.completion_signals],
+        # Issue #3110: the declared artifact contract must survive the
+        # response boundary, or a backlog/plan declaration is silently
+        # dropped on the wire. The default contract serialises as code_diff.
+        artifact_spec=task.artifact_spec.to_dict(),
         slack_context=task.slack_context,
         metadata=task.metadata,
         created_at=task.created_at,
         claimed_at=task.claimed_at,
+        completed_at=task.completed_at,
+        closed_at=task.closed_at,
         progress_log=cast("list[ProgressEntry]", task.progress_log).copy(),  # type: ignore[reportUnknownMemberType]
         version=task.version,
         parent_session_id=task.parent_session_id,
@@ -321,11 +336,12 @@ def task_to_response(task: Task) -> TaskResponse:
         terminal_reason=task.terminal_reason,
         max_output_tokens=task.max_output_tokens,
         meta_messages=list(task.meta_messages),
+        max_turns=task.max_turns,
     )
 
 
 # ---------------------------------------------------------------------------
-# SSE event bus — fan-out to all connected dashboard clients
+# SSE event bus - fan-out to all connected dashboard clients
 # ---------------------------------------------------------------------------
 
 
@@ -424,7 +440,7 @@ class SSEBus:
         while window and window[0] <= cutoff:
             window.popleft()
         if len(window) >= self._reconnect_max_per_window:
-            # Exceeded the window — trip the cooldown and reject.
+            # Exceeded the window - trip the cooldown and reject.
             self._reconnect_cooldown_until[ip] = ts + self._reconnect_cooldown_s
             logger.warning(
                 "SSE bus: blocking IP %s for %.0fs (>%d reconnects in %.0fs)",
@@ -446,7 +462,7 @@ class SSEBus:
             client_ip: Optional remote IP string. When provided, the
                 connection is subject to the reconnect-frequency
                 limiter and the per-IP buffer budget. ``None`` opts out
-                (used by synthetic callers — heartbeat loop, unit tests).
+                (used by synthetic callers - heartbeat loop, unit tests).
 
         Raises:
             PermissionError: If *client_ip* has exceeded the reconnect
@@ -625,11 +641,18 @@ async def _reaper_loop(store: TaskStore, interval_s: float = 30.0) -> None:
         store.mark_stale_dead()
 
 
-async def _node_reaper_loop(node_reg: NodeRegistry, interval_s: float = 15.0) -> None:
-    """Periodically mark stale cluster nodes as offline."""
+async def _node_reaper_loop(node_reg: NodeRegistry, store: TaskStore, interval_s: float = 15.0) -> None:
+    """Periodically mark stale cluster nodes offline and release their claims.
+
+    A node that stops heartbeating is transitioned ONLINE -> OFFLINE, and any
+    tasks it had claimed are re-queued to OPEN so a surviving worker can pick
+    them up. Without the task release a crashed worker's claims would stay
+    CLAIMED forever with no live agent (#2801).
+    """
     while True:
         await asyncio.sleep(interval_s)
-        node_reg.mark_stale()
+        for node in node_reg.mark_stale():
+            store.reopen_tasks_for_node(node.id)
 
 
 async def _sse_heartbeat_loop(bus: SSEBus, interval_s: float = 15.0) -> None:
@@ -647,6 +670,36 @@ async def _sse_heartbeat_loop(bus: SSEBus, interval_s: float = 15.0) -> None:
             removed = bus.cleanup_stale()
             if removed > 0:
                 logger.info("SSE bus: cleaned up %d stale subscribers", removed)
+
+
+def _install_artifact_event_publisher(bus: SSEBus | None) -> None:
+    """Point the lineage write boundary's event sink at ``bus`` (issue #2559).
+
+    Passing ``None`` clears the sink, which the lifespan does on shutdown so a
+    stopped server does not leave the orchestrator publishing into a dead bus.
+
+    The write boundary swallows anything this raises: an artifact write that
+    landed in the spine must not be undone because a notification could not be
+    delivered. Journaling happens either way, so a run with no server attached
+    still replays the identical fan-out.
+    """
+    from bernstein.adapters.base import set_artifact_event_publisher
+    from bernstein.core.server.sse_events import SSEEvent
+
+    if bus is None:
+        set_artifact_event_publisher(None)
+        return
+
+    def _publish(event: Any) -> None:
+        payload = event.to_payload()
+        sse = SSEEvent.artifact_produced(
+            uri=payload.pop("uri"),
+            entry_hash=payload.pop("entry_hash"),
+            **payload,
+        )
+        bus.publish(sse.event.value, json.dumps(sse.data, sort_keys=True))
+
+    set_artifact_event_publisher(_publish)
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +733,7 @@ def read_log_tail(path: Path, offset: int = 0) -> str:
         return ""
     text = data.decode("utf-8", errors="replace")
     # When seeking into the middle of a file, the first partial line is
-    # incomplete — strip it so callers only see whole lines.
+    # incomplete - strip it so callers only see whole lines.
     if offset > 0 and not text.startswith("\n"):
         idx = text.find("\n")
         if idx == -1:
@@ -700,7 +753,7 @@ def _split_cors_origins(
     """Separate literal CORS origins from glob patterns and build a regex.
 
     ``starlette.middleware.cors.CORSMiddleware`` compares ``allow_origins``
-    literally — ``"http://localhost:*"`` never matches a real browser
+    literally - ``"http://localhost:*"`` never matches a real browser
     origin such as ``"http://localhost:3000"``. requires us to
     translate glob-style origins into an ``allow_origin_regex`` that
     CORSMiddleware actually honors.
@@ -712,7 +765,7 @@ def _split_cors_origins(
 
     Returns:
         A ``(literal_origins, origin_regex)`` tuple.  ``literal_origins`` is
-        the subset containing no ``*`` — safe to pass to ``allow_origins``.
+        the subset containing no ``*`` - safe to pass to ``allow_origins``.
         ``origin_regex`` is ``None`` when no globs were present; otherwise
         it is a single combined regex matching any of the glob origins.
     """
@@ -728,7 +781,7 @@ def _split_cors_origins(
         return literal_origins, None
 
     # Translate each glob origin to a regex fragment.  Escape everything
-    # except ``*`` — and translate ``*`` to either ``\d+`` (when it is the
+    # except ``*`` - and translate ``*`` to either ``\d+`` (when it is the
     # port component, i.e. follows ``:``) or the generic ``[^/]*`` match.
     fragments: list[str] = []
     for origin in glob_origins:
@@ -737,7 +790,7 @@ def _split_cors_origins(
         while i < len(origin):
             ch = origin[i]
             if ch == "*":
-                # A ``:*`` suffix means "any port" — restrict to digits so we
+                # A ``:*`` suffix means "any port" - restrict to digits so we
                 # don't accept pathological inputs like ``http://localhost:evil``.
                 if parts and parts[-1].endswith(":"):
                     parts.append(r"\d+")
@@ -761,15 +814,32 @@ def _do_reload_seed_config(workdir: Path, jsonl_path: Path, application: Any) ->
         write_config_snapshot,
     )
     from bernstein.core.runtime_state import hash_file, write_config_state
-    from bernstein.core.seed import SeedError, parse_seed
-    from bernstein.core.tenanting import TenantRegistry, ensure_tenant_layout, tenant_registry_from_seed
+    from bernstein.core.security.tenant_isolation import ensure_tenant_data_layout
+    from bernstein.core.seed import SeedError, parse_seed, resolve_seed_path
+    from bernstein.core.tenanting import (
+        InvalidTenantIdError,
+        TenantRegistry,
+        tenant_registry_from_seed,
+    )
 
-    seed_path = workdir / "bernstein.yaml"
+    # resolve_seed_path() checks BERNSTEIN_SEED_PATH env first so this reload
+    # picks up the same seed file the bootstrap process actually parsed,
+    # instead of silently falling back to workdir/bernstein.yaml.
+    seed_path = resolve_seed_path(workdir)
+    logger.info("_do_reload_seed_config: resolved seed_path=%s (exists=%s)", seed_path, seed_path.exists())
     sdd_dir = jsonl_path.parent.parent
     previous_snapshot = read_config_snapshot(sdd_dir)
     current_snapshot = load_redacted_config(seed_path if seed_path.exists() else None)
     diff = diff_config_snapshots(previous_snapshot, current_snapshot)
     config_hash = hash_file(seed_path if seed_path.exists() else None)
+    # A reload that cannot use the seed must not widen what the running server
+    # accepts. An empty registry reports `is_configured` false, and
+    # `resolve_tenant_scope` skips its membership check when nothing is
+    # configured, so blanking the registry on a bad reload turned a refusal
+    # into "every tenant name is allowed". The last registry that loaded is
+    # kept instead; only a server that never had one starts out empty.
+    previous_registry = getattr(application.state, "tenant_registry", None)
+    fallback_registry = previous_registry if isinstance(previous_registry, TenantRegistry) else TenantRegistry()
     payload: dict[str, Any] = {
         "seed_path": str(seed_path) if seed_path.exists() else None,
         "config_hash": config_hash,
@@ -782,14 +852,52 @@ def _do_reload_seed_config(workdir: Path, jsonl_path: Path, application: Any) ->
             application.state.seed_config = parse_seed(seed_path)  # type: ignore[attr-defined]
             application.state.tenant_registry = tenant_registry_from_seed(application.state.seed_config)  # type: ignore[attr-defined]
             for tenant in application.state.tenant_registry.tenants:  # type: ignore[attr-defined]
-                ensure_tenant_layout(sdd_dir, tenant.id)
+                # `ensure_tenant_layout` refuses a tenant directory whose
+                # component is a symlink or is not a directory, because
+                # following it would write one tenant's state through a path
+                # another one controls. The refusal is the point; escaping as a
+                # raw `OSError` was not, since it took the server down on boot
+                # with nothing naming which tenant to look at. Only the layout
+                # call is wrapped, so a filesystem error from anywhere else in
+                # this block still surfaces as itself.
+                try:
+                    # The full data layout, not just backlog and metrics: the
+                    # runtime, WAL and audit directories are anchored the same
+                    # way, and validating only half of it left a linked `audit`
+                    # to surface much later as a failed task write.
+                    ensure_tenant_data_layout(sdd_dir, tenant.id)
+                except OSError as exc:
+                    msg = (
+                        f"tenant '{tenant.id}' layout unusable under {sdd_dir}: {exc}. Replace the linked "
+                        "or non-directory component with a real directory, copying its contents across "
+                        "rather than linking them."
+                    )
+                    raise SeedError(msg) from exc
             payload["loaded"] = True
         except SeedError as exc:
             payload["error"] = str(exc)
-            application.state.tenant_registry = TenantRegistry()  # type: ignore[attr-defined]
+            application.state.tenant_registry = fallback_registry  # type: ignore[attr-defined]
+        except InvalidTenantIdError as exc:
+            # Runs from lifespan startup and from SIGHUP, and both treat a seed
+            # they cannot use as a configuration error to report rather than as
+            # a reason to refuse to run. A tenant id that is not a usable path
+            # segment is still refused -- no registry, no layout -- but it is
+            # refused as an answer instead of as a crash on boot.
+            payload["error"] = (
+                f"tenant configuration rejected: {exc}. Rename the tenant in the seed file, then move its "
+                "existing directory under .sdd to the new name."
+            )
+            application.state.tenant_registry = fallback_registry  # type: ignore[attr-defined]
+            logger.error("Seed reload rejected a tenant id: %s", exc)
     else:
+        # A seed that is gone is not a seed that says "no tenants". Blanking
+        # the registry here dropped the allowlist a running server was already
+        # enforcing, and an unconfigured registry accepts every tenant name, so
+        # deleting the file or pointing BERNSTEIN_SEED_PATH at a missing one
+        # widened the server rather than narrowing it. The last registry that
+        # loaded is kept; a server that never had one still starts empty.
         application.state.seed_config = None  # type: ignore[attr-defined]
-        application.state.tenant_registry = TenantRegistry()  # type: ignore[attr-defined]
+        application.state.tenant_registry = fallback_registry  # type: ignore[attr-defined]
     write_config_state(
         sdd_dir,
         config_hash=config_hash,
@@ -827,7 +935,7 @@ def preflight_multi_worker_guard() -> None:
     """Refuse to boot when multi-worker mode is requested.
 
     Bernstein's ``TaskStore`` coordinates mutations with an in-process
-    ``asyncio.Lock`` and appends to JSONL without ``fcntl.flock`` — running
+    ``asyncio.Lock`` and appends to JSONL without ``fcntl.flock`` - running
     under ``uvicorn --workers N`` (or ``WEB_CONCURRENCY>1``) causes torn
     JSONL lines and duplicate task claims.
 
@@ -882,7 +990,7 @@ def create_app(
 
     Raises:
         SystemExit: Via ``preflight_multi_worker_guard`` when the operator
-            requests more than one uvicorn worker — the ``TaskStore`` is
+            requests more than one uvicorn worker - the ``TaskStore`` is
             single-process and multi-worker mode corrupts state
             .
     """
@@ -915,7 +1023,7 @@ def create_app(
     effective_token = auth_token or os.environ.get("BERNSTEIN_AUTH_TOKEN")
 
     # Auth is enabled by default.  Operators can opt out via the
-    # BERNSTEIN_AUTH_DISABLED env var or the ``auth.enabled`` seed key —
+    # BERNSTEIN_AUTH_DISABLED env var or the ``auth.enabled`` seed key -
     # both paths log a loud warning on startup.
     from bernstein.core.security.auth_middleware import auth_disabled_via_opt_out
 
@@ -930,18 +1038,24 @@ def create_app(
         _nodes_persist = _runtime_dir / "nodes.json"
     node_registry = NodeRegistry(effective_cluster, persist_path=_nodes_persist)
 
-    # Cluster JWT authentication
+    # Cluster JWT authentication. Constructed below, once the API legacy
+    # token is resolved, so the outer middleware and the inner cluster layer
+    # can share one worker-join credential (#2805).
     from bernstein.core.cluster_auth import ClusterAuthConfig, ClusterAuthenticator
 
     _cluster_auth_secret = effective_cluster.auth_token or ""
     cluster_authenticator: ClusterAuthenticator | None = None
-    if effective_cluster.enabled and _cluster_auth_secret:
-        cluster_authenticator = ClusterAuthenticator(
-            ClusterAuthConfig(secret=_cluster_auth_secret, require_auth=True),
-        )
 
     store = TaskStore(jsonl_path, metrics_jsonl_path=metrics_jsonl_path)
     sse_bus = SSEBus()
+
+    def _publish_task_update(task_obj: Any) -> None:
+        sse_bus.publish(
+            "task_update",
+            json.dumps({"id": task_obj.id, "status": task_obj.status.value}),
+        )
+
+    store.add_task_listener(_publish_task_update)
     workdir = (
         jsonl_path.parent.parent.parent
         if jsonl_path.parent.name == "runtime" and jsonl_path.parent.parent.name == ".sdd"
@@ -952,6 +1066,23 @@ def create_app(
     auth_enabled = auth_config.enabled or auth_config.oidc.enabled or auth_config.saml.enabled
     auth_service = AuthService(auth_config, AuthStore(sdd_dir)) if auth_enabled else None
     legacy_auth_token = effective_token or auth_config.legacy_token or None
+
+    # Wire the cluster authenticator with a single worker-join credential
+    # story (#2805): a worker presenting either the cluster secret or the
+    # operator API bearer token authenticates node registration/heartbeat.
+    # The outer SSOAuthMiddleware already accepts the legacy API token on
+    # every path, so teaching the inner cluster layer to accept it too means
+    # one token clears both layers even when a distinct
+    # BERNSTEIN_CLUSTER_AUTH_SECRET is configured.
+    if effective_cluster.enabled and _cluster_auth_secret:
+        _extra_cluster_secrets = tuple(s for s in (legacy_auth_token,) if s and s != _cluster_auth_secret)
+        cluster_authenticator = ClusterAuthenticator(
+            ClusterAuthConfig(
+                secret=_cluster_auth_secret,
+                require_auth=True,
+                shared_secrets=_extra_cluster_secrets,
+            ),
+        )
 
     def _reload_seed_config() -> dict[str, Any]:
         """Reload and persist bernstein.yaml metadata without restarting."""
@@ -974,14 +1105,27 @@ def create_app(
         reaper = asyncio.create_task(_reaper_loop(store))
         # Launch SSE heartbeat loop
         sse_heartbeat = asyncio.create_task(_sse_heartbeat_loop(sse_bus))
-        # Launch node-stale reaper if cluster mode is on
-        node_reaper: asyncio.Task[None] | None = None
-        if effective_cluster.enabled:
-            node_reaper = asyncio.create_task(
-                _node_reaper_loop(node_registry, interval_s=effective_cluster.node_heartbeat_interval_s)
+        # Issue #2559: mirror artifact production events onto the SSE bus.
+        # The events are journaled beside the spine regardless; this only adds
+        # live delivery while a server is up, and the sink is cleared on
+        # shutdown so a stopped server never holds a stale bus reference.
+        _install_artifact_event_publisher(sse_bus)
+        # Launch the node-stale reaper whenever the /cluster/nodes routes are
+        # mounted (always) rather than only when cluster auth is enabled. Node
+        # liveness reaping is not part of the auth layer, and a worker can only
+        # register in the auth-off configuration, so gating the reaper behind
+        # the auth flag meant it never ran in any cluster a worker had joined
+        # (#2801).
+        node_reaper: asyncio.Task[None] = asyncio.create_task(
+            _node_reaper_loop(
+                node_registry,
+                store,
+                interval_s=effective_cluster.node_heartbeat_interval_s,
             )
+        )
         yield
         # Shutdown
+        _install_artifact_event_publisher(None)
         reaper.cancel()
         sse_heartbeat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1011,20 +1155,21 @@ def create_app(
         title="Bernstein Task Server",
         version="1.0.0",
         description=(
-            "Bernstein REST API — multi-agent orchestration for CLI coding agents.\n\n"
+            "Bernstein REST API - the open-source governance layer for AI agents, "
+            "one git worktree per task.\n\n"
             "## Authentication\n\n"
             "Authentication is ENABLED by default.  Include a Bearer token in "
             "all requests:\n\n"
             "```\nAuthorization: Bearer <token>\n```\n\n"
             "To run without auth (development only), set `BERNSTEIN_AUTH_DISABLED=1` "
-            "— this logs a loud warning and passes every request through.\n\n"
+            "- this logs a loud warning and passes every request through.\n\n"
             "Public endpoints (no auth required): `/health`, `/health/ready`, "
             "`/health/live`, `/ready`, `/alive`, `/.well-known/agent.json`, "
             "`/docs`, `/openapi.json`, and the auth-flow endpoints "
             "(`/auth/login`, `/auth/oidc/callback`, etc.).\n\n"
             "Webhook and hook endpoints (`/webhook`, `/webhooks/*`, "
             "`/hooks/{session_id}`) authenticate via HMAC-SHA256 signatures "
-            "— they do NOT accept Bearer tokens.\n\n"
+            "- they do NOT accept Bearer tokens.\n\n"
             "## Base URL\n\n"
             "Default: `http://127.0.0.1:8052`. Override with env vars `BERNSTEIN_HOST` and "
             "`BERNSTEIN_PORT`.\n\n"
@@ -1038,13 +1183,13 @@ def create_app(
             "| 403 | Forbidden (IP not in allowlist) |\n"
             "| 404 | Resource not found |\n"
             "| 409 | Conflict (task already in terminal state) |\n"
-            "| 429 | Rate limited — respect the `Retry-After` header |\n"
+            "| 429 | Rate limited - respect the `Retry-After` header |\n"
             "| 500 | Internal server error |\n"
         ),
         lifespan=lifespan,
     )
 
-    # Crash guard — outermost middleware, catches unhandled exceptions
+    # Crash guard - outermost middleware, catches unhandled exceptions
     application.add_middleware(CrashGuardMiddleware)
 
     # body-size cap. Added BEFORE auth/rate-limit so oversized bodies
@@ -1061,7 +1206,7 @@ def create_app(
         policy=load_frame_embedding_policy(),
     )
 
-    # Structured request logging — logs after crash-guard normalization so the
+    # Structured request logging - logs after crash-guard normalization so the
     # final status code is always captured.
     application.add_middleware(
         StructuredAccessLogMiddleware,
@@ -1073,11 +1218,11 @@ def create_app(
 
     application.add_middleware(RequestLoggingMiddleware)
 
-    # Read-only mode — blocks all writes before auth is even checked
+    # Read-only mode - blocks all writes before auth is even checked
     if readonly:
         application.add_middleware(ReadOnlyMiddleware)
 
-    # Auth middleware — supports SSO JWTs, agent identity JWTs (zero-trust),
+    # Auth middleware - supports SSO JWTs, agent identity JWTs (zero-trust),
     # and legacy bearer tokens.  The agent identity store is shared with
     # application state so spawned agents can authenticate per-request.
     from bernstein.core.agent_identity import AgentIdentityStore
@@ -1092,6 +1237,10 @@ def create_app(
     # Empty string disables the check (legacy behaviour).
     expected_resource = auth_config.expected_resource or None
 
+    # In cluster mode the worker credential (the cluster secret) must clear
+    # the outer middleware too, not only the inner cluster route layer (#2805).
+    _mw_cluster_secret = _cluster_auth_secret if (effective_cluster.enabled and _cluster_auth_secret) else None
+
     application.add_middleware(
         SSOAuthMiddleware,
         auth_service=auth_service,
@@ -1099,23 +1248,57 @@ def create_app(
         agent_identity_store=_agent_identity_store,
         auth_disabled=auth_disabled_flag,
         expected_resource=expected_resource,
+        cluster_secret=_mw_cluster_secret,
     )
 
-    # Per-endpoint request rate limiting — reads buckets from app.state.seed_config.
+    # Dashboard auth (#2366) - scoped sessions / tokens for the /dashboard
+    # surface. Added AFTER the SSO middleware so it sees the request first:
+    # a validated dashboard credential stamps
+    # ``request.state.dashboard_principal``, which the SSO layer honours for
+    # dashboard paths. The audit-chain key and store are constructed here
+    # (shared with the mailbox block below) because every dashboard authz
+    # decision is anchored in the ``dashboard-auth`` lineage run and mirrored
+    # onto the chain with the acting principal attached.
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.server.dashboard_auth import DashboardAuthMiddleware, DashboardAuthState
+    from bernstein.core.server.dashboard_tokens import (
+        DashboardGovernance,
+        DashboardTokenRegistry,
+        resolve_dashboard_hmac_key,
+    )
+
+    _chain_key = resolve_dashboard_hmac_key(sdd_dir)
+    _audit_chain = AuditChainStore(sdd_dir / "audit", key=_chain_key)
+
+    dashboard_auth_state = DashboardAuthState(
+        token_registry=DashboardTokenRegistry(sdd_dir / "auth" / "dashboard_tokens.jsonl", hmac_key=_chain_key),
+        governance=DashboardGovernance(
+            sdd_dir / "lineage",
+            hmac_key=_chain_key,
+            audit_chain=_audit_chain,
+        ),
+    )
+    application.add_middleware(DashboardAuthMiddleware, state=dashboard_auth_state)
+    application.state.dashboard_auth_state = dashboard_auth_state  # type: ignore[attr-defined]
+
+    # Per-endpoint request rate limiting - reads buckets from app.state.seed_config.
     application.add_middleware(RequestRateLimitMiddleware)
 
     # SSE reconnect-frequency limiter. Rejects /events clients that
     # reconnect faster than 3 times per 60 s for a 5-minute cooldown.
     application.add_middleware(SSEReconnectLimiterMiddleware)
 
-    # IP allowlist — reads allowed_ips from app.state.seed_config.network dynamically.
+    # IP allowlist - reads allowed_ips from app.state.seed_config.network dynamically.
     application.add_middleware(IPAllowlistMiddleware)
 
-    # CORS middleware — configured from bernstein.yaml or defaults to localhost:*
+    # CORS middleware - configured from bernstein.yaml or defaults to localhost:*
     from bernstein.core.seed import CORSConfig
 
     cors_config = CORSConfig()  # default; overridden after seed_config loads
-    seed_path = workdir / "bernstein.yaml"
+    from bernstein.core.seed import resolve_seed_path
+
+    seed_path = resolve_seed_path(workdir)
+    logger.info("create_app: resolved seed_path=%s (exists=%s)", seed_path, seed_path.exists())
     if seed_path.exists():
         with contextlib.suppress(Exception):
             from bernstein.core.seed import parse_seed
@@ -1127,7 +1310,7 @@ def create_app(
     from starlette.middleware.cors import CORSMiddleware
 
     # starlette.middleware.cors.CORSMiddleware compares
-    # ``allow_origins`` LITERALLY — so ``http://localhost:*`` never matches
+    # ``allow_origins`` LITERALLY - so ``http://localhost:*`` never matches
     # a real ``http://localhost:3000``.  Detect glob patterns, strip them
     # from the literal list, and translate them to a regex passed via
     # ``allow_origin_regex`` so wildcard ports actually work.
@@ -1149,7 +1332,12 @@ def create_app(
     bulletin = BulletinBoard()
     message_board = MessageBoard()
     direct_channel = DirectChannel()
-    a2a_handler = A2AHandler(server_url="http://localhost:8052")
+    # Persist A2A state alongside the rest of the server's runtime state so an
+    # inbound task and its receipt survive a restart (#2609).
+    a2a_handler = A2AHandler(
+        server_url="http://localhost:8052",
+        state_path=sdd_dir / "a2a" / "state.json",
+    )
     a2a_federation = A2AFederation(local_endpoint="http://localhost:8052")
     acp_handler = ACPHandler(server_url="http://localhost:8052")
 
@@ -1159,15 +1347,69 @@ def create_app(
     application.state.direct_channel = direct_channel  # type: ignore[attr-defined]
     application.state.a2a_handler = a2a_handler  # type: ignore[attr-defined]
     application.state.a2a_federation = a2a_federation  # type: ignore[attr-defined]
+    # Mints the lineage receipt every inbound A2A response carries (#2609).
+    # ``None`` when key material or the lineage root is unavailable, in which
+    # case responses are served unattested rather than not at all.
+    application.state.a2a_receipt_issuer = build_receipt_issuer(sdd_dir)  # type: ignore[attr-defined]
+    # Inbound A2A JSON-RPC auth (#2609): API key + OAuth2 client-credentials,
+    # both declared in the agent card. Built from ``BERNSTEIN_A2A_*`` env at
+    # app creation; the JSON-RPC surface is inert unless
+    # ``BERNSTEIN_A2A_SERVER_ENABLED`` is set, so this stays dormant by default.
+    from bernstein.core.protocols.a2a.server_auth import A2AServerAuth
+
+    application.state.a2a_server_auth = A2AServerAuth.from_env()  # type: ignore[attr-defined]
     application.state.acp_handler = acp_handler  # type: ignore[attr-defined]
     application.state.node_registry = node_registry  # type: ignore[attr-defined]
+    # MESH topology branch (#2558): only a MESH node carries a coordinator, so
+    # ``POST /cluster/claims/gossip`` answers 409 everywhere else rather than
+    # folding a peer's receipts into a journal nothing arbitrates through.
+    # STAR keeps ``node_registry`` as its sole coordination surface, unchanged.
+    from bernstein.core.protocols.cluster.mesh_coordinator import build_mesh_coordinator
+
+    application.state.mesh_coordinator = build_mesh_coordinator(  # type: ignore[attr-defined]
+        effective_cluster,
+        sdd_dir=sdd_dir,
+        chain=_audit_chain,
+    )
     application.state.cluster_authenticator = cluster_authenticator  # type: ignore[attr-defined]
     application.state.sse_bus = sse_bus  # type: ignore[attr-defined]
     application.state.runtime_dir = jsonl_path.parent  # type: ignore[attr-defined]  # .sdd/runtime/
     application.state.sdd_dir = sdd_dir  # type: ignore[attr-defined]  # .sdd/
     application.state.workdir = workdir  # type: ignore[attr-defined]
 
-    # Real-time behavior anomaly monitor — checks file access and output-size on
+    # Worker mailbox + audit chain (#2357). The mailbox journal shares the
+    # audit chain's HMAC key domain so the delivered message log
+    # cross-verifies against the chain. The key stays inside the server's
+    # state dir (self-contained, cwd-independent) but outside the log
+    # directory, mirroring the key/log separation the audit module
+    # documents; an explicit BERNSTEIN_AUDIT_KEY_PATH override still wins
+    # so operators can point every verifier at one key.
+    from bernstein.core.communication.task_mailbox import TaskMailbox
+
+    application.state.audit_chain = _audit_chain  # type: ignore[attr-defined]
+    # Both halves of the claim ledger land on this chain (#3037). The claim
+    # routes mirror every granted claim as ``task.claim_receipt``; the store
+    # mirrors every transition that surrenders a held claim as the matching
+    # ``task.release_receipt``. Attached here rather than behind
+    # ``BERNSTEIN_AUDIT`` so a plain ``bernstein serve`` node records both --
+    # an acquisition-only ledger replays as node A holding a task node B is
+    # already running.
+    store.attach_audit_chain(_audit_chain)
+    application.state.task_mailbox = TaskMailbox(  # type: ignore[attr-defined]
+        jsonl_path.parent / "mailbox.jsonl",
+        hmac_key=_chain_key,
+        identity_dir=sdd_dir / "identity",
+    )
+
+    # Verifiable claim-receipt loop (#2555). The MCP claim path atomically
+    # claims from a shared JSON backlog and signs the returned receipt with a
+    # dedicated install identity alongside the mailbox identity. The backlog
+    # path aligns with the ``bernstein backlog`` CLI default so both surfaces
+    # claim from one file.
+    application.state.claim_backlog_path = jsonl_path.parent / "task-backlog.json"  # type: ignore[attr-defined]
+    application.state.claim_identity_dir = sdd_dir / "identity"  # type: ignore[attr-defined]
+
+    # Real-time behavior anomaly monitor - checks file access and output-size on
     # every progress update and writes kill signals for compromised sessions.
     from bernstein.core.behavior_anomaly import RealtimeBehaviorMonitor
 
@@ -1185,7 +1427,7 @@ def create_app(
     application.state.draining = False  # type: ignore[attr-defined]
     application.state.readonly = readonly  # type: ignore[attr-defined]
 
-    # Config drift watcher — snapshot current config file checksums
+    # Config drift watcher - snapshot current config file checksums
     from bernstein.core.config_watcher import ConfigWatcher
 
     application.state.config_watcher = ConfigWatcher.snapshot(workdir)  # type: ignore[attr-defined]
@@ -1208,12 +1450,14 @@ def create_app(
     def root() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         return {"name": "Bernstein Task Server", "status": "running", "docs": "/docs"}
 
-    # WEB-011: Paginated task search — must precede tasks_router so /tasks/search
+    # WEB-011: Paginated task search - must precede tasks_router so /tasks/search
     # is matched before /tasks/{task_id}.
+    from bernstein.core.routes.a2a_jsonrpc import router as a2a_jsonrpc_router
     from bernstein.core.routes.acp import router as acp_router
     from bernstein.core.routes.agent_comparison import router as agent_comparison_router
-    from bernstein.core.routes.api_v1 import router as api_v1_router
+    from bernstein.core.routes.api_v1 import build_router as build_api_v1_router
     from bernstein.core.routes.approvals import router as approvals_router
+    from bernstein.core.routes.artifacts import router as artifacts_router
     from bernstein.core.routes.audit_log import router as audit_log_router
     from bernstein.core.routes.batch_ops import router as batch_ops_router
     from bernstein.core.routes.custom_metrics import router as custom_metrics_router
@@ -1230,12 +1474,16 @@ def create_app(
     from bernstein.core.routes.hooks import router as hooks_router
     from bernstein.core.routes.identities import router as identities_router
     from bernstein.core.routes.mcp_bot_tools import router as mcp_bot_tools_router
+    from bernstein.core.routes.missions import router as missions_router
+    from bernstein.core.routes.orchestrator_holds import router as orchestrator_holds_router
     from bernstein.core.routes.paginated_tasks import router as paginated_tasks_router
     from bernstein.core.routes.plans import router as plans_router
     from bernstein.core.routes.predictive import router as predictive_router
     from bernstein.core.routes.provider_latency import router as provider_latency_router
+    from bernstein.core.routes.review_board import router as review_board_router
     from bernstein.core.routes.sbom import router as sbom_router
     from bernstein.core.routes.session_peek import router as session_peek_router
+    from bernstein.core.routes.sla import router as sla_router
     from bernstein.core.routes.slo import router as slo_router
     from bernstein.core.routes.task_detail import router as task_detail_router
     from bernstein.core.routes.task_trace import router as task_trace_router
@@ -1245,7 +1493,7 @@ def create_app(
 
     # Full roster of application routers.
     #
-    # AUDIT-126 — the /api/v1 mount used to receive only a hand-picked subset
+    # AUDIT-126 - the /api/v1 mount used to receive only a hand-picked subset
     # (tasks, status, costs, export, grafana, health, batch_ops, etc.), so
     # newer routes silently lacked a versioned counterpart. Collecting every
     # router here and iterating once guarantees that adding a new router
@@ -1280,6 +1528,7 @@ def create_app(
         plans_router,
         gateway_router,
         slo_router,
+        sla_router,
         custom_metrics_router,
         sbom_router,
         hooks_router,
@@ -1301,7 +1550,18 @@ def create_app(
         well_known_router,
         mcp_bot_tools_router,
         session_peek_router,
+        orchestrator_holds_router,
+        review_board_router,
+        artifacts_router,
+        missions_router,
+        a2a_jsonrpc_router,
     ]
+
+    # Fresh per-app router: including route groups mutates the target router,
+    # so reusing the module-level instance would grow it by a full copy of
+    # the v1 route set on every create_app call (unbounded route/memory
+    # growth in app-per-test suites, ending in RecursionError at startup).
+    api_v1_router = build_api_v1_router()
 
     for r in all_routers:
         application.include_router(r)
@@ -1309,7 +1569,7 @@ def create_app(
         # versioned surface stays in parity with the legacy root paths.
         api_v1_router.include_router(r)
 
-    # Gateway metrics — active only when a gateway session is running.
+    # Gateway metrics - active only when a gateway session is running.
     application.state.mcp_gateway = None  # type: ignore[attr-defined]
 
     application.include_router(api_v1_router)
@@ -1320,14 +1580,14 @@ def create_app(
     # outside ``api_v1_router``.  We redirect rather than duplicate the
     # schema route so the SPA's swagger-ui pickup keeps the single source
     # of truth.
-    from starlette.responses import RedirectResponse as _RedirectResponse
+    from starlette.responses import RedirectResponse
 
     @application.get("/api/v1/openapi.json", include_in_schema=False)
-    async def _openapi_v1_alias() -> _RedirectResponse:
-        return _RedirectResponse(url="/openapi.json", status_code=307)
+    async def _openapi_v1_alias() -> RedirectResponse:
+        return RedirectResponse(url="/openapi.json", status_code=307)
 
     # Web GUI auto-mount (best-effort): if the SPA build is present in the
-    # wheel, expose it at /ui/* and add /api/v1/gui-meta. Failure is silent —
+    # wheel, expose it at /ui/* and add /api/v1/gui-meta. Failure is silent -
     # source-checkout installs without `cd web && npm run build` simply do
     # not get the GUI mounted, and `bernstein gui serve` is the explicit
     # entry point in that case.

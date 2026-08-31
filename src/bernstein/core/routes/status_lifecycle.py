@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from bernstein.core.config.run_overlay import RunOverlayError, write_overlay
 from bernstein.core.prometheus import (
     generate_latest,
     registry,
@@ -44,6 +45,8 @@ router = APIRouter()
 @router.get("/health")
 def health_check(request: Request) -> HealthResponse:
     """Liveness check with component-level status."""
+    from bernstein.core.routes.task_crud import _resolve_request_tenant_scope
+
     store = _get_store(request)
     is_readonly: bool = getattr(request.app.state, "readonly", False)
     summary = store.status_summary()
@@ -58,7 +61,7 @@ def health_check(request: Request) -> HealthResponse:
     return HealthResponse(
         status=overall_status,
         uptime_s=round(time.time() - store.start_ts, 2),
-        task_count=len(store.list_tasks()),
+        task_count=store.count_tasks(tenant_id=_resolve_request_tenant_scope(request)),
         agent_count=store.agent_count,
         task_queue_depth=summary.get("open", 0),
         memory_mb=float(runtime.get("memory_mb", 0.0)),
@@ -109,7 +112,7 @@ async def update_config(request: Request) -> JSONResponse:
     ``bernstein.yaml`` so the orchestrator's hot-reload picks it up on
     the next tick (~30s).  Returns the new effective value.
 
-    Agent identity JWTs (per-agent, task-scoped) are rejected with 403 —
+    Agent identity JWTs (per-agent, task-scoped) are rejected with 403 -
     mutating process-wide config is an operator action.  SSO admin users
     and legacy operator tokens may proceed.  Bearer-level permission
     enforcement is handled by :class:`SSOAuthMiddleware` via the
@@ -143,24 +146,23 @@ async def update_config(request: Request) -> JSONResponse:
         return JSONResponse(status_code=400, content={"error": "missing max_agents"})
     new_max = max(1, min(int(new_max), 50))  # clamp to sane range
 
-    # Update bernstein.yaml — the orchestrator watches mtime and hot-reloads
+    # Write the run override to the untracked overlay, never to the tracked
+    # file: this endpoint changes configuration for the duration of a run, and
+    # a run that edits bernstein.yaml in the work tree puts that edit into
+    # every commit an agent makes with a staged tree (issue #4485). The
+    # orchestrator's hot-reload watches both layers, so the change is picked
+    # up exactly as it was before.
     yaml_path = Path.cwd() / "bernstein.yaml"
     if not yaml_path.exists():
         return JSONResponse(status_code=404, content={"error": "bernstein.yaml not found"})
 
     try:
-        import yaml as _yaml
-
-        raw = yaml_path.read_text(encoding="utf-8")
-        data: dict[str, Any] = _yaml.safe_load(raw) or {}
-        data["max_agents"] = new_max
-        yaml_path.write_text(_yaml.dump(data, default_flow_style=False, sort_keys=False), encoding="utf-8")
-    # bot-ack: pre-existing-1723 (yaml IO + serialisation can raise broadly)
-    except Exception as exc:
-        logger.error("Failed to update bernstein.yaml: %s", exc)
+        overlay_path = write_overlay({"max_agents": new_max}, config_path=yaml_path)
+    except RunOverlayError as exc:
+        logger.error("Failed to write the run-configuration overlay: %s", exc)
         return JSONResponse(status_code=500, content={"error": "config update failed"})
 
-    logger.info("Config updated via API: max_agents=%d", new_max)
+    logger.info("Config updated via API: max_agents=%d (overlay %s)", new_max, overlay_path)
     return JSONResponse(content={"max_agents": new_max, "status": "updated"})
 
 

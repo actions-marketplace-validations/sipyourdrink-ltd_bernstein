@@ -14,6 +14,8 @@ from bernstein.core.wal_replay import (
     WALReplayEngine,
 )
 
+from bernstein.core.persistence.wal import _compute_entry_hash
+
 
 @pytest.fixture
 def sdd_dir(tmp_path: Path) -> Path:
@@ -190,7 +192,7 @@ class TestIdempotencyStore:
             actor="test",
         )
         store = IdempotencyStore(sdd_dir)
-        # Must not raise — OSError is caught and logged.
+        # Must not raise - OSError is caught and logged.
         store.mark_executed(entry)
         # In-memory state should reflect that the durable write failed.
         assert store.is_executed(entry) is False
@@ -224,7 +226,7 @@ class TestIdempotencyStore:
 
 
 # ---------------------------------------------------------------------------
-# WALReplayEngine — scanning
+# WALReplayEngine - scanning
 # ---------------------------------------------------------------------------
 
 
@@ -258,7 +260,7 @@ class TestWALReplayScanning:
 
 
 # ---------------------------------------------------------------------------
-# WALReplayEngine — idempotency
+# WALReplayEngine - idempotency
 # ---------------------------------------------------------------------------
 
 
@@ -271,7 +273,7 @@ class TestWALReplayIdempotency:
         # First replay
         summary1 = engine.scan_and_replay()
         assert summary1.replayed == 2
-        # Second replay — same entries should be skipped
+        # Second replay - same entries should be skipped
         engine2 = WALReplayEngine(sdd_dir, current_run_id="current")
         summary2 = engine2.scan_and_replay()
         assert summary2.skipped_idempotent == 2
@@ -279,7 +281,7 @@ class TestWALReplayIdempotency:
 
 
 # ---------------------------------------------------------------------------
-# WALReplayEngine — staleness
+# WALReplayEngine - staleness
 # ---------------------------------------------------------------------------
 
 
@@ -296,7 +298,10 @@ class TestWALReplayStaleness:
             actor="test",
             committed=False,
         )
-        # Hack: overwrite the WAL to have an old timestamp
+        # Rewrite the WAL with an old timestamp. entry_hash is recomputed
+        # so the entry stays self-consistent: recovery only trusts
+        # chain-verified entries, and a hand-edited payload carrying its
+        # original hash is dropped before the staleness check is reached.
         wal_path = sdd_dir / "runtime" / "wal" / "old-run.wal.jsonl"
         lines = wal_path.read_text().splitlines()
         old_entries = []
@@ -304,6 +309,7 @@ class TestWALReplayStaleness:
             if line.strip():
                 data = json.loads(line)
                 data["timestamp"] = time.time() - 7200  # 2 hours old
+                data["entry_hash"] = _compute_entry_hash({k: v for k, v in data.items() if k != "entry_hash"})
                 old_entries.append(json.dumps(data))
         wal_path.write_text("\n".join(old_entries) + "\n")
 
@@ -313,7 +319,7 @@ class TestWALReplayStaleness:
 
 
 # ---------------------------------------------------------------------------
-# WALReplayEngine — replay handler
+# WALReplayEngine - replay handler
 # ---------------------------------------------------------------------------
 
 
@@ -356,7 +362,7 @@ class TestReplayHandler:
 
 
 # ---------------------------------------------------------------------------
-# WALReplayEngine — informational entries
+# WALReplayEngine - informational entries
 # ---------------------------------------------------------------------------
 
 

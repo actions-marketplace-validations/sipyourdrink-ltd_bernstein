@@ -70,7 +70,7 @@ def generate_yaml(
     # the operator's GitHub code search picks it up uniformly
     # regardless of any subsequent yaml resaves that may strip later
     # comments.  Skipped entirely when emission is off or the token is
-    # the disabled sentinel — we never emit a useless ``0…0`` placeholder
+    # the disabled sentinel - we never emit a useless ``0…0`` placeholder
     # in the user's repo.
     if _identity.IDENTITY_EMISSION_ENABLED:
         token_line = render_yaml_comment()
@@ -222,3 +222,17 @@ def init_wizard_cmd(target_dir: str, non_interactive: bool) -> None:
 
     console.print("\n[bold green]Done![/bold green] Run [cyan]bernstein doctor[/cyan] to verify setup.")
     console.print(f'Then: [cyan]bernstein run[/cyan] or [cyan]bernstein -g "{goal}"[/cyan]\n')
+
+
+@click.command("init-wizard", help="[Deprecated] Use 'bernstein init --wizard' instead.")
+@click.option("--dir", "target_dir", default=".", show_default=True, help="Directory to initialise.")
+@click.option("--non-interactive", is_flag=True, default=False, help="Use defaults without prompting.")
+@click.pass_context
+def init_wizard_alias_cmd(ctx: click.Context, target_dir: str, non_interactive: bool) -> None:
+    """[Deprecated] Use 'bernstein init --wizard' instead."""
+    click.echo(
+        "WARNING: 'bernstein init-wizard' is deprecated and will be removed in v4.0.0 (#3140): "
+        "use 'bernstein init --wizard' instead.",
+        err=True,
+    )
+    ctx.invoke(init_wizard_cmd, target_dir=target_dir, non_interactive=non_interactive)

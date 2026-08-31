@@ -52,13 +52,13 @@ URL after launch: `http://127.0.0.1:8052/ui/`.
 
     Then refresh `/ui/`. The SPA reads `localStorage.bernstein_token` on every API request.
 
-2. **Disable auth (dev only).** `BERNSTEIN_AUTH_DISABLED=1 bernstein gui serve` — middleware logs a loud warning. Never expose this on a network-reachable host.
+2. **Disable auth (dev only).** `BERNSTEIN_AUTH_DISABLED=1 bernstein gui serve` - middleware logs a loud warning. Never expose this on a network-reachable host.
 
 3. **Port collision.** If `:8052` is taken, pass `--port`. The launcher does not auto-fallback.
 
 4. **Static assets missing.** `bernstein gui serve` will exit with `GUI static assets not found at …` if the wheel was built without the `static/` bundle. Rebuild with `cd web && npm install && npm run build` (writes to `../src/bernstein/gui/static/`).
 
-5. **No extras gate.** `bernstein gui serve` runs on a plain install; the `[gui]` extra is forward-compat only and is not required at runtime. Install it (`pip install 'bernstein[gui]'`) only to pin the `qrcode` dep for `bernstein gui qr` / `--tunnel`.
+5. **No extras gate.** `bernstein gui serve` runs on a plain install. See [Install the extras](#install-the-extras) above for why the `[gui]` extra is forward-compat only and when you need it.
 
 ## Verify
 

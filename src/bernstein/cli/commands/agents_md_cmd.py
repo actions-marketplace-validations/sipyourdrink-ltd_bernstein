@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 
 _TARGET_CHOICES = ("canonical", "cursor", "claude", "aider", "goose")
 
+#: Exit code when a git checkout's default branch cannot be resolved. The
+#: generated context files are committed verbatim, so writing a wrong or
+#: guessed branch name is worse than failing loudly (issue #4578).
+_EXIT_UNRESOLVED_DEFAULT_BRANCH = 3
+
 
 # ---------------------------------------------------------------------------
 # Group
@@ -91,10 +96,16 @@ def agents_md_cmd(ctx: click.Context) -> None:
     default=None,
     help="Display name for the H1. Defaults to the workdir basename.",
 )
-def agents_md_generate(workdir: Path, target: str, repo_name: str | None) -> None:
+@click.option(
+    "--default-branch",
+    default=None,
+    help="Explicit default branch for the git-workflow section; overrides "
+    "git probes. Useful for CI clones that never fetch origin/HEAD.",
+)
+def agents_md_generate(workdir: Path, target: str, repo_name: str | None, default_branch: str | None) -> None:
     """Print one target's content to stdout. No file is written."""
-    sections, name = _generate_sections(workdir, repo_name)
-    output = _render_target(sections, target, name)
+    sections, module_map_page, name = _generate_sections(workdir, repo_name, default_branch)
+    output = _render_target(sections, target, name, module_map_page)
     # Each target's BridgeOutput has 1+ files; print them concatenated with
     # a clear separator so the operator can see the structure.
     files = list(output.files.items())
@@ -136,10 +147,18 @@ def agents_md_generate(workdir: Path, target: str, repo_name: str | None) -> Non
     is_flag=True,
     help="Show what would be written without touching disk.",
 )
-def agents_md_write(workdir: Path, target: str, repo_name: str | None, dry_run: bool) -> None:
+@click.option(
+    "--default-branch",
+    default=None,
+    help="Explicit default branch for the git-workflow section; overrides "
+    "git probes. Useful for CI clones that never fetch origin/HEAD.",
+)
+def agents_md_write(
+    workdir: Path, target: str, repo_name: str | None, dry_run: bool, default_branch: str | None
+) -> None:
     """Write one target's files to disk."""
-    sections, name = _generate_sections(workdir, repo_name)
-    output = _render_target(sections, target, name)
+    sections, module_map_page, name = _generate_sections(workdir, repo_name, default_branch)
+    output = _render_target(sections, target, name, module_map_page)
     written = _write_output(output, workdir, dry_run=dry_run)
     if dry_run:
         click.echo(f"[dry-run] {len(output.files)} file(s) would be written under {workdir}")
@@ -150,7 +169,7 @@ def agents_md_write(workdir: Path, target: str, repo_name: str | None, dry_run: 
 
 
 # ---------------------------------------------------------------------------
-# sync — the killer-feature command
+# sync - the killer-feature command
 # ---------------------------------------------------------------------------
 
 
@@ -172,12 +191,18 @@ def agents_md_write(workdir: Path, target: str, repo_name: str | None, dry_run: 
     is_flag=True,
     help="Show what would be written without touching disk.",
 )
-def agents_md_sync(workdir: Path, repo_name: str | None, dry_run: bool) -> None:
+@click.option(
+    "--default-branch",
+    default=None,
+    help="Explicit default branch for the git-workflow section; overrides "
+    "git probes. Useful for CI clones that never fetch origin/HEAD.",
+)
+def agents_md_sync(workdir: Path, repo_name: str | None, dry_run: bool, default_branch: str | None) -> None:
     """Write all target formats so all five files agree."""
     from bernstein.core.knowledge.agents_md_bridge import render_all
 
-    sections, name = _generate_sections(workdir, repo_name)
-    outputs = render_all(sections, repo_name=name)
+    sections, module_map_page, name = _generate_sections(workdir, repo_name, default_branch)
+    outputs = render_all(sections, repo_name=name, module_map_page=module_map_page)
     written_total = 0
     planned_total = 0
     for target, output in outputs.items():
@@ -196,7 +221,7 @@ def agents_md_sync(workdir: Path, repo_name: str | None, dry_run: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# verify — CI-friendly drift detector
+# verify - CI-friendly drift detector
 # ---------------------------------------------------------------------------
 
 
@@ -220,7 +245,13 @@ def agents_md_sync(workdir: Path, repo_name: str | None, dry_run: bool) -> None:
     default=None,
     help="Display name for the H1. Defaults to the workdir basename.",
 )
-def agents_md_verify(workdir: Path, target: str, repo_name: str | None) -> None:
+@click.option(
+    "--default-branch",
+    default=None,
+    help="Explicit default branch for the git-workflow section; overrides "
+    "git probes. Useful for CI clones that never fetch origin/HEAD.",
+)
+def agents_md_verify(workdir: Path, target: str, repo_name: str | None, default_branch: str | None) -> None:
     """Exit 1 if any on-disk file diverges from the generated content.
 
     Designed for CI gating::
@@ -232,13 +263,13 @@ def agents_md_verify(workdir: Path, target: str, repo_name: str | None) -> None:
         render,
     )
 
-    sections, name = _generate_sections(workdir, repo_name)
+    sections, module_map_page, name = _generate_sections(workdir, repo_name, default_branch)
     targets: tuple[Target, ...] = ALL_TARGETS if target == "all" else (target,)  # type: ignore[assignment]
 
     drift_count = 0
     checked_count = 0
     for t in targets:
-        output = render(sections, t, repo_name=name)
+        output = render(sections, t, repo_name=name, module_map_page=module_map_page)
         for rel, expected in output.files.items():
             checked_count += 1
             on_disk = workdir / rel
@@ -279,7 +310,7 @@ def agents_md_verify(workdir: Path, target: str, repo_name: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# diff — informational, no exit-code drama
+# diff - informational, no exit-code drama
 # ---------------------------------------------------------------------------
 
 
@@ -303,19 +334,25 @@ def agents_md_verify(workdir: Path, target: str, repo_name: str | None) -> None:
     default=None,
     help="Display name for the H1. Defaults to the workdir basename.",
 )
-def agents_md_diff(workdir: Path, target: str, repo_name: str | None) -> None:
+@click.option(
+    "--default-branch",
+    default=None,
+    help="Explicit default branch for the git-workflow section; overrides "
+    "git probes. Useful for CI clones that never fetch origin/HEAD.",
+)
+def agents_md_diff(workdir: Path, target: str, repo_name: str | None, default_branch: str | None) -> None:
     """Print unified diff between on-disk and generated for each target file."""
     from bernstein.core.knowledge.agents_md_bridge import (
         ALL_TARGETS,
         render,
     )
 
-    sections, name = _generate_sections(workdir, repo_name)
+    sections, module_map_page, name = _generate_sections(workdir, repo_name, default_branch)
     targets: tuple[Target, ...] = ALL_TARGETS if target == "all" else (target,)  # type: ignore[assignment]
 
     any_diff = False
     for t in targets:
-        output = render(sections, t, repo_name=name)
+        output = render(sections, t, repo_name=name, module_map_page=module_map_page)
         for rel, expected in output.files.items():
             on_disk = workdir / rel
             actual = on_disk.read_text(encoding="utf-8") if on_disk.is_file() else ""
@@ -340,8 +377,17 @@ def agents_md_diff(workdir: Path, target: str, repo_name: str | None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _generate_sections(workdir: Path, repo_name: str | None) -> tuple[list[AgentsMdSection], str]:
-    """Run the generator + return ``(sections, repo_name)``.
+def _generate_sections(
+    workdir: Path, repo_name: str | None, default_branch: str | None = None
+) -> tuple[list[AgentsMdSection], str | None, str]:
+    """Run the generator + return ``(sections, module_map_page, repo_name)``.
+
+    ``module_map_page`` is the full per-file table for ``docs/sdd/module-map.md``
+    (#4142) - computed alongside ``sections`` here, once, since both read the
+    same repo tree and every command below needs both. ``None`` when there is
+    nothing to document, matching :func:`render_module_map_page`'s own
+    not-applicable case; callers pass it straight through to the bridge,
+    which omits the file rather than writing an empty page.
 
     ``repo_name`` resolution order:
 
@@ -354,15 +400,28 @@ def _generate_sections(workdir: Path, repo_name: str | None) -> tuple[list[Agent
     a worktree whose directory name is auto-generated (e.g.
     ``.claude/worktrees/agent-abc123``) instead of the project's real name.
     """
-    from bernstein.core.knowledge.agents_md_generator import generate
+    from bernstein.core.knowledge.agents_md_generator import (
+        DefaultBranchUnresolvedError,
+        GenerateOptions,
+        generate,
+        render_module_map_page,
+    )
 
     resolved = workdir.resolve()
-    sections = generate(resolved)
+    try:
+        sections = generate(resolved, GenerateOptions(default_branch=default_branch))
+    except DefaultBranchUnresolvedError as exc:
+        click.echo(
+            f"error: {exc}",
+            err=True,
+        )
+        sys.exit(_EXIT_UNRESOLVED_DEFAULT_BRANCH)
     if not sections:
         click.echo(f"No content derived from {workdir}: is this a repository?", err=True)
         sys.exit(2)
+    module_map_page = render_module_map_page(resolved)
     name = repo_name or _infer_repo_name(resolved)
-    return sections, name
+    return sections, module_map_page, name
 
 
 def _infer_repo_name(repo_path: Path) -> str:
@@ -386,7 +445,7 @@ def _read_pyproject_name(pyproj: Path) -> str | None:
         return None
     try:
         import tomllib  # py311+
-    except ImportError:  # pragma: no cover — handled at runtime
+    except ImportError:  # pragma: no cover - handled at runtime
         return None
     try:
         data: dict[str, object] = tomllib.loads(pyproj.read_text(encoding="utf-8"))
@@ -417,7 +476,7 @@ def _coerce_name_field(mapping: dict[object, object]) -> str | None:
     """Pull ``mapping["name"]`` and return it only when it's a usable string.
 
     Centralised so both manifest readers stay simple and pyright doesn't
-    have to chase ``Unknown`` types through nested narrowing — the
+    have to chase ``Unknown`` types through nested narrowing - the
     ``# type: ignore`` at the call sites is the trade-off for keeping JSON
     parsing typed-as-``object`` until the runtime check narrows it.
     """
@@ -427,11 +486,13 @@ def _coerce_name_field(mapping: dict[object, object]) -> str | None:
     return None
 
 
-def _render_target(sections: list[AgentsMdSection], target: str, repo_name: str) -> BridgeOutput:
+def _render_target(
+    sections: list[AgentsMdSection], target: str, repo_name: str, module_map_page: str | None
+) -> BridgeOutput:
     """Single-target render bridge."""
     from bernstein.core.knowledge.agents_md_bridge import render
 
-    return render(sections, target, repo_name=repo_name)  # type: ignore[arg-type]
+    return render(sections, target, repo_name=repo_name, module_map_page=module_map_page)  # type: ignore[arg-type]
 
 
 def _write_output(output: BridgeOutput, repo_root: Path, *, dry_run: bool) -> int:

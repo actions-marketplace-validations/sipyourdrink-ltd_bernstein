@@ -1,13 +1,13 @@
 """Public-key signatures over a multi-tenant export's ``head_sha256``.
 
 The v1 multi-tenant audit export (PR #1175) signs the chain with HMAC
-only — the auditor must share the operator's HMAC key to verify, which
+only - the auditor must share the operator's HMAC key to verify, which
 breaks the typical "sovereign auditor reads the bundle without holding
 secrets" workflow. v2 layers an Ed25519 signature over the bundle's
 ``head_sha256`` so a key-less auditor can still authenticate the bundle's
 origin.
 
-The signing key is shared with the lineage signer (PR #1151) — same
+The signing key is shared with the lineage signer (PR #1151) - same
 rotation cadence, same KMS plumbing. The orchestrator hands a
 :class:`~bernstein.core.security.lineage_kms.KMSAdapter` to the multi-
 tenant exporter; the exporter calls ``adapter.sign(head_sha256_bytes)``
@@ -29,7 +29,7 @@ The v2 verifier accepts a ``head_signature`` block of the shape:
 When the verifier is given an explicit ``trusted_public_key_jwk``, it
 confirms the bundle's embedded JWK matches before trusting the
 signature. When no trusted JWK is supplied, the bundle's embedded JWK
-is used directly — the operator is opting into "trust-on-first-use".
+is used directly - the operator is opting into "trust-on-first-use".
 
 Determinism
 -----------
@@ -49,6 +49,7 @@ byte-identical bundles in v2 just as in v1.
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -95,7 +96,7 @@ def build_head_signature(
     """Sign ``head_sha256`` and return the v2 ``head_signature`` block.
 
     The signed payload is the **raw 32-byte digest** of the canonical
-    JSONL — i.e. ``bytes.fromhex(head_sha256_hex)``. We sign the bytes
+    JSONL - i.e. ``bytes.fromhex(head_sha256_hex)``. We sign the bytes
     rather than the hex string because:
 
     1. Other tooling (cosign, sigstore, scitt) signs binary payloads
@@ -199,7 +200,7 @@ def verify_head_signature(
         )
     try:
         signature_bytes = base64.b64decode(sig_b64, validate=True)
-    except (ValueError, base64.binascii.Error) as exc:
+    except (ValueError, binascii.Error) as exc:
         return HeadSignatureVerification(
             ok=False,
             errors=[f"head_signature.signature_b64 not valid base64: {exc}"],
@@ -240,7 +241,7 @@ def _public_key_from_jwk(jwk: dict[str, Any]) -> Ed25519PublicKey:
     padding = "=" * (-len(x) % 4)
     try:
         raw = base64.urlsafe_b64decode(x + padding)
-    except (ValueError, base64.binascii.Error) as exc:
+    except (ValueError, binascii.Error) as exc:
         raise ValueError(f"invalid base64url: {exc}") from exc
     if len(raw) != 32:
         raise ValueError(f"Ed25519 public key must be 32 bytes (got {len(raw)})")

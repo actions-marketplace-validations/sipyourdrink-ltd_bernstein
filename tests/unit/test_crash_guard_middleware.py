@@ -3,7 +3,7 @@
 Covers three guarantees:
 
 1.  SSE requests (``Accept: text/event-stream`` or ``/events`` path) are
-    NOT wrapped — the exception propagates so Uvicorn closes the
+    NOT wrapped - the exception propagates so Uvicorn closes the
     connection cleanly instead of sending a JSON 500 into an SSE stream.
 2.  Non-SSE requests are converted to a JSON 500 response as before.
 3.  In production (no ``BERNSTEIN_DEBUG`` env var) the log line is a
@@ -45,6 +45,16 @@ def _build_app() -> FastAPI:
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    # The SSE routes are also mounted under the /api/v1 version prefix;
+    # the guard must treat the versioned alias the same as /events.
+    @app.get("/api/v1/events")
+    def events_v1(request: Request) -> StreamingResponse:
+        async def gen() -> AsyncGenerator[bytes, None]:
+            yield b"event: hello\ndata: 1\n\n"
+            raise RuntimeError("sse-fail-v1: /another/secret")
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
     return app
 
 
@@ -61,10 +71,26 @@ def test_sse_request_by_path_reraises() -> None:
     """SSE endpoints (path /events) let the exception propagate."""
     client = TestClient(_build_app(), raise_server_exceptions=True)
     with pytest.raises(RuntimeError, match="sse-fail"):
-        # TestClient materialises the stream — the exception raised
+        # TestClient materialises the stream - the exception raised
         # inside the generator must propagate, NOT be swallowed by the
         # crash guard.
         with client.stream("GET", "/events") as response:
+            for _ in response.iter_bytes():
+                pass
+
+
+def test_versioned_sse_request_by_path_reraises() -> None:
+    """The /api/v1-prefixed SSE alias is also passed through, not wrapped.
+
+    Regression guard: the versioned SSE routes previously escaped SSE
+    detection, so the crash guard wrapped their stream and turned a
+    transport-level disconnect into a spurious 500. Detection now strips
+    the /api/v1 prefix, so a mid-stream exception propagates just like
+    the unprefixed /events route.
+    """
+    client = TestClient(_build_app(), raise_server_exceptions=True)
+    with pytest.raises(RuntimeError, match="sse-fail-v1"):
+        with client.stream("GET", "/api/v1/events") as response:
             for _ in response.iter_bytes():
                 pass
 
@@ -73,7 +99,7 @@ def test_sse_request_by_accept_header_is_detected() -> None:
     """``Accept: text/event-stream`` is sufficient to skip the guard."""
 
     # Build a synthetic request object with just enough shape for the
-    # detector — avoid a full HTTP roundtrip.
+    # detector - avoid a full HTTP roundtrip.
     class _URL:
         path = "/not-events"
 

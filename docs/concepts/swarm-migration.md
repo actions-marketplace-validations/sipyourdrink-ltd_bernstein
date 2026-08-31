@@ -1,6 +1,6 @@
 # Swarm migration
 
-A migration is "the same transform applied to N files" — framework
+A migration is "the same transform applied to N files" - framework
 upgrades, lint-rule rollouts, API renames. The `swarm_migration`
 module enumerates targets, chunks them, fans out one short-lived
 agent per chunk, and reduces the results back into a single report.
@@ -11,7 +11,7 @@ Map-reduce, deterministic, one CLI command.
 `task_splitter` decomposes a parent task into 2-5 subtasks via the
 manager LLM. That's the right shape for normal feature work. It is
 the **wrong** shape for a migration touching hundreds of files where
-each file gets the same prompt — the LLM-driven split is wasted
+each file gets the same prompt - the LLM-driven split is wasted
 tokens and the LLM-chosen chunks are worse than a deterministic glob.
 
 Swarm migration is a separate first-class entry point that skips the
@@ -57,11 +57,20 @@ The fanout:
 2. `chunk_targets(targets, chunk_size)` partitions into chunks.
 3. `spawn_swarm(plan)` emits one task per chunk with role=`backend`,
    scope=`small`.
-4. `reduce_swarm(parent_id, child_results)` aggregates pass/fail per
-   chunk and posts a `SwarmReport` to the bulletin board.
+4. As each chunk task reaches a terminal state, the orchestrator
+   records it in the plan's checkpoint (completed, or failed once its
+   reopen budget is exhausted). Once every chunk has resolved,
+   `reduce_swarm` runs automatically, aggregating pass/fail per chunk;
+   the resulting `SwarmReport` is posted to the bulletin board and
+   written into the checkpoint alongside the chunk records.
 
-Re-running the same plan ID skips already-completed chunks
-(idempotent).
+Re-running the same plan ID skips chunks **verified complete** in the
+checkpoint, and reuses the existing task of any chunk still **in flight** on
+the server so a mid-swarm re-run never hands a second agent the same files.
+A chunk that never ran, permanently failed, or whose task is gone (a crash
+that never recorded a failure) gets a fresh task, so a restart can always
+make progress on the chunks that did not finish rather than returning
+whatever task id was last recorded for them.
 
 ## Configuration
 
@@ -75,7 +84,7 @@ Re-running the same plan ID skips already-completed chunks
 
 - Chunks must be **independent**. Cross-file refactors (rename a
   symbol used by 200 files) need a single agent or a custom split.
-- The transform logic lives in the agent's prompt — Bernstein does not
+- The transform logic lives in the agent's prompt - Bernstein does not
   ship code transforms.
 - Rollback on partial failure uses the existing drain + worktree merge
   logic. There is no migration-specific rollback.

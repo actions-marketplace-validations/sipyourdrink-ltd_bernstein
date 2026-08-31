@@ -6,12 +6,12 @@ test files while still writing the remaining five, reducing wall-clock time.
 
 Public API
 ----------
-- :func:`incremental_merge_files` — merge specific committed files from an
+- :func:`incremental_merge_files` - merge specific committed files from an
   agent's branch into the current branch of the main repo.
-- :func:`get_incremental_merge_state` — read which files have already been
+- :func:`get_incremental_merge_state` - read which files have already been
   merged for a given session.
-- :class:`IncrementalMergeResult` — result of a single partial merge.
-- :class:`IncrementalMergeState` — cumulative state across all partial merges
+- :class:`IncrementalMergeResult` - result of a single partial merge.
+- :class:`IncrementalMergeState` - cumulative state across all partial merges
   for one agent session.
 
 Design notes
@@ -22,7 +22,7 @@ from the agent's branch without triggering a full merge commit.  A follow-up
 ``git commit`` records the snapshot with a descriptive message.
 
 Files that have not been committed to the agent's branch yet are returned as
-``uncommitted_files`` and skipped — the agent must commit them in its worktree
+``uncommitted_files`` and skipped - the agent must commit them in its worktree
 first.  Already-merged files (recorded in the state file) are also skipped to
 prevent double-merging.
 
@@ -44,9 +44,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from bernstein.core.git.git_basic import run_git
+from bernstein.core.git.read_set_admission import ReadSetAdmissionRefused, check_read_set_changed
+from bernstein.core.git.read_set_receipt import refuse_read_set
+from bernstein.core.quality.run_config_gate import check_paths
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from bernstein.core.security.audit_chain import AuditChainStore
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +79,7 @@ class IncrementalMergeResult:
         skipped_already_merged: Files that were already merged in a prior
             partial-merge call (skipped to avoid double-applying).
         uncommitted_files: Files the agent has not yet committed to its branch
-            (skipped — caller must commit them in the worktree first).
+            (skipped - caller must commit them in the worktree first).
         conflicting_files: Files whose content conflicted during checkout.
         dirty_files: Files the operator has modified in the main workdir
             (staged or unstaged) and that would be clobbered by the merge.
@@ -123,11 +128,20 @@ class IncrementalMergeState:
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> IncrementalMergeState:
         """Deserialise from a dict read from the state file."""
+        merged_files_raw = data.get("merged_files", [])
+        if not isinstance(merged_files_raw, list):
+            raise ValueError(f"merged_files must be a list, got {type(merged_files_raw).__name__}")
+        merge_commits_raw = data.get("merge_commits", [])
+        if not isinstance(merge_commits_raw, list):
+            raise ValueError(f"merge_commits must be a list, got {type(merge_commits_raw).__name__}")
+        last_merged_ts_raw = data.get("last_merged_ts", 0.0)
+        if isinstance(last_merged_ts_raw, bool) or not isinstance(last_merged_ts_raw, (int, float)):
+            raise ValueError(f"last_merged_ts must be a number, got {type(last_merged_ts_raw).__name__}")
         return cls(
             session_id=str(data.get("session_id", "")),
-            merged_files=list(data.get("merged_files", [])),  # type: ignore[arg-type]
-            merge_commits=list(data.get("merge_commits", [])),  # type: ignore[arg-type]
-            last_merged_ts=float(data.get("last_merged_ts", 0.0)),  # type: ignore[arg-type]
+            merged_files=[str(f) for f in merged_files_raw],
+            merge_commits=[str(c) for c in merge_commits_raw],
+            last_merged_ts=float(last_merged_ts_raw),
         )
 
 
@@ -286,7 +300,7 @@ def _dirty_target_files(workdir: Path, files: list[str]) -> list[str]:
             continue
         xy = line[:2]
         path = line[3:].strip()
-        # Strip renames: "XY old -> new" — we care about the destination path.
+        # Strip renames: "XY old -> new" - we care about the destination path.
         if " -> " in path:
             path = path.split(" -> ", 1)[1].strip()
         # Remove surrounding quotes that git adds for paths with special chars.
@@ -319,6 +333,10 @@ def incremental_merge_files(
     message: str = "",
     *,
     merge_lock: threading.Lock | None = None,
+    task_id: str = "",
+    journal_path: str = "",
+    worktree_root: str = "",
+    audit_chain: AuditChainStore | None = None,
 ) -> IncrementalMergeResult:
     """Merge specific committed files from an agent's branch into the current branch.
 
@@ -329,7 +347,7 @@ def incremental_merge_files(
 
     This is designed to be called from the task-server route while the agent
     is still running.  The final full merge at agent-completion time will still
-    happen — but because the incremental-merge state is recorded, you can
+    happen - but because the incremental-merge state is recorded, you can
     choose to exclude already-merged files from the final merge diff (the
     responsibility lies with the orchestrator's merge logic).
 
@@ -343,6 +361,10 @@ def incremental_merge_files(
         merge_lock: Optional external lock to hold during the git operations.
             Pass the :class:`MergeQueue`'s ``merge_lock`` to serialise all
             merge activity (incremental + final) across sessions.
+        task_id: Task ID for admission control and refusal receipt.
+        journal_path: Path to the run's event journal for read-set derivation.
+        worktree_root: Worktree root for git operations.
+        audit_chain: Audit chain store for anchoring refusal receipts.
 
     Returns:
         :class:`IncrementalMergeResult` describing what was merged.
@@ -362,6 +384,65 @@ def incremental_merge_files(
     branch = f"agent/{session_id}"
 
     with session_lock:
+        # Read-set admission check: refuse merge if read-set paths have changed
+        if task_id and journal_path and worktree_root:
+            try:
+                base_commit = "HEAD"
+                changed_paths = check_read_set_changed(
+                    journal_path=journal_path,
+                    worktree_root=worktree_root,
+                    base_commit=base_commit,
+                    target_branch=branch,
+                )
+                if changed_paths:
+                    # Emit refusal receipt
+                    if audit_chain:
+                        # Get audit chain key for signing
+
+                        from bernstein.core.security.audit import AuditLog
+                        from bernstein.core.security.audit_chain import AuditChainStore
+
+                        sdd_dir = runtime_dir.parent
+                        audit_log = AuditLog.load_from_file(str(sdd_dir / "runtime" / "audit.log"))
+                        chain = AuditChainStore(audit_log)
+                        # Sign and persist the refusal receipt
+                        receipt = refuse_read_set(
+                            chain=chain,
+                            sdd_dir=sdd_dir,
+                            task_id=task_id,
+                            base_commit=base_commit,
+                            target_branch=branch,
+                            changed_paths=changed_paths,
+                            private_key_pem="",
+                            public_key_pem="",
+                        )
+                        receipt_str = json.dumps(receipt.to_dict())
+                        logger.error(
+                            "Read-set admission refused for task %s: %d path(s) changed. Refusal receipt: %s",
+                            task_id,
+                            len(changed_paths),
+                            receipt_str,
+                        )
+                    else:
+                        logger.error(
+                            "Read-set admission refused for task %s: %d path(s) changed",
+                            task_id,
+                            len(changed_paths),
+                        )
+                    raise ReadSetAdmissionRefused(
+                        f"Read-set changed: {len(changed_paths)} path(s) modified since base commit {base_commit}"
+                    )
+            except ReadSetAdmissionRefused:
+                raise
+            except Exception as exc:
+                # Same contract as the refusal above: this branch only runs
+                # for a task that declared a journal for admission, and an
+                # admission question that could not be answered refuses
+                # rather than admitting by default.
+                raise ReadSetAdmissionRefused(
+                    f"Read-set admission check could not run for task {task_id}: {exc}"
+                ) from exc
+
         # Load current state to find already-merged files
         state = _load_state(runtime_dir, session_id)
         already_merged = set(state.merged_files)
@@ -466,6 +547,28 @@ def _execute_incremental_merge(
             conflicting_files=conflicting,
             commit_sha="",
             error="All files conflicted during checkout",
+        )
+
+    # The file list reaches here from an API caller, so nothing upstream has
+    # decided that these paths are deliverables. A run-configuration path is
+    # refused before it is staged rather than restored after the commit, so
+    # the invariant does not depend on this particular path remembering to
+    # clean up afterwards (issue #4485).
+    run_config_verdict = check_paths(merged)
+    if not run_config_verdict.ok:
+        logger.warning(
+            "Incremental merge for session %s refused: %s",
+            session_id,
+            run_config_verdict.details,
+        )
+        return IncrementalMergeResult(
+            success=False,
+            merged_files=[],
+            skipped_already_merged=already_merged_requested,
+            uncommitted_files=uncommitted,
+            conflicting_files=conflicting,
+            commit_sha="",
+            error=run_config_verdict.details,
         )
 
     run_git(["add", "--", *merged], workdir)

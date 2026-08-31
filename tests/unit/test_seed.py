@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,7 @@ def seed_file(tmp_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# parse_seed — valid inputs
+# parse_seed - valid inputs
 # ---------------------------------------------------------------------------
 
 
@@ -117,6 +118,73 @@ class TestParseSeedValid:
         cfg = parse_seed(seed_file)
         assert cfg.role_model_policy == {"backend": {"provider": "codex", "model": "gpt-5.4-mini", "effort": "high"}}
 
+    def test_role_model_policy_parses_base_url_and_api_key_env(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n'
+            "role_model_policy:\n"
+            "  backend:\n"
+            "    provider: openai_agents\n"
+            "    model: gpt-5\n"
+            "    base_url: http://localhost:8000/v1\n"
+            "    api_key_env: OPENROUTER_API_KEY\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        entry = cfg.role_model_policy["backend"]
+        assert entry["base_url"] == "http://localhost:8000/v1"
+        assert entry["api_key_env"] == "OPENROUTER_API_KEY"
+
+    def test_role_model_policy_rejects_non_credential_api_key_env(self, seed_file: Path) -> None:
+        # Fail-closed: a credential-shaped but unrelated host secret name
+        # (e.g. GITHUB_TOKEN) must be rejected at parse time so a
+        # repo-carried config cannot forward it to an arbitrary endpoint.
+        # The rejection must come from the credential allowlist, not from an
+        # "unknown keys" path (which is why the message names the allowlist).
+        seed_file.write_text('goal: "T"\nrole_model_policy:\n  backend:\n    api_key_env: GITHUB_TOKEN\n')
+        with pytest.raises(SeedError, match="allowed credential variable name"):
+            parse_seed(seed_file)
+
+    def test_role_model_policy_parses_response_style(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nrole_model_policy:\n  backend:\n    model: gpt-5\n    response_style: terse\n')
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        assert cfg.role_model_policy["backend"]["response_style"] == "terse"
+
+    def test_role_model_policy_rejects_unknown_response_style(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\nrole_model_policy:\n  backend:\n    model: gpt-5\n    response_style: shouty\n'
+        )
+        with pytest.raises(SeedError, match="response_style"):
+            parse_seed(seed_file)
+
+    def test_response_style_with_missing_template_fails_validation(self, seed_file: Path) -> None:
+        # AC4 (#2243): a style whose mapped mode-profile template file is
+        # missing from the workdir override directory fails config
+        # validation with the typed template error, not at spawn time.
+        from bernstein.core.agents.response_style import ResponseStyleTemplateError
+
+        profiles = seed_file.parent / "templates" / "mode_profiles"
+        profiles.mkdir(parents=True)
+        (profiles / "deep.yaml").write_text(
+            "name: deep\nsystem_prompt_preamble: |\n  Deep preamble.\n",
+            encoding="utf-8",
+        )
+        seed_file.write_text('goal: "T"\nrole_model_policy:\n  backend:\n    model: gpt-5\n    response_style: terse\n')
+        with pytest.raises(SeedError, match="fast.yaml") as excinfo:
+            parse_seed(seed_file)
+        assert isinstance(excinfo.value, ResponseStyleTemplateError) or isinstance(
+            excinfo.value.__cause__, ResponseStyleTemplateError
+        )
+
+    def test_response_style_with_bundled_templates_passes_validation(self, seed_file: Path) -> None:
+        # No workdir override dir -> bundled templates satisfy validation.
+        seed_file.write_text(
+            'goal: "T"\nrole_model_policy:\n  default:\n    model: gpt-5\n    response_style: verbose\n'
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        assert cfg.role_model_policy["default"]["response_style"] == "verbose"
+
     def test_batch_config_parsed(self, seed_file: Path) -> None:
         seed_file.write_text('goal: "T"\nbatch:\n  enabled: true\n  eligible: [docs, style, tests]\n')
         cfg = parse_seed(seed_file)
@@ -166,7 +234,115 @@ class TestParseSeedValid:
 
 
 # ---------------------------------------------------------------------------
-# parse_seed — invalid inputs
+# parse_seed - local_endpoints profiles (issue #2356)
+# ---------------------------------------------------------------------------
+
+
+_LOCAL_ENDPOINTS_YAML = (
+    "local_endpoints:\n"
+    "  workhorse:\n"
+    "    base_url: http://127.0.0.1:11434/v1\n"
+    "    model: qwen2.5-coder\n"
+    "    engine: ollama\n"
+    "    timeout: 120\n"
+)
+
+
+class TestRoleModelPolicyLocalEndpoints:
+    """``role_model_policy.<role>.endpoint`` -> ``local_endpoints`` profile.
+
+    The seed parser must accept and resolve the same profile references the
+    pydantic ``BernsteinConfig`` schema already validates, so the shipped
+    ``examples/local-fleet/bernstein.yaml`` parses via ``parse_seed`` (the
+    runtime spawn path) and not only via ``load_and_validate``.
+    """
+
+    def test_endpoint_reference_resolves_profile_onto_entry(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n' + _LOCAL_ENDPOINTS_YAML + "role_model_policy:\n  linter:\n    endpoint: workhorse\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        entry = cfg.role_model_policy["linter"]
+        # The profile is the single source of truth: base_url/model are
+        # materialised onto the entry (same shape the schema produces).
+        assert entry["endpoint"] == "workhorse"
+        assert entry["base_url"] == "http://127.0.0.1:11434/v1"
+        assert entry["model"] == "qwen2.5-coder"
+
+    def test_endpoint_reference_carries_profile_api_key_env(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n'
+            "local_endpoints:\n"
+            "  gateway:\n"
+            "    base_url: http://127.0.0.1:8000/v1\n"
+            "    model: gpt-5\n"
+            "    api_key_env: OPENROUTER_API_KEY\n"
+            "role_model_policy:\n  backend:\n    endpoint: gateway\n"
+        )
+        cfg = parse_seed(seed_file)
+        assert cfg.role_model_policy is not None
+        assert cfg.role_model_policy["backend"]["api_key_env"] == "OPENROUTER_API_KEY"
+
+    def test_endpoint_reference_to_unknown_profile_rejected(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n' + _LOCAL_ENDPOINTS_YAML + "role_model_policy:\n  linter:\n    endpoint: missing\n"
+        )
+        with pytest.raises(SeedError, match="unknown local_endpoints profile"):
+            parse_seed(seed_file)
+
+    def test_endpoint_with_inline_endpoint_fields_rejected(self, seed_file: Path) -> None:
+        # The profile pins the certified endpoint; setting base_url/model
+        # inline alongside it is rejected (mirrors the schema).
+        seed_file.write_text(
+            'goal: "T"\n'
+            + _LOCAL_ENDPOINTS_YAML
+            + "role_model_policy:\n  linter:\n    endpoint: workhorse\n    model: gpt-5\n"
+        )
+        with pytest.raises(SeedError, match="cannot be set inline"):
+            parse_seed(seed_file)
+
+    def test_endpoint_must_be_a_string(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n' + _LOCAL_ENDPOINTS_YAML + "role_model_policy:\n  linter:\n    endpoint: 123\n"
+        )
+        with pytest.raises(SeedError, match="endpoint.*non-empty string"):
+            parse_seed(seed_file)
+
+    def test_local_endpoints_profile_requires_base_url(self, seed_file: Path) -> None:
+        seed_file.write_text('goal: "T"\nlocal_endpoints:\n  workhorse:\n    model: qwen2.5-coder\n')
+        with pytest.raises(SeedError, match="base_url"):
+            parse_seed(seed_file)
+
+    def test_local_endpoints_profile_rejects_unknown_keys(self, seed_file: Path) -> None:
+        seed_file.write_text(
+            'goal: "T"\n'
+            "local_endpoints:\n"
+            "  workhorse:\n"
+            "    base_url: http://127.0.0.1:11434/v1\n"
+            "    model: qwen2.5-coder\n"
+            "    bogus: yes\n"
+        )
+        with pytest.raises(SeedError, match="unknown keys: bogus"):
+            parse_seed(seed_file)
+
+    def test_local_endpoints_profile_rejects_non_credential_api_key_env(self, seed_file: Path) -> None:
+        # Fail-closed: an unrelated host secret name must not slip through by
+        # hiding in a local_endpoints profile instead of an inline entry.
+        seed_file.write_text(
+            'goal: "T"\n'
+            "local_endpoints:\n"
+            "  gateway:\n"
+            "    base_url: http://127.0.0.1:8000/v1\n"
+            "    model: gpt-5\n"
+            "    api_key_env: GITHUB_TOKEN\n"
+        )
+        with pytest.raises(SeedError, match="allowed credential variable name"):
+            parse_seed(seed_file)
+
+
+# ---------------------------------------------------------------------------
+# parse_seed - invalid inputs
 # ---------------------------------------------------------------------------
 
 
@@ -259,7 +435,7 @@ class TestParseSeedInvalid:
 
 
 # ---------------------------------------------------------------------------
-# parse_seed — worktree_setup
+# parse_seed - worktree_setup
 # ---------------------------------------------------------------------------
 
 
@@ -658,3 +834,161 @@ class TestQualityGatesBenchmarkParsing:
         seed_file.write_text('goal: "Test"\nquality_gates:\n  benchmark: "enabled"\n')
         with pytest.raises(SeedError, match="benchmark must be a mapping"):
             parse_seed(seed_file)
+
+
+# ---------------------------------------------------------------------------
+# resolve_seed_path
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSeedPathWorkdirFallback:
+    """The workdir fallback must honour the documented contract of returning
+    a resolved, absolute path -- matching the explicit-path and
+    BERNSTEIN_SEED_PATH branches."""
+
+    def test_fallback_returns_absolute_resolved_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bernstein.core.config.seed import resolve_seed_path
+
+        monkeypatch.delenv("BERNSTEIN_SEED_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        resolved = resolve_seed_path(Path("."))
+
+        assert resolved.is_absolute()
+        assert resolved == (tmp_path / "bernstein.yaml").resolve()
+
+    def test_fallback_normalizes_dot_segments(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bernstein.core.config.seed import resolve_seed_path
+
+        monkeypatch.delenv("BERNSTEIN_SEED_PATH", raising=False)
+        (tmp_path / "sub").mkdir()
+
+        resolved = resolve_seed_path(tmp_path / "sub" / "..")
+
+        assert resolved.is_absolute()
+        assert resolved == (tmp_path / "bernstein.yaml").resolve()
+
+
+# ---------------------------------------------------------------------------
+# parse_seed - unknown top-level keys
+# ---------------------------------------------------------------------------
+
+_SEED_PARSER_LOGGER = "bernstein.core.config.seed_parser"
+
+
+class TestParseSeedUnknownTopLevelKeys:
+    """Unknown top-level keys warn (never fail) and suggest the nearest known key."""
+
+    def test_unknown_key_warns_and_names_it(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text('goal: "Test"\nmax_agnets: 3\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            cfg = parse_seed(seed_file)
+
+        assert cfg.goal == "Test"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("max_agnets" in m for m in messages)
+
+    def test_unknown_key_suggests_nearest_match(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text('goal: "Test"\nmax_agnets: 3\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("max_agnets" in m and "max_agents" in m for m in messages)
+
+    def test_tasks_key_suggests_cells(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text('goal: "Test"\ntasks:\n  - id: t1\n    description: x\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("tasks" in m and "cells" in m for m in messages)
+
+    def test_valid_seed_warns_nothing(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text(FULL_YAML)
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        assert not caplog.records
+
+    def test_parse_result_unchanged_by_unknown_key(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        seed_file.write_text(MINIMAL_YAML)
+        baseline = parse_seed(seed_file)
+
+        seed_file.write_text(MINIMAL_YAML + "tasks: [{id: t1, description: x}]\n")
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            with_unknown = parse_seed(seed_file)
+
+        assert with_unknown == baseline
+
+    def test_unknown_key_without_close_match_still_warns(
+        self, seed_file: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        seed_file.write_text('goal: "Test"\nzzqqxx: 1\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("zzqqxx" in m for m in messages)
+
+    def test_container_image_key_hints_sandbox_image(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """``container_image:`` has no top-level equivalent; the warning must
+        point operators at ``sandbox.image`` instead of silently dropping the
+        value (bug #3023)."""
+        seed_file.write_text('goal: "Test"\ncontainer_image: bernstein-qwen:3.9.0\n')
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            parse_seed(seed_file)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("container_image" in m and "sandbox.image" in m for m in messages)
+
+
+class TestParseSeedEvolutionEnabled:
+    """``evolution_enabled`` must survive the YAML -> SeedConfig hop.
+
+    The key was schema-known through ``BernsteinConfig``, so it never tripped
+    the unknown-key warning above, yet no parser branch consumed it. The value
+    therefore never reached ``OrchestratorConfig``, which kept its ``True``
+    default no matter what the seed said. A key that is silently ignored is
+    harder to notice than one that is rejected: the only outward sign was
+    ``config_snapshot.json`` (dumped from the YAML) disagreeing with the run
+    manifest (serialised from the live config object).
+    """
+
+    def test_defaults_to_true_when_absent(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML)
+        assert parse_seed(seed_file).evolution_enabled is True
+
+    def test_explicit_false_is_preserved(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML + "evolution_enabled: false\n")
+        assert parse_seed(seed_file).evolution_enabled is False
+
+    def test_explicit_true_is_preserved(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML + "evolution_enabled: true\n")
+        assert parse_seed(seed_file).evolution_enabled is True
+
+    def test_non_boolean_is_rejected(self, seed_file: Path) -> None:
+        seed_file.write_text(MINIMAL_YAML + 'evolution_enabled: "sometimes"\n')
+        with pytest.raises(SeedError, match="evolution_enabled must be a boolean"):
+            parse_seed(seed_file)
+
+    def test_key_is_consumed_not_merely_tolerated(self, seed_file: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """Warning-free *and* value-carrying.
+
+        Silently-ignored is exactly the state this guards against, and it also
+        produces no warning, so the absence of a warning proves nothing on its
+        own. The parsed value has to change too.
+        """
+        seed_file.write_text(MINIMAL_YAML + "evolution_enabled: false\n")
+
+        with caplog.at_level(logging.WARNING, logger=_SEED_PARSER_LOGGER):
+            cfg = parse_seed(seed_file)
+
+        assert not caplog.records
+        assert cfg.evolution_enabled is False

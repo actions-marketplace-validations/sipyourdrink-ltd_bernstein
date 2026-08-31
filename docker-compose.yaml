@@ -3,13 +3,13 @@ version: "3.9"
 # Bernstein cluster-mode deployment
 #
 # Roles:
-#   bernstein-server      — task server + web dashboard (port 8052)
-#   bernstein-orchestrator — reads the backlog, spawns workers via HTTP
-#   bernstein-worker      — claims and executes tasks (scale with --scale)
-#   prometheus            — scrapes /metrics from bernstein-server (port 9090)
-#   grafana               — pre-built agent dashboards (port 3000, admin/admin)
-#   postgres              — shared relational state for the task store
-#   redis                 — distributed locks and bulletin board
+#   bernstein-server      - task server + web dashboard (port 8052)
+#   bernstein-orchestrator - reads the backlog, spawns workers via HTTP
+#   bernstein-worker      - claims and executes tasks (scale with --scale)
+#   prometheus            - scrapes /metrics from bernstein-server (port 9090)
+#   grafana               - pre-built agent dashboards (port 3000, admin/admin)
+#   postgres              - shared relational state for the task store
+#   redis                 - distributed locks and bulletin board
 #
 # Usage:
 #   docker compose up -d
@@ -33,18 +33,35 @@ x-bernstein-common: &bernstein-common
     BERNSTEIN_AUTH_TOKEN: ${BERNSTEIN_AUTH_TOKEN:-changeme}
     BERNSTEIN_BIND_HOST: "0.0.0.0"
     BERNSTEIN_CLUSTER_ENABLED: "true"
-    # LLM provider keys — set in .env
+    # LLM provider keys - set in .env
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
     OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     TAVILY_API_KEY: ${TAVILY_API_KEY:-}
     # Database / cache URLs
-    BERNSTEIN_DATABASE_URL: postgresql://bernstein:bernstein@postgres:5432/bernstein  # NOSONAR — development-only default, not used in production
+    BERNSTEIN_DATABASE_URL: postgresql://bernstein:bernstein@postgres:5432/bernstein  # NOSONAR - development-only default, not used in production
     BERNSTEIN_REDIS_URL: redis://redis:6379/0
   volumes:
     - sdd-data:/workspace/.sdd
     - project-data:/workspace/project
+    # Container sandbox isolation runs each agent in its own sibling container.
+    # It is requested ONLY via the `sandbox:` section of bernstein.yaml, the
+    # `--sandbox` flag, or BERNSTEIN_SANDBOX_RUNTIME - compliance presets
+    # (`--compliance regulated` etc.) do NOT select it. It needs THREE things
+    # the lean base image does not ship - uncomment the socket mount below AND
+    # use an image that adds the runtime CLI + Docker SDK:
+    #   1. a `docker` (or `podman`) CLI on PATH inside the container;
+    #   2. the Python Docker SDK: `pip install "bernstein[docker]"`;
+    #   3. the host Docker socket, mounted here.
+    # Without all three a container request cannot be honoured: it either
+    # refuses or downgrades to worktree isolation - and any downgrade is
+    # surfaced in the run summary and recorded as a `sandbox.isolation_downgrade`
+    # audit entry, never a silent WARNING. See the "Container sandbox isolation"
+    # section of docs/operations/deployment-guide.md.
+    # SECURITY: mounting the Docker socket grants the container control of the
+    # host daemon (≈ host root). Enable it only on trusted cluster hosts.
+    # - /var/run/docker.sock:/var/run/docker.sock
   depends_on:
     bernstein-server:
       condition: service_healthy
@@ -70,7 +87,7 @@ services:
       BERNSTEIN_BIND_HOST: "0.0.0.0"
       BERNSTEIN_CLUSTER_ENABLED: "true"
       BERNSTEIN_AUTH_TOKEN: ${BERNSTEIN_AUTH_TOKEN:-changeme}
-      BERNSTEIN_DATABASE_URL: postgresql://bernstein:bernstein@postgres:5432/bernstein  # NOSONAR — development-only default, not used in production
+      BERNSTEIN_DATABASE_URL: postgresql://bernstein:bernstein@postgres:5432/bernstein  # NOSONAR - development-only default, not used in production
       BERNSTEIN_REDIS_URL: redis://redis:6379/0
     ports:
       - "8052:8052"
@@ -117,7 +134,7 @@ services:
   # and optionally Jaeger/Datadog/New Relic.
   # Profile: docker compose --profile otel up -d
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.152.0
+    image: otel/opentelemetry-collector-contrib:0.159.0
     profiles: [otel]
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
@@ -157,7 +174,7 @@ services:
     restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus:v3.11.3
+    image: prom/prometheus:v3.14.0
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -174,7 +191,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:13.0.1
+    image: grafana/grafana:13.2.0
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
@@ -194,10 +211,10 @@ services:
 
   # ── Infrastructure ─────────────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: bernstein
-      POSTGRES_PASSWORD: bernstein  # NOSONAR — development-only default, not used in production
+      POSTGRES_PASSWORD: bernstein  # NOSONAR - development-only default, not used in production
       POSTGRES_DB: bernstein
     volumes:
       - postgres-data:/var/lib/postgresql/data

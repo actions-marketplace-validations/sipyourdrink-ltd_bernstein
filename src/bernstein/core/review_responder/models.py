@@ -7,11 +7,11 @@ responder talk to each other without circular imports.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 
-class RoundOutcome(str, Enum):  # noqa: UP042 - StrEnum forces str-cmp wins; we want explicit dual-base for label exports
+class RoundOutcome(StrEnum):
     """Outcome label attached to a completed (or aborted) review round.
 
     Values are kept stable because they appear as a Prometheus label.
@@ -30,7 +30,7 @@ class RoundOutcome(str, Enum):  # noqa: UP042 - StrEnum forces str-cmp wins; we 
 class ReviewComment:
     """Normalised inline review comment from GitHub.
 
-    The shape is deliberately minimal — we only carry what the responder
+    The shape is deliberately minimal - we only carry what the responder
     actually needs (path, line range, body, reviewer, timestamps, ids).
 
     Attributes:
@@ -47,6 +47,7 @@ class ReviewComment:
         diff_hunk: Diff hunk snippet attached by GitHub, may be empty.
         created_at: ISO 8601 timestamp from GitHub.
         updated_at: ISO 8601 timestamp from GitHub.
+        thread_id: GitHub review-thread node id (GraphQL), for thread resolution.
         in_reply_to: ``comment_id`` of the parent comment, when threaded.
     """
 
@@ -63,6 +64,7 @@ class ReviewComment:
     diff_hunk: str
     created_at: str
     updated_at: str
+    thread_id: str = ""
     in_reply_to: int | None = None
 
     @property

@@ -1,4 +1,4 @@
-"""Voice command layer — speech-to-text via whisper.cpp for hands-free control.
+"""Voice command layer - speech-to-text via whisper.cpp for hands-free control.
 
 Implements ``bernstein listen``: captures microphone audio, transcribes locally
 using faster-whisper (offline, no cloud), parses utterances into CLI commands,
@@ -59,7 +59,7 @@ def _parse_workers(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Command grammar — (pattern, cli_args_template)
+# Command grammar - (pattern, cli_args_template)
 # Patterns are tried in order; first match wins.
 # Named groups from the regex are available for template substitution.
 # ---------------------------------------------------------------------------
@@ -271,8 +271,9 @@ def _load_whisper_model(model_size: str) -> Any:
         from faster_whisper import WhisperModel
     except ImportError as exc:
         console.print(
-            "[red]Error:[/red] 'faster-whisper' is not installed.\n"
-            "Install it with: [bold]pip install faster-whisper[/bold]"
+            r"[red]Error:[/red] Voice dependencies are not installed."
+            "\n"
+            r"Install the voice extra with: [bold]pip install 'bernstein\[voice]'[/bold]"
         )
         raise SystemExit(1) from exc
 
@@ -281,17 +282,36 @@ def _load_whisper_model(model_size: str) -> Any:
 
 
 def _import_audio_deps() -> tuple[Any, Any]:
-    """Import numpy and sounddevice or exit with an error message."""
+    """Import numpy and sounddevice, or exit 1 with an actionable message.
+
+    Two distinct failures are possible and they need different instructions.
+    A missing package raises ``ImportError`` and is fixed by installing the
+    ``voice`` extra. ``sounddevice`` also loads the PortAudio shared library
+    at import time, and when the wheel is installed but the system library is
+    not - the documented Linux case - it raises ``OSError`` instead. Installing
+    the extra again does not fix that one.
+
+    Raises:
+        SystemExit: Always, with code 1, when either import fails.
+    """
     try:
         import numpy as np
         import sounddevice as sd
 
         return np, sd
     except ImportError as exc:
-        missing = "sounddevice" if "sounddevice" in str(exc) else "numpy"
         console.print(
-            f"[red]Error:[/red] '{missing}' is not installed.\n"
-            f"Install it with: [bold]pip install sounddevice numpy[/bold]"
+            r"[red]Error:[/red] Voice dependencies are not installed."
+            "\n"
+            r"Install the voice extra with: [bold]pip install 'bernstein\[voice]'[/bold]"
+        )
+        raise SystemExit(1) from exc
+    except OSError as exc:
+        console.print(
+            f"[red]Error:[/red] Voice dependencies are installed but failed to load: {exc}\n"
+            "'sounddevice' needs the PortAudio system library at import time.\n"
+            "Install it with: [bold]apt install libportaudio2[/bold] (Debian/Ubuntu), "
+            "[bold]pacman -S portaudio[/bold] (Arch), or [bold]brew install portaudio[/bold] (macOS)."
         )
         raise SystemExit(1) from exc
 
@@ -400,7 +420,7 @@ def _listen_loop(
         text = _capture_and_transcribe(model, silence_threshold, min_audio_secs)
 
         if text is None:
-            # KeyboardInterrupt or too short — stop cleanly
+            # KeyboardInterrupt or too short - stop cleanly
             break
 
         if not text:
@@ -421,7 +441,7 @@ def _listen_loop(
             continue
 
         try:
-            # SECURITY: use list args, not shell=True — cmd contains voice input
+            # SECURITY: use list args, not shell=True - cmd contains voice input
             subprocess.run(shlex.split(cmd), check=False)
         except Exception as exc:
             console.print(f"[red]  Error executing command:[/red] {exc}")
@@ -500,8 +520,8 @@ def listen_cmd(
       deploy prod: bernstein -g "deploy to production"
 
     \b
-    Requirements (install separately):
-      pip install faster-whisper sounddevice numpy
+    Requirements (optional extra, not installed by default):
+      pip install 'bernstein[voice]'
 
     \b
       bernstein listen                   # start voice session

@@ -1,4 +1,4 @@
-"""``bernstein reject`` — refuse a pending approval gate.
+"""``bernstein reject`` - refuse a pending approval gate.
 
 Mirror of :mod:`bernstein.cli.commands.approve_cmd`: writes
 ``<workdir>/.sdd/runtime/approvals/<task_id>.rejected`` so the
@@ -19,7 +19,7 @@ from bernstein.cli.helpers import console
 
 
 @click.command("reject")
-@click.argument("task_id")
+@click.argument("task_id", required=False)
 @click.option(
     "--workdir",
     default=".",
@@ -32,7 +32,13 @@ from bernstein.cli.helpers import console
     show_default=True,
     help="Foreground TTY prompts confirm before writing the sentinel.",
 )
-def reject(task_id: str, workdir: str, prompt: bool) -> None:
+@click.option(
+    "--tool",
+    "tool_id",
+    default=None,
+    help="Resolve a pending tool-call approval by id instead of a task (flag form of ``reject-tool``).",
+)
+def reject(task_id: str | None, workdir: str, prompt: bool, tool_id: str | None) -> None:
     """Reject a pending task (review gate or pre-spawn approval gate).
 
     Writes a ``<task_id>.rejected`` decision file under
@@ -44,14 +50,38 @@ def reject(task_id: str, workdir: str, prompt: bool) -> None:
     creates the file, subsequent invocations exit with ``already
     resolved``.
 
+    Pass ``--tool <id>`` instead to refuse a pending tool-call approval
+    from the interactive approval queue; ``reject-tool`` remains as an
+    alias for this flag form.
+
     \b
-    Example:
+    Examples:
       bernstein reject T-abc123
+      bernstein reject --tool ap-1a2b3c4d5e6f
     """
-    approvals_dir = Path(workdir) / ".sdd" / "runtime" / "approvals"
+    if tool_id is not None:
+        from bernstein.cli.commands.approval_cmd import reject_tool
+
+        reject_tool(latest=False, approval_id=tool_id, workdir=workdir)
+        return
+
+    if task_id is None:
+        raise click.UsageError(
+            "Missing argument 'TASK_ID'; pass a task id, or --tool <id> to resolve a pending tool-call approval."
+        )
+
+    from bernstein.core.orchestration.approval_gate import UnsafeApprovalIdError, approval_path
+
+    # Same rule as the approve and read sides; validated before mkdir.
+    try:
+        decision_file = approval_path(Path(workdir), task_id, ".rejected")
+        approved_file = approval_path(Path(workdir), task_id, ".approved")
+    except UnsafeApprovalIdError as exc:
+        console.print(f"[red]Refusing to reject:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    approvals_dir = decision_file.parent
     approvals_dir.mkdir(parents=True, exist_ok=True)
-    decision_file = approvals_dir / f"{task_id}.rejected"
-    approved_file = approvals_dir / f"{task_id}.approved"
 
     if approved_file.exists():
         console.print(

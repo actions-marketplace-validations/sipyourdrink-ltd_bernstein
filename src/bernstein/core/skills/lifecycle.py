@@ -30,22 +30,41 @@ Out of scope for this module (deferred to follow-up tracks):
 
 - Source types beyond ``local`` (Git, OCI, index).
 - Signature verification and trust roots.
-- Sensitive-pattern-scan-on-install (the existing sanitiser already
-  scrubs invisible Unicode codepoints at load time; refusing installs on
-  sensitive patterns is track 4).
+- Source-content scans beyond the invisible Unicode install gate and the
+  reserved sandbox-profile gate. Strict lint can block ERROR findings; the
+  default path remains advisory for backwards compatibility.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
+import os
 import shutil
 import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import yaml
+from pydantic import ValidationError
+
+from bernstein.core.security.audit import load_or_create_audit_key
+from bernstein.core.security.audit_chain import AuditChainStore, record_skill_install_receipt
+from bernstein.core.security.path_containment import (
+    PathContainmentError,
+    contained_subpath,
+)
+from bernstein.core.skills.lint import LintSeverity, lint_skill
+from bernstein.core.skills.manifest import SkillManifest, parse_skill_md
+from bernstein.core.skills.packaging import tree_content_hash
+from bernstein.core.skills.plugin_schema import PLUGIN_SCHEMA_ID, schema_errors
+from bernstein.core.skills.provenance import InstallReceipt, write_install_receipt
+from bernstein.core.skills.sanitizer import strip_invisible_tags
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Public constants
@@ -318,24 +337,27 @@ def _referenced_files(skill_dir: Path, frontmatter: dict[str, Any]) -> list[Path
         values = frontmatter.get(bucket, [])
         if not isinstance(values, list):
             continue
-        bucket_root = (skill_dir / bucket).resolve()
         for entry in cast("list[object]", values):
             if not isinstance(entry, str):
                 continue
-            entry_path = Path(entry)
-            if entry_path.is_absolute() or ".." in entry_path.parts:
-                # Reject traversal / absolute paths: the digest must not
-                # depend on files outside the skill directory.
-                continue
+            # The bucket is part of the *candidate*, not the base, so a
+            # bucket that is itself a symlink out of the skill tree is
+            # refused rather than followed. Anchoring to a resolved bucket
+            # root admitted that escape and then tripped the sort key below
+            # with an uncaught ValueError. This matches what lint already
+            # reports as ``unsafe-reference-path``.
             try:
-                candidate = (bucket_root / entry_path).resolve()
-            except OSError:
-                continue
-            if not candidate.is_relative_to(bucket_root):
+                candidate = contained_subpath(skill_root, f"{bucket}/{entry}", label=f"{bucket} entry")
+            except (PathContainmentError, OSError):
+                # Best-effort by contract: the digest simply does not cover
+                # an entry it cannot prove is inside the skill directory.
+                # Lint is what surfaces these to the author.
                 continue
             if candidate.is_file():
                 out.append(candidate)
-    out.sort(key=lambda p: str(p.resolve().relative_to(skill_root)))
+    # Every path is a proven descendant of skill_root, so the relative key
+    # cannot raise.
+    out.sort(key=lambda p: str(p.relative_to(skill_root)))
     return out
 
 
@@ -397,6 +419,26 @@ class InstallResult:
     changed: bool
 
 
+@dataclass(frozen=True)
+class InitSkillResult:
+    """Outcome of scaffolding a new local skill."""
+
+    name: str
+    install_dir: Path
+
+
+class _ScaffoldManifestData(TypedDict):
+    """Validated frontmatter fields for a deterministic skill scaffold."""
+
+    manifest_schema: int
+    name: str
+    description: str
+    trigger_keywords: list[str]
+    references: list[str]
+    scripts: list[str]
+    assets: list[str]
+
+
 def _detect_skill_name(source: Path) -> str:
     """Derive the canonical name for a local source.
 
@@ -408,6 +450,160 @@ def _detect_skill_name(source: Path) -> str:
     return source.stem
 
 
+def _skill_title(name: str) -> str:
+    """Return a deterministic human-readable heading for a skill slug."""
+    return name.replace("-", " ").capitalize()
+
+
+def _scaffold_manifest_data(name: str, description: str) -> _ScaffoldManifestData:
+    """Return validated starter frontmatter for a scaffolded skill."""
+    return {
+        "manifest_schema": 1,
+        "name": name,
+        "description": description,
+        "trigger_keywords": [],
+        "references": [],
+        "scripts": [],
+        "assets": [],
+    }
+
+
+def _scaffold_skill_md(name: str, description: str) -> str:
+    """Render the deterministic starter ``SKILL.md`` body."""
+    frontmatter = yaml.safe_dump(
+        _scaffold_manifest_data(name, description),
+        sort_keys=False,
+        allow_unicode=False,
+    )
+    return (
+        "---\n"
+        f"{frontmatter}"
+        "---\n"
+        "\n"
+        f"# {_skill_title(name)}\n"
+        "\n"
+        "Describe when to use this skill and the exact workflow it should follow.\n"
+    )
+
+
+def init_skill(
+    name: str,
+    *,
+    scope: InstallScope,
+    workdir: Path,
+    home: Path | None = None,
+    description: str | None = None,
+) -> InitSkillResult:
+    """Create a deterministic local skill scaffold in the selected scope.
+
+    Args:
+        name: Lowercase skill slug.
+        scope: Project or user scope.
+        workdir: Current project root.
+        home: Override for the user's home (tests).
+        description: Optional description for the scaffold. Defaults to a
+            deterministic valid description derived from ``name``.
+
+    Returns:
+        :class:`InitSkillResult` with the target directory.
+
+    Raises:
+        SkillLifecycleError: When the name is invalid or the target exists.
+    """
+    try:
+        SkillManifest.validate_name(name)
+    except ValueError as exc:
+        raise SkillLifecycleError(str(exc)) from exc
+
+    skill_description = (
+        description if description is not None else f"Skill {name} scaffolded for deterministic authoring."
+    )
+    try:
+        SkillManifest.model_validate(_scaffold_manifest_data(name, skill_description))
+    except ValidationError as exc:
+        raise SkillLifecycleError(f"{name}: invalid scaffold manifest: {exc.errors()}") from exc
+
+    dest_root = scope_root(scope, workdir=workdir, home=home)
+    install_dir = dest_root / name
+    if install_dir.exists():
+        raise SkillLifecycleError(f"{name}: skill already exists at {install_dir}")
+
+    staging_dir = dest_root / f".{name}.init-tmp"
+
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        staging_dir.mkdir(parents=True)
+        (staging_dir / "SKILL.md").write_text(_scaffold_skill_md(name, skill_description), encoding="utf-8")
+        for bucket in ("references", "scripts", "assets"):
+            (staging_dir / bucket).mkdir()
+        staging_dir.replace(install_dir)
+    except OSError as exc:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise SkillLifecycleError(f"{name}: failed to initialize scaffold: {exc}") from exc
+
+    return InitSkillResult(name=name, install_dir=install_dir)
+
+
+def _raise_for_strict_lint_errors(skill_dir: Path, *, skill_name: str) -> None:
+    """Raise when strict lint finds blocking errors for an installed skill."""
+    errors = [
+        finding for finding in lint_skill(skill_dir, skill_name=skill_name) if finding.severity is LintSeverity.ERROR
+    ]
+    if not errors:
+        return
+    details = "; ".join(f"{finding.code}: {finding.message}" for finding in errors)
+    raise SkillLifecycleError(f"{skill_name}: strict lint failed: {details}")
+
+
+def _raise_for_invisible_unicode(
+    skill_dir: Path,
+    *,
+    skill_name: str,
+    allow_invisible_unicode: bool,
+) -> None:
+    """Raise when ``SKILL.md`` contains invisible Unicode codepoints."""
+    if allow_invisible_unicode:
+        return
+    skill_md = skill_dir / "SKILL.md"
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SkillLifecycleError(f"{skill_name}: cannot read SKILL.md for sanitizer gate: {exc}") from exc
+
+    _cleaned, count = strip_invisible_tags(content)
+    if count > 0:
+        raise SkillLifecycleError(
+            f"{skill_name}: SKILL.md contains {count} invisible Unicode codepoint(s); "
+            "refusing install unless allow_invisible_unicode=True",
+        )
+
+
+def _raise_for_unsupported_sandbox_profile(
+    skill_dir: Path,
+    *,
+    skill_name: str,
+    accept_risk: bool,
+) -> None:
+    """Raise when a skill asks for sandbox injection that is not available."""
+    if accept_risk:
+        return
+    skill_md = skill_dir / "SKILL.md"
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SkillLifecycleError(f"{skill_name}: cannot read SKILL.md for sandbox profile gate: {exc}") from exc
+
+    front_raw, _body = _split_skill_md(content)
+    frontmatter = _frontmatter_dict(front_raw)
+    if frontmatter.get("sandbox_profile") is None:
+        return
+    raise SkillLifecycleError(
+        f"{skill_name}: sandbox_profile requires sandbox injector support; refusing install unless accept_risk=True",
+    )
+
+
 def install_local(
     source: Path,
     *,
@@ -415,6 +611,9 @@ def install_local(
     workdir: Path,
     home: Path | None = None,
     override_name: str | None = None,
+    strict_lint: bool = False,
+    allow_invisible_unicode: bool = False,
+    accept_risk: bool = False,
 ) -> InstallResult:
     """Install a skill from a local path into the chosen scope.
 
@@ -432,6 +631,12 @@ def install_local(
         home: Override for the user's home (tests).
         override_name: Override the auto-detected skill name. The TOML
             ``name`` field wins over filesystem layout when supplied.
+        strict_lint: When ``True``, ERROR lint findings abort the install.
+            WARNING findings remain advisory.
+        allow_invisible_unicode: When ``True``, bypass the install-time
+            invisible Unicode refusal for controlled reproduction.
+        accept_risk: When ``True``, bypass explicit-risk install refusals
+            such as reserved ``sandbox_profile`` injection metadata.
 
     Returns:
         :class:`InstallResult` with the target directory and digest.
@@ -471,7 +676,19 @@ def install_local(
                 raise SkillLifecycleError(f"{source}: cannot read source: {exc}") from exc
             (staging_dir / "SKILL.md").write_text(content, encoding="utf-8")
 
+        _raise_for_invisible_unicode(
+            staging_dir,
+            skill_name=name,
+            allow_invisible_unicode=allow_invisible_unicode or accept_risk,
+        )
+        _raise_for_unsupported_sandbox_profile(
+            staging_dir,
+            skill_name=name,
+            accept_risk=accept_risk,
+        )
         digest = compute_skill_digest(staging_dir)
+        if strict_lint:
+            _raise_for_strict_lint_errors(staging_dir, skill_name=name)
     except Exception:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
@@ -482,6 +699,382 @@ def install_local(
     return InstallResult(name=name, install_dir=install_dir, digest=digest, changed=True)
 
 
+# ---------------------------------------------------------------------------
+# Agent Plugins directory layout (#3772, slice 1 of #3540)
+# ---------------------------------------------------------------------------
+
+#: Filename of the Agent Plugins v1.0.0 root manifest.
+PLUGIN_MANIFEST_FILENAME: str = "plugin.json"
+
+#: Lockfile ``source`` tag for skills installed from a plugin directory.
+_PLUGIN_LOCK_SOURCE: str = "plugin"
+
+#: Key used in spine_anchors dict for the plugin-tree receipt anchor.
+_PLUGIN_TREE_ANCHOR_KEY: str = "(plugin-tree)"
+
+
+@dataclass(frozen=True)
+class SkippedSkill:
+    """A skill inside a plugin tree that was not installed."""
+
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PluginInstallResult:
+    """Outcome of installing every skill under an Agent Plugins directory."""
+
+    installed: list[InstallResult]
+    skipped: list[SkippedSkill]
+    spine_anchors: dict[str, str]
+
+
+def _resolve_plugin_skills_dir(source: Path, data: dict[str, object]) -> Path | None:
+    """Resolve the ``skills`` field of a plugin manifest, containment-checked.
+
+    ``plugin.json`` is untrusted input: it arrives with whatever tree the
+    user was handed. An absolute value, a ``../`` component, or an
+    ordinary-looking component that is a symlink out of the tree would
+    otherwise make ``skills_dir.iterdir()`` walk a directory outside the
+    plugin root, and every ``SKILL.md`` found there would be copied into
+    the install scope. ``contained_subpath`` pairs a string-shape check
+    (rejects absolute and ``..`` shapes before any filesystem call) with a
+    realpath comparison (catches the symlink case), so a manifest that
+    escapes the root is treated as not-a-plugin.
+
+    Returns ``None`` on any refusal so layout detection and install share
+    one resolution path and cannot drift apart.
+    """
+    skills_field = data.get("skills")
+    if not isinstance(skills_field, str) or not skills_field:
+        return None
+    try:
+        return contained_subpath(source, skills_field, label="plugin skills directory")
+    except (PathContainmentError, OSError):
+        return None
+
+
+def is_agent_plugins_layout(source: Path) -> bool:
+    """Strict Agent Plugins v1.0.0 layout detection.
+
+    A directory counts as an Agent Plugins layout only when a root
+    ``plugin.json`` parses with a non-empty ``name`` field, a ``$schema``
+    field whose value is the exact string
+    ``https://agent-plugins.org/schemas/1.0.0/plugin.schema.json`` (any other
+    value, including no value at all, is rejected), and a ``skills`` field
+    that resolves to a directory inside the plugin root (see
+    :func:`_resolve_plugin_skills_dir`).
+
+    Strictness rules (#3772, #3540 decision):
+
+    - Missing ``$schema`` field: rejected.
+    - Unknown ``$schema`` value (e.g. a different version URL or arbitrary
+      string): rejected with a debug log message naming the offending value.
+    - ``$schema`` present with the correct 1.0.0 URL: accepted.
+    - Non-dictionary JSON root: rejected.
+    - Missing or empty ``name``: rejected.
+    - ``skills`` field absent or resolves outside the plugin root: rejected.
+
+    These rules prevent misfiring on unrelated directories that merely happen
+    to contain a ``skills/`` folder or a file named ``plugin.json``.
+    """
+    if not source.is_dir():
+        return False
+    manifest_path = source / PLUGIN_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        return False
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    data = cast("dict[str, object]", raw)
+    name = data.get("name")
+    if not isinstance(name, str) or not name:
+        return False
+    if "$schema" not in data:
+        logger.debug("Rejecting %s as Agent Plugins layout: missing $schema field", source)
+        return False
+    schema_spec = {"const": PLUGIN_SCHEMA_ID}
+    errors = schema_errors(data["$schema"], schema_spec, schema_spec, path="$.$schema")
+    if errors:
+        logger.debug(
+            "Rejecting %s as Agent Plugins layout: unknown $schema (%s)",
+            source,
+            "; ".join(errors),
+        )
+        return False
+    skills_dir = _resolve_plugin_skills_dir(source, data)
+    return skills_dir is not None and skills_dir.is_dir()
+
+
+def install_plugin_local(
+    source: Path,
+    *,
+    scope: InstallScope,
+    workdir: Path,
+    home: Path | None = None,
+    strict_lint: bool = False,
+    accept_risk: bool = False,
+    force: bool = False,
+) -> PluginInstallResult:
+    """Install every skill under an Agent Plugins directory layout.
+
+    A non-plugin directory raises :class:`SkillLifecycleError`. Each
+    conformant ``skills/<name>/SKILL.md`` is installed through
+    :func:`install_local` and recorded in ``skills.lock`` with its content
+    digest (``source="plugin"``) so a later ``sync`` can detect drift. An
+    invalid individual skill is skipped with a diagnostic naming it rather
+    than aborting the whole plugin install.
+
+    A skill whose name already holds a lock row from a *different* source -
+    such as ``bernstein-skills.toml`` or a different plugin pack - is refused
+    the same way, naming the source or pack it would have replaced. Overwriting it
+    would delete an install the operator chose deliberately and silently flip that
+    row's provenance, letting a pack shadow a trusted skill. Pass ``force=True`` to
+    take the replacement anyway. A same-source reinstall (drift heal, upgrade) of
+    the same pack is untouched and stays silent.
+    """
+    if not source.is_dir():
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout "
+            f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
+        )
+    manifest_path = source / PLUGIN_MANIFEST_FILENAME
+    try:
+        manifest_raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout "
+            f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
+        ) from exc
+    if not isinstance(manifest_raw, dict):
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout "
+            f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
+        )
+    manifest = cast("dict[str, object]", manifest_raw)
+    name_field = manifest.get("name")
+    if not isinstance(name_field, str) or not name_field:
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout "
+            f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
+        )
+    if "$schema" not in manifest:
+        raise SkillLifecycleError(f"{source}: not an Agent Plugins directory layout (missing $schema field)")
+    schema_spec = {"const": PLUGIN_SCHEMA_ID}
+    errors = schema_errors(manifest["$schema"], schema_spec, schema_spec, path="$.$schema")
+    if errors:
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout (unknown $schema: {'; '.join(errors)})"
+        )
+    # Resolved once, containment-checked: the same value is used for the
+    # walk below and for the lockfile paths, never re-joined from the raw
+    # manifest string.
+    skills_dir = _resolve_plugin_skills_dir(source, manifest)
+    if skills_dir is None or not skills_dir.is_dir():
+        raise SkillLifecycleError(
+            f"{source}: plugin manifest 'skills' must resolve to a directory inside the plugin root"
+        )
+
+    installed: list[InstallResult] = []
+    skipped: list[SkippedSkill] = []
+    # Read before the loop: the collision has to be caught *before*
+    # install_local writes, because that call already clobbers the target
+    # directory. Refusing only at lock-write time would leave the previous
+    # skill's tree destroyed with no row describing it.
+    existing_lock = {} if force else _read_lock(workdir / SKILLS_LOCK_FILENAME)
+    for skill_dir in sorted(skills_dir.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        name = skill_dir.name
+        # Per-skill isolation: one bad SKILL.md must not abort the pack.
+        try:
+            # The field-level check proved skills_dir is inside the plugin;
+            # this proves the entry is too. A skill directory symlinked out
+            # of the pack would install content the operator never saw.
+            if _escapes(skills_dir, skill_dir):
+                raise SkillLifecycleError(f"{skill_dir}: skill directory resolves outside the plugin")
+            prior = existing_lock.get(name)
+            if prior is not None:
+                if prior.source != _PLUGIN_LOCK_SOURCE:
+                    raise SkillLifecycleError(
+                        f"{name}: already installed from source {prior.source!r}; "
+                        f"installing this plugin would replace it. Re-run with --force to take the plugin's copy"
+                    )
+                elif prior.pack is not None and prior.pack != name_field:
+                    raise SkillLifecycleError(
+                        f"{name}: already installed from plugin pack {prior.pack!r}; "
+                        f"installing pack {name_field!r} would replace it. "
+                        f"Re-run with --force to take the new plugin's copy"
+                    )
+            parse_skill_md(skill_md)
+            installed.append(
+                install_local(
+                    skill_dir,
+                    scope=scope,
+                    workdir=workdir,
+                    home=home,
+                    strict_lint=strict_lint,
+                    accept_risk=accept_risk,
+                )
+            )
+        except Exception as exc:  # per-skill skip contract: one bad SKILL.md must not abort the pack
+            skipped.append(SkippedSkill(name=name, reason=str(exc)))
+
+    if installed:
+        spine_anchors = _record_plugin_receipts(installed, source, workdir=workdir)
+        _record_plugin_lock(
+            installed,
+            skills_dir,
+            workdir=workdir,
+            pack=str(name_field) if name_field else None,
+            plugin_tree_receipt=spine_anchors.get(_PLUGIN_TREE_ANCHOR_KEY),
+        )
+    else:
+        spine_anchors = {}
+    return PluginInstallResult(installed=installed, skipped=skipped, spine_anchors=spine_anchors)
+
+
+def _record_plugin_receipts(
+    installed: list[InstallResult],
+    plugin_root: Path,
+    *,
+    workdir: Path,
+) -> dict[str, str]:
+    """Write per-skill install receipts and a plugin-tree receipt, anchor them in the lineage spine.
+
+    Mirrors the pattern used by the catalog installer: every installed skill
+    gets an :class:`~bernstein.core.skills.provenance.InstallReceipt` written
+    to ``.sdd/skills/receipts/`` and anchored in the ``skills`` lineage spine.
+    The audit chain receives a ``skill.install_receipt`` event per skill.
+    The plugin tree as a whole (the directory containing ``plugin.json``) also
+    receives a content-addressed receipt so provenance_graph can attribute skill
+    usage back to the originating plugin pack.
+
+    Args:
+        installed: List of successful per-skill install results.
+        plugin_root: Root of the plugin pack (the directory with ``plugin.json``).
+        workdir: Project root; receipts land under ``.sdd/skills/receipts/``.
+
+    Returns:
+        A dict mapping skill names (and ``"(plugin-tree)"``) to their spine
+        entry hashes.
+    """
+    import time
+
+    hmac_key = load_or_create_audit_key()
+    lineage_root = workdir / ".sdd" / "lineage"
+    spine_anchors: dict[str, str] = {}
+    timestamp = int(time.time())
+
+    for result in installed:
+        skill_hash = result.digest.digest
+        skill_md_path = result.install_dir / "SKILL.md"
+        manifest_hash = hashlib.sha256(skill_md_path.read_bytes()).hexdigest()
+        install_id = f"plugin:{plugin_root.name}:{result.name}:{timestamp}"
+
+        receipt = InstallReceipt(
+            skill_hash=skill_hash,
+            manifest_hash=manifest_hash,
+            install_id=install_id,
+            timestamp=timestamp,
+        )
+        anchor = write_install_receipt(
+            workdir=workdir,
+            lineage_root=lineage_root,
+            hmac_key=hmac_key,
+            receipt=receipt,
+        )
+        spine_anchors[result.name] = anchor
+
+        chain = AuditChainStore(workdir / ".sdd" / "audit", key=hmac_key)
+        record_skill_install_receipt(
+            chain=chain,
+            skill_hash=skill_hash,
+            manifest_hash=manifest_hash,
+            install_id=install_id,
+            spine_anchor=anchor,
+            actor="skill_provenance.plugin",
+        )
+
+    plugin_tree_hash = tree_content_hash(plugin_root)
+    plugin_tree_manifest_path = plugin_root / PLUGIN_MANIFEST_FILENAME
+    plugin_tree_manifest_hash = hashlib.sha256(plugin_tree_manifest_path.read_bytes()).hexdigest()
+    plugin_tree_install_id = f"plugin:{plugin_root.name}:tree:{timestamp}"
+
+    tree_receipt = InstallReceipt(
+        skill_hash=plugin_tree_hash,
+        manifest_hash=plugin_tree_manifest_hash,
+        install_id=plugin_tree_install_id,
+        timestamp=timestamp,
+    )
+    tree_anchor = write_install_receipt(
+        workdir=workdir,
+        lineage_root=lineage_root,
+        hmac_key=hmac_key,
+        receipt=tree_receipt,
+    )
+    spine_anchors[_PLUGIN_TREE_ANCHOR_KEY] = tree_anchor
+
+    chain = AuditChainStore(workdir / ".sdd" / "audit", key=hmac_key)
+    record_skill_install_receipt(
+        chain=chain,
+        skill_hash=plugin_tree_hash,
+        manifest_hash=plugin_tree_manifest_hash,
+        install_id=plugin_tree_install_id,
+        spine_anchor=tree_anchor,
+        actor="skill_provenance.plugin",
+    )
+
+    return spine_anchors
+
+
+def _record_plugin_lock(
+    installed: list[InstallResult],
+    skills_dir: Path,
+    *,
+    workdir: Path,
+    pack: str | None = None,
+    plugin_tree_receipt: str | None = None,
+) -> None:
+    """Merge plugin-installed skills into ``skills.lock`` ([[skills]] rows).
+
+    Each row's ``path`` names the ``skills/<name>/`` directory the skill
+    came from (not the plugin root), so a later ``sync``/drift reader can
+    locate the individual skill tree.
+    """
+    lock_path = workdir / SKILLS_LOCK_FILENAME
+    entries = _read_lock(lock_path)
+    for result in installed:
+        entries[result.name] = LockEntry(
+            name=result.name,
+            source=_PLUGIN_LOCK_SOURCE,
+            path=str(skills_dir / result.name),
+            digest=result.digest.digest,
+            pack=pack,
+            plugin_tree_receipt=plugin_tree_receipt,
+        )
+    _write_lock(lock_path, list(entries.values()))
+
+
+def _escapes(root: Path, candidate: Path) -> bool:
+    """Whether *candidate* resolves outside *root* once symlinks are followed.
+
+    The string-shape half of the containment barrier does not apply here:
+    these paths come from ``iterdir``/``rglob`` over a tree we were handed,
+    so the only lie available is a symlink, and ``realpath`` is the check
+    that sees through it.
+    """
+    prefix = os.path.join(os.path.realpath(root), "")
+    return not os.path.realpath(candidate).startswith(prefix)
+
+
 def _copy_skill_tree(source: Path, dest: Path) -> None:
     """Copy a skill directory tree, preserving SKILL.md + sibling buckets.
 
@@ -489,8 +1082,15 @@ def _copy_skill_tree(source: Path, dest: Path) -> None:
     ``scripts``, ``assets``) are mirrored; anything else under the source
     directory is ignored so a dotfile from the author's editor cannot leak
     into the installed copy.
+
+    Every copied path must resolve inside *source*: the tree is untrusted
+    input, and a symlinked bucket or nested file would otherwise publish
+    content from outside the tree the operator inspected -- the same escape
+    :func:`_resolve_plugin_skills_dir` refuses one level up.
     """
     skill_md = source / "SKILL.md"
+    if _escapes(source, skill_md):
+        raise SkillLifecycleError(f"{skill_md}: SKILL.md resolves outside the skill directory")
     shutil.copy2(skill_md, dest / "SKILL.md")
     for bucket in ("references", "scripts", "assets"):
         src_bucket = source / bucket
@@ -505,6 +1105,8 @@ def _copy_skill_tree(source: Path, dest: Path) -> None:
         for child in sorted(src_bucket.rglob("*")):
             if not child.is_file():
                 continue
+            if _escapes(source, child):
+                raise SkillLifecycleError(f"{child}: {bucket} entry resolves outside the skill directory")
             rel = child.relative_to(src_bucket)
             target = dst_bucket / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -559,6 +1161,8 @@ class LockEntry:
     source: str
     path: str
     digest: str
+    pack: str | None = None
+    plugin_tree_receipt: str | None = None
 
 
 def _read_lock(path: Path) -> dict[str, LockEntry]:
@@ -581,13 +1185,24 @@ def _read_lock(path: Path) -> dict[str, LockEntry]:
         source = item_dict.get("source")
         path_value = item_dict.get("path")
         digest = item_dict.get("digest")
+        pack = item_dict.get("pack")
+        plugin_tree_receipt = item_dict.get("plugin_tree_receipt")
         if (
             isinstance(name, str)
             and isinstance(source, str)
             and isinstance(path_value, str)
             and isinstance(digest, str)
+            and (pack is None or isinstance(pack, str))
+            and (plugin_tree_receipt is None or isinstance(plugin_tree_receipt, str))
         ):
-            out[name] = LockEntry(name=name, source=source, path=path_value, digest=digest)
+            out[name] = LockEntry(
+                name=name,
+                source=source,
+                path=path_value,
+                digest=digest,
+                pack=pack,
+                plugin_tree_receipt=plugin_tree_receipt,
+            )
     return out
 
 
@@ -612,9 +1227,14 @@ def _write_lock(path: Path, entries: list[LockEntry]) -> None:
                 f"source = {_toml_quote(entry.source)}",
                 f"path = {_toml_quote(entry.path)}",
                 f"digest = {_toml_quote(entry.digest)}",
-                "",
             )
         )
+        if entry.pack is not None:
+            lines.append(f"pack = {_toml_quote(entry.pack)}")
+        if entry.plugin_tree_receipt is not None:
+            lines.append(f"plugin_tree_receipt = {_toml_quote(entry.plugin_tree_receipt)}")
+        lines.append("")
+
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
@@ -637,6 +1257,9 @@ def sync_skills(
     scope: InstallScope = InstallScope.PROJECT,
     workdir: Path | None = None,
     home: Path | None = None,
+    strict_lint: bool = False,
+    allow_invisible_unicode: bool = False,
+    accept_risk: bool = False,
 ) -> list[SyncOutcome]:
     """Reconcile ``bernstein-skills.toml`` with the chosen scope.
 
@@ -650,6 +1273,12 @@ def sync_skills(
         scope: Where to install. Defaults to PROJECT.
         workdir: Project root. Defaults to ``toml_path.parent``.
         home: Override for the user's home (tests).
+        strict_lint: When ``True``, ERROR lint findings abort changed and
+            unchanged installs. WARNING findings remain advisory.
+        allow_invisible_unicode: When ``True``, bypass the install-time
+            invisible Unicode refusal for controlled reproduction.
+        accept_risk: When ``True``, bypass explicit-risk install refusals
+            such as reserved ``sandbox_profile`` injection metadata.
 
     Returns:
         One :class:`SyncOutcome` per skill, in declaration order.
@@ -708,6 +1337,18 @@ def sync_skills(
             source_digest = hasher.hexdigest()
 
         if prior_digest == source_digest and existing_install.is_dir():
+            _raise_for_invisible_unicode(
+                existing_install,
+                skill_name=entry.name,
+                allow_invisible_unicode=allow_invisible_unicode or accept_risk,
+            )
+            _raise_for_unsupported_sandbox_profile(
+                existing_install,
+                skill_name=entry.name,
+                accept_risk=accept_risk,
+            )
+            if strict_lint:
+                _raise_for_strict_lint_errors(existing_install, skill_name=entry.name)
             outcomes.append(
                 SyncOutcome(
                     name=entry.name,
@@ -732,6 +1373,9 @@ def sync_skills(
             workdir=workdir,
             home=home,
             override_name=entry.name,
+            strict_lint=strict_lint,
+            allow_invisible_unicode=allow_invisible_unicode,
+            accept_risk=accept_risk,
         )
         action = "updated" if entry.name in previous_lock else "installed"
         outcomes.append(
@@ -764,6 +1408,7 @@ def read_lock_entries(toml_dir: Path) -> list[LockEntry]:
 __all__ = [
     "SKILLS_LOCK_FILENAME",
     "SKILLS_TOML_FILENAME",
+    "InitSkillResult",
     "InstallResult",
     "InstallScope",
     "LockEntry",
@@ -774,6 +1419,7 @@ __all__ = [
     "SkillsTomlError",
     "SyncOutcome",
     "compute_skill_digest",
+    "init_skill",
     "install_local",
     "load_skills_toml",
     "read_lock_entries",

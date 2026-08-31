@@ -1,4 +1,4 @@
-"""Agent identity lifecycle routes — create, list, revoke, audit."""
+"""Agent identity lifecycle routes - create, list, revoke, audit."""
 
 from __future__ import annotations
 
@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+# Runtime import (not type-only): FastAPI resolves this annotation at
+# route-registration time to build the query-param validator.
+from bernstein.core.agent_identity import AgentIdentityStatus  # noqa: TC001
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -28,22 +32,24 @@ def _identity_store(request: Request) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# GET /identities — list all agent identities
+# GET /identities - list all agent identities
 # ---------------------------------------------------------------------------
 
 
 @router.get("/identities")
 def list_identities(
     request: Request,
-    status: str | None = None,
+    status: AgentIdentityStatus | None = None,
     role: str | None = None,
 ) -> JSONResponse:
-    """List agent identities with optional status/role filters."""
-    from bernstein.core.agent_identity import AgentIdentityStatus
+    """List agent identities with optional status/role filters.
 
+    ``status`` is validated against the :class:`AgentIdentityStatus`
+    enum by FastAPI, so an unknown value yields a ``422`` rather than
+    reaching the handler and raising an unhandled ``ValueError``.
+    """
     store = _identity_store(request)
-    filter_status = AgentIdentityStatus(status) if status else None
-    identities = store.list_identities(status=filter_status, role=role)
+    identities = store.list_identities(status=status, role=role)
 
     return JSONResponse(
         {
@@ -65,7 +71,7 @@ def list_identities(
 
 
 # ---------------------------------------------------------------------------
-# GET /identities/{identity_id} — get single identity
+# GET /identities/{identity_id} - get single identity
 # ---------------------------------------------------------------------------
 
 
@@ -83,7 +89,7 @@ def get_identity(request: Request, identity_id: str) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# POST /identities/{identity_id}/revoke — revoke an identity
+# POST /identities/{identity_id}/revoke - revoke an identity
 # ---------------------------------------------------------------------------
 
 
@@ -103,7 +109,7 @@ async def revoke_identity(request: Request, identity_id: str) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# GET /identities/{identity_id}/audit — audit trail for an identity
+# GET /identities/{identity_id}/audit - audit trail for an identity
 # ---------------------------------------------------------------------------
 
 

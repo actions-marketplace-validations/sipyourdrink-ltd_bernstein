@@ -9,11 +9,11 @@ After every agent finishes a task, Bernstein runs the **janitor**, which
 combines two complementary verification surfaces. The first is a
 **structured-signal verifier** that evaluates declarative completion signals
 attached to the task (file exists, test passes, regex match). The second is
-the **gate pipeline** — a configurable sequence of build/lint/type/test/security
+the **gate pipeline** - a configurable sequence of build/lint/type/test/security
 gates that runs on the actual diff. Only when both layers agree does the task
 move toward merge.
 
-If verification fails, Bernstein doesn't just block — it feeds the failure
+If verification fails, Bernstein doesn't just block - it feeds the failure
 back into the cascade-router via `record_and_escalate()`, which retries the
 task on a more capable model in the same chain. An optional **cross-model
 verifier** runs the diff past a *second* model from a different provider for
@@ -38,6 +38,26 @@ The janitor evaluates each `CompletionSignal` declared on the task
 | `file_contains`  | A regex matches the file's content.                                     |
 | `llm_review`     | Synchronous LLM review against a written rubric.                        |
 | `llm_judge`      | Async LLM judge (`judge_task()`, `janitor.py:462`); used for ambiguous tasks. |
+| `schema_valid` / `criteria_match` / `hash_stable` / `figures_grounded` | Artifact-mode criteria over the produced artifact's canonical bytes. They fail closed on the filesystem path; only `evaluate_artifact_signals()`, called with the artifact in scope, can pass one. |
+
+A `test_passes` command is resolved against the tree before it runs. The path in
+the signal is written when the task is planned, not read off the suite, so the
+two drift: a plan mirroring `src/bernstein/core/security/` asks for
+`tests/unit/core/security/test_policy.py` while the file lives at
+`tests/unit/test_policy.py`. pytest then exits during collection without running
+anything, and the task is rejected over a path the agent never chose.
+`_resolve_test_path_command()` rewrites the command onto the file that exists,
+but only when exactly one file under the declared root carries that basename. A
+basename absent everywhere means the test was never written, and an ambiguous
+one means the janitor cannot tell which was meant; both keep the original path
+so the command fails honestly.
+
+Which evaluator runs is decided by the task's declared artifact kind.
+`verify_task_completion()` (`core/tasks/artifact_completion.py`) is the seam the
+completion paths call: a `code_diff` task falls through to `verify_task()`
+below, unchanged; an artifact-mode task is evaluated against the artifact it
+produced and completes on a signed lineage receipt rather than a commit. See
+[../operations/artifacts.md](../operations/artifacts.md).
 
 `verify_task()` (`janitor.py:80-97`) reduces all signals to a single
 pass/fail and a list of failure descriptions. The async
@@ -49,18 +69,18 @@ signal evaluation with async LLM judges (`judge_task()`,
 
 Two LLM-mediated paths exist for ambiguous verification:
 
-- **`llm_review`** — synchronous, runs once per signal, expects a yes/no
+- **`llm_review`** - synchronous, runs once per signal, expects a yes/no
   verdict against a rubric (`janitor.py:_check_llm_review`).
-- **`llm_judge`** — async with retry. `JUDGE_MODEL = "anthropic/
+- **`llm_judge`** - async with retry. `JUDGE_MODEL = "anthropic/
   claude-sonnet-4-20250514"`, `JUDGE_MAX_TOKENS = 1024`,
   `JUDGE_CONFIDENCE_THRESHOLD = 0.7`; below the threshold, results are
   flagged for human review (`janitor.py:36-44`). The judge prompt template
   lives in `prompts/judge.md`.
 
-The janitor never blocks merge by itself — it produces results that the
+The janitor never blocks merge by itself - it produces results that the
 orchestrator interprets. A failed janitor verification is the first
 escalation trigger consulted by the cascade-router (see
-[Pipeline → cascade-router escalation](#pipeline--cascade-router-escalation)
+[Pipeline → cascade-router escalation](#pipeline-cascade-router-escalation)
 below).
 
 ## Gates
@@ -93,6 +113,7 @@ Default required gates (only those whose `quality_gates.<flag>: true`):
 | `pii_scan`               | `pii_scan: true`            | `any_changed`      | required            |
 | `dlp_scan`               | `dlp_scan: true`            | `any_changed`      | required            |
 | `merge_conflict`         | `merge_conflict_check`      | `any_changed`      | required            |
+| `run_config`             | `run_config: true`          | `always`           | required            |
 | `coverage_delta`         | `coverage_delta`            | `python_changed`   | required            |
 | `dep_audit`              | `dep_audit`                 | `deps_changed`     | required            |
 | `import_cycle`           | `import_cycle_check`        | `python_changed`   | required            |
@@ -127,6 +148,7 @@ classes that subclass `GatePlugin` (`gate_plugins.py:20-46`):
 from pathlib import Path
 from bernstein.core.quality.gate_plugins import GatePlugin
 from bernstein.core.quality.gate_runner import GateResult
+
 
 class NoFooGate(GatePlugin):
     @property
@@ -190,13 +212,13 @@ The default reviewer mapping (`cross_model_verifier.py:37-43`):
 | `qwen`                 | `claude-haiku`                        |
 
 `CrossModelVerifierConfig` (`:84-106`) is `enabled=True` *as a class
-default*, but the orchestrator config wires it off by default — operators
+default*, but the orchestrator config wires it off by default - operators
 must enable it explicitly via `quality_gates.cross_model.enabled: true`.
 
 The reviewer is asked for one of two verdicts (`:120-123`):
 
-- `approve` — diff is fine.
-- `request_changes` — diff has issues. When `block_on_issues=True`
+- `approve` - diff is fine.
+- `request_changes` - diff has issues. When `block_on_issues=True`
   (default), this prevents merge and creates a fix task; otherwise
   findings are logged only.
 
@@ -220,39 +242,37 @@ After the orchestrator records a completed attempt, it calls
 janitor_passed=..., output=...)` (`cascade_router.py:386-478`). The
 function consults `_should_escalate()` (`:639-673`) in this order:
 
-1. **Hard task failure** — `attempt.success=False` with no other context →
+1. **Hard task failure** - `attempt.success=False` with no other context →
    escalate (`:655-657`).
-2. **Janitor verification failure** — `janitor_passed=False` → escalate
+2. **Janitor verification failure** - `janitor_passed=False` → escalate
    (`:660-661`). This is the wire from janitor results into model
    escalation.
-3. **Low-confidence regex on agent output** — `detect_low_confidence()`
+3. **Low-confidence regex on agent output** - `detect_low_confidence()`
    scans the last 2,000 chars for phrases like `"I'm not sure"`,
    `"partial implementation"`, `"TODO: escalat"` (`:371-384`,
    `_LOW_CONFIDENCE_PATTERN`). When matched, escalate.
-4. **Explicit failure flag** — `attempt.success=False` after the above
+4. **Explicit failure flag** - `attempt.success=False` after the above
    checks (`:670-671`).
 
-If any trigger fires, the cascade list (`_cascade_for_task()`,
-`:681-700`) is consulted: standard tasks step `haiku → sonnet → opus`;
-high-stakes tasks (role in `manager`/`architect`/`security`, complexity
-high, scope large, priority 1) skip haiku and step `sonnet → opus`. When
-the current model is already at the top, escalation gives up
-(`:448-455`).
+If any trigger fires, the cascade list (`_cascade_for_task()`) is
+consulted: tasks step `sonnet → opus`. The earlier `haiku` tier was
+retired, so standard and high-stakes tasks now share the same chain.
+When the current model is already at the top, escalation gives up.
 
 The bandit (`EpsilonGreedyBandit` from `core/cost/cost.py`) is updated on
-every observation (`cascade_router.py:559-568`). On the next call to
+every observation (`cascade_router.py`). On the next call to
 `select()` for a fresh task, the router proactively skips a tier when
 `observations >= MIN_OBSERVATIONS` and `success_rate < QUALITY_THRESHOLD`
-(`:594-614`) — i.e. the bandit learns "haiku never works for role=qa,
-start at sonnet."
+- i.e. the bandit learns "sonnet rarely works for role=qa, start at
+opus."
 
 Chain reports persist to `.sdd/metrics/cascade_chains.jsonl`
 (`save_chain()`, `:518-539`). Each line lists every attempt with
 `{model, cost_usd, latency_s, success, escalated, escalation_reason}`,
 the final model, total cost, and `saved_vs_direct_opus_usd`.
 
-The full cross-adapter (rather than intra-Claude) story — what happens on
-rate-limit / timeout / API error — lives in
+The full cross-adapter (rather than intra-Claude) story - what happens on
+rate-limit / timeout / API error - lives in
 `core/routing/cascade.py:CascadeFallbackManager`. Both surfaces are
 documented end-to-end in [Model routing](model-routing.md).
 
@@ -329,11 +349,11 @@ Quality endpoints (FastAPI, all in `core/routes/quality.py` and
 
 On-disk artefacts:
 
-- `.sdd/metrics/quality_gates.jsonl` — one line per gate execution
+- `.sdd/metrics/quality_gates.jsonl` - one line per gate execution
   (`quality_gates.py:1148`).
-- `.sdd/metrics/cascade_chains.jsonl` — one line per cascade chain
+- `.sdd/metrics/cascade_chains.jsonl` - one line per cascade chain
   completion (`cascade_router.py:533`).
-- `.sdd/metrics/tasks.jsonl` — task lifecycle events used by behaviour
+- `.sdd/metrics/tasks.jsonl` - task lifecycle events used by behaviour
   anomaly detection.
 
 Trend reads, file-health rollups, and budget forecasts all stream from

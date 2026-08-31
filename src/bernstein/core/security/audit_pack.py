@@ -8,14 +8,14 @@ control is paired with the concrete file or hash that proves it.
 
 This module provides that checklist:
 
-* :class:`EvidenceSource` — declarative pointer from a SOC 2 control to
+* :class:`EvidenceSource` - declarative pointer from a SOC 2 control to
   the on-disk artefact that backs it (audit-chain HMAC tail, credential-
   scoping policy, capability-matrix CI run, cluster-TLS cert validation
   log, wheelhouse verification result).
-* :func:`resolve_evidence_sources` — walks the project root, materialises
+* :func:`resolve_evidence_sources` - walks the project root, materialises
   each source into a path or sha256 reference, and records freshness so
   the markdown can flag stale evidence (last-modified > N days).
-* :func:`generate_audit_pack` — renders the checklist as Markdown,
+* :func:`generate_audit_pack` - renders the checklist as Markdown,
   one row per (control, source).
 
 The markdown is self-contained so it can be uploaded as a CI artifact
@@ -53,13 +53,16 @@ SourceKind = Literal[
 
 #: Markdown stamp used when a source is configured but the artefact is
 #: not present on disk yet (the operator hasn't run the relevant flow).
-PENDING_EVIDENCE: str = "evidence: pending — artefact not produced"
+PENDING_EVIDENCE: str = "evidence: pending - artefact not produced"
+
+#: Resolution status of a single evidence source.
+EvidenceStatus = Literal["OK", "PENDING", "STALE"]
 
 #: Pretty-printed status markers to keep the checklist scannable in
 #: terminal output and rendered Markdown alike.
-STATUS_OK: str = "OK"
-STATUS_PENDING: str = "PENDING"
-STATUS_STALE: str = "STALE"
+STATUS_OK: EvidenceStatus = "OK"
+STATUS_PENDING: EvidenceStatus = "PENDING"
+STATUS_STALE: EvidenceStatus = "STALE"
 
 #: Default freshness window in days. Anything older flips a source to
 #: ``STALE``. Operators tune via :func:`generate_audit_pack(stale_after_days=N)`.
@@ -102,13 +105,13 @@ class ResolvedEvidence:
             ``"sha256:<digest>"`` when the source is content-addressed.
         last_modified: Unix mtime of the resolved artefact (``0.0`` when
             pending).
-        details: Free-form structured data — e.g. wheelhouse counts, the
-            HMAC chain tail digest — that downstream renderers can show
+        details: Free-form structured data - e.g. wheelhouse counts, the
+            HMAC chain tail digest - that downstream renderers can show
             without re-reading disk.
     """
 
     source: EvidenceSource
-    status: Literal["OK", "PENDING", "STALE"]
+    status: EvidenceStatus
     evidence_ref: str
     last_modified: float = 0.0
     details: dict[str, Any] = field(default_factory=dict[str, Any])
@@ -164,25 +167,25 @@ DEFAULT_EVIDENCE_SOURCES: tuple[EvidenceSource, ...] = (
         control_id="CC6.8",
         kind="wheelhouse_verify",
         relpath=".sdd/runtime/wheelhouse",
-        description="bernstein verify wheelhouse — supply-chain integrity attestation for installed wheels.",
+        description="bernstein verify wheelhouse - supply-chain integrity attestation for installed wheels.",
     ),
     EvidenceSource(
         control_id="CC7.2",
         kind="audit_chain",
         relpath=".sdd/audit",
-        description="System monitoring proof — every event is HMAC-chained for tamper-evidence.",
+        description="System monitoring proof - every event is HMAC-chained for tamper-evidence.",
     ),
     EvidenceSource(
         control_id="CC7.4",
         kind="run_log",
         relpath=".sdd/runtime",
-        description="Recent orchestrator runs — proves incident response activity is recorded.",
+        description="Recent orchestrator runs - proves incident response activity is recorded.",
     ),
 )
 
 
 # ---------------------------------------------------------------------------
-# Resolvers — one per :class:`SourceKind`
+# Resolvers - one per :class:`SourceKind`
 # ---------------------------------------------------------------------------
 
 
@@ -190,7 +193,7 @@ def _hmac_chain_tail_digest(audit_dir: Path) -> tuple[str, float, dict[str, Any]
     """Return ``(sha256_ref, mtime, details)`` for the audit chain tail.
 
     The chain tail HMAC is a single content hash that summarises the
-    entire log — quoting it in the evidence pack lets an auditor pin a
+    entire log - quoting it in the evidence pack lets an auditor pin a
     specific tail without shipping the full chain inline.
     """
     if not audit_dir.is_dir():
@@ -372,7 +375,7 @@ def _resolve_one(
         ref, mtime, details = _wheelhouse_verify_summary(target)
     elif source.kind == "run_log":
         ref, mtime, details = _run_log_summary(target, include_since=include_since)
-    else:  # pragma: no cover — Literal exhaustively covered above
+    else:  # pragma: no cover - Literal exhaustively covered above
         ref, mtime, details = "", 0.0, {"reason": f"unknown source kind {source.kind!r}"}
 
     if not ref:
@@ -395,7 +398,7 @@ def _resolve_one(
         )
 
     # Either a relative path or a content-addressed reference. Prefer the
-    # file path when the source kind has one — content hashes alone are
+    # file path when the source kind has one - content hashes alone are
     # opaque without the file location.
     pretty = f"evidence: {source.relpath} ({ref})"
     return ResolvedEvidence(
@@ -513,7 +516,7 @@ def render_markdown(
 
 
 # ---------------------------------------------------------------------------
-# Public entry point — used by the CLI
+# Public entry point - used by the CLI
 # ---------------------------------------------------------------------------
 
 
@@ -526,7 +529,7 @@ class AuditPackResult:
         markdown_path: On-disk path to the saved markdown (``None`` when
             ``write=False``).
         manifest: JSON manifest with one row per resolved evidence
-            source — useful for machine-parseable downstream tooling
+            source - useful for machine-parseable downstream tooling
             (CI artefacts, Vanta/Drata sync, etc.).
         manifest_path: On-disk path to the saved manifest.
         resolved: The resolved evidence list.

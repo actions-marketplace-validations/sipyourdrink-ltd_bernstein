@@ -1,4 +1,4 @@
-"""Workflow DSL — declarative YAML/Python for conditional task DAGs.
+"""Workflow DSL - declarative YAML/Python for conditional task DAGs.
 
 Extends governed workflow mode (``WorkflowDefinition``) with user-authored
 conditional DAGs.  DAG nodes map to workflow phases; edges carry guard
@@ -72,7 +72,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -80,10 +80,27 @@ import yaml
 
 from bernstein.core.knowledge.task_graph import EdgeType
 from bernstein.core.models import Scope, Task, TaskStatus
+from bernstein.core.orchestration.activity import ActivityKind
+from bernstein.core.planning.recovery_receipt import DEFAULT_JOURNAL_TAIL
 from bernstein.core.planning.workflow import WorkflowDefinition, WorkflowPhase
+from bernstein.core.tasks.lifecycle import (
+    DEPENDENCY_BLOCKED_STATUSES,
+    SUCCESSFUL_TASK_STATUSES,
+    UNSUCCESSFUL_TERMINAL_STATUSES,
+)
+from bernstein.core.tasks.unreachable import (
+    blocking_dependency,
+    dependency_can_never_satisfy,
+    unreachable_tasks,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
+
+    from bernstein.core.lineage.spine import LineageSpine
+    from bernstein.core.quality.quality_gates import QualityGatesResult
+    from bernstein.core.replay.journal import EventJournal
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +289,7 @@ def _parse_condition(raw: str) -> ast.Expression:
     try:
         return ast.parse(raw, mode="eval")
     except SyntaxError as exc:
-        msg = f"Invalid condition syntax: {raw!r} — {exc}"
+        msg = f"Invalid condition syntax: {raw!r} - {exc}"
         raise ConditionError(msg) from exc
 
 
@@ -328,6 +345,8 @@ class DAGNode:
         description: Human-readable description.
         estimated_minutes: Time estimate for scheduling.
         retry: Optional retry/loop configuration.
+        activity_kind: The agent modality (research/data/ops/browser).
+            None means coding (the default scheduling path).
     """
 
     id: str
@@ -336,6 +355,7 @@ class DAGNode:
     description: str = ""
     estimated_minutes: int = 30
     retry: RetryPolicy | None = None
+    activity_kind: ActivityKind | None = None
 
 
 @dataclass(frozen=True)
@@ -383,7 +403,15 @@ class WorkflowDAG:
         phase_hash = self.definition.definition_hash()
         dag_payload = json.dumps(
             {
-                "nodes": [{"id": n.id, "phase": n.phase, "role": n.role} for n in self.nodes],
+                "nodes": [
+                    {
+                        "id": n.id,
+                        "phase": n.phase,
+                        "role": n.role,
+                        "activity_kind": n.activity_kind.value if n.activity_kind else None,
+                    }
+                    for n in self.nodes
+                ],
                 "edges": [
                     {
                         "source": e.source,
@@ -531,6 +559,16 @@ def _parse_nodes(raw: dict[str, Any]) -> tuple[DAGNode, ...]:
                 raise DSLError(msg)
             retry = _parse_retry(node_id, retry_raw)
 
+        activity_kind: ActivityKind | None = None
+        activity_raw = spec.get("activity")
+        if activity_raw is not None:
+            try:
+                activity_kind = ActivityKind(str(activity_raw))
+            except ValueError:
+                valid = ", ".join(sorted(k.value for k in ActivityKind))
+                msg = f"nodes.{node_id}.activity: unknown kind {activity_raw!r}, expected one of [{valid}]"
+                raise DSLError(msg) from None
+
         nodes.append(
             DAGNode(
                 id=node_id,
@@ -539,6 +577,7 @@ def _parse_nodes(raw: dict[str, Any]) -> tuple[DAGNode, ...]:
                 description=str(spec.get("description", "")),
                 estimated_minutes=int(spec.get("estimated_minutes", 30)),
                 retry=retry,
+                activity_kind=activity_kind,
             )
         )
 
@@ -693,6 +732,11 @@ def validate_dag(dag: WorkflowDAG) -> ValidationResult:
     if result.errors:
         return result
 
+    # Check activity kinds.
+    for node in dag.nodes:
+        if node.activity_kind is not None and not isinstance(node.activity_kind, ActivityKind):
+            result.errors.append(f"Node {node.id!r} has invalid activity_kind: {node.activity_kind!r}")
+
     node_map = dag.node_map
     phase_index = {name: i for i, name in enumerate(phase_names)}
 
@@ -820,13 +864,52 @@ class EdgeResolution(StrEnum):
     PENDING = "pending"  # Upstream not yet terminal.
 
 
-TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED})
+# Derived from the lifecycle sets rather than hand-listed. The hand-written
+# version omitted CLOSED, ORPHANED, ABANDONED, REFUSED and BLOCKED_BY_ABANDON,
+# so an edge out of a source in any of those resolved PENDING forever: a node
+# whose dependency had completed and been reaped (CLOSED) never became ready,
+# and a strand out of an abandoned or refused node stopped at the first ring -
+# the very failure mode the BLOCKED_BY_FAILED_DEP entry was added to prevent.
+#
+# Deriving it means a status added to the lifecycle cannot be forgotten here.
+TERMINAL_STATUSES: frozenset[TaskStatus] = SUCCESSFUL_TASK_STATUSES | UNSUCCESSFUL_TERMINAL_STATUSES
+
+# The node whose skipped edge stranded this one. Deliberately the same key the
+# task store stamps on its own cascade (#3452), so a record from either
+# scheduler answers "why did this never run" with a lookup rather than an
+# inference.
+BLOCKING_NODE_METADATA_KEY = "blocking_task_id"
+
+# The inbound edges that all resolved SKIPPED, rendered "source -> target".
+SKIPPED_EDGES_METADATA_KEY = "skipped_edges"
+
+# Why the blocking node named by BLOCKING_NODE_METADATA_KEY is blocking. A second
+# key rather than a richer value under the existing one, so every reader that
+# already looks up ``blocking_task_id`` keeps working untouched.
+BLOCKING_CAUSE_METADATA_KEY = "blocking_cause"
+
+
+class BlockingCause(StrEnum):
+    """Why a stranded node's blocking dependency never let it run.
+
+    The outcome is the same either way - the dependent is stranded - but the
+    operator response is not. A node that failed once with no retry policy may
+    just need one, while a node that burned every attempt it was given is
+    saying the failure is not transient. Both looked identical on the record
+    before this existed.
+    """
+
+    #: The blocking node reached a terminal non-success state, and either
+    #: declared no retry policy or never exhausted one.
+    DEPENDENCY_FAILED = "dependency_failed"
+    #: The blocking node declared ``retry:`` and used up ``max_attempts``.
+    RETRY_EXHAUSTED = "retry_exhausted"
 
 
 class DAGExecutor:
     """Drives task scheduling through a conditional DAG.
 
-    Works alongside ``WorkflowExecutor`` — phases gate which nodes are
+    Works alongside ``WorkflowExecutor`` - phases gate which nodes are
     eligible; the ``DAGExecutor`` resolves conditional edges within those
     phases.
 
@@ -864,9 +947,24 @@ class DAGExecutor:
             return EdgeResolution.PENDING
 
         if edge.condition is None:
-            # Unconditional edge: satisfied when source is DONE.
-            if source_task.status == TaskStatus.DONE:
+            # Unconditional edge: satisfied when the source succeeded. CLOSED
+            # counts, not just DONE - a task is closed once its agent is reaped
+            # and its branch merged, which is the store's rule too
+            # (_dependencies_satisfied accepts either).
+            if source_task.status in SUCCESSFUL_TASK_STATUSES:
                 return EdgeResolution.SATISFIED
+            # Otherwise ask the shared classification instead of inferring
+            # "not done means never" locally, so this side cannot drift from
+            # the store's answer for the same status.
+            if dependency_can_never_satisfy(source_task):
+                return EdgeResolution.SKIPPED
+            return EdgeResolution.SKIPPED
+
+        # A source materialised as unreachable produced no result, so there is
+        # no outcome for a guard to test. Skipping without evaluating keeps the
+        # strand propagating instead of letting a guard such as
+        # ``status != 'done'`` read a node that never ran as a live failure.
+        if source_task.status == TaskStatus.BLOCKED_BY_FAILED_DEP:
             return EdgeResolution.SKIPPED
 
         # Conditional edge: evaluate guard predicate.
@@ -890,16 +988,27 @@ class DAGExecutor:
             return self.should_retry(node_id, existing)
         return existing is None
 
-    def _are_deps_resolved(self, incoming: list[DAGEdge], tasks: dict[str, Task]) -> bool:
-        """Return True if all incoming edges are resolved and at least one is satisfied."""
+    def _resolve_incoming(self, incoming: list[DAGEdge], tasks: dict[str, Task]) -> EdgeResolution:
+        """Collapse a node's inbound edges into a single resolution.
+
+        ``SATISFIED`` when at least one edge is satisfied and none is still
+        pending: the node is eligible. ``PENDING`` when any edge is still
+        pending: the node may yet become eligible. ``SKIPPED`` when every edge
+        resolved ``SKIPPED``: the node can never become eligible.
+
+        That last case is the one a bool return could not express (#3622). It
+        collapsed into the same "not ready" as PENDING, so ``ready_nodes``
+        omitted the node and no caller could tell a node that was still
+        waiting from one that had run out of paths in.
+        """
         any_satisfied = False
         for edge in incoming:
             resolution = self.resolve_edge(edge, tasks)
             if resolution == EdgeResolution.PENDING:
-                return False
+                return EdgeResolution.PENDING
             if resolution == EdgeResolution.SATISFIED:
                 any_satisfied = True
-        return any_satisfied
+        return EdgeResolution.SATISFIED if any_satisfied else EdgeResolution.SKIPPED
 
     def ready_nodes(self, tasks: dict[str, Task]) -> list[str]:
         """Return node IDs whose dependencies are fully resolved.
@@ -931,10 +1040,145 @@ class DAGExecutor:
                     ready.append(node.id)
                 continue
 
-            if self._are_deps_resolved(incoming, tasks) and self._is_node_eligible(node.id, existing):
+            if self._resolve_incoming(incoming, tasks) == EdgeResolution.SATISFIED and self._is_node_eligible(
+                node.id, existing
+            ):
                 ready.append(node.id)
 
         return ready
+
+    def materialize_unreachable(self, tasks: dict[str, Task]) -> list[str]:
+        """Record every node that can no longer become ready, and what stranded it.
+
+        A node whose inbound edges all resolved ``SKIPPED`` is never returned
+        by ``ready_nodes``, so before this no Task was constructed for it and
+        the run record simply did not mention it: the node was neither blocked
+        nor cancelled, it was absent. Here it is written into *tasks* in
+        ``BLOCKED_BY_FAILED_DEP`` - the state the task store moves a stranded
+        dependent into (#3452) - carrying the skipped edges and the node that
+        stranded it.
+
+        Only a node stranded by an *unsuccessful* upstream is materialised. A
+        node whose inbound edges all skipped because their guards were false
+        while the sources completed is a branch not taken, not a strand, and
+        stays absent exactly as before. That distinction is
+        ``blocking_dependency``'s rather than a second one stated here.
+
+        Nodes are materialised a ring at a time: a node stranded by one
+        materialised in this call is found on the following pass rather than
+        mid-pass, so the answer does not depend on DAG node order.
+
+        Args:
+            tasks: Map of node_id -> Task for the run. Mutated in place.
+
+        Returns:
+            The node IDs materialised by this call, sorted.
+        """
+        materialized: list[str] = []
+
+        while True:
+            ring: dict[str, Task] = {}
+            for node in self._dag.nodes:
+                if node.id in tasks:
+                    continue
+                incoming = self._edges_by_target.get(node.id, [])
+                if not incoming or self._resolve_incoming(incoming, tasks) != EdgeResolution.SKIPPED:
+                    continue
+                blocked = self._blocked_task(node, incoming)
+                blocking_node = blocking_dependency(blocked, tasks)
+                if blocking_node is None:
+                    continue
+                blocked.metadata[BLOCKING_NODE_METADATA_KEY] = blocking_node
+                blocked.metadata[BLOCKING_CAUSE_METADATA_KEY] = str(self._blocking_cause(blocking_node))
+                blocked.result_summary = f"dependency {blocking_node} is {tasks[blocking_node].status.value}"
+                ring[node.id] = blocked
+
+            if not ring:
+                return sorted(materialized)
+
+            tasks.update(ring)
+            materialized.extend(ring)
+
+    def unreachable_nodes(self, tasks: Mapping[str, Task]) -> list[tuple[str, str]]:
+        """Return ``(node_id, blocking_node_id)`` for nodes that could never run.
+
+        Derived from the run record alone: no edge is re-resolved and nothing
+        is re-executed, so a replayed journal yields the same answer as the
+        live map, and two runs over the same graph yield the same pairs in the
+        same order.
+
+        The rule is ``unreachable_tasks`` (#3452) rather than a second one
+        stated here, applied to a projection of the record. The projection is
+        keyed by node id, because that is what a DAG edge names while a Task
+        id carries a per-run suffix; and it carries inbound edges only for the
+        nodes materialised as blocked. The two schedulers read a dependency
+        differently - the store needs every dependency to have delivered, a
+        DAG node needs only one inbound edge satisfied - so projecting every
+        node's inbound edges would report a node that ran on one satisfied
+        edge while another was skipped. What strands a DAG node is its whole
+        inbound set resolving ``SKIPPED``, which is exactly the set
+        ``materialize_unreachable`` records.
+
+        Args:
+            tasks: Map of node_id -> Task for the run.
+
+        Returns:
+            ``(node_id, blocking_node_id)`` pairs, sorted by node ID.
+        """
+        projection = [
+            replace(
+                task,
+                id=node_id,
+                depends_on=list(task.depends_on) if task.status in DEPENDENCY_BLOCKED_STATUSES else [],
+            )
+            for node_id, task in tasks.items()
+        ]
+        return unreachable_tasks(projection)
+
+    def _blocked_task(self, node: DAGNode, incoming: list[DAGEdge]) -> Task:
+        """Build the terminal record for a node that can never become ready.
+
+        ``depends_on`` carries every inbound source rather than
+        ``create_task``'s unconditional subset, because all of them skipped -
+        that whole set is what the node waited on and never got.
+        """
+        task = Task(
+            # Deterministic where ``create_task`` mints a uuid: this node never
+            # runs, so nothing claims it by id, and a replay of the same run
+            # should reproduce the row rather than a fresh one.
+            id=f"{node.id}-unreachable",
+            title=node.description or f"DAG node: {node.id}",
+            description=node.description,
+            role=node.role,
+            priority=2,
+            scope=Scope.MEDIUM,
+            estimated_minutes=node.estimated_minutes,
+            status=TaskStatus.BLOCKED_BY_FAILED_DEP,
+            depends_on=sorted(edge.source for edge in incoming),
+            created_at=time.time(),
+        )
+        task.terminal_reason = "blocked_by_failed_dependency"
+        task.metadata[SKIPPED_EDGES_METADATA_KEY] = [
+            f"{edge.source} -> {edge.target}" for edge in sorted(incoming, key=lambda e: (e.source, e.target))
+        ]
+        return task
+
+    def _blocking_cause(self, node_id: str) -> BlockingCause:
+        """Classify why ``node_id`` is blocking its dependents.
+
+        Only a node that declared a retry policy AND used up ``max_attempts``
+        counts as exhausted. A node whose ``until`` condition was met stopped
+        deliberately with attempts to spare, which is not the same statement
+        about the failure, so it stays ``DEPENDENCY_FAILED``.
+        """
+        node = self._node_map.get(node_id)
+        if node is None or node.retry is None:
+            return BlockingCause.DEPENDENCY_FAILED
+
+        if self._retry_counts.get(node_id, 0) >= node.retry.max_attempts:
+            return BlockingCause.RETRY_EXHAUSTED
+
+        return BlockingCause.DEPENDENCY_FAILED
 
     def should_retry(self, node_id: str, task: Task) -> bool:
         """Check if a failed task should be retried per the node's retry policy.
@@ -967,11 +1211,53 @@ class DAGExecutor:
         """Increment the retry counter for a node."""
         self._retry_counts[node_id] = self._retry_counts.get(node_id, 0) + 1
 
-    def create_task(self, node_id: str) -> Task:
+    def create_task(
+        self,
+        node_id: str,
+        *,
+        source_task: Task | None = None,
+        source_edge: DAGEdge | None = None,
+        spine: LineageSpine | None = None,
+        journal: EventJournal | None = None,
+        gate_report: QualityGatesResult | None = None,
+        recovery_store: dict[str, str] | None = None,
+        actor: str = "dag-executor",
+        model: str = "",
+        timestamp: int = 0,
+        journal_tail_limit: int = DEFAULT_JOURNAL_TAIL,
+    ) -> Task:
         """Create a Task from a DAG node template.
+
+        When ``source_task`` is supplied (an ``on_fail`` recovery hop), the
+        created Task carries a lineage-attested failure receipt built from the
+        failing task's condition context, the tail of the run journal filtered
+        to that task, and its quality gate report. The receipt is the recovery
+        task's primary artifact: it is anchored on the run's lineage spine (when
+        ``spine`` is given) and injected into the recovery agent's prompt
+        through ``recovery_store`` (the same channel ``evict_degraded_sessions``
+        populates). When ``source_task`` is ``None`` the output is byte-identical
+        to a bare node instantiation - root and unconditional nodes are
+        unchanged.
 
         Args:
             node_id: The DAG node ID to instantiate.
+            source_task: The failing upstream Task, when this is a recovery hop.
+            source_edge: The resolved failing edge; its ``source`` names the
+                failing node. Falls back to ``source_task.id`` when omitted.
+            spine: The run's lineage spine; when given, the receipt is anchored
+                and its entry hash is stamped on the Task metadata.
+            journal: The run's event journal; its tail (filtered to the failing
+                task) is folded into the receipt.
+            gate_report: The failing task's quality gate report.
+            recovery_store: The ``orchestrator._context_recovery`` channel; when
+                given, the rendered receipt preamble is stored keyed by the new
+                Task id.
+            actor: Actor recorded on the spine entry.
+            model: Model string recorded on the spine entry.
+            timestamp: Stable integer timestamp for the spine entry (default 0
+                so identical fixtures replay byte-identically).
+            journal_tail_limit: Maximum number of trailing journal events kept
+                in the receipt.
 
         Returns:
             A new Task ready for scheduling.
@@ -989,7 +1275,7 @@ class DAGExecutor:
             if edge.condition is None and edge.edge_type in {EdgeType.BLOCKS, EdgeType.VALIDATES}
         ]
 
-        return Task(
+        task = Task(
             id=task_id,
             title=node.description or f"DAG node: {node.id}",
             description=node.description,
@@ -1001,6 +1287,84 @@ class DAGExecutor:
             depends_on=dep_ids,
             created_at=time.time(),
         )
+
+        if source_task is None:
+            # Byte-identical to the historical behaviour: no receipt, no
+            # metadata mutation (metadata stays its default empty dict).
+            return task
+
+        self._attach_recovery_receipt(
+            task,
+            node=node,
+            source_task=source_task,
+            source_edge=source_edge,
+            spine=spine,
+            journal=journal,
+            gate_report=gate_report,
+            recovery_store=recovery_store,
+            actor=actor,
+            model=model,
+            timestamp=timestamp,
+            journal_tail_limit=journal_tail_limit,
+        )
+        return task
+
+    def _attach_recovery_receipt(
+        self,
+        task: Task,
+        *,
+        node: DAGNode,
+        source_task: Task,
+        source_edge: DAGEdge | None,
+        spine: LineageSpine | None,
+        journal: EventJournal | None,
+        gate_report: QualityGatesResult | None,
+        recovery_store: dict[str, str] | None,
+        actor: str,
+        model: str,
+        timestamp: int,
+        journal_tail_limit: int,
+    ) -> None:
+        """Build, anchor, and inject a failure receipt for a recovery Task."""
+        from bernstein.core.planning.recovery_receipt import (
+            RECEIPT_CONTENT_HASH_METADATA_KEY,
+            RECEIPT_FAILING_NODE_METADATA_KEY,
+            RECEIPT_HASH_METADATA_KEY,
+            build_receipt,
+            record_receipt_on_spine,
+        )
+        from bernstein.core.replay.journal import load_events
+
+        failing_node_id = source_edge.source if source_edge is not None else source_task.id
+        journal_events = load_events(journal.path).events if journal is not None else None
+
+        receipt = build_receipt(
+            failing_node_id=failing_node_id,
+            recovery_node_id=node.id,
+            source_status=source_task.status.value,
+            condition_context=build_condition_context(source_task),
+            source_task_id=source_task.id,
+            journal_events=journal_events,
+            gate_report=gate_report,
+            journal_tail_limit=journal_tail_limit,
+        )
+
+        task.metadata[RECEIPT_CONTENT_HASH_METADATA_KEY] = receipt.content_hash()
+        task.metadata[RECEIPT_FAILING_NODE_METADATA_KEY] = failing_node_id
+
+        if spine is not None:
+            entry_hash = record_receipt_on_spine(
+                receipt,
+                spine=spine,
+                actor=actor,
+                model=model,
+                timestamp=timestamp,
+            )
+            receipt = receipt.with_entry_hash(entry_hash)
+            task.metadata[RECEIPT_HASH_METADATA_KEY] = entry_hash
+
+        if recovery_store is not None:
+            recovery_store[task.id] = receipt.render_preamble()
 
 
 # ---------------------------------------------------------------------------

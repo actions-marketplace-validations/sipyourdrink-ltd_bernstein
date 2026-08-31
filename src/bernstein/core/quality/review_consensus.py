@@ -267,7 +267,7 @@ def bucket_for_score(score: float) -> ConsensusLevel:
 
 def _normalise_tokens(text: str) -> frozenset[str]:
     """Lowercase, drop stopwords / short tokens, return a set for Jaccard."""
-    tokens = re.findall(r"[A-Za-z_][A-Za-z_0-9]+", text.lower())
+    tokens = re.findall(r"[^\W\d]\w+", text.lower(), flags=re.ASCII)
     return frozenset(t for t in tokens if t not in _STOPWORDS and len(t) >= 3)
 
 
@@ -442,14 +442,14 @@ def must_address(
 
 
 # ---------------------------------------------------------------------------
-# Rendering - the review-bot-ack sticky comment provenance line
+# Rendering - the PR review summary provenance line
 # ---------------------------------------------------------------------------
 
 
 def render_provenance(finding: ConsensusFinding) -> str:
     """Render the ``[detected by N/M bots, agreement Y%]`` provenance tag.
 
-    This is the snippet the review-bot-ack sticky comment renderer appends
+    This is the snippet the PR review summary renderer appends
     to each finding so an operator can see consensus at a glance.
     """
     percent = round(finding.agreement_ratio * 100)

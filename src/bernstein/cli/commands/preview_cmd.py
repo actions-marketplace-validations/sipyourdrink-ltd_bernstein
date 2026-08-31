@@ -1,14 +1,14 @@
-"""``bernstein preview`` — sandboxed dev-server with public tunnel link.
+"""``bernstein preview`` - sandboxed dev-server with public tunnel link.
 
 Subcommands:
 
-* ``preview start`` — auto-discover (or override) the dev-server
+* ``preview start`` - auto-discover (or override) the dev-server
   command, boot it inside the originating session's sandbox, expose it
   via the existing ``bernstein tunnel`` wrapper, and print a shareable
   HTTPS URL.
-* ``preview list`` — print every active preview as a table or JSON.
-* ``preview status <id>`` — print details for a single preview.
-* ``preview stop <id>|--all`` — tear the preview down.
+* ``preview list`` - print every active preview as a table or JSON.
+* ``preview status <id>`` - print details for a single preview.
+* ``preview stop <id>|--all`` - tear the preview down.
 
 The CLI is intentionally thin: every meaningful decision lives in
 :class:`bernstein.core.preview.PreviewManager`.
@@ -20,7 +20,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 
@@ -32,6 +32,7 @@ from bernstein.core.preview import (
     PreviewState,
     list_candidates,
 )
+from bernstein.core.preview.manager import SandboxLike
 
 if TYPE_CHECKING:
     from bernstein.core.sandbox.backend import SandboxSession
@@ -132,7 +133,10 @@ def start_cmd(
     try:
         preview = manager.start(
             cwd=cwd,
-            sandbox_session=sandbox_session,
+            # SandboxSession structurally satisfies SandboxLike (backend_name,
+            # session_id); SandboxLike is a plain class rather than a
+            # typing.Protocol, so mypy can't see the duck-typed match.
+            sandbox_session=cast(SandboxLike, sandbox_session),
             command=command_arg,
             provider=provider,
             auth_mode=AuthMode(auth_mode),
@@ -271,7 +275,7 @@ async def _create_sandbox_session(cwd: Path) -> SandboxSession:
 
     Reuses the existing :class:`WorktreeSandboxBackend` so the dev
     server runs in the same isolation primitive the originating
-    session used. We deliberately don't try to "re-attach" — the
+    session used. We deliberately don't try to "re-attach" - the
     backend either reuses a warm worktree (when *cwd* already lives
     under ``.sdd/worktrees/``) or carves out a new lightweight one.
     """

@@ -1,4 +1,4 @@
-"""Man page generator — creates troff-format man pages from Click CLI commands.
+"""Man page generator - creates troff-format man pages from Click CLI commands.
 
 Walks the Click command tree and produces one man page per command/subcommand
 in standard troff format suitable for ``man(1)``.
@@ -166,7 +166,7 @@ def generate_all_man_pages(cli_group: click.Group) -> dict[str, str]:
     ]
     pages["bernstein"] = generate_man_page(
         cmd_name="bernstein",
-        cmd_help=cli_group.help or "Declarative agent orchestration for engineering teams.",
+        cmd_help=cli_group.help or "The open-source governance layer for AI agents.",
         options=top_options,
         subcommands=top_subcommands,
     )

@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -41,6 +41,7 @@ from bernstein.core.autofix.telemetry_grounded import (
     parse_json_payload,
     verify_webhook_signature,
 )
+from bernstein.core.routes._unconfigured import UNCONFIGURED_STATUS
 
 if TYPE_CHECKING:
     from bernstein.core.autofix.telemetry_grounded import AuditEmitter
@@ -71,7 +72,7 @@ class TelemetryReceiverState:
 
 def configure_receiver(
     *,
-    app_state: object,
+    app_state: Any,
     settings: TelemetrySettings,
     retriever: GroundingRetriever,
     dispatch_hook: GroundedDispatchHook,
@@ -146,7 +147,7 @@ async def _handle_source(
     )
     if state is None:
         return JSONResponse(
-            status_code=503,
+            status_code=UNCONFIGURED_STATUS,
             content={
                 "detail": (
                     "telemetry-grounded autofix receiver is not configured; bootstrap must call configure_receiver()."
@@ -161,7 +162,7 @@ async def _handle_source(
         secret = os.environ.get(cfg.secret_env, "")
         if not secret:
             return JSONResponse(
-                status_code=503,
+                status_code=UNCONFIGURED_STATUS,
                 content={
                     "detail": (
                         f"telemetry source {source!r} requires secret_env {cfg.secret_env!r}; the env var is not set."
@@ -227,8 +228,7 @@ def _extract_signature_header(request: Request) -> str:
     """
     headers_lower = {k.lower(): v for k, v in request.headers.items()}
     for header_name in (
-        "sentry-hook-signature",  # Sentry / GlitchTip integrations
-        "x-glitchtip-hook-signature",
+        "sentry-hook-signature",  # Sentry-protocol integrations
         "x-hub-signature-256",  # GitHub workflow_run webhook
         "x-datadog-signature",  # Datadog
         "x-bernstein-telemetry-signature",  # custom / loki / jsonl
@@ -241,7 +241,7 @@ def _extract_signature_header(request: Request) -> str:
 
 @router.post("/webhooks/telemetry/sentry/")
 async def telemetry_sentry(request: Request) -> JSONResponse:
-    """Receive a Sentry / GlitchTip issue-alert webhook."""
+    """Receive a Sentry-protocol issue-alert webhook."""
     return await _handle_source(request, "sentry")
 
 

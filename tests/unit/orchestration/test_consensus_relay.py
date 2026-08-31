@@ -538,7 +538,9 @@ _cycle_id_alphabet = "abcdefghijklmnopqrstuvwxyz0123456789-_"
 
 
 class TestPropertyChainIntegrity:
-    @settings(max_examples=40, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=40, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         ids=st.lists(
             st.text(min_size=1, max_size=12, alphabet=_cycle_id_alphabet),
@@ -562,7 +564,9 @@ class TestPropertyChainIntegrity:
             s.append(cycle_id=cid, **kw)
         s.verify()
 
-    @settings(max_examples=40, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=40, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         ids=st.lists(
             st.text(min_size=1, max_size=12, alphabet=_cycle_id_alphabet),
@@ -596,7 +600,9 @@ class TestPropertyChainIntegrity:
         with pytest.raises(RelayChainError):
             s.verify()
 
-    @settings(max_examples=30, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=30, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         ids=st.lists(
             st.text(min_size=1, max_size=12, alphabet=_cycle_id_alphabet),
@@ -623,7 +629,9 @@ class TestPropertyChainIntegrity:
         second = [canonicalise_relay(e) for e in s.all_entries()]
         assert first == second
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         cycle_id=st.text(min_size=1, max_size=20, alphabet=_cycle_id_alphabet),
         kw=_cycle_kwargs(),
@@ -639,7 +647,9 @@ class TestPropertyChainIntegrity:
         reloaded = RelayDocument.from_dict(json.loads(json.dumps(doc.to_dict())))
         assert reloaded == doc
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         key_seed=st.binary(min_size=16, max_size=64),
         kw=_cycle_kwargs(),
@@ -651,7 +661,9 @@ class TestPropertyChainIntegrity:
         b = s2.append(cycle_id="cx", now_ns=0, **kw)
         assert a.operator_hmac != b.operator_hmac
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         cycle_id=st.text(min_size=1, max_size=12, alphabet=_cycle_id_alphabet),
         kw=_cycle_kwargs(),
@@ -660,7 +672,9 @@ class TestPropertyChainIntegrity:
         doc = _doc(cycle_id=cycle_id, **{k: v for k, v in kw.items() if k != "phase"}, phase=kw["phase"])
         assert canonicalise_relay(doc) == canonicalise_relay(doc)
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(kw=_cycle_kwargs())
     def test_acknowledge_sets_flag_property(self, tmp_path: Path, kw: dict[str, Any]) -> None:
         s = RelayStore(tmp_path / f"ack-{uuid.uuid4().hex}", key=b"k" * 32)
@@ -670,7 +684,9 @@ class TestPropertyChainIntegrity:
         # second acknowledge is a no-op
         assert s.acknowledge("c1").operator_hmac == out.operator_hmac
 
-    @settings(max_examples=30, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=30, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         ids=st.lists(
             st.text(min_size=1, max_size=12, alphabet=_cycle_id_alphabet),
@@ -696,7 +712,9 @@ class TestPropertyChainIntegrity:
         assert on_disk == set(ids)
         assert s.cycles() == ids
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(kw=_cycle_kwargs())
     def test_head_reflects_latest_append(self, tmp_path: Path, kw: dict[str, Any]) -> None:
         s = RelayStore(tmp_path / f"head-{uuid.uuid4().hex}", key=b"k" * 32)
@@ -705,7 +723,9 @@ class TestPropertyChainIntegrity:
         head = s.head()
         assert head is not None and head.cycle_id == last.cycle_id
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         cycle_id=st.text(min_size=1, max_size=12, alphabet=_cycle_id_alphabet),
         kw=_cycle_kwargs(),
@@ -728,7 +748,9 @@ class TestPropertyChainIntegrity:
         with pytest.raises(RelayChainError):
             s.verify()
 
-    @settings(max_examples=30, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=30, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         ids=st.lists(
             st.text(min_size=1, max_size=12, alphabet=_cycle_id_alphabet),
@@ -757,7 +779,9 @@ class TestPropertyChainIntegrity:
             assert curr.prev_hash == _relay_entry_hash(prev)
             assert curr.prev_cycle_id == prev.cycle_id
 
-    @settings(max_examples=15, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=15, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(kw=_cycle_kwargs())
     def test_export_markdown_round_trip(self, tmp_path: Path, kw: dict[str, Any]) -> None:
         s = RelayStore(tmp_path / f"md-{uuid.uuid4().hex}", key=b"k" * 32)
@@ -765,7 +789,9 @@ class TestPropertyChainIntegrity:
         md = s.export_markdown()
         assert "# Cycle relay c1" in md
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         bad_phase=st.text(min_size=1, max_size=20).filter(lambda x: x not in _PHASES),
     )
@@ -774,7 +800,9 @@ class TestPropertyChainIntegrity:
         with pytest.raises(RelayValidationError):
             s.append(cycle_id="cx", phase=bad_phase)
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(
+        derandomize=True, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
     @given(
         prefix=st.text(min_size=0, max_size=10, alphabet=_cycle_id_alphabet),
         sep=st.sampled_from(["/", "\\", "\x00", "../", "/etc/passwd"]),
@@ -791,6 +819,129 @@ class TestPropertyChainIntegrity:
         s = RelayStore(tmp_path / f"traversal-{uuid.uuid4().hex}", key=b"k" * 32)
         with pytest.raises(RelayValidationError):
             s.append(cycle_id=bad_id, phase="plan")
+
+
+# ---------------------------------------------------------------------------
+# Spawn-prompt section builder (issue #4678)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSpawnSection:
+    """Tests for :func:`bernstein.core.orchestration.consensus_relay.build_spawn_section`."""
+
+    def test_empty_store_returns_empty_string(self, tmp_path: Path) -> None:
+        from bernstein.core.orchestration.consensus_relay import build_spawn_section
+
+        result = build_spawn_section(relay_root=tmp_path / "empty", key=b"k" * 32)
+        assert result == ""
+
+    def test_renders_phase_and_decisions(self, tmp_path: Path) -> None:
+        from bernstein.core.orchestration.consensus_relay import RelayDecision, RelayStore, build_spawn_section
+
+        store = RelayStore(tmp_path / "relay", key=b"k" * 32)
+        store.append(
+            cycle_id="c1",
+            phase="plan",
+            decisions=(RelayDecision(title="go left", rationale="safer path", confidence=0.85),),
+            open_questions=("is the timeout right?",),
+            next_action="confirm with team",
+        )
+        section = build_spawn_section(relay_root=tmp_path / "relay", key=b"k" * 32)
+        assert "## Prior cycle consensus" in section
+        assert "- phase: plan" in section
+        assert "go left" in section
+        assert "0.85" in section
+        assert "is the timeout right?" in section
+        assert "confirm with team" in section
+
+    def test_renders_latest_cycle_only(self, tmp_path: Path) -> None:
+        from bernstein.core.orchestration.consensus_relay import RelayDecision, RelayStore, build_spawn_section
+
+        store = RelayStore(tmp_path / "relay", key=b"k" * 32)
+        store.append(cycle_id="c1", phase="plan", next_action="first")
+        store.append(
+            cycle_id="c2",
+            phase="implement",
+            decisions=(RelayDecision(title="use postgres", rationale="scales better", confidence=0.9),),
+            next_action="second",
+        )
+        section = build_spawn_section(relay_root=tmp_path / "relay", key=b"k" * 32)
+        assert "use postgres" in section
+        assert "second" in section
+        assert "first" not in section
+
+    def test_tampered_entry_omits_section(self, tmp_path: Path) -> None:
+        import json
+
+        from bernstein.core.orchestration.consensus_relay import RelayDecision, RelayStore, build_spawn_section
+
+        store = RelayStore(tmp_path / "relay", key=b"k" * 32)
+        store.append(
+            cycle_id="c1",
+            phase="plan",
+            decisions=(RelayDecision(title="keep going", rationale="", confidence=0.5),),
+            next_action="ship it",
+        )
+        # Tamper with the entry after signing.
+        path = store.root / "c1.json"
+        payload = json.loads(path.read_text())
+        payload["next_action"] = "INJECTED"
+        path.write_text(json.dumps(payload))
+        section = build_spawn_section(relay_root=tmp_path / "relay", key=b"k" * 32)
+        assert section == ""
+
+    def test_wrong_key_omits_section(self, tmp_path: Path) -> None:
+        from bernstein.core.orchestration.consensus_relay import RelayStore, build_spawn_section
+
+        store = RelayStore(tmp_path / "relay", key=b"k" * 32)
+        store.append(cycle_id="c1", phase="plan", next_action="ok")
+        section = build_spawn_section(relay_root=tmp_path / "relay", key=b"z" * 32)
+        assert section == ""
+
+    def test_unreadable_json_returns_empty(self, tmp_path: Path) -> None:
+        from bernstein.core.orchestration.consensus_relay import build_spawn_section
+
+        relay_dir = tmp_path / "relay"
+        relay_dir.mkdir(parents=True, exist_ok=True)
+        # Write a malformed JSON file.
+        (relay_dir / "c1.json").write_text("{not valid json", encoding="utf-8")
+        # Also write a corrupt index so the store reads the file.
+        import json
+
+        (relay_dir / "_index.json").write_text(json.dumps(["c1"]), encoding="utf-8")
+        section = build_spawn_section(relay_root=relay_dir, key=b"k" * 32)
+        assert section == ""
+
+    def test_deterministic_render(self, tmp_path: Path) -> None:
+        from bernstein.core.orchestration.consensus_relay import RelayDecision, RelayStore, build_spawn_section
+
+        store = RelayStore(tmp_path / "relay", key=b"k" * 32)
+        store.append(
+            cycle_id="c1",
+            phase="plan",
+            decisions=(RelayDecision(title="go left", rationale="because", confidence=0.7),),
+            open_questions=("is this safe?",),
+            next_action="ship it",
+        )
+        first = build_spawn_section(relay_root=tmp_path / "relay", key=b"k" * 32)
+        second = build_spawn_section(relay_root=tmp_path / "relay", key=b"k" * 32)
+        assert first == second
+
+    def test_size_cap_enforced(self, tmp_path: Path) -> None:
+        from bernstein.core.orchestration.consensus_relay import RelayDecision, RelayStore, build_spawn_section
+
+        store = RelayStore(tmp_path / "relay", key=b"k" * 32)
+        store.append(
+            cycle_id="c1",
+            phase="implement",
+            decisions=tuple(
+                RelayDecision(title=f"decision {i}", rationale="x" * 500, confidence=0.5) for i in range(20)
+            ),
+            open_questions=tuple(f"q{i}: " + "x" * 200 for i in range(10)),
+            next_action="y" * 2000,
+        )
+        section = build_spawn_section(relay_root=tmp_path / "relay", key=b"k" * 32)
+        assert len(section.encode("utf-8")) <= 4000
 
 
 # ---------------------------------------------------------------------------

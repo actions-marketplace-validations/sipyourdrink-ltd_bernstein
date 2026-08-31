@@ -1,7 +1,7 @@
 # Contract for the Sourcegraph / Ampcode Amp CLI (adapter: amp).
 #
 # Upstream renamed the npm package to ``@ampcode/cli`` and restructured
-# the flag surface — what the adapter calls ``--model`` is now
+# the flag surface - what the adapter calls ``--model`` is now
 # ``--mode``, ``--prompt`` is now ``--execute``, ``--headless`` is now
 # ``--stream-json``. This contract pins to the **current** upstream
 # surface so the drift detector stays useful; updating
@@ -16,6 +16,7 @@ auth:
   required_for_help: false
   required_for_models: false
   secret_env: "AMP_API_KEY"
+  basis: api_key
 required_flags:
   - "--mode"
   - "--execute"

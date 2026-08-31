@@ -23,7 +23,10 @@ import os
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from bernstein.core.lineage.provenance import TrustClass
 
 
 class Decision(StrEnum):
@@ -50,7 +53,7 @@ class ApprovalResult:
 
 
 # ---------------------------------------------------------------------------
-# Command normalization — defeat evasion techniques
+# Command normalization - defeat evasion techniques
 # ---------------------------------------------------------------------------
 
 # Unicode homoglyph map: visually similar characters → ASCII equivalents.
@@ -216,12 +219,12 @@ def normalize_command(cmd: str) -> str:
 # Pattern lists
 # ---------------------------------------------------------------------------
 
-# Allow patterns — safe, read-only or low-risk operations.
+# Allow patterns - safe, read-only or low-risk operations.
 # Each entry is a raw regex string matched against the stripped sub-command.
 #
 # IMPORTANT: Do NOT add bare `^<tool>\s` patterns for tools that can take
 # arbitrary paths or arguments (python, cat, cp, mv, mkdir, touch, rm).
-# Any such allowance effectively defeats the deny list — e.g. bare
+# Any such allowance effectively defeats the deny list - e.g. bare
 # `^python\s` lets an agent run `python /tmp/evil.py`, and bare `^cat\s`
 # lets it read `/etc/shadow`.  If an invocation is genuinely safe, encode
 # that safety into the regex (fixed sub-command, no caller-controlled
@@ -229,7 +232,7 @@ def normalize_command(cmd: str) -> str:
 # escape hatch.
 _ALLOW_PATTERNS: Final[list[str]] = [
     # Filesystem read-only (bare `cat`/`head`/`tail` intentionally NOT
-    # allowed here — see credential-read deny patterns below; operators
+    # allowed here - see credential-read deny patterns below; operators
     # can opt in via BERNSTEIN_AUTO_APPROVE_EXTRA if needed)
     r"^ls(\s|$)",
     r"^head\s",
@@ -270,7 +273,7 @@ _ALLOW_PATTERNS: Final[list[str]] = [
     r"^command\s",
     r"^ps\s",
     r"^top\s",
-    # Python / uv — restricted: only `-m <allowed_tool>` or version probe.
+    # Python / uv - restricted: only `-m <allowed_tool>` or version probe.
     # Bare `python <script>` is NOT auto-approved because the script path
     # is caller-controlled (agent could run python /tmp/evil.py).
     r"^python(\d(\.\d+)?)?\s+--version$",
@@ -293,6 +296,11 @@ _ALLOW_PATTERNS: Final[list[str]] = [
     # HTTP to localhost Bernstein server (task completion, status checks)
     r"^curl\s+.*http://127\.0\.0\.1:8052",
     r"^curl\s+.*localhost:8052",
+    # Completion front door. It posts to the same localhost task server the
+    # curl patterns above already allow, and resolves the port and the agent
+    # token itself, so it must not be less approvable than the hand-built
+    # request it replaces.
+    r"^bernstein\s+task\s+complete(\s|$)",
     # Output formatting
     r"^jq(\s|$)",
     r"^column(\s|$)",
@@ -309,7 +317,7 @@ _ALLOW_PATTERNS: Final[list[str]] = [
     r"^cd$",
 ]
 
-# Deny patterns — destructive or high-risk operations.
+# Deny patterns - destructive or high-risk operations.
 _DENY_PATTERNS: Final[list[str]] = [
     # Destructive filesystem
     r"\brm\s+.*(-[a-zA-Z]*r[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*)\s",
@@ -350,7 +358,7 @@ _DENY_PATTERNS: Final[list[str]] = [
     r"\bwget\b.*\|\s*(ba)?sh\b",
     r"\bcurl\b.*\|\s*python\b",
     r"\bwget\b.*\|\s*python\b",
-    # Process termination — aggressive
+    # Process termination - aggressive
     r"\bkill\s+.*-9\b",
     r"\bkill\s+.*-SIGKILL\b",
     r"\bpkill\s",
@@ -367,7 +375,7 @@ _DENY_PATTERNS: Final[list[str]] = [
     r">\s*~/\.ssh/",
     r">\s*/root/",
     # Writing to Bernstein control-plane state (no agent should mutate these
-    # via raw shell — they are the orchestrator's source of truth)
+    # via raw shell - they are the orchestrator's source of truth)
     r">\s*\.bernstein/",
     r">\s*\.sdd/",
     r">>\s*\.bernstein/",
@@ -402,7 +410,7 @@ _DENY_PATTERNS: Final[list[str]] = [
     r"\broute\s+(add|del|flush)\b",
     r"\bnetcat\b\s+.*-[eE]\b",  # reverse shell pattern
     r"\bnc\b\s+.*-[eE]\b",
-    # Package installs (no --global-as-global needed — any install is review-worthy)
+    # Package installs (no --global-as-global needed - any install is review-worthy)
     r"\bnpm\s+(install|i|add|uninstall|remove|ci)\b",
     r"\byarn\s+(add|remove|install)\b",
     r"\bpnpm\s+(add|remove|install)\b",
@@ -411,7 +419,7 @@ _DENY_PATTERNS: Final[list[str]] = [
     r"\bcargo\s+(install|uninstall)\b",
     r"\bgo\s+install\b",
     r"\bgem\s+(install|uninstall)\b",
-    # Git push without explicit branch/remote pattern — must be reviewed.
+    # Git push without explicit branch/remote pattern - must be reviewed.
     # We keep a narrow allow for `git push origin main`/`HEAD` via the
     # deny-not-matching fall-through; any other `git push` falls into ASK.
     r"\bgit\s+push\s+.*--mirror\b",
@@ -435,7 +443,7 @@ _DENY_PATTERNS: Final[list[str]] = [
 #
 #        BERNSTEIN_AUTO_APPROVE_EXTRA='^make\s+test$::^docker\s+ps$'
 #
-# 2. :func:`set_extra_allow_patterns` — programmatic override, useful for
+# 2. :func:`set_extra_allow_patterns` - programmatic override, useful for
 #    tests and for operators loading config from a file.
 #
 # Deny patterns always take precedence over extra allow patterns: the
@@ -470,7 +478,7 @@ def _parse_extra_patterns(raw: str | None) -> list[re.Pattern[str]]:
         try:
             out.append(re.compile(pattern))
         except re.error:
-            # Malformed regex — never widen the allow list on bad input
+            # Malformed regex - never widen the allow list on bad input
             continue
     return out
 
@@ -517,6 +525,13 @@ _compiled_allow: list[re.Pattern[str]] = [re.compile(p) for p in _ALLOW_PATTERNS
 _compiled_deny: list[re.Pattern[str]] = [re.compile(p) for p in _DENY_PATTERNS]
 
 # Non-bash tool allow-list: tools that are always safe to approve.
+#
+# Only read-only / no-side-effect tools belong here.  Write-capable tools
+# (``Edit``, ``Write``, ``NotebookEdit``) are intentionally excluded so they
+# fall through to ASK - ``NotebookEdit`` rewrites ``.ipynb`` files (which may
+# embed shell-executing cells) and is classified as an edit tool elsewhere in
+# the codebase (``observability/traces.py`` ``_EDIT_TOOLS``), so auto-approving
+# it would contradict the write-tool policy below.
 _SAFE_TOOLS: Final[frozenset[str]] = frozenset(
     {
         "Read",
@@ -527,7 +542,6 @@ _SAFE_TOOLS: Final[frozenset[str]] = frozenset(
         "WebFetch",
         "WebSearch",
         "NotebookRead",
-        "NotebookEdit",
     }
 )
 
@@ -574,7 +588,7 @@ def decompose_command(cmd: str) -> list[str]:
     Handles:
     - ``&&`` and ``||`` (short-circuit operators)
     - ``;`` (sequential execution)
-    - ``|`` (pipes — each segment is a separate command)
+    - ``|`` (pipes - each segment is a separate command)
     - Quoted strings (single and double) are not split inside quotes.
 
     Args:
@@ -643,7 +657,36 @@ def _match_allow(cmd: str) -> str | None:
     return None
 
 
-def classify_command(cmd: str) -> ApprovalResult:
+def _downgrade_for_taint(
+    result: ApprovalResult,
+    derived_trust: TrustClass | None,
+) -> ApprovalResult:
+    """Downgrade an APPROVE to ASK when the command derives from taint.
+
+    A command whose text derives from an untrusted-origin artefact (its
+    lineage closure bottoms out at ``third_party`` or ``public``) is never
+    auto-approved: the structural gate closes the direct path, and this closes
+    the data-flow laundering path. DENY and ASK are left untouched -- taint can
+    only tighten a decision, never loosen it. Trusted derivations and the
+    default ``None`` leave the decision exactly as computed.
+    """
+    if derived_trust is None or result.decision is not Decision.APPROVE:
+        return result
+    # Local import keeps the auto-approve hot path free of a lineage import
+    # unless a caller actually threads provenance through.
+    from bernstein.core.lineage.provenance import is_untrusted
+
+    if not is_untrusted(derived_trust):
+        return result
+    return ApprovalResult(
+        Decision.ASK,
+        f"Command text derives from an untrusted-origin artefact "
+        f"(trust={derived_trust.value}); escalating to human review",
+        matched_pattern="provenance:untrusted_derivation",
+    )
+
+
+def classify_command(cmd: str, *, derived_trust: TrustClass | None = None) -> ApprovalResult:
     """Classify a (potentially compound) bash command.
 
     Applies :func:`normalize_command` first to defeat encoding tricks,
@@ -659,10 +702,18 @@ def classify_command(cmd: str) -> ApprovalResult:
 
     Args:
         cmd: Raw shell command string (may include ``&&``, ``||``, etc.).
+        derived_trust: Optional propagated trust class of the artefact the
+            command text derives from (issue #2513). When it is untrusted an
+            APPROVE is downgraded to ASK; DENY and ASK are unaffected.
 
     Returns:
         :class:`ApprovalResult` with the worst-case decision.
     """
+    return _downgrade_for_taint(_classify_command_base(cmd), derived_trust)
+
+
+def _classify_command_base(cmd: str) -> ApprovalResult:
+    """Pattern-only classification (no provenance)."""
     # Detect base64-decode pipe patterns on the raw command before normalization
     if _BASE64_PIPE_RE.search(cmd):
         return ApprovalResult(
@@ -708,7 +759,12 @@ def classify_command(cmd: str) -> ApprovalResult:
     return ApprovalResult(Decision.APPROVE, f"All {len(sub_commands)} sub-command(s) matched allow list")
 
 
-def classify_tool_call(tool_name: str, tool_input: dict[str, object]) -> ApprovalResult:
+def classify_tool_call(
+    tool_name: str,
+    tool_input: dict[str, object],
+    *,
+    derived_trust: TrustClass | None = None,
+) -> ApprovalResult:
     """Classify any tool call by name and input.
 
     For ``Bash`` (or ``bash``) tools, delegates to :func:`classify_command`.
@@ -719,16 +775,22 @@ def classify_tool_call(tool_name: str, tool_input: dict[str, object]) -> Approva
     Args:
         tool_name: Name of the tool being called (e.g. ``"Bash"``, ``"Edit"``).
         tool_input: Tool input dict.  For bash tools, must contain ``"command"``.
+        derived_trust: Optional propagated trust class of the artefact the tool
+            call derives from (issue #2513). An untrusted derivation downgrades
+            an APPROVE to ASK; DENY and ASK are unaffected.
 
     Returns:
         :class:`ApprovalResult` with the decision.
     """
     if tool_name.lower() in ("bash", "shell"):
         cmd = str(tool_input.get("command", ""))
-        return classify_command(cmd)
+        return classify_command(cmd, derived_trust=derived_trust)
 
     if tool_name in _SAFE_TOOLS:
-        return ApprovalResult(Decision.APPROVE, f"Tool {tool_name!r} is in the safe-tools allow list")
+        return _downgrade_for_taint(
+            ApprovalResult(Decision.APPROVE, f"Tool {tool_name!r} is in the safe-tools allow list"),
+            derived_trust,
+        )
 
     if tool_name in _DANGEROUS_TOOLS:
         return ApprovalResult(Decision.DENY, f"Tool {tool_name!r} is in the dangerous-tools deny list")

@@ -1,4 +1,4 @@
-"""Plugin manager — discovers, loads, and invokes Bernstein plugins."""
+"""Plugin manager - discovers, loads, and invokes Bernstein plugins."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ _manager: PluginManager | None = None
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_LIST_OBJ = "list[object]"
+type _CAST_LIST_OBJ = list[object]
 
 
 def _mcp_entry_from_dict(d: dict[str, Any]) -> Any:
@@ -174,6 +174,7 @@ class CommandHook:
         hooks_dir: Path,
         plugin_root: str = "",
         seen: set[tuple[str, str]] | None = None,
+        workspace_root: Path | None = None,
     ) -> None:
         """Create a CommandHook instance.
 
@@ -183,10 +184,21 @@ class CommandHook:
                 source. Used for dedup logging when collisions occur.
             seen: Shared set tracking registered hook+script combos across all
                 CommandHook instances. Mutated in place.
+            workspace_root: Project root whose trust state gates execution of
+                these committed hook scripts. When ``None`` it is derived from
+                *hooks_dir* (``.bernstein/hooks`` lives directly under the
+                project root), so the trust decision always tracks the tree the
+                scripts were discovered in.
         """
         self._hooks_dir = hooks_dir
         self._plugin_root = plugin_root
         self._seen: set[tuple[str, str]] = seen if seen is not None else set()
+        # ``.bernstein/hooks`` sits directly under the project root, so the
+        # root is the grandparent of the hooks directory.  Anchoring the trust
+        # check here means committed hook scripts can only run when the tree
+        # they live in has been explicitly trusted, independent of whatever
+        # workdir the shared PluginManager happens to hold.
+        self._workspace_root = workspace_root if workspace_root is not None else hooks_dir.parent.parent
 
     def _script_key(self, script: Path) -> str:
         """Return a dedup key for a script based on its resolved path."""
@@ -314,6 +326,19 @@ class CommandHook:
         self, hook_name: str, script: Path, current_payload: dict[str, Any]
     ) -> tuple[dict[str, Any], bool]:
         """Execute a single hook script and return (updated_payload, should_abort)."""
+        # Fail-closed trust gate at the execution boundary.  This is the last
+        # check before a committed script is handed to the shell, so a hook
+        # that reached this point through any dispatch path - including one
+        # whose PluginManager never resolved a workdir - cannot run in an
+        # untrusted or indeterminate workspace.
+        if not is_workspace_trusted(self._workspace_root):
+            log.warning(
+                "Hook execution gated: workspace is not trusted (%s). "
+                "Skipping hook script %s. Grant workspace trust to enable hook execution.",
+                self._workspace_root,
+                script.name,
+            )
+            return current_payload, False
         sub_kwargs, env = self._prepare_hook_env(**current_payload)
         proc = subprocess.run(
             [str(script)],
@@ -560,14 +585,17 @@ class CommandHook:
         )
 
 
+REPORTER_NAME_PREFIX = "reporters:"
+
+
 class PluginManager:
     """Discovers, loads, and invokes Bernstein plugins.
 
     Plugins are discovered from two sources:
 
-    1. **Entry points** — any installed package that registers hooks under
+    1. **Entry points** - any installed package that registers hooks under
        the ``bernstein.plugins`` entry-point group.
-    2. **bernstein.yaml** ``plugins:`` field — a list of dotted import paths
+    2. **bernstein.yaml** ``plugins:`` field - a list of dotted import paths
        to be imported and registered as plugins.
 
     The manager handles lifecycle hooks (task creation, agent spawning, etc.)
@@ -649,7 +677,7 @@ class PluginManager:
         tool: str,
         tool_input: dict[str, Any],
     ) -> str | None:
-        """Fire on_pre_tool_use hook — can block via HookBlockingError (T681).
+        """Fire on_pre_tool_use hook - can block via HookBlockingError (T681).
 
         Returns:
             Optional denial hint from a firstresult hook, or None.
@@ -778,7 +806,7 @@ class PluginManager:
         """
         if not _is_interactive():
             log.warning(
-                "Elicitation requested for session %s, but stdin is not a TTY — returning non_interactive",
+                "Elicitation requested for session %s, but stdin is not a TTY - returning non_interactive",
                 session_id,
             )
             self._safe_call("on_elicitation", session_id=session_id, prompt=prompt, options=options)
@@ -914,7 +942,7 @@ class PluginManager:
         max_tokens: int = 4096,
         timeout_seconds: float = 30.0,
     ) -> dict[str, Any] | None:
-        """Fire on_agent_hook — forked LLM call with isolated context (T457).
+        """Fire on_agent_hook - forked LLM call with isolated context (T457).
 
         Invokes plugin hooks with a forked LLM context slice.  The hook
         result should be a structured decision (``allow``/``deny``/``ask``).
@@ -1032,6 +1060,23 @@ class PluginManager:
                     stacklevel=1,
                 )
 
+        from bernstein.plugins.reporters import discover_reporters
+
+        discover_reporters(self._register_reporter)
+
+    def _register_reporter(self, reporter: object, name: str) -> None:
+        """Apply policy and register a discovered reporter hook plugin.
+
+        Registered under a group-qualified Pluggy name: entry-point names are only
+        unique within their own group, so a `slack` in both `bernstein.plugins` and
+        `bernstein.reporters` made Pluggy raise "Plugin name already registered"
+        and the reporter was dropped with nothing but a warning, which is the
+        silent-plugin failure this issue is about.
+        """
+        check_plugin_allowed(name, self._policy)
+        self._pm.register(reporter, name=f"{REPORTER_NAME_PREFIX}{name}")
+        self._registered_names.append(f"{REPORTER_NAME_PREFIX}{name}")
+
     def discover_config_plugins(self, config_plugins: list[str]) -> None:
         """Load plugins listed in ``bernstein.yaml`` under the ``plugins:`` key.
 
@@ -1079,7 +1124,10 @@ class PluginManager:
         try:
             hooks_dir = root / ".bernstein" / "hooks"
             if hooks_dir.is_dir():
-                self.register(CommandHook(hooks_dir, seen=self._hook_seen), name="command_hooks")
+                self.register(
+                    CommandHook(hooks_dir, seen=self._hook_seen, workspace_root=root),
+                    name="command_hooks",
+                )
         except Exception as exc:
             log.warning("Command hooks subsystem failed to load: %s", exc)
 
@@ -1116,13 +1164,19 @@ class PluginManager:
         Also discovers command hooks in ``.bernstein/hooks/``.
 
         Each subsystem (entry points, command hooks, config plugins) loads
-        independently — a failure in one does not prevent the others from
+        independently - a failure in one does not prevent the others from
         loading.
 
         Args:
             workdir: Project root directory.  Defaults to ``Path.cwd()``.
         """
         root = workdir or Path.cwd()
+
+        # Anchor the trust decision to the tree we are about to load from.
+        # Discovering hooks under ``root`` and then gating them on a different
+        # (or absent) ``_workdir`` is exactly the gap that let committed hooks
+        # run untrusted, so the manager's trust root is the root it loads.
+        self._workdir = root
 
         # Load enterprise plugin policy before any plugin registration.
         self._policy = load_plugin_policy(root)
@@ -1172,6 +1226,15 @@ class PluginManager:
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
+
+    @property
+    def workdir(self) -> Path | None:
+        """Project root this manager is anchored to for trust decisions.
+
+        ``None`` until a workdir is established (via the constructor or
+        :meth:`load_from_workdir`), in which case hook execution is gated.
+        """
+        return self._workdir
 
     @property
     def registered_names(self) -> list[str]:
@@ -1236,14 +1299,21 @@ class PluginManager:
     def _check_workspace_trust(self) -> bool:
         """Check whether the workspace is trusted for hook execution (T456).
 
-        Returns True if hooks are allowed to run, False if they should be
-        skipped because trust has not been granted.
+        Fails closed: hooks run only when the workspace root is known *and*
+        has been explicitly trusted.  An indeterminate root (``None``) is
+        treated as untrusted rather than auto-trusted, and simply matching the
+        current working directory no longer grants trust on its own - being
+        *inside* a directory is not consent to run code committed into it.
 
         Returns:
             True when hooks are allowed, False when gated.
         """
-        if self._workdir is None or self._workdir == Path.cwd():
-            return True
+        if self._workdir is None:
+            log.warning(
+                "Hook execution gated: workspace root is indeterminate; treating as untrusted. "
+                "Initialise the plugin manager with the project workdir to enable hook execution.",
+            )
+            return False
         if not is_workspace_trusted(self._workdir):
             log.warning(
                 "Hook execution gated: workspace is not trusted (%s). Run the trust command to enable hook execution.",
@@ -1291,6 +1361,15 @@ class PluginManager:
 def get_plugin_manager(workdir: Path | None = None, reload: bool = False) -> PluginManager:
     """Return the global :class:`PluginManager` instance.
 
+    The manager is a process-global singleton, but the *first* caller does not
+    always know the project root: internal callers (guardrails, trackers,
+    metrics) invoke this with no ``workdir`` and could otherwise pin the
+    singleton to an indeterminate root before a request-scoped caller supplies
+    the real one.  To keep the trust decision anchored to the real project
+    root, a concrete ``workdir`` that differs from the current singleton's root
+    rebuilds the manager against it.  ``None`` never forces a rebuild, so
+    workdir-less callers keep sharing whatever manager is already established.
+
     Args:
         workdir: Project root for loading local plugins.
         reload: If True, discard any existing manager and create a new one.
@@ -1299,7 +1378,7 @@ def get_plugin_manager(workdir: Path | None = None, reload: bool = False) -> Plu
         The (possibly freshly constructed) :class:`PluginManager`.
     """
     global _manager
-    if _manager is None or reload:
+    if _manager is None or reload or (workdir is not None and _manager.workdir != workdir):
         _manager = PluginManager(workdir=workdir)
         _manager.load_from_workdir(workdir)
     return _manager

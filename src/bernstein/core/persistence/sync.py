@@ -50,6 +50,9 @@ class BacklogTask:
     complexity: str
     source_file: str
     approval_required: bool = False
+    # Issue #3110: the declared artifact contract (validated
+    # ``ArtifactSpec.to_dict()`` payload), or None for the default code_diff.
+    artifact_spec: dict[str, Any] | None = None
 
 
 def parse_backlog_file(path: Path) -> BacklogTask | None:
@@ -57,15 +60,24 @@ def parse_backlog_file(path: Path) -> BacklogTask | None:
 
     Supports two formats:
     1. **YAML frontmatter** (``---`` delimited block at the top of the file).
-    2. **Markdown bold fields** — lines like ``**Role:** backend``.
+    2. **Markdown bold fields** - lines like ``**Role:** backend``.
 
     Args:
         path: Path to the backlog file.
 
     Returns:
-        Parsed BacklogTask, or None if the file cannot be parsed.
+        Parsed BacklogTask, or None if the file cannot be parsed. A file whose
+        ``artifact_spec`` declaration is malformed is refused (#3110): the
+        refusal is logged with the offending field named, no task is created
+        from it, and the sync continues with the other files.
     """
-    parsed = parse_backlog_path(path)
+    from bernstein.core.backlog_parser import BacklogParseError
+
+    try:
+        parsed = parse_backlog_path(path)
+    except BacklogParseError as exc:
+        logger.error("backlog sync: refused %s - %s", path.name, exc)
+        return None
     if parsed is None:
         return None
     return BacklogTask(
@@ -77,6 +89,7 @@ def parse_backlog_file(path: Path) -> BacklogTask | None:
         complexity=parsed.complexity,
         source_file=parsed.source_file,
         approval_required=parsed.require_human_approval,
+        artifact_spec=dict(parsed.artifact_spec) if parsed.artifact_spec is not None else None,
     )
 
 
@@ -182,7 +195,7 @@ def _build_existing_slugs(client: httpx.Client, server_url: str) -> set[str]:
         Set of normalised slugs.
     """
     slugs: set[str] = set()
-    # ``cancelled`` must be included — otherwise a YAML left in
+    # ``cancelled`` must be included - otherwise a YAML left in
     # backlog/open/ for a task the manager cancelled gets re-injected on
     # every startup sync and keeps failing forever.
     for status in ("open", "claimed", "in_progress", "done", "failed", "cancelled"):
@@ -213,7 +226,7 @@ def _build_task_payload(task: BacklogTask) -> dict[str, Any]:
     if f"source: {task.source_file}" not in description:
         description = description + f"\n\n<!-- source: {task.source_file} -->"
 
-    return {
+    payload: dict[str, Any] = {
         "title": task.title,
         "description": description,
         "role": task.role,
@@ -222,6 +235,11 @@ def _build_task_payload(task: BacklogTask) -> dict[str, Any]:
         "complexity": task.complexity,
         "approval_required": task.approval_required,
     }
+    if task.artifact_spec is not None:
+        # A validated declaration must reach the server; dropping it here
+        # would silently downgrade the task to code_diff (#3110).
+        payload["artifact_spec"] = dict(task.artifact_spec)
+    return payload
 
 
 def _sync_one_by_one(
@@ -326,7 +344,7 @@ def sync_backlog_to_server(
         try:
             existing_slugs = _build_existing_slugs(_client, server_url)
         except httpx.ConnectError:
-            result.errors.append("Cannot connect to task server — is it running?")
+            result.errors.append("Cannot connect to task server - is it running?")
             return result
 
         md_files = _collect_backlog_files(backlog_open, backlog_issues, task_filter)
@@ -383,7 +401,7 @@ def _prepare_batch_payloads(
             continue
         if _task_already_exists(task, existing_slugs):
             result.skipped.append(md_file.name)
-            logger.debug("Skipping %s — task already on server", md_file.name)
+            logger.debug("Skipping %s - task already on server", md_file.name)
             continue
         batch_payloads.append(_build_task_payload(task))
         batch_files.append(md_file)
@@ -454,8 +472,8 @@ def _move_completed_files(
     """Move backlog files for completed/failed/cancelled tasks to closed/."""
     done_slugs: set[str] = set()
     for terminal in ("done", "failed", "cancelled"):
-        for task in _get_tasks_by_status(client, server_url, terminal):
-            title = task.get("title", "")
+        for server_task in _get_tasks_by_status(client, server_url, terminal):
+            title = server_task.get("title", "")
             if title:
                 done_slugs.add(normalise_title(title))
 

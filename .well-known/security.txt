@@ -1,22 +1,17 @@
-# Bernstein Security Contact — RFC 9116
+# Bernstein Security Contact - RFC 9116
 # https://securitytxt.org/
 
-Contact: mailto:security@bernstein.dev
-Contact: https://hackerone.com/bernstein
-
-Encryption: https://bernstein.dev/.well-known/security-pgp.asc
-
-Acknowledgments: https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/security/security-acknowledgments.md
+Contact: mailto:forte@bernstein.run
+Contact: https://github.com/sipyourdrink-ltd/bernstein/security/advisories/new
 
 Policy: https://github.com/sipyourdrink-ltd/bernstein/blob/main/SECURITY.md
 
-Hiring: https://bernstein.dev/careers
-
 Preferred-Languages: en
 
-Canonical: https://bernstein.dev/.well-known/security.txt
+Canonical: https://bernstein.run/.well-known/security.txt
 
-# Reports older than 90 days without a fix should be disclosed responsibly.
-# We commit to responding within 72 hours and resolving criticals within 7 days.
+# Do not open public issues for vulnerabilities. A first substantive
+# response can take up to 90 days; you may disclose 90 days after your
+# report regardless of fix status. Full terms in the linked policy.
 
-Expires: 2027-01-01T00:00:00.000Z
+Expires: 2027-01-24T00:00:00.000Z

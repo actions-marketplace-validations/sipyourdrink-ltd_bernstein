@@ -1,17 +1,17 @@
-"""FastAPI task server — central coordination point for all agents.
+"""FastAPI task server - central coordination point for all agents.
 
 Agents pull tasks via HTTP, report completion, and send heartbeats.
 State is held in-memory and flushed periodically to JSONL for persistence.
 
 This module is a thin re-export shim.  The actual implementation lives in:
-- ``server_models.py`` — Pydantic request/response schemas
-- ``server_middleware.py`` — HTTP middleware classes
-- ``server_app.py`` — Application factory, SSE bus, helpers, notifications
+- ``server_models.py`` - Pydantic request/response schemas
+- ``server_middleware.py`` - HTTP middleware classes
+- ``server_app.py`` - Application factory, SSE bus, helpers, notifications
 """
 
 from __future__ import annotations
 
-# Lazy app instance — delegate to server_app's __getattr__
+# Lazy app instance - delegate to server_app's __getattr__
 from typing import Any as _Any
 
 from bernstein.core.server.server_app import DEFAULT_JSONL_PATH as DEFAULT_JSONL_PATH
@@ -30,7 +30,6 @@ from bernstein.core.server.server_app import node_to_response as node_to_respons
 from bernstein.core.server.server_app import notify_agent_status as notify_agent_status
 from bernstein.core.server.server_app import read_log_tail as read_log_tail
 from bernstein.core.server.server_app import task_to_response as task_to_response
-from bernstein.core.server.server_middleware import _PUBLIC_PATH_PREFIXES as _PUBLIC_PATH_PREFIXES
 from bernstein.core.server.server_middleware import _PUBLIC_PATHS as _PUBLIC_PATHS
 from bernstein.core.server.server_middleware import _WRITE_METHODS as _WRITE_METHODS
 
@@ -87,6 +86,8 @@ from bernstein.core.server.server_models import TaskCompleteRequest as TaskCompl
 from bernstein.core.server.server_models import TaskCountsResponse as TaskCountsResponse
 from bernstein.core.server.server_models import TaskCreate as TaskCreate
 from bernstein.core.server.server_models import TaskFailRequest as TaskFailRequest
+from bernstein.core.server.server_models import TaskMessagePost as TaskMessagePost
+from bernstein.core.server.server_models import TaskMessageResponse as TaskMessageResponse
 from bernstein.core.server.server_models import TaskPatchRequest as TaskPatchRequest
 from bernstein.core.server.server_models import TaskProgressRequest as TaskProgressRequest
 from bernstein.core.server.server_models import TaskResponse as TaskResponse

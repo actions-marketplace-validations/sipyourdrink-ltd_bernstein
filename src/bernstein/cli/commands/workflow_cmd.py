@@ -3,10 +3,10 @@
 Two manifest flavours coexist under ``bernstein workflow``:
 
 * The legacy **DSL** (conditional task DAGs that plug into the
-  orchestrator's deterministic crew-routing model — see
+  orchestrator's deterministic crew-routing model - see
   :mod:`bernstein.core.planning.workflow_dsl`).  Surface: the original
   ``validate``/``list``/``show`` commands keep working unchanged.
-* The new **YAML manifest** flavour added in #1108 — Archon-inspired
+* The new **YAML manifest** flavour added in #1108 - declarative
   agent / command / loop nodes executed via
   :class:`bernstein.core.workflows.WorkflowRunner`.  Surface:
   ``run``/``init`` plus dual-mode ``validate``/``list`` that auto-detect
@@ -28,7 +28,7 @@ import click
 def _detect_kind(path: Path) -> str:
     """Sniff a YAML file and return ``'spec'``, ``'dsl'``, or ``'unknown'``.
 
-    The sniff stays purely structural — it doesn't import either parser
+    The sniff stays purely structural - it doesn't import either parser
     so a malformed file in one schema can't blow up the other path.
 
     Args:
@@ -69,7 +69,7 @@ def workflow_group() -> None:
 
     \b
     Two manifest flavours are supported and auto-detected by validate/list:
-    - YAML manifest (Archon-style): nodes as a list, executed by
+    - YAML manifest (declarative): nodes as a list, executed by
       `bernstein workflow run`.
     - DSL: nodes keyed by id with `phases:`, used by the orchestrator's
       deterministic crew-routing model.
@@ -281,7 +281,7 @@ def list_cmd(search_dir: str | None, bundled_only: bool) -> None:
                         path.parent.as_posix(),
                     )
                 except DSLError as exc:
-                    table.add_row(path.stem, "DSL", "-", "-", f"[red]error: {exc}[/red]")
+                    table.add_row(path.stem, "DSL", "-", "-", f"[red]error: {_one_line_error(exc)}[/red]")
 
     if table.row_count == 0:
         console.print("[dim]No workflows found.[/dim]")
@@ -290,8 +290,33 @@ def list_cmd(search_dir: str | None, bundled_only: bool) -> None:
     _ = WorkflowSpecError  # keep import live for static analysers
 
 
+def _one_line_error(exc: Exception) -> str:
+    """Collapse a (possibly multi-line) error message onto one line.
+
+    Pydantic's ``ValidationError`` prints one paragraph per failed field -
+    left as-is inside a Rich table cell, the embedded newlines render as
+    hard breaks and short lines (a bare field name, say) end up wrapped
+    one word per line.  Joining on ``"; "`` keeps every field's message
+    but guarantees the row stays a single scannable line; a hard cap keeps
+    a pathological message from blowing out the column width.
+    """
+    text = "; ".join(line.strip() for line in str(exc).splitlines() if line.strip())
+    if len(text) > 160:
+        text = text[:157] + "..."
+    return text
+
+
 def _add_spec_row(path: Path, table: Any, *, source: str) -> None:
-    """Append a row for a YAML manifest, capturing parse errors inline."""
+    """Append a row for a YAML manifest, capturing parse errors inline.
+
+    DSL-form manifests (top-level ``phases`` or mapping-style ``nodes``)
+    are skipped here - the legacy DSL section below renders them with
+    their own kind label, and forcing them through the WorkflowSpec
+    loader would surface an unrelated schema-mismatch error (#4461).
+    """
+    if _detect_kind(path) == "dsl":
+        return
+
     from bernstein.core.workflows import WorkflowSpecError, load_workflow_spec
 
     try:
@@ -304,12 +329,206 @@ def _add_spec_row(path: Path, table: Any, *, source: str) -> None:
             source,
         )
     except WorkflowSpecError as exc:
-        table.add_row(path.stem, "manifest", "-", "-", f"[red]error: {exc}[/red]")
+        table.add_row(path.stem, "manifest", "-", "-", f"[red]error: {_one_line_error(exc)}[/red]")
 
 
 # ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
+
+
+def _resolve_manifest_path(name_or_path: str, *, workdir: Path) -> Path | None:
+    """Best-effort locate a manifest file for kind-sniffing before dispatch.
+
+    Mirrors the lookup order :func:`resolve_workflow` uses internally
+    (direct path, then bundled + user-installed directories by name), but
+    returns ``None`` instead of raising so callers can fall back to the
+    existing spec-only resolution - and its existing error messages -
+    unchanged when nothing is found here either.
+    """
+    from bernstein.core.workflows.workflow_spec import discover_workflows
+
+    candidate = Path(name_or_path)
+    if candidate.suffix in {".yaml", ".yml"} or candidate.exists():
+        return candidate if candidate.is_file() else None
+    for name, path in discover_workflows(workdir=workdir):
+        if name == name_or_path:
+            return path
+    return None
+
+
+def _run_dsl_cmd(path: Path, *, dry_run: bool, console: Any) -> None:
+    """Handle ``workflow run`` for a DSL-form (conditional task DAG) manifest.
+
+    DSL manifests describe a governed, phase-gated task DAG that the live
+    orchestrator drives (Task objects, agent spawns, conditional edges
+    evaluated against task state) - there is no standalone way to fire
+    one node at a time the way ``WorkflowRunner`` does for the YAML
+    manifest schema, and instantiating ``WorkflowExecutor`` here just to
+    print a plan would write real files under ``.sdd/runtime/workflow/``
+    for a run that never happens. ``--dry-run`` still parses and validates
+    the DAG and prints its phase/node plan, so schema drift shows up
+    without needing a full orchestrator run; a bare ``run`` names the two
+    invocations that actually work today instead of falling through to
+    the WorkflowSpec loader and its unrelated pydantic wall (#4461).
+    """
+    from bernstein.core.workflow_dsl import DSLError, parse_workflow_yaml, validate_dag
+
+    try:
+        dag = parse_workflow_yaml(path)
+    except DSLError as exc:
+        console.print(f"[bold red]Resolve failed:[/bold red] {_one_line_error(exc)}")
+        raise SystemExit(1) from exc
+
+    result = validate_dag(dag)
+    if not result.is_valid:
+        console.print(f"[bold red]Resolve failed:[/bold red] {'; '.join(result.errors)}")
+        raise SystemExit(1)
+
+    name = dag.definition.name
+    console.print(f"[bold]Workflow:[/bold] {name} ({path})")
+    console.print(
+        f"[dim]DSL conditional-DAG workflow; {len(dag.nodes)} node(s) "
+        f"across {len(dag.definition.phases)} phase(s).[/dim]\n",
+    )
+
+    if dry_run:
+        for phase in dag.definition.phases:
+            ids = ", ".join(node.id for node in dag.nodes if node.phase == phase.name)
+            if ids:
+                console.print(f"  [bold]Phase {phase.name}:[/bold] {ids}")
+        return
+
+    console.print(
+        "[yellow]DSL workflows aren't executable via `workflow run` yet; "
+        f"use `bernstein workflow run {name} --dry-run` for the plan or "
+        f"`bernstein workflow show {name}` for full structure.[/yellow]",
+    )
+    raise SystemExit(1)
+
+
+@workflow_group.command("resume")
+@click.argument("run_id")
+@click.option("-g", "--goal", default="", help="Goal text substituted into {goal} placeholders.")
+@click.option(
+    "-m",
+    "--manifest",
+    "manifest_arg",
+    default=None,
+    help="Path or name of the manifest (re-resolves to validate digest). "
+    "If omitted, re-resolves from the path stored at run start.",
+)
+def resume_cmd(run_id: str, goal: str, manifest_arg: str | None) -> None:
+    """Resume a previously killed or interrupted workflow run.
+
+    Re-resolves the original manifest, validates its spec digest against
+    the snapshot recorded at run start, and re-enters the DAG at the
+    first non-completed node.
+
+    \b
+    Example:
+      bernstein workflow run idea-to-pr -g "Add JWT auth"  # prints run_id
+      bernstein workflow resume <run_id> -g "Add JWT auth"
+      bernstein workflow resume <run_id> -m ./my-flow.yaml
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from bernstein.core.workflows import NodeStatus, WorkflowRunError, WorkflowRunner, WorkflowSpecError
+    from bernstein.core.workflows.workflow_runner import (
+        load_spec_snapshot,
+        run_complete_marker_exists,
+    )
+    from bernstein.core.workflows.workflow_spec import resolve_workflow
+
+    console = Console()
+    workdir = Path.cwd()
+
+    # Refuse to resume a finished run.
+    completion = run_complete_marker_exists(workdir, run_id)
+    if completion is not None:
+        console.print(
+            f"[yellow]Run {run_id} already completed (succeeded={completion.get('succeeded')}). "
+            "No-op: start a new run with `workflow run`.[/yellow]"
+        )
+        return
+
+    snapshot = load_spec_snapshot(workdir, run_id)
+    if snapshot is None:
+        console.print(
+            f"[bold red]No workflow run state for run_id {run_id!r} under {workdir / '.sdd/runs'}.[/bold red]"
+        )
+        console.print("Start a new run with `bernstein workflow run` first.")
+        raise SystemExit(1)
+
+    # Re-resolve the manifest: prefer --manifest, then the stored source path/name.
+    if manifest_arg is not None:
+        try:
+            path, spec = resolve_workflow(manifest_arg, workdir=workdir)
+        except WorkflowSpecError as exc:
+            console.print(f"[bold red]Resolve failed:[/bold red] {exc}")
+            raise SystemExit(1) from exc
+    else:
+        stored_source = snapshot.get("source")
+        if stored_source is None:
+            console.print(
+                "[bold red]Cannot resume: the manifest path was not recorded at run start. "
+                "Re-run with --manifest <path-or-name> to validate the spec digest.[/bold red]"
+            )
+            raise SystemExit(1)
+        try:
+            path, spec = resolve_workflow(stored_source, workdir=workdir)
+        except WorkflowSpecError as exc:
+            # The stored path may be absolute; try resolving it directly.
+            candidate = Path(stored_source)
+            if candidate.is_absolute() and candidate.is_file():
+                path = candidate
+                from bernstein.core.workflows import load_workflow_spec
+
+                try:
+                    spec = load_workflow_spec(path)
+                except WorkflowSpecError as exc2:
+                    console.print(f"[bold red]Resolve failed:[/bold red] {exc2}")
+                    raise SystemExit(1) from exc2
+            else:
+                console.print(f"[bold red]Resolve failed:[/bold red] {exc}")
+                raise SystemExit(1) from exc
+
+    console.print(f"[bold]Workflow:[/bold] {spec.name} ({path})")
+    console.print(f"[dim]Resuming run {run_id} - {len(spec.nodes)} node(s).[/dim]\n")
+
+    runner = WorkflowRunner(workdir=workdir)
+    try:
+        execution = runner.resume(spec, goal=goal, run_id=run_id)
+    except (WorkflowSpecError, WorkflowRunError) as exc:
+        console.print(f"[bold red]Resume failed:[/bold red] {exc}")
+        raise SystemExit(1) from exc
+
+    table = Table(title=f"Resume {run_id}")
+    table.add_column("Node")
+    table.add_column("Status")
+    table.add_column("Iters", justify="right")
+    table.add_column("Exit", justify="right")
+    table.add_column("Wall (s)", justify="right")
+    table.add_column("Note")
+    for node_exec in execution.nodes:
+        if node_exec.status == NodeStatus.SUCCESS:
+            colour = "green"
+        elif node_exec.status == NodeStatus.FAILED:
+            colour = "red"
+        else:
+            colour = "yellow"
+        table.add_row(
+            node_exec.node_id,
+            f"[{colour}]{node_exec.status.value}[/{colour}]",
+            str(node_exec.iterations),
+            "-" if node_exec.exit_code is None else str(node_exec.exit_code),
+            f"{node_exec.wall_time_seconds:.2f}",
+            node_exec.error or "",
+        )
+    console.print(table)
+    if not execution.succeeded:
+        raise SystemExit(1)
 
 
 @workflow_group.command("run")
@@ -329,6 +548,8 @@ def run_cmd(name_or_path: str, goal: str, dry_run: bool) -> None:
     or by filesystem path.  Agent-typed nodes dispatch through the
     existing AgentSpawner; command-typed nodes shell out; loop nodes
     re-fire until their predicate exits 0 or max_iterations is hit.
+    DSL-form manifests (conditional task DAGs) dry-run their plan here;
+    a full run belongs to the live orchestrator, not this command.
 
     \b
     Examples:
@@ -342,6 +563,12 @@ def run_cmd(name_or_path: str, goal: str, dry_run: bool) -> None:
     from bernstein.core.workflows.workflow_spec import resolve_workflow
 
     console = Console()
+
+    sniff_path = _resolve_manifest_path(name_or_path, workdir=Path.cwd())
+    if sniff_path is not None and _detect_kind(sniff_path) == "dsl":
+        _run_dsl_cmd(sniff_path, dry_run=dry_run, console=console)
+        return
+
     try:
         path, spec = resolve_workflow(name_or_path, workdir=Path.cwd())
     except WorkflowSpecError as exc:
@@ -369,11 +596,12 @@ def run_cmd(name_or_path: str, goal: str, dry_run: bool) -> None:
     table.add_column("Wall (s)", justify="right")
     table.add_column("Note")
     for node_exec in execution.nodes:
-        colour = (
-            "green"
-            if node_exec.status == NodeStatus.SUCCESS
-            else ("red" if node_exec.status == NodeStatus.FAILED else "yellow")
-        )
+        if node_exec.status == NodeStatus.SUCCESS:
+            colour = "green"
+        elif node_exec.status == NodeStatus.FAILED:
+            colour = "red"
+        else:
+            colour = "yellow"
         table.add_row(
             node_exec.node_id,
             f"[{colour}]{node_exec.status.value}[/{colour}]",

@@ -25,8 +25,33 @@ import operator
 import random
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any
 
+# Pricing table + per-call pricing live in the dependency-free leaf
+# ``model_prices`` so adapters can price a call without importing this
+# module (which reaches routing internals); re-exported for existing
+# ``from bernstein.core.cost.cost import ...`` call sites.
+from bernstein.core.cost.model_prices import (
+    MODEL_COSTS_PER_1M_TOKENS as MODEL_COSTS_PER_1M_TOKENS,
+)
+from bernstein.core.cost.model_prices import (
+    MODEL_GEMINI_3_1_PRO as MODEL_GEMINI_3_1_PRO,
+)
+from bernstein.core.cost.model_prices import (
+    MODEL_GPT_5_4 as MODEL_GPT_5_4,
+)
+from bernstein.core.cost.model_prices import (
+    MODEL_GPT_5_5 as MODEL_GPT_5_5,
+)
+from bernstein.core.cost.model_prices import (
+    ModelUsdPer1MTokens as ModelUsdPer1MTokens,
+)
+from bernstein.core.cost.model_prices import (
+    UsagePriceResult as UsagePriceResult,
+)
+from bernstein.core.cost.model_prices import (
+    price_model_usage as price_model_usage,
+)
 from bernstein.core.models import Complexity, Scope, Task, TaskStatus
 
 if TYPE_CHECKING:
@@ -42,77 +67,71 @@ EPSILON: float = 0.1  # 10% explore, 90% exploit
 MIN_OBSERVATIONS: int = 5  # arms trusted only after this many samples
 QUALITY_THRESHOLD: float = 0.80  # minimum success_rate to consider an arm
 
-# Model name constants (used across pricing tables and cache tiers)
-MODEL_GPT_5_4 = "gpt-5.4"
-MODEL_GPT_5_5 = "gpt-5.5"
-MODEL_GEMINI_3_1_PRO = "gemini-3.1-pro"
 
+def read_tokens_sidecar_totals(sidecar_path: Path) -> tuple[int, int]:
+    """Sum cumulative (input, output) tokens from a runner ``.tokens`` sidecar.
 
-class ModelUsdPer1MTokens(TypedDict, total=False):
-    """USD per 1 million tokens (list prices, approximate)."""
+    The openai_agents runner appends one ``{"ts", "in", "out"}`` JSON record
+    per LLM call to ``.sdd/runtime/<session_id>.tokens`` (bug-13) so that
+    token usage survives agent death. This is the SINGLE shared reader for
+    that format: the live-cost tick (``Orchestrator._record_live_costs``) and
+    any recovery path should both price from this same source of truth, so
+    the run ledger's ``spent_usd`` can never diverge from per-task costs.
 
-    input: float
-    output: float
-    cache_read: float | None
-    cache_write: float | None
+    Args:
+        sidecar_path: Path to the ``.tokens`` sidecar file.
 
+    Returns:
+        ``(total_input_tokens, total_output_tokens)`` - ``(0, 0)`` when the
+        sidecar is missing, empty, or unreadable (not an error: providers
+        other than openai_agents don't write one).
+    """
+    try:
+        raw = sidecar_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0, 0
+    total_in = 0
+    total_out = 0
+    for line_num, line in enumerate(raw.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            total_in += int(rec.get("in", 0) or 0)
+            total_out += int(rec.get("out", 0) or 0)
+        except (ValueError, TypeError, AttributeError) as exc:
+            # Widened beyond json.loads(): this file is RE-READ IN FULL every
+            # orchestrator tick, so a well-formed-but-wrong-shape record (not
+            # a dict, or "in"/"out" not coercible to int) that raises on the
+            # SUBSEQUENT .get()/int() calls would otherwise poison every
+            # subsequent tick's cost read for the whole session, not just one
+            # call. Skip the bad record and keep summing the rest.
+            logger.debug(
+                "Skipping malformed .tokens sidecar record at %s:%d: %s - line=%s",
+                sidecar_path,
+                line_num,
+                exc,
+                line[:500],
+            )
+            continue
+    return total_in, total_out
 
-# Per-model input/output pricing per 1M tokens (USD). Keys match substring checks in ``_model_cost``.
-# Updated 2026-05-05 from official API pricing pages — GPT-5.5 added (announced
-# 2026-04-23, generally available in API on 2026-04-24).
-MODEL_COSTS_PER_1M_TOKENS: dict[str, ModelUsdPer1MTokens] = {
-    "haiku": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
-    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
-    "opus": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
-    # GPT-5.5: launched 2026-04-24 at GPT-5.4 input parity with cheaper
-    # output (per OpenAI pricing page); GPT-5.4 retained as pinned fallback.
-    MODEL_GPT_5_5: {"input": 2.5, "output": 12.0},
-    "gpt-5.5-mini": {"input": 0.6, "output": 3.0},
-    MODEL_GPT_5_4: {"input": 2.5, "output": 15.0},
-    "gpt-5.4-mini": {"input": 0.75, "output": 4.5},
-    # OpenAI Agents SDK v2 baseline models (oai-001). Launch prices as of
-    # 2026-04-19 — gpt-5 is roughly sonnet-parity on input, cheaper on output;
-    # gpt-5-mini is the default for the runner; o4 is the reasoning tier.
-    "gpt-5": {"input": 2.5, "output": 15.0},
-    "gpt-5-mini": {"input": 0.5, "output": 2.5},
-    "o4": {"input": 3.0, "output": 12.0},
-    "o3": {"input": 2.0, "output": 8.0},
-    "o4-mini": {"input": 1.1, "output": 4.4},
-    "gemini-3": {"input": 3.0, "output": 15.0, "cache_read": 0.1},
-    MODEL_GEMINI_3_1_PRO: {"input": 0.50, "output": 3.00, "cache_read": 0.02},
-    "gemini-3-flash": {"input": 0.15, "output": 1.00, "cache_read": 0.005},
-    "qwen3-coder": {"input": 0.22, "output": 0.9},
-    # DeepSeek V4 family (FEAT deepseek-v4-flash-eu, added 2026-05-07).
-    # Hosted prices from deepseek.com release pages; the structural
-    # arbitrage comes from V4-Flash at ~$1.74/MTok input (CAISI 2026-04
-    # evaluation places the model ~8 months behind frontier — adequate
-    # for the 60-70% of agentic workloads that are not the hardest 30%).
-    # Self-hosted runs (Ollama / vLLM via :class:`OllamaAdapter`) reduce
-    # input cost to electricity; the hosted entries below are the
-    # opportunity-cost reference used by ``CostTracker`` to narrate
-    # "saved $X by self-hosting" in the run summary.
-    "deepseek-v4-flash": {"input": 1.74, "output": 0.20},
-    "deepseek-v4-pro": {"input": 4.50, "output": 1.50},
-    # Blended-only entries in ``_MODEL_COST_USD_PER_1K`` — approximate 40/60 input/output split of total $/1M.
-    "qwen-max": {"input": 0.8, "output": 1.2},
-    "qwen-plus": {"input": 0.4, "output": 0.6},
-    "qwen-turbo": {"input": 0.16, "output": 0.24},
-}
 
 # Approximate cost per 1k tokens (input+output blended average), USD.
 # Updated 2026-03-28 from official API pricing pages.
 # Used only as a tiebreaker when multiple arms meet the quality threshold.
 _MODEL_COST_USD_PER_1K: dict[str, float] = {
-    # Claude (Anthropic) — per 1M tokens: Opus $5/$25, Sonnet $3/$15, Haiku $1/$5
+    # Claude (Anthropic) - per 1M tokens: Opus $5/$25, Sonnet $3/$15, Haiku $1/$5
     "haiku": 0.003,  # ($1 + $5) / 2 / 1000
     "sonnet": 0.009,  # ($3 + $15) / 2 / 1000
     "opus": 0.015,  # ($5 + $25) / 2 / 1000
-    # OpenAI — per 1M tokens: GPT-5.4 $2.50/$15, o3 $2/$8, o4-mini $1.10/$4.40.
+    # OpenAI - per 1M tokens: GPT-5.4 $2.50/$15, o3 $2/$8, o4-mini $1.10/$4.40.
     # _model_cost() uses substring matching, so more-specific keys (mini
     # variants, o4-mini) must come *before* the shorter stems they share
     # a prefix with.  Without this ordering, "gpt-5-mini" would hit the
     # "gpt-5" row and inherit its higher blended cost.
-    # GPT-5.5 family — substring matching ordering: mini before stem.
+    # GPT-5.5 family - substring matching ordering: mini before stem.
     "gpt-5.5-mini": 0.0018,  # ($0.60 + $3.00) / 2 / 1000
     MODEL_GPT_5_5: 0.00725,  # ($2.50 + $12.00) / 2 / 1000
     "gpt-5.4-mini": 0.002625,  # ($0.75 + $4.50) / 2 / 1000
@@ -124,16 +143,16 @@ _MODEL_COST_USD_PER_1K: dict[str, float] = {
     "o4-mini": 0.00275,  # ($1.10 + $4.40) / 2 / 1000
     "o4": 0.0075,  # ($3 + $12) / 2 / 1000
     "o3": 0.005,  # ($2 + $8) / 2 / 1000
-    # Gemini (Google) — per 1M tokens: 3-pro ~$3/$15, 3.1-pro $0.50/$3, 3-flash $0.15/$1
+    # Gemini (Google) - per 1M tokens: 3-pro ~$3/$15, 3.1-pro $0.50/$3, 3-flash $0.15/$1
     "gemini-3": 0.009,  # ($3 + $15) / 2 / 1000
     MODEL_GEMINI_3_1_PRO: 0.00175,  # ($0.50 + $3.00) / 2 / 1000
     "gemini-3-flash": 0.000575,  # ($0.15 + $1.00) / 2 / 1000
-    # Qwen — open-weight, very cheap via API
+    # Qwen - open-weight, very cheap via API
     "qwen3-coder": 0.00056,  # ($0.22 + $0.90) / 2 / 1000
     "qwen-max": 0.001,
     "qwen-plus": 0.0005,
     "qwen-turbo": 0.0002,
-    # DeepSeek V4 family — FEAT deepseek-v4-flash-eu.  Self-hosted runs
+    # DeepSeek V4 family - FEAT deepseek-v4-flash-eu.  Self-hosted runs
     # against vLLM/Ollama drop the marginal cost to electricity; these
     # blended figures reflect the hosted ``deepseek.com`` API prices and
     # are used as the opportunity-cost reference.  ``deepseek-v4-flash``
@@ -143,7 +162,7 @@ _MODEL_COST_USD_PER_1K: dict[str, float] = {
     "deepseek-v4-pro": 0.003,  # ($4.50 + $1.50) / 2 / 1000
 }
 
-# Cascade order — sonnet first (haiku removed: on Max plan sonnet is
+# Cascade order - sonnet first (haiku removed: on Max plan sonnet is
 # unlimited and produces much better results)
 CASCADE: list[str] = ["sonnet", "opus"]
 
@@ -178,7 +197,7 @@ def get_all_bandit_arms() -> list[str]:
         if model in seen:
             continue
         if model not in _MODEL_COST_USD_PER_1K:
-            # Skip arms without pricing data — we'd have no rational way to
+            # Skip arms without pricing data - we'd have no rational way to
             # compare them against the cascade during exploitation.
             continue
         seen.add(model)
@@ -188,6 +207,10 @@ def get_all_bandit_arms() -> list[str]:
 
 def _model_cost(model: str) -> float:
     """Rough cost per 1k tokens for a model name."""
+    from bernstein.core.cost.model_prices import is_free_route
+
+    if is_free_route(model):
+        return 0.0
     model_lower = model.lower()
     for key, cost in _MODEL_COST_USD_PER_1K.items():
         if key in model_lower:
@@ -337,8 +360,8 @@ class EpsilonGreedyBandit:
 
     The epsilon-greedy learning loop was retired in to unify model
     selection and cost forecasting on a single store. This class preserves
-    the original API — ``select``, ``record``, ``seed_arm``, ``get_arm``,
-    ``summary``, ``save``, ``load`` — but every mutation is now mirrored into
+    the original API - ``select``, ``record``, ``seed_arm``, ``get_arm``,
+    ``summary``, ``save``, ``load`` - but every mutation is now mirrored into
     the canonical ``BanditRouter`` state at ``.sdd/routing/``.
 
     * ``select(role, candidate_models)`` picks the cheapest arm whose
@@ -493,8 +516,8 @@ class EpsilonGreedyBandit:
         models = candidate_models or CASCADE.copy()
 
         # Exploration: random choice with probability epsilon
-        # S311: not security-sensitive — bandit exploration, not cryptography.
-        if random.random() < self.epsilon:  # NOSONAR — non-crypto RNG for bandit exploration
+        # S311: not security-sensitive - bandit exploration, not cryptography.
+        if random.random() < self.epsilon:  # NOSONAR - non-crypto RNG for bandit exploration
             chosen = random.choice(models)  # NOSONAR
             logger.debug("Bandit[%s]: explore → %s", role, chosen)
             return chosen
@@ -513,7 +536,7 @@ class EpsilonGreedyBandit:
         for model in models:
             arm = self._arms.get((role, model))
             if arm is None:
-                # Never seen — treat as a pessimistic 0-observation arm so
+                # Never seen - treat as a pessimistic 0-observation arm so
                 # it only wins via explicit exploration, not greedy price.
                 continue
             if arm.success_rate >= self.quality_threshold:
@@ -524,7 +547,7 @@ class EpsilonGreedyBandit:
                 qualifying.append((model, cost))
 
         if not qualifying:
-            # All arms are under-performing or unseen — fall back to the
+            # All arms are under-performing or unseen - fall back to the
             # cheapest model to keep trying (cascade will escalate on
             # actual failures, and epsilon-exploration will keep probing
             # new arms).
@@ -552,7 +575,7 @@ class EpsilonGreedyBandit:
         key = (role, model)
         if key in self._arms and self._arms[key].observations > 0:
             logger.debug(
-                "Bandit[%s/%s]: skipping seed — arm already has %d real observations",
+                "Bandit[%s/%s]: skipping seed - arm already has %d real observations",
                 role,
                 model,
                 self._arms[key].observations,
@@ -608,7 +631,7 @@ class EpsilonGreedyBandit:
             self._mirror_record_to_router(router, role=role, model=model, success=success)
 
         logger.debug(
-            "Bandit[%s/%s]: recorded success=%s, cost=%.5f — arm now: obs=%d, success_rate=%.2f",
+            "Bandit[%s/%s]: recorded success=%s, cost=%.5f - arm now: obs=%d, success_rate=%.2f",
             role,
             model,
             success,
@@ -668,8 +691,8 @@ class EpsilonGreedyBandit:
         Since the legacy ``record()`` API only has ``(role, model)`` and a
         success bit, we cannot reconstruct a full ``TaskContext``. Instead we
         build a ``TaskContext`` with neutral mid-range features so the
-        LinUCB update lands predominantly on the bias axis — the same axis
-        that :meth:`BanditPolicy.seed_arm` writes to — keeping live updates
+        LinUCB update lands predominantly on the bias axis - the same axis
+        that :meth:`BanditPolicy.seed_arm` writes to - keeping live updates
         coherent with seeds.
         """
         try:
@@ -769,10 +792,31 @@ def compute_savings_vs_opus(records: list[dict[str, Any]]) -> float:
     return savings
 
 
+def _record_is_completed(rec: dict[str, Any]) -> bool:
+    """Return whether a task record counts as a completed task.
+
+    Reconciles with ``bernstein cost``'s ``_count_task_status`` so the manual-
+    savings figure and the ``Tasks: N completed`` line are computed from the
+    same completion-aware view (issue #2797): an explicit ``status`` wins, and
+    only when no status was recorded does a nonzero ``cost_usd`` stand in as
+    "this task did real work". A free-route run that recorded neither a
+    ``done`` status nor any spend is therefore not counted, so no savings
+    figure is claimed for ``0`` completed tasks.
+    """
+    status = str(rec.get("status", "") or "").strip().lower()
+    if status:
+        return status == "done"
+    return float(rec.get("cost_usd", 0.0) or 0.0) > 0.0
+
+
 def compute_savings_vs_manual(records: list[dict[str, Any]], hourly_rate: float = 100.0) -> dict[str, float]:
     """Estimate savings vs manual coding.
 
-    Calculates: estimated_manual_hours * hourly_rate - api_cost.
+    Calculates: estimated_manual_hours * hourly_rate - api_cost. Manual hours
+    are summed only over completed task records (see
+    :func:`_record_is_completed`) so the savings figure reconciles with the
+    completed-task count instead of claiming hours for tasks that never
+    completed.
 
     Args:
         records: Task metric records from tasks.jsonl.
@@ -785,6 +829,8 @@ def compute_savings_vs_manual(records: list[dict[str, Any]], hourly_rate: float 
     api_cost = 0.0
     for rec in records:
         api_cost += float(rec.get("cost_usd", 0.0) or 0.0)
+        if not _record_is_completed(rec):
+            continue
         # Check if explicitly recorded, otherwise estimate based on scope
         recorded_hours = float(rec.get("estimated_manual_hours", 0.0) or 0.0)
         if recorded_hours <= 0:

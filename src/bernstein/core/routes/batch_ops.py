@@ -1,6 +1,6 @@
 """WEB-017: Batch operations endpoint for task management.
 
-POST /tasks/batch-ops — execute bulk cancel, retry, reprioritize, or tag
+POST /tasks/batch-ops - execute bulk cancel, retry, reprioritize, or tag
 operations on up to 200 tasks in a single request.
 """
 
@@ -13,6 +13,9 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+
+from bernstein.core.routes.task_crud import require_tenant_scope_for_ids
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
 
 if TYPE_CHECKING:
     from bernstein.core.task_store import TaskStore
@@ -166,11 +169,22 @@ async def batch_operations(body: BatchRequest, request: Request) -> BatchResult:
     if errors:
         raise HTTPException(status_code=422, detail="; ".join(errors))
 
+    # Normalise first, then scope-check the normalised ids: these are the
+    # values the loop below acts on, and checking the raw input instead would
+    # let the rewrite carry an id past the check.
+    task_ids = [re.sub(r"[^\w\-]", "", raw_id)[:64] for raw_id in body.ids]
+    enforce_agent_task_scope_for_ids(request, task_ids)
+    # The gate above pins an *agent* credential to its own task ids and says
+    # nothing about any other credential type, so on its own it leaves every
+    # action below reachable across tenants.  Applied here, beside it, rather
+    # than inside the loop: each action mutates, so a per-item check would let
+    # a mixed batch apply its in-scope half before refusing the rest.
+    require_tenant_scope_for_ids(request, task_ids)
+
     store = _get_store(request)
     result = BatchResult()
 
-    for raw_id in body.ids:
-        task_id = re.sub(r"[^\w\-]", "", raw_id)[:64]
+    for task_id in task_ids:
         try:
             if body.action == BatchAction.CANCEL:
                 await _cancel_task(store, task_id)

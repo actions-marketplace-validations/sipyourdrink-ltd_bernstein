@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import stat
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -33,6 +35,15 @@ def _make_zip(dest: Path, contents: dict[str, str]) -> Path:
     return dest
 
 
+def _make_zip_with_mode(dest: Path, name: str, data: str, mode: int) -> Path:
+    """Create a zip archive containing one entry with a Unix mode."""
+    info = zipfile.ZipInfo(filename=name)
+    info.external_attr = mode << 16
+    with zipfile.ZipFile(dest, "w") as zf:
+        zf.writestr(info, data)
+    return dest
+
+
 def _make_tgz(dest: Path, contents: dict[str, str]) -> Path:
     """Create a .tar.gz archive at *dest*."""
     import io
@@ -56,7 +67,7 @@ def _make_github_api_response(asset_name: str, download_url: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# PluginSource union — structural tests
+# PluginSource union - structural tests
 # ---------------------------------------------------------------------------
 
 
@@ -106,6 +117,50 @@ class TestExtractArchive:
         dest = tmp_path / "out"
         _extract_archive(archive, dest)
         assert (dest / "hello.txt").read_text() == "world"
+
+    def test_extract_zip_rejects_sibling_prefix_escape(self, tmp_path: Path) -> None:
+        archive = _make_zip(tmp_path / "plugin.zip", {"../out_evil/pwned.txt": "owned"})
+        dest = tmp_path / "out"
+
+        with pytest.raises(ValueError, match="Zip entry would escape target directory"):
+            _extract_archive(archive, dest)
+
+        assert not (tmp_path / "out_evil" / "pwned.txt").exists()
+
+    def test_extract_zip_rejects_backslash_traversal_entry(self, tmp_path: Path) -> None:
+        """A '..\\' entry must be refused on every host, not just Windows.
+
+        A bare ``(dest / name).resolve()`` treats a backslash as an ordinary
+        filename character on POSIX, so a zip built to attack a Windows
+        target extracted inertly-but-not-safely on POSIX before this site
+        went through the shared containment helper, which splits on both
+        separators regardless of platform.
+        """
+        archive = _make_zip(tmp_path / "plugin.zip", {"..\\out_evil\\pwned.txt": "owned"})
+        dest = tmp_path / "out"
+
+        with pytest.raises(ValueError, match="Zip entry would escape target directory"):
+            _extract_archive(archive, dest)
+
+        assert not (tmp_path / "out_evil" / "pwned.txt").exists()
+
+    def test_extract_zip_preserves_unix_file_mode(self, tmp_path: Path) -> None:
+        """Zip extraction preserves the Unix mode on POSIX; extracts on Windows.
+
+        Runs on every OS. POSIX asserts the 0o755 mode is preserved; Windows
+        does not carry Unix mode bits, so it asserts the entry was extracted
+        with the expected content instead of skipping the lane.
+        """
+        archive = _make_zip_with_mode(tmp_path / "plugin.zip", "bin/plugin", "#!/bin/sh\n", 0o755)
+        dest = tmp_path / "out"
+
+        _extract_archive(archive, dest)
+
+        extracted = dest / "bin" / "plugin"
+        if sys.platform == "win32":
+            assert extracted.read_text() == "#!/bin/sh\n"
+        else:
+            assert stat.S_IMODE(extracted.stat().st_mode) == 0o755
 
     def test_extract_tar_gz(self, tmp_path: Path) -> None:
         archive = _make_tgz(tmp_path / "plugin.tar.gz", {"readme.md": "# Plugin"})
@@ -205,7 +260,7 @@ class TestDirectorySourceInstall:
 
 
 # ---------------------------------------------------------------------------
-# GitHubSource — mocked network
+# GitHubSource - mocked network
 # ---------------------------------------------------------------------------
 
 
@@ -312,7 +367,7 @@ class TestGitHubSourceInstall:
 
 
 # ---------------------------------------------------------------------------
-# GitSource — mocked subprocess
+# GitSource - mocked subprocess
 # ---------------------------------------------------------------------------
 
 

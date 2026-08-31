@@ -3,7 +3,7 @@
 Bernstein's agent isolation has historically been git-worktree-only. This
 module defines the shape that lets additional isolation backends (Docker,
 E2B, Modal, Daytona, Cloudflare, Vercel ...) plug in behind a uniform
-interface — every backend provisions a :class:`SandboxSession` against a
+interface - every backend provisions a :class:`SandboxSession` against a
 :class:`~bernstein.core.sandbox.manifest.WorkspaceManifest` and exposes
 ``read``/``write``/``exec``/``ls``/``snapshot``/``shutdown`` primitives.
 
@@ -53,6 +53,13 @@ class SandboxCapability(StrEnum):
             identifier that later ``backend.resume`` can restore.
         PERSISTENT_VOLUMES: The backend can mount persistent volumes that
             outlive the session (used by oai-003 cloud artifact storage).
+        SCOPED_MOUNT: The backend guarantees the sandbox filesystem exposes
+            only the task's owned files, not the whole repository. Backends
+            that bind-mount the full checkout (e.g. Docker mounts the repo
+            read-only so ``git checkout`` keeps full history) must NOT
+            declare this. It gates the sandbox relaxation of the
+            ``scope_enforcement`` guardrail: the write-scope boundary is only
+            redundant when the mount itself is scoped to the task.
     """
 
     FILE_RW = "file_rw"
@@ -61,6 +68,7 @@ class SandboxCapability(StrEnum):
     GPU = "gpu"
     SNAPSHOT = "snapshot"
     PERSISTENT_VOLUMES = "persistent_volumes"
+    SCOPED_MOUNT = "scoped_mount"
 
 
 @dataclass(frozen=True)
@@ -203,7 +211,7 @@ class SandboxSession(ABC):
     async def shutdown(self) -> None:
         """Release all resources held by the session.
 
-        Idempotent — safe to call multiple times.
+        Idempotent - safe to call multiple times.
         """
 
 

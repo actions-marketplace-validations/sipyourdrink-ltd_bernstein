@@ -92,6 +92,7 @@ def _make_task_dict(
 
 _COMPLETE_RE = re.compile(r"^/tasks/(.+)/complete$")
 _FAIL_RE = re.compile(r"^/tasks/(.+)/fail$")
+_TASK_RE = re.compile(r"^/tasks/([^/]+)$")
 
 
 class _BernsteinFakeTransport(httpx.AsyncBaseTransport):
@@ -130,6 +131,12 @@ class _BernsteinFakeTransport(httpx.AsyncBaseTransport):
         self._tasks[task_id] = task
         return httpx.Response(201, json=task)
 
+    def _handle_get_task(self, task_id: str) -> httpx.Response:
+        task = self._tasks.get(task_id)
+        if task is None:
+            return httpx.Response(404, json={"error": f"task {task_id!r} not found"})
+        return httpx.Response(200, json=task)
+
     def _handle_task_transition(
         self,
         request: httpx.Request,
@@ -156,6 +163,10 @@ class _BernsteinFakeTransport(httpx.AsyncBaseTransport):
 
         if method == "POST" and path == "/tasks":
             return self._handle_post_tasks(request)
+
+        m_task = _TASK_RE.match(path)
+        if method == "GET" and m_task:
+            return self._handle_get_task(m_task.group(1))
 
         m_complete = _COMPLETE_RE.match(path)
         if method == "POST" and m_complete:
@@ -281,8 +292,32 @@ class McpFakeLab:
         with patch("bernstein.mcp.server.httpx.AsyncClient", side_effect=_make_client):
             result = await mcp.call_tool(tool_name, args)
 
-        # FastMCP returns a list of lists of content objects
-        return result[0][0].text  # type: ignore[index]
+        if hasattr(result, "content"):
+            # Structured tools (#3086) answer with a CallToolResult whose
+            # text block is unchanged.
+            text: str = result.content[0].text  # type: ignore[union-attr]
+        else:
+            # FastMCP returns a list of lists of content objects
+            text = result[0][0].text  # type: ignore[index]
+        # Strip the MCP cost-meter envelope (#1696) so tests assert
+        # the tool's inner contract, not the cross-cutting meter. The
+        # envelope shape is {"result": <payload>, "_meter": {...}}.
+        # Tests that want to inspect the envelope itself can opt out
+        # via the dedicated MCP cost-meter test suite.
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+        if isinstance(parsed, dict) and "_meter" in parsed and "result" in parsed:
+            parsed = parsed["result"]
+        # Strip the deprecated-alias wrapper (#3087) the same way, so tests
+        # against an alias assert its historical payload; the wrapper itself
+        # is covered by the tool-surface consolidation suite.
+        if isinstance(parsed, dict) and parsed.get("deprecated") is True and "result" in parsed:
+            parsed = parsed["result"]
+        if isinstance(parsed, str):
+            return parsed
+        return json.dumps(parsed)
 
     # ------------------------------------------------------------------
     # Inspection helpers

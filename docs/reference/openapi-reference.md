@@ -2,25 +2,28 @@
 
 Bernstein exposes a task-server HTTP API on `http://127.0.0.1:8052` by default. The full OpenAPI 3.1 specification is available at `/openapi.json` when the server is running.
 
-This page is the canonical hand-maintained reference. It covers ~196 HTTP/WebSocket endpoints across 49 route files, plus 8 MCP tools. Endpoints requiring authentication are marked with `Y` in the **Auth** column.
+This page is a hand-maintained tour of the FastAPI route modules under `src/bernstein/core/routes/`, plus 13 MCP tools. Endpoints requiring authentication are marked with `Y` in the **Auth** column. `docs/reference/openapi.json` is the complete machine-readable list; where the two disagree, the JSON wins.
 
 ## Generating the spec
 
-Use the included script to regenerate `docs/openapi.json` from the FastAPI app definition without starting the server:
+Use the included script to regenerate `docs/reference/openapi.json` from the FastAPI app definition without starting the server:
 
 ```bash
 uv run python scripts/generate_openapi.py
-# Written docs/reference/openapi.json  (216 paths, 72 schemas)
+# Written docs/reference/openapi.json  (459 paths, 121 schemas)
 ```
 
 Run this after adding or modifying any API route, Pydantic model, or response schema, then commit the updated JSON. The hosted Redoc page reads the spec at load time, so the rendered reference updates automatically once the JSON is committed.
 
-**Alternative -- fetch from a running server:**
+Forgetting the step is a CI failure, not a silent rot: `tests/unit/test_openapi_snapshot_drift.py` rebuilds the app and diffs it against the committed snapshot, naming whatever moved. It compares paths, component schema names, the property names inside those schemas, and each operation's response codes and media types. Prose is deliberately excluded, so rewording a handler docstring never forces a snapshot commit -- but it does mean a description-only change reaches the published reference on the next regeneration, whenever that is.
+
+**Alternative -- inspect the spec from a running server:**
 
 ```bash
-bernstein run &
-curl -s http://127.0.0.1:8052/openapi.json > docs/reference/openapi.json
+curl -s http://127.0.0.1:8052/openapi.json | python -m json.tool
 ```
+
+Read-only. Redirecting `curl` into the snapshot writes minified JSON and rewrites every line of the committed file, so refresh it with the script above instead.
 
 > The OpenAPI JSON declares each route at both its bare path (e.g. `/tasks`) and an `/api/v1/`-prefixed alias (e.g. `/api/v1/tasks`). Both are live; pick one prefix per client.
 
@@ -34,7 +37,7 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8052/tasks
 
 Public endpoints (no auth required): `/health`, `/health/ready`, `/health/live`, `/.well-known/agent.json`, `/.well-known/acp.json`, `/docs`, `/openapi.json`, plus loopback connections from `127.0.0.1` (for local CLI use).
 
-Bearer tokens are issued via `/auth/cli/token` (device flow) or `/auth/token` (programmatic), and rotated via `/auth/refresh`.
+Bearer tokens are issued via the CLI device flow (`/auth/cli/device`, `/auth/cli/authorize`, `/auth/cli/token`).
 
 ---
 
@@ -325,9 +328,7 @@ Source: `core/routes/auth.py`.
 | POST | `/auth/cli/device` | `cli_device_init` | N | Initiate CLI device-flow login |
 | POST | `/auth/cli/token` | `cli_device_token` | N | Exchange device code for token |
 | POST | `/auth/cli/authorize` | `cli_authorize` | N | Authorize a pending device |
-| POST | `/auth/token` | `token_grant` | N | Programmatic token issue |
-| POST | `/auth/refresh` | `token_refresh` | N | Refresh an expired token |
-| POST | `/auth/validate` | `token_validate` | N | Validate a token |
+| GET | `/auth/login` | `login` | N | Interactive login |
 | GET | `/auth/me` | `current_user` | Y | Authenticated-user profile |
 | POST | `/auth/logout` | `logout` | Y | Revoke current session |
 | GET | `/auth/group-mappings` | `group_mappings` | Y | OIDC/SAML group -> role mappings |
@@ -417,7 +418,7 @@ Source: `core/routes/bulletin.py`, `core/routes/channel.py`.
 
 ## MCP tools
 
-The MCP tools below are exposed via Bernstein's MCP server (`core/mcp/server.py`), not over HTTP. They are callable from any MCP-aware client (Claude Desktop, Cursor, etc.) once the MCP server is registered.
+The MCP tools below are exposed via Bernstein's MCP server (`mcp/server.py`), not over HTTP. They are callable from any MCP-aware client (Claude Desktop, Cursor, etc.) once the MCP server is registered.
 
 | Tool name | Purpose |
 |-----------|---------|
@@ -426,8 +427,14 @@ The MCP tools below are exposed via Bernstein's MCP server (`core/mcp/server.py`
 | `bernstein_tasks` | List tasks with filtering |
 | `bernstein_cost` | Cost summary for the current run |
 | `bernstein_stop` | Stop the running orchestrator |
-| `bernstein_approve` | Approve a pending task or request |
+| `bernstein_approve` | Sign off a finished result that is waiting on a decision |
+| `bernstein_complete` | Report the result of work the caller is executing |
+| `bernstein_create_subtask` | Create a subtask under an existing task |
 | `bernstein_health` | Health check |
+| `bernstein_scenarios` | List available scenarios |
+| `bernstein_scenario` | Run a scenario |
+| `bernstein_scenario_status` | Fetch scenario run status |
+| `verify_chain` | Verify an artefact's lineage chain |
 | `load_skill` | Load a skill pack at runtime |
 
 These are **MCP tools**, not HTTP endpoints. They consume tool-call payloads matching each tool's MCP schema (see `mcp/server.py` for `inputSchema` definitions).

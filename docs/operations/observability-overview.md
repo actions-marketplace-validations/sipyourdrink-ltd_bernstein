@@ -6,14 +6,14 @@ Audience: SREs wiring Bernstein into an existing observability stack.
 
 Bernstein emits four classes of signal:
 
-- **Metrics** — Prometheus-format counters, gauges, and histograms exposed at
+- **Metrics** - Prometheus-format counters, gauges, and histograms exposed at
   `/metrics`. Native Datadog APM and OpenTelemetry/OTLP export are also
   available out of the box.
-- **Traces** — task and agent execution spans via OpenTelemetry, with built-in
+- **Traces** - task and agent execution spans via OpenTelemetry, with built-in
   presets for Jaeger, Grafana Tempo, Datadog, Zipkin, and console.
-- **Events** — structured JSON events on a Server-Sent-Events bus
+- **Events** - structured JSON events on a Server-Sent-Events bus
   (`/events`), per-task progress streams, and per-agent log streams.
-- **Anomaly signals** — `core/observability/behavior_anomaly.py` runs both
+- **Anomaly signals** - `core/observability/behavior_anomaly.py` runs both
   post-completion and real-time detectors over agent state and emits
   signals from `LOG` (informational) all the way to `KILL_AGENT` (terminate
   the agent on the next tick).
@@ -25,7 +25,7 @@ one dashboard import; adding Datadog or OTLP export is one config block.
 ## Endpoints catalogue
 
 All HTTP. Authentication rules follow the standard middleware
-([Security and identity](security-and-identity.md)) — `/metrics` is
+([Security and identity](security-and-identity.md)) - `/metrics` is
 gated by viewer permissions when an auth backend is configured.
 
 ### Prometheus / Grafana / SLOs
@@ -166,9 +166,7 @@ Environment variables (`apm_integration.py:29-37`):
 Setup is one of:
 
 ```python
-from bernstein.core.observability.apm_integration import (
-    auto_configure_apm, configure_datadog
-)
+from bernstein.core.observability.apm_integration import auto_configure_apm, configure_datadog
 
 # Auto-pick whatever is available based on env vars
 auto_configure_apm()
@@ -179,7 +177,7 @@ configure_datadog()
 
 What gets sent: task and agent spans (start/end, status,
 role, model, complexity), gate execution spans, cascade-router
-escalations, and exception traces. Logs are not piped directly — use the
+escalations, and exception traces. Logs are not piped directly - use the
 Datadog Agent's log file collection on `.sdd/runtime/*.log` if you need
 log correlation.
 
@@ -194,9 +192,7 @@ tracer, meter, span context manager, and named presets for common
 backends (`telemetry.py:1-22`).
 
 ```python
-from bernstein.core.observability.telemetry import (
-    init_telemetry_from_preset, init_telemetry, start_span
-)
+from bernstein.core.observability.telemetry import init_telemetry_from_preset, init_telemetry, start_span
 
 # Built-in presets (telemetry.py:86-100): "jaeger", "grafana", "datadog",
 # "zipkin", "console", and more. Each preset hardcodes endpoint, protocol,
@@ -219,6 +215,60 @@ service name is `bernstein` (`telemetry.py:58`).
 Service maps work out of the box because every span carries
 `service.name` as a resource attribute; no extra config required for
 Tempo or Jaeger to associate them.
+
+### Signed journal projection (verifiable spans)
+
+Ordinary OTLP spans carry random ids that any tool can emit and none can
+verify. `core/observability/otel_projection.py` makes the GenAI export a
+*deterministic projection* of the run event journal instead:
+
+- span ids are derived from journal entry hashes (`span_id = H("otel.span",
+  entry_hash)[:8 bytes]`), so two replays of the same run export a
+  byte-identical trace,
+- every span carries `bernstein.journal.entry_hash` pinning the exact
+  journal row it projects,
+- journal events map onto the OTel GenAI operation layers (`invoke_workflow`
+  root, `invoke_agent`, `execute_tool`, `chat`),
+- the whole span set is signed with the install-identity Ed25519 key, so a
+  tampered span breaks the entry-hash binding or the signature.
+
+The projection is written to the local
+`.sdd/runs/<run_id>/projection.otel.json` store even when no OTLP endpoint is
+set (`BERNSTEIN_OTEL_ENDPOINT` stays opt-in). The GenAI convention attributes
+are still Development-stage; they live behind the stability flag
+(`--no-genai-stability` to omit them) and never affect the ids or the
+entry-hash binding, so an attribute rename cannot corrupt the journal-anchored
+truth.
+
+```bash
+# Project a run's journal into a signed OTel span set (local JSONL store).
+bernstein trace project <run_id>
+
+# Recompute span ids from the journal and verify the signature.
+bernstein trace verify-projection <run_id>
+```
+
+Each emit appends an `otel.projection` event to the HMAC audit chain
+recording the run id, the journal head, the derived trace id, the span count,
+and the sha256 of the signed span set, so an operator can confirm from the
+chain alone that a trace faithfully projects the journal.
+
+### Live OTLP streaming of the projection
+
+With `BERNSTEIN_OTEL_ENDPOINT` set, `core/observability/otel_bridge.py`
+streams that same projection to the collector *during* the run: each
+appended journal entry is projected incrementally (the streaming projector
+is property-tested equal to the batch projection) and exported with the
+identical journal-derived ids, plus `bernstein.audit.anchor` (the first-entry
+projection anchor) and `bernstein.run.id` on every span. The trace id derived
+from that anchor joins the spans to the completed `otel.projection` audit
+event, which records the final journal head. Set
+`BERNSTEIN_OTEL_GENAI_STABILITY=false` to omit Development-stage GenAI
+attributes without changing identity. Off by default -- no endpoint means no
+exporter initialisation and no network attempts. Backfill a completed run
+with `bernstein telemetry export-otel --run <run_id>`
+(`--dry-run` prints the OTLP/JSON without exporting). Full guide:
+[OTLP export](../observability/otlp-export.md).
 
 ## SLO tracking
 
@@ -249,14 +299,14 @@ in-process actions, watch `GET /slo/budget` for `is_depleted: true`
 Source: `core/observability/behavior_anomaly.py`. Covers two distinct
 detection modes (`behavior_anomaly.py:1-20`):
 
-1. **Post-completion** — `BehaviorAnomalyDetector` analyses metrics from
+1. **Post-completion** - `BehaviorAnomalyDetector` analyses metrics from
    `.sdd/metrics/tasks.jsonl` after a task finishes and emits
    `AnomalySignal` values.
-2. **Real-time** — `RealtimeBehaviorMonitor` tracks in-flight session
+2. **Real-time** - `RealtimeBehaviorMonitor` tracks in-flight session
    state on every progress update and fires immediately on suspicious
    activity. On `KILL_AGENT` severity it writes a structured kill-signal
    file (`.sdd/runtime/{session_id}.kill`) so the orchestrator
-   terminates the agent on the next tick — the same mechanism the
+   terminates the agent on the next tick - the same mechanism the
    circuit breaker uses.
 
 Real-time detection dimensions (`behavior_anomaly.py:11-19`):
@@ -275,11 +325,11 @@ Allow-list patterns counter false positives: `*.env.example`,
 
 How to interpret alerts:
 
-- **`LOG`** — informational. Often noise during refactors that touch
+- **`LOG`** - informational. Often noise during refactors that touch
   many files at once.
-- **`WARN`** — investigate the agent log; the agent is misbehaving but
+- **`WARN`** - investigate the agent log; the agent is misbehaving but
   not necessarily compromised.
-- **`KILL_AGENT`** — the runtime has already written a kill signal. The
+- **`KILL_AGENT`** - the runtime has already written a kill signal. The
   orchestrator will terminate the agent on its next tick and the
   agent's branch is preserved for human review under
   `.sdd/quarantine/{session_id}.json` (see [Circuit breakers](#circuit-breakers)
@@ -299,9 +349,9 @@ Two distinct breakers, both producing structured signals.
 Real-time breaker that auto-terminates misbehaving agents
 (`circuit_breaker.py:1-15`). Triggers:
 
-- **Scope violation** — agent edited files outside the task's
+- **Scope violation** - agent edited files outside the task's
   `owned_files`.
-- **Budget violation** — agent exceeded a per-session token limit.
+- **Budget violation** - agent exceeded a per-session token limit.
 
 On trigger:
 
@@ -317,7 +367,7 @@ the `agent_lifecycle` module on the next tick.
 **Service-level cascading-failure circuit breaker**
 (`core/observability/cascading_failure_circuit_breaker.py`):
 
-Three-state breaker per service (CLOSED / OPEN / HALF_OPEN —
+Three-state breaker per service (CLOSED / OPEN / HALF_OPEN -
 `cascading_failure_circuit_breaker.py:39-44`). Wraps calls to upstream
 services (LLM providers, task server, git) with independent failure and
 latency thresholds. Configuration

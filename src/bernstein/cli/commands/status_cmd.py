@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -12,6 +13,7 @@ from typing import Any, cast
 import click
 
 from bernstein.cli.helpers import (
+    ServerAuthError,
     console,
     is_json,
     is_process_alive,
@@ -22,7 +24,10 @@ from bernstein.cli.helpers import (
 from bernstein.cli.status import collect_rate_limit_snapshots, render_status
 from bernstein.cli.ui import make_console
 from bernstein.core.agent_discovery import AgentCapabilities, DiscoveryResult, discover_agents_cached
+from bernstein.core.process_utils import list_command_lines, process_cwd
 from bernstein.tui.worker_badges import format_worker_badge, get_badge_for_worker
+
+logger = logging.getLogger(__name__)
 
 _NOT_AUTHENTICATED_MSG = "not authenticated"
 
@@ -65,7 +70,7 @@ def _load_remote_agents_from_snapshot(runtime_dir: Path) -> list[dict[str, Any]]
                 "command": f"[remote] {runtime_backend}",
                 "model": item.get("model", "?"),
                 "worker_pid": "remote",
-                "child_pid": "—",
+                "child_pid": "-",
                 "runtime": runtime_str,
                 "started_at": started_at,
                 "runtime_backend": runtime_backend,
@@ -165,7 +170,17 @@ def status(as_json: bool, no_color: bool, view_mode: str | None) -> None:
     """
     from bernstein.core.view_mode import ViewMode, get_view_config, load_view_mode
 
-    data = server_get("/status")
+    try:
+        data = server_get("/status", raise_on_auth_error=True)
+    except ServerAuthError:
+        if as_json or is_json():
+            print_json({"error": "Server is running but rejected credentials"})
+        else:
+            console.print(
+                "[red]Server is running but rejected credentials.[/red] "
+                "Run [bold]bernstein[/bold] in this workspace, or set BERNSTEIN_AUTH_TOKEN to match the server."
+            )
+        raise SystemExit(1) from None
     if data is None:
         if as_json or is_json():
             print_json({"error": "Cannot reach task server"})
@@ -184,6 +199,11 @@ def status(as_json: bool, no_color: bool, view_mode: str | None) -> None:
     if snapshots:
         data["rate_limit_meters"] = snapshots
 
+    # Attach the supervisor summary (stuck-count + oldest-stall age).
+    # Operators reading ``bernstein status`` should not have to remember
+    # the dedicated supervisor command to spot a wedged worker.
+    data["supervisor"] = _supervisor_status_summary(Path.cwd())
+
     if as_json or is_json():
         print_json(data)
         return
@@ -200,9 +220,51 @@ def status(as_json: bool, no_color: bool, view_mode: str | None) -> None:
 
     render_status(data, console=con, view_config=vc)
 
+    supervisor_line = _supervisor_summary_line(Path.cwd())
+    if supervisor_line:
+        con.print(f"[dim]{supervisor_line}[/dim]")
+
+
+def _supervisor_status_summary(workdir: Path) -> dict[str, Any]:
+    """Return the supervisor stuck-count summary for ``bernstein status --json``.
+
+    Returns an empty dict if the aggregator raises - the command must
+    never fail on a missing or malformed runtime tree. Failures are
+    logged so an operator can correlate an empty summary with a real
+    cause instead of treating silence as healthy.
+    """
+    try:
+        from bernstein.core.defaults import AGENT
+        from bernstein.core.orchestration.supervisor_aggregator import (
+            aggregator_snapshot,
+            snapshot_to_dict,
+        )
+
+        snapshot = aggregator_snapshot(workdir, heartbeat_stale_s=AGENT.heartbeat_stale_s)
+    except Exception:  # pragma: no cover - status must never error on this
+        logger.exception("supervisor status summary failed")
+        return {}
+    return snapshot_to_dict(snapshot)
+
+
+def _supervisor_summary_line(workdir: Path) -> str:
+    """Return the one-line supervisor summary string for the human view."""
+    try:
+        from bernstein.core.defaults import AGENT
+        from bernstein.core.orchestration.supervisor_aggregator import (
+            aggregator_snapshot,
+            format_summary_line,
+        )
+
+        snapshot = aggregator_snapshot(workdir, heartbeat_stale_s=AGENT.heartbeat_stale_s)
+    except Exception:  # pragma: no cover - status must never error on this
+        logger.exception("supervisor summary line render failed")
+        return ""
+    return format_summary_line(snapshot)
+
 
 # ---------------------------------------------------------------------------
-# ps — process visibility
+# ps - process visibility
 # ---------------------------------------------------------------------------
 
 
@@ -220,7 +282,11 @@ def _collect_pid_agents(pid_path: Path) -> tuple[list[dict[str, Any]], list[Path
             continue
 
         worker_pid = info.get("worker_pid", 0)
-        alive = is_process_alive(worker_pid) if worker_pid else False
+        child_pid = info.get("child_pid")
+        # Probe the leaf child PID independently: an adapter leaf process can
+        # outlive its worker briefly, and reporting on ``worker_pid`` alone made
+        # ``ps`` go blind to a still-running agent (issue #2800).
+        alive = (bool(worker_pid) and is_process_alive(worker_pid)) or (bool(child_pid) and is_process_alive(child_pid))
         if not alive:
             stale_files.append(pid_file)
             continue
@@ -238,13 +304,92 @@ def _collect_pid_agents(pid_path: Path) -> tuple[list[dict[str, Any]], list[Path
                 "command": info.get("command", "?"),
                 "model": info.get("model", "?"),
                 "worker_pid": worker_pid,
-                "child_pid": info.get("child_pid"),
+                "child_pid": child_pid,
                 "runtime": runtime_str,
                 "started_at": started_at,
             }
         )
 
     return agents, stale_files
+
+
+def _ps_scan_workdir(pid_path: Path) -> Path:
+    """Resolve the project root for the live scan from the PID directory.
+
+    ``ps`` matches processes by their absolute ``.sdd`` path prefixes, so the
+    scan needs the absolute project root. The default PID directory is
+    ``<project>/.sdd/runtime/pids``; when the layout matches we walk up to the
+    project root, otherwise we fall back to the current working directory.
+    """
+    resolved = pid_path.resolve()
+    if resolved.name == "pids" and resolved.parent.name == "runtime" and resolved.parent.parent.name == ".sdd":
+        return resolved.parent.parent.parent
+    return Path.cwd()
+
+
+def _classify_live_process(
+    pid: int, command: str, workdir: Path, worktree_prefix: str, heartbeat_prefix: str
+) -> str | None:
+    """Return the role of a repo-owned process, or ``None`` when unrelated.
+
+    Agents are matched by worktree/heartbeat path markers alone; the
+    orchestrator, server, and watchdog must additionally run with a cwd inside
+    this project so a sibling checkout's server is never attributed here.
+    """
+    if worktree_prefix in command or heartbeat_prefix in command:
+        return "agent"
+    is_watchdog = "bernstein.core.orchestration.bootstrap" in command and "--watchdog" in command
+    is_spawner = "bernstein.core.orchestrator" in command
+    is_server = "uvicorn bernstein.core.server:app" in command
+    if not (is_watchdog or is_spawner or is_server):
+        return None
+    if process_cwd(pid) != workdir:
+        return None
+    if is_watchdog:
+        return "watchdog"
+    if is_spawner:
+        return "spawner"
+    return "server"
+
+
+def _scan_live_agent_rows(workdir: Path, known_pids: set[int]) -> list[dict[str, Any]]:
+    """Cross-check the OS process table for live repo-owned processes.
+
+    PID files are the primary source, but ``hard_stop`` deletes them; this scan
+    keeps ``ps`` honest by surfacing the orchestrator, server, watchdog, and
+    agent processes that are still alive after the files are gone (#2874). PIDs
+    already covered by a PID-file row are skipped. Each candidate's liveness is
+    re-probed so a process that exited between the ``ps`` snapshot and now is
+    dropped rather than reported as a phantom.
+    """
+    worktree_prefix = str(workdir / ".sdd" / "worktrees")
+    heartbeat_prefix = str(workdir / ".sdd" / "runtime" / "heartbeats")
+    self_pid = os.getpid()
+    seen = set(known_pids)
+    rows: list[dict[str, Any]] = []
+    for pid, command in list_command_lines():
+        if pid in seen or pid == self_pid:
+            continue
+        role = _classify_live_process(pid, command, workdir, worktree_prefix, heartbeat_prefix)
+        if role is None:
+            continue
+        # Race guard: the pid was in the ps snapshot but may have exited since.
+        if not is_process_alive(pid):
+            continue
+        seen.add(pid)
+        rows.append(
+            {
+                "session": f"{role}:{pid}",
+                "role": role,
+                "command": "-",
+                "model": "-",
+                "worker_pid": pid,
+                "child_pid": None,
+                "runtime": "-",
+                "source": "scan",
+            }
+        )
+    return rows
 
 
 @click.command("ps")
@@ -269,20 +414,55 @@ def ps_cmd(as_json: bool, pid_dir: str) -> None:
 
     _decorate_agent_rows(agents)
 
-    from bernstein.core.agents.spawn_supervisor import get_supervisor
+    # Live process-table cross-check: surface repo-owned processes that outlived
+    # their PID files (e.g. after ``bernstein stop --force``) so ``ps`` never
+    # goes blind while the orchestrator or an agent is still running (#2874).
+    known_pids: set[int] = set()
+    for agent in agents:
+        for key in ("worker_pid", "child_pid"):
+            value = agent.get(key)
+            if isinstance(value, int) and value > 0:
+                known_pids.add(value)
+    agents.extend(_scan_live_agent_rows(_ps_scan_workdir(pid_path), known_pids))
 
-    parked = get_supervisor().parked_sessions()
+    # Read the on-disk store as well as this process's supervisor: the
+    # orchestrator that parks a session runs elsewhere, so an in-process
+    # read alone is empty by construction (#3453).
+    from bernstein.core.agents.spawn_supervisor import get_supervisor
+    from bernstein.core.orchestration.supervisor_aggregator import observed_parked_sessions
+
+    parked_state = observed_parked_sessions(
+        _ps_scan_workdir(pid_path),
+        in_process=get_supervisor().parked_sessions(),
+    )
+    parked = sorted(parked_state.session_ids)
 
     if as_json or is_json():
-        print_json({"agents": agents, "parked": parked} if parked else agents)
+        # Shape is load-bearing and stays exactly as it was: a bare list
+        # unless something is parked, an object when something is. Making
+        # it unconditionally an object would break every existing reader
+        # of `ps --json-output` (tests/unit/test_status_cmd_openclaw_bridge
+        # asserts payload[0]), so the availability flag rides along inside
+        # the object form rather than forcing one.
+        if parked:
+            payload: dict[str, Any] = {
+                "agents": agents,
+                "parked": parked,
+                "parked_available": parked_state.available,
+            }
+            print_json(payload)
+        else:
+            print_json(agents)
         return
 
     if not agents and not parked:
         console.print("[dim]No running agents.[/dim]")
+        _print_parked_unavailable(parked_state.available)
         return
 
     if not agents:
         _print_parked(parked)
+        _print_parked_unavailable(parked_state.available)
         return
 
     table = Table(title="Bernstein Agents", show_lines=False, header_style="bold cyan")
@@ -305,7 +485,7 @@ def ps_cmd(as_json: bool, pid_dir: str) -> None:
             str(a.get("worker_badge", "")),
             ", ".join(cast("list[str]", a.get("skill_badges", []))),
             str(a["worker_pid"]),
-            str(a["child_pid"] or "—"),
+            str(a["child_pid"] or "-"),
             a["runtime"],
         )
 
@@ -324,8 +504,20 @@ def _print_parked(parked: list[str]) -> None:
     console.print("[dim]Resume with: bernstein agents resume <id>[/dim]")
 
 
+def _print_parked_unavailable(available: bool) -> None:
+    """Say so when nothing can vouch for the parked state.
+
+    "No parked sessions" and "no supervisor ever wrote here" are
+    different claims, and rendering them identically is what let this
+    surface reassure for its whole life (#3453).
+    """
+    if available:
+        return
+    console.print("[dim]parked state unavailable (no supervisor has written to this workspace)[/dim]")
+
+
 # ---------------------------------------------------------------------------
-# doctor — self-diagnostic helpers
+# doctor - self-diagnostic helpers
 # ---------------------------------------------------------------------------
 
 _CheckFn = Any  # Callable[[str, bool, str, str, str], None]
@@ -373,7 +565,7 @@ def _doctor_check_postgres(_check: _CheckFn) -> None:
         import asyncio
 
         asyncio.run(_check_pg())
-        _check(_STORAGE_BACKEND_LABEL, True, f"postgres — connected ({db_url[:40]}...)", "")
+        _check(_STORAGE_BACKEND_LABEL, True, f"postgres - connected ({db_url[:40]}...)", "")
     except ImportError:
         _check(
             _STORAGE_BACKEND_LABEL,
@@ -385,7 +577,7 @@ def _doctor_check_postgres(_check: _CheckFn) -> None:
         _check(
             _STORAGE_BACKEND_LABEL,
             False,
-            f"postgres — connection failed: {exc}",
+            f"postgres - connection failed: {exc}",
             "Check BERNSTEIN_DATABASE_URL and ensure PostgreSQL is running",
         )
 
@@ -529,13 +721,51 @@ def _doctor_auto_fix(
 
 
 # ---------------------------------------------------------------------------
-# doctor — self-diagnostic
+# doctor - self-diagnostic
 # ---------------------------------------------------------------------------
 
 
 def _add_check(checks: list[dict[str, Any]], name: str, ok: bool, detail: str, fix: str = "", fix_id: str = "") -> None:
     """Append a diagnostic check result."""
     checks.append({"name": name, "ok": ok, "detail": detail, "fix": fix, "fix_id": fix_id})
+
+
+def _doctor_check_eval_gate_power(checks: list[dict[str, Any]], workdir: Path) -> None:
+    """Advisory: flag statistical eval gate decisions taken below the minimum n (#2520).
+
+    Non-blocking. A verdict receipt records whether the minimum n per arm was
+    met; any stored receipt decided below that floor is surfaced so an operator
+    knows a promotion may have stood on too few tasks to survive a re-run.
+    """
+    from bernstein.cli.commands.doctor_cmd import check_eval_gate_min_n_advisory
+
+    advisory = check_eval_gate_min_n_advisory(workdir)
+    detail = advisory["detail"]
+    fix = advisory.get("fix", "")
+    # Advisory only: never fail the run, but keep the underpowered note visible.
+    _add_check(checks, advisory["name"], True, detail, fix)
+
+
+def _doctor_check_otel_export(checks: list[dict[str, Any]]) -> None:
+    """Surface the live OTLP export advisory (#2526, Phase 4).
+
+    Advisory only: with ``BERNSTEIN_OTEL_ENDPOINT`` set but the optional
+    ``opentelemetry-exporter-otlp-proto-grpc`` extra missing, every
+    journal-anchored span is silently dropped on the wire path. This warns the
+    operator without failing the doctor run (the ci-tools/last-green pattern:
+    WARN rows stay ``ok`` and prefix the detail).
+    """
+    from bernstein.cli.commands.doctor_cmd import check_otel_export_advisory
+
+    row = check_otel_export_advisory()
+    warn = row["status"] == "WARN"
+    _add_check(
+        checks,
+        row["name"],
+        True,
+        f"WARNING: {row['detail']}" if warn else row["detail"],
+        row["fix"],
+    )
 
 
 def _doctor_check_python(checks: list[dict[str, Any]]) -> bool:
@@ -566,9 +796,66 @@ def _doctor_check_adapters(checks: list[dict[str, Any]]) -> bool:
             f"Adapter: {adapter_name}",
             found,
             "found in PATH" if found else "not in PATH",
-            f"Install {adapter_name} CLI — see docs" if not found else "",
+            f"Install {adapter_name} CLI - see docs" if not found else "",
         )
     return any_adapter
+
+
+def _doctor_check_last_green(checks: list[dict[str, Any]]) -> None:
+    """Surface adapter last-green advisories from the canary projection.
+
+    Rows come from the packaged last-green projection regenerated by the
+    nightly adapter conformance canary (see
+    docs/adapters/conformance-canary.md). Advisory only: an installed
+    version ahead of last-green is surfaced as a WARNING detail (the
+    ci-tools pattern) and never fails the doctor run.
+    """
+    from bernstein.cli.commands.doctor_cmd import check_canary_last_green
+
+    for row in check_canary_last_green():
+        warn = row["status"] == "WARN"
+        _add_check(
+            checks,
+            row["name"],
+            True,
+            f"WARNING: {row['detail']}" if warn else row["detail"],
+            row["fix"],
+        )
+
+
+def _doctor_check_version_posture(checks: list[dict[str, Any]], workdir: Path) -> None:
+    """Seal the adapter version posture into a chain-anchored receipt (#2515).
+
+    The advisory rows above are advisory-only console text. This turns the
+    version posture into a signed, content-addressed receipt mirrored into the
+    HMAC audit chain, so "only floor-satisfying binaries were spawnable in this
+    environment during window X" is provable offline from a contiguous chain
+    slice. The row surfaced here is a projection of that sealed receipt (its
+    content hash and a compact verdict tally); it never fails the doctor run.
+    """
+    from bernstein.cli.commands.doctor_cmd import emit_version_posture_receipt
+
+    try:
+        sealed = emit_version_posture_receipt(workdir)
+    except Exception:  # posture is advisory: never break the doctor run
+        return
+    entries = sealed["entries"]
+    if not entries:
+        return  # no tracked adapter installed: nothing to attest
+    below = sum(1 for e in entries if e["verdict"] == "below_floor")
+    unknown = sum(1 for e in entries if e["verdict"] == "unknown_version")
+    anchored = "chain-anchored" if sealed["anchored"] else "unanchored (audit write failed)"
+    detail = (
+        f"{len(entries)} tracked adapter(s), {below} below floor, {unknown} unknown; "
+        f"receipt sha256:{sealed['receipt_sha256'][:12]} ({anchored})"
+    )
+    _add_check(
+        checks,
+        "Adapter version posture",
+        below == 0,
+        detail,
+        "Upgrade below-floor adapters; the receipt records the posture regardless" if below else "",
+    )
 
 
 def _doctor_check_auth(checks: list[dict[str, Any]]) -> bool:
@@ -729,8 +1016,8 @@ def _doctor_check_context_and_plugins(checks: list[dict[str, Any]], workdir: Pat
 
     from bernstein.cli.install_check import check_installations
 
-    for w in check_installations():
-        _add_check(checks, w.name, w.ok, w.detail, w.fix)
+    for iw in check_installations():
+        _add_check(checks, iw.name, iw.ok, iw.detail, iw.fix)
 
     from bernstein.plugins.plugin_errors import get_plugin_errors
 
@@ -771,6 +1058,49 @@ def _doctor_check_commit_attribution(checks: list[dict[str, Any]], workdir: Path
         _add_check(checks, _COMMIT_ATTRIBUTION_LABEL, True, f"{commit_result.total_commits} commits: {role_parts}")
 
 
+def _doctor_check_schedule_supervisor(checks: list[dict[str, Any]], workdir: Path) -> None:
+    """Surface schedule supervisor liveness, last fire, and next fire.
+
+    Issue #1798. The doctor entry is informational: a missing supervisor
+    is reported, but we do not fail the overall doctor exit on the basis
+    of an idle schedule subsystem.
+    """
+    sdd_dir = workdir / ".sdd"
+    if not sdd_dir.exists():
+        return
+    try:
+        from bernstein.core.orchestration.schedule_supervisor import ScheduleSupervisor
+        from bernstein.core.planning.schedule_store import ScheduleStore
+
+        store = ScheduleStore(sdd_dir)
+        supervisor = ScheduleSupervisor(store, lambda _e: None, None)
+        status = supervisor.status()
+    except Exception as exc:
+        _add_check(
+            checks,
+            "Schedule supervisor",
+            False,
+            f"unavailable: {exc}",
+            "Check src/bernstein/core/orchestration/schedule_supervisor.py imports",
+        )
+        return
+
+    if status.schedules_total == 0:
+        _add_check(checks, "Schedule supervisor", True, "no schedules registered")
+        return
+
+    import time as _time
+
+    parts = [f"{status.schedules_total} schedule(s)"]
+    if status.last_fire_at:
+        parts.append("last fire " + _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(status.last_fire_at)))
+    else:
+        parts.append("last fire (none)")
+    if status.next_fire_at:
+        parts.append("next fire " + _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(status.next_fire_at)))
+    _add_check(checks, "Schedule supervisor", True, "; ".join(parts))
+
+
 def _doctor_check_compliance(checks: list[dict[str, Any]], workdir: Path) -> None:
     """Check compliance mode prerequisites."""
     from bernstein.core.compliance import load_compliance_config
@@ -795,33 +1125,6 @@ def _doctor_check_compliance(checks: list[dict[str, Any]], workdir: Path) -> Non
             )
         else:
             _add_check(checks, f"Compliance ({preset_label})", True, "all prerequisites met")
-
-
-def _doctor_check_secrets_yaml(checks: list[dict[str, Any]], workdir: Path) -> None:
-    """Check secrets provider connectivity from bernstein.yaml."""
-    try:
-        yaml_path = workdir / "bernstein.yaml"
-        if yaml_path.exists():
-            from bernstein.core.seed import parse_seed
-
-            seed = parse_seed(yaml_path)
-            if seed.secrets:
-                from bernstein.core.secrets import check_secrets_connectivity
-
-                ok, detail = check_secrets_connectivity(seed.secrets)
-                _add_check(
-                    checks,
-                    f"Secrets: {seed.secrets.provider}",
-                    ok,
-                    detail,
-                    f"Check {seed.secrets.provider} credentials and path {seed.secrets.path}" if not ok else "",
-                )
-            else:
-                _add_check(checks, "Secrets", True, "none (using environment variables)")
-        else:
-            _add_check(checks, "Secrets", True, "no bernstein.yaml (using environment variables)")
-    except Exception as exc:
-        _add_check(checks, "Secrets", False, f"configuration error: {exc}", "Check bernstein.yaml syntax")
 
 
 def _doctor_print_fix_summary(auto_fix: bool, fixed: list[str], manual_needed: list[str]) -> None:
@@ -889,6 +1192,8 @@ def doctor(as_json: bool, auto_fix: bool) -> None:
 
     py_ok = _doctor_check_python(checks)
     any_adapter = _doctor_check_adapters(checks)
+    _doctor_check_last_green(checks)
+    _doctor_check_version_posture(checks, workdir)
     any_key = _doctor_check_auth(checks)
     _doctor_check_port(checks)
     _doctor_check_workspace(checks, workdir)
@@ -914,11 +1219,12 @@ def doctor(as_json: bool, auto_fix: bool) -> None:
     _doctor_check_context_and_plugins(checks, workdir)
     _doctor_check_commit_attribution(checks, workdir)
     _doctor_check_compliance(checks, workdir)
+    _doctor_check_schedule_supervisor(checks, workdir)
+    _doctor_check_eval_gate_power(checks, workdir)
+    _doctor_check_otel_export(checks)
 
     if auto_fix:
         _doctor_auto_fix(checks, stale_pid_paths, workdir, fixed, manual_needed)
-
-    _doctor_check_secrets_yaml(checks, workdir)
 
     if as_json or is_json():
         result_dict: dict[str, Any] = {"checks": checks}
@@ -955,7 +1261,7 @@ def _detect_runtime_environment() -> str:
 
 
 # ---------------------------------------------------------------------------
-# commit-stats — agent attribution report
+# report commits - agent attribution report
 # ---------------------------------------------------------------------------
 
 
@@ -968,9 +1274,9 @@ def commit_stats_cmd(since: str | None, until: str | None, repo_dir: str, as_jso
     """Show commit attribution by agent role.
 
     \b
-      bernstein commit-stats                    # all-time stats
-      bernstein commit-stats --since 2025-01-01 # since a date
-      bernstein commit-stats --json             # machine-readable output
+      bernstein report commits                    # all-time stats
+      bernstein report commits --since 2025-01-01 # since a date
+      bernstein report commits --json             # machine-readable output
     """
     from bernstein.cli.commit_stats import collect_commit_stats, render_commit_stats
 

@@ -6,8 +6,12 @@ in headless mode for non-interactive task execution.
 
 Installation: ``npm install -g @continuedev/cli`` (binary is ``cn``).
 Authentication: ``~/.continue/config.yaml`` or provider API keys in the env.
-Model selection is driven by the Continue config; ``cn`` has no CLI flag for
-per-invocation model override, so ``model_config.model`` is logged only.
+Model selection is driven by the Continue config, so ``model_config.model``
+is logged only. Note: ``cn`` 1.5.x does expose a ``--model`` flag, but it
+takes a Continue *hub slug* (``owner/package``) rather than a provider model
+ID, so Bernstein's model identifiers cannot be passed through unmapped.
+
+Last verified against upstream @continuedev/cli 1.5.47 on 2026-08-10.
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ class ContinueDevAdapter(CLIAdapter):
         task_scope: str = "medium",
         budget_multiplier: float = 1.0,
         system_addendum: str = "",
+        multimodal_context: Any | None = None,
     ) -> SpawnResult:
         """Launch a Continue.dev agent process.
 
@@ -70,6 +75,7 @@ class ContinueDevAdapter(CLIAdapter):
         Raises:
             RuntimeError: If the ``cn`` binary is not found in PATH.
         """
+        self.refuse_multimodal_if_needed(multimodal_context)
         self.enforce_network_policy()
         log_path = workdir / ".sdd" / "runtime" / f"{session_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)

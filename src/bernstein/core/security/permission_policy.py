@@ -39,7 +39,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from bernstein.core.security.policy_engine import (
     DecisionType,
@@ -47,7 +47,7 @@ from bernstein.core.security.policy_engine import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,8 @@ BUILTIN_PROFILE_NAMES: tuple[str, ...] = (
     PROFILE_REVIEWER,
     PROFILE_CUSTOM,
 )
+
+_EMPTY_STRINGS: Final[tuple[str, ...]] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -201,15 +203,15 @@ def list_builtin_profiles() -> tuple[PermissionProfile, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _coerce_str_tuple(value: Any) -> tuple[str, ...]:
+def _coerce_str_tuple(value: object) -> tuple[str, ...]:
     """Normalize a YAML/TOML list-of-strings into ``tuple[str, ...]``."""
     if value is None:
-        return ()
+        return _EMPTY_STRINGS
     if isinstance(value, (list, tuple)):
-        return tuple(str(item) for item in value if item is not None)
+        return tuple(str(item) for item in cast("Sequence[object]", value) if item is not None)
     if isinstance(value, str):
         return (value,)
-    return ()
+    return _EMPTY_STRINGS
 
 
 def _merge_overrides(base: PermissionProfile, overrides: Mapping[str, Any]) -> PermissionProfile:
@@ -239,10 +241,10 @@ def _load_yaml_permissions(workdir: Path) -> Mapping[str, Any] | None:
         return None
     if not isinstance(raw, dict):
         return None
-    section = raw.get("permissions")
+    section = cast("Mapping[str, Any]", raw).get("permissions")
     if not isinstance(section, dict):
         return None
-    return section
+    return cast("Mapping[str, Any]", section)
 
 
 def _load_toml_permissions(workdir: Path) -> Mapping[str, Any] | None:
@@ -260,7 +262,7 @@ def _load_toml_permissions(workdir: Path) -> Mapping[str, Any] | None:
     section = raw.get("permissions")
     if not isinstance(section, dict):
         return None
-    return section
+    return cast("Mapping[str, Any]", section)
 
 
 def load_permissions_config(workdir: Path | None = None) -> Mapping[str, Any] | None:
@@ -284,10 +286,10 @@ def resolve_profile(
         2. ``BERNSTEIN_PERMISSION_PROFILE`` env var
         3. ``permissions.profile`` in ``bernstein.toml`` / ``bernstein.yaml``
 
-    Returns ``None`` when nothing is configured — callers MUST treat that
+    Returns ``None`` when nothing is configured - callers MUST treat that
     as "no policy installed" and preserve current default behaviour.
     """
-    section = load_permissions_config(workdir) or {}
+    section: Mapping[str, Any] = load_permissions_config(workdir) or {}
 
     chosen = cli_override or os.environ.get(ENV_PROFILE) or section.get("profile")
     if not chosen:
@@ -296,7 +298,7 @@ def resolve_profile(
     chosen_norm = str(chosen).strip().lower()
     base = get_builtin_profile(chosen_norm)
     if base is None:
-        # Unknown profile name — fail closed by returning a deny-all
+        # Unknown profile name - fail closed by returning a deny-all
         # skeleton named after what the operator asked for so the
         # audit trail shows the typo verbatim.
         logger.warning("Unknown permission profile %r; falling back to deny-all", chosen)
@@ -304,12 +306,12 @@ def resolve_profile(
 
     overrides = section.get(chosen_norm)
     if isinstance(overrides, dict):
-        return _merge_overrides(base, overrides)
+        return _merge_overrides(base, cast("Mapping[str, Any]", overrides))
     return base
 
 
 # ---------------------------------------------------------------------------
-# PolicyChecker — the one and only dispatch hook
+# PolicyChecker - the one and only dispatch hook
 # ---------------------------------------------------------------------------
 
 
@@ -333,7 +335,7 @@ class ToolCall:
     shell_cmd: str | None = None
     session_id: str = "unknown"
     actor: str = "agent"
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 def _match_glob(value: str, patterns: tuple[str, ...]) -> bool:
@@ -390,7 +392,7 @@ class PolicyChecker:
         """
         prof = self._profile
 
-        # Deny paths always lose — even when the tool is broadly allowed.
+        # Deny paths always lose - even when the tool is broadly allowed.
         if call.path is not None and _match_glob(call.path, prof.deny_paths):
             return PermissionDecision(
                 type=DecisionType.DENY,
@@ -512,20 +514,20 @@ def _record_denial(
             )
 
 
-_TRACKER_SINGLETON: Any = None
+_tracker_singleton: Any = None
 
 
 def _default_tracker() -> Any:
     """Singleton DenialTracker for opt-in callers (best effort)."""
-    global _TRACKER_SINGLETON
-    if _TRACKER_SINGLETON is None:
+    global _tracker_singleton
+    if _tracker_singleton is None:
         try:
             from bernstein.core.security.denial_tracker import DenialTracker
 
-            _TRACKER_SINGLETON = DenialTracker()
+            _tracker_singleton = DenialTracker()
         except Exception:  # pragma: no cover - defensive
             return None
-    return _TRACKER_SINGLETON
+    return _tracker_singleton
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +552,7 @@ def check_tool_call(
     When *profile* is omitted the active profile is resolved via
     :func:`resolve_profile`. If no profile is configured at all the
     returned decision is :class:`DecisionType.ALLOW` with a reason that
-    flags the no-op path — callers can rely on the same return type in
+    flags the no-op path - callers can rely on the same return type in
     both modes.
     """
     effective = profile if profile is not None else resolve_profile(workdir=workdir)

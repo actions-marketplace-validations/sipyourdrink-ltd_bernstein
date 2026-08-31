@@ -14,17 +14,26 @@ from pydantic import BaseModel
 
 from bernstein.core.lifecycle import transition_task
 from bernstein.core.models import PlanStatus, TaskStatus
+from bernstein.core.routes._unconfigured import UNCONFIGURED_STATUS
+from bernstein.core.security.auth_middleware import enforce_agent_task_scope_for_ids
+from bernstein.core.security.plan_approval import PlanHashMismatchError
 
 if TYPE_CHECKING:
-    from bernstein.core.plan_approval import PlanStore
+    from bernstein.core.security.plan_approval import PlanStore
 
 router = APIRouter(prefix="/plans", tags=["plans"])
+
+
+#: Answer for every plan route when plan mode is off on this deployment.
+#: See ``bernstein.core.routes._unconfigured`` for why this is a 4xx.
+PLAN_MODE_DISABLED_STATUS = UNCONFIGURED_STATUS
+PLAN_MODE_DISABLED_DETAIL = "Plan mode is not enabled on this server"
 
 
 def _get_plan_store(request: Request) -> PlanStore:
     store: PlanStore | None = getattr(request.app.state, "plan_store", None)
     if store is None:
-        raise HTTPException(status_code=503, detail="Plan store not initialized (plan_mode may be disabled)")
+        raise HTTPException(status_code=PLAN_MODE_DISABLED_STATUS, detail=PLAN_MODE_DISABLED_DETAIL)
     return store
 
 
@@ -45,7 +54,11 @@ class PlanDecisionRequest(BaseModel):
 
 
 @router.get(
-    "", responses={400: {"description": "Invalid status filter"}, 503: {"description": "Plan store not initialized"}}
+    "",
+    responses={
+        400: {"description": "Invalid status filter"},
+        404: {"description": "Plan mode is not enabled on this server"},
+    },
 )
 def list_plans(request: Request, status: str | None = None) -> list[dict[str, Any]]:
     """List all plans, optionally filtered by status.
@@ -65,7 +78,8 @@ def list_plans(request: Request, status: str | None = None) -> list[dict[str, An
 
 
 @router.get(
-    "/{plan_id}", responses={404: {"description": "Plan not found"}, 503: {"description": "Plan store not initialized"}}
+    "/{plan_id}",
+    responses={404: {"description": "Plan not found, or plan mode is not enabled on this server"}},
 )
 def get_plan(request: Request, plan_id: str) -> dict[str, Any]:
     """Get a single plan by ID."""
@@ -78,9 +92,8 @@ def get_plan(request: Request, plan_id: str) -> dict[str, Any]:
 @router.post(
     "/{plan_id}/approve",
     responses={
-        404: {"description": "Plan not found"},
-        409: {"description": "Plan already decided"},
-        503: {"description": "Plan store not initialized"},
+        404: {"description": "Plan not found, or plan mode is not enabled on this server"},
+        409: {"description": "Plan already decided, or the plan changed after it was rendered for review"},
     },
 )
 def approve_plan(request: Request, plan_id: str, body: PlanDecisionRequest | None = None) -> dict[str, Any]:
@@ -98,8 +111,20 @@ def approve_plan(request: Request, plan_id: str, body: PlanDecisionRequest | Non
 
     reason = body.reason if body else ""
 
+    # Bind the decision to the reviewed rendering: refuse to promote tasks if
+    # the plan changed after it was rendered for approval.
+    try:
+        store.verify_rendering_hash(plan_id)
+    except PlanHashMismatchError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     # Promote tasks from PLANNED to OPEN
     task_store = request.app.state.store  # type: ignore[attr-defined]
+    # The plan id resolves to a batch of existing tasks this route
+    # transitions, so the scope rule is applied to the resolved ids rather
+    # than to the plan: promoting task B here is the same mutation a
+    # path-scoped route would refuse for a token that does not hold B.
+    enforce_agent_task_scope_for_ids(request, [e.task_id for e in plan.task_estimates])
     promoted: list[str] = []
     for estimate in plan.task_estimates:
         task = task_store._tasks.get(estimate.task_id)  # pyright: ignore[reportPrivateUsage]
@@ -123,9 +148,8 @@ def approve_plan(request: Request, plan_id: str, body: PlanDecisionRequest | Non
 @router.post(
     "/{plan_id}/reject",
     responses={
-        404: {"description": "Plan not found"},
-        409: {"description": "Plan already decided"},
-        503: {"description": "Plan store not initialized"},
+        404: {"description": "Plan not found, or plan mode is not enabled on this server"},
+        409: {"description": "Plan already decided, or the plan changed after it was rendered for review"},
     },
 )
 def reject_plan(request: Request, plan_id: str, body: PlanDecisionRequest | None = None) -> dict[str, Any]:
@@ -142,8 +166,18 @@ def reject_plan(request: Request, plan_id: str, body: PlanDecisionRequest | None
 
     reason = body.reason if body else ""
 
+    # Bind the decision to the reviewed rendering: refuse to cancel tasks if
+    # the plan changed after it was rendered for review.
+    try:
+        store.verify_rendering_hash(plan_id)
+    except PlanHashMismatchError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     # Cancel PLANNED tasks
     task_store = request.app.state.store  # type: ignore[attr-defined]
+    # Same rule as approve: the tasks this cancels are named by the plan, not
+    # by the path, so bind the identity to the ids it is about to act on.
+    enforce_agent_task_scope_for_ids(request, [e.task_id for e in plan.task_estimates])
     cancelled: list[str] = []
     for estimate in plan.task_estimates:
         task = task_store._tasks.get(estimate.task_id)  # pyright: ignore[reportPrivateUsage]

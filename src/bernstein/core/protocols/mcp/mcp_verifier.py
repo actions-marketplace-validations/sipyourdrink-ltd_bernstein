@@ -18,11 +18,11 @@ This module is the **verification entry point** that Bernstein consults
    (when the caller provides the bundle bytes)
 
 Sigstore (Fulcio + Rekor) verification is the second signature path the
-ticket calls for. It is **deferred** to a follow-up PR (TODO below) because
+ticket calls for. It is **deferred** to a follow-up PR (see note below) because
 the substrate in :mod:`bernstein.core.security.sigstore_attestation` is
 attestation-side only and the verify path needs a Rekor-fetch + bundle
 parse that warrants its own review surface. Ed25519 alone is a complete,
-non-mocked crypto path on its own — losing the cosign/Sigstore identity
+non-mocked crypto path on its own - losing the cosign/Sigstore identity
 attestation only loses the *who-published-this* signal, not the *content
 integrity* signal.
 
@@ -74,7 +74,7 @@ __all__ = [
 #: one source of truth instead of stringly-typed prefixes.
 ED25519_FINGERPRINT_PREFIX: str = "ed25519/"
 
-#: Type tag baked into the manifest signing input — mirrors the
+#: Type tag baked into the manifest signing input - mirrors the
 #: ``agent-card+jws`` typ binding used in :mod:`agent_card_signer`. Without
 #: this binding, a signature minted for a different JWS context with the
 #: same key would verify here.
@@ -286,7 +286,7 @@ def _load_yaml_or_json(text: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Canonicalization (RFC 8785 JCS — same approach as agent_card_signer)
+# Canonicalization (RFC 8785 JCS - same approach as agent_card_signer)
 # ---------------------------------------------------------------------------
 
 
@@ -344,8 +344,8 @@ def verify_mcp_server(
         trusted_publishers: Set of fingerprints (``ed25519/<hex>``) the
             local site has explicitly trusted. A signature that verifies
             mathematically but isn't from a trusted publisher returns
-            :data:`VerificationVerdict.UNTRUSTED_PUBLISHER` — never
-            ``OK`` — so a stolen-key + new-fingerprint scenario doesn't
+            :data:`VerificationVerdict.UNTRUSTED_PUBLISHER` - never
+            ``OK`` - so a stolen-key + new-fingerprint scenario doesn't
             silently pass.
         bundle_bytes: Optional canonical server bundle. When provided
             **and** the manifest declares a ``content_hash``, the bytes
@@ -362,6 +362,28 @@ def verify_mcp_server(
             ok=False,
             verdict=exc.verdict,
             failure_reason=str(exc),
+        )
+
+    if not isinstance(signature_b64, str):
+        # Declared ``str``, but this is the boundary where a third party's
+        # signature arrives: a JSON ``null`` or a raw ``Path.read_bytes()``
+        # reaches here from callers this module does not type-check. The
+        # contract is to return a verdict, so a non-string is refused rather
+        # than surfacing as an ``AttributeError`` from ``.strip()`` below.
+        #
+        # ``None`` is a signature that was never supplied; anything else is a
+        # supplied signature that cannot be read. Policy maps UNSIGNED and
+        # BAD_SIGNATURE to different outcomes, so the two stay distinct.
+        return MCPVerificationResult(
+            ok=False,
+            verdict=(VerificationVerdict.UNSIGNED if signature_b64 is None else VerificationVerdict.BAD_SIGNATURE),
+            failure_reason=(
+                "no signature provided"
+                if signature_b64 is None
+                else f"signature must be a base64 string, got {type(signature_b64).__name__}"
+            ),
+            manifest=manifest,
+            publisher_fingerprint=manifest.publisher_fingerprint,
         )
 
     if not signature_b64.strip():
@@ -433,10 +455,11 @@ def _verify_ed25519(
     """Return True iff Ed25519 signature verifies under public_key_pem.
 
     Reuses the same ``cryptography`` package already vendored for
-    :mod:`agent_card_signer` — no new heavy deps.
+    :mod:`agent_card_signer` - no new heavy deps.
     """
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
     try:
         signature = base64.b64decode(signature_b64.encode("ascii"), validate=True)
@@ -448,18 +471,25 @@ def _verify_ed25519(
     except (ValueError, TypeError):
         return False
 
+    if not isinstance(public_key, Ed25519PublicKey):
+        # public_key was parsed but is not Ed25519 (e.g. RSA PEM passed in).
+        # Previously this surfaced as the TypeError/AttributeError raised by
+        # the differing verify() signatures of the other key types.
+        return False
+
     try:
-        public_key.verify(signature, signing_input)  # type: ignore[union-attr]
+        public_key.verify(signature, signing_input)
     except InvalidSignature:
         return False
     except (TypeError, AttributeError):
-        # public_key was parsed but is not Ed25519 (e.g. RSA PEM passed in)
+        # Retained so malformed (non-bytes) arguments from untyped callers
+        # keep returning False rather than propagating.
         return False
     return True
 
 
 # ---------------------------------------------------------------------------
-# TODO(sigstore): Sigstore + Rekor verification path
+# Sigstore + Rekor verification path
 # ---------------------------------------------------------------------------
 # The ticket calls for both an Ed25519 content-integrity signature *and* a
 # Sigstore identity-attestation signature (Fulcio short-lived cert + Rekor

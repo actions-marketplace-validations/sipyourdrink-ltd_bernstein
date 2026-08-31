@@ -1,7 +1,7 @@
 """Tests for worktree cleanup salvage (audit-088).
 
 These tests use a real git repo + real ``git worktree add`` because the salvage
-codepath shells out to ``git`` for status, add, commit, branch -M, and diff —
+codepath shells out to ``git`` for status, add, commit, branch -M, and diff -
 mocking all of that would defeat the purpose.  Each test runs in ``tmp_path``
 so no state escapes the sandbox.
 """
@@ -18,7 +18,7 @@ from bernstein.core.git.worktree import WorktreeManager
 
 
 def _run(cmd: list[str], cwd: Path) -> None:
-    """Run a git command, raising on failure — test helper."""
+    """Run a git command, raising on failure - test helper."""
     subprocess.run(
         cmd,
         cwd=cwd,
@@ -133,6 +133,31 @@ def test_salvage_creates_branch_and_filesystem_fallback(
 
     # 4. Branch was not pushed (no remote).
     assert result.branch_pushed is False
+
+
+def test_salvage_logs_each_branch_step(
+    repo_with_worktree: tuple[Path, Path, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Logging gap: ``_try_salvage_branch``'s 4 git steps (add/commit/rename/
+    push) previously only surfaced failures via a returned errors list --
+    nothing was logged per-step, so a stuck salvage looked identical to a
+    silent one in the logs. Assert each step logs its own line, and that a
+    push failure (no remote configured in this fixture) logs a WARNING
+    rather than staying silent."""
+    caplog.set_level("INFO", logger="bernstein.core.git.salvage")
+    repo_root, worktree_path, session_id = repo_with_worktree
+    _dirty_the_worktree(worktree_path)
+
+    result = salvage_worktree(repo_root, worktree_path, session_id, push=True)
+
+    assert result.salvaged is True
+    messages = [r.message for r in caplog.records]
+    assert any("salvage step 1/4 ok (git add -A)" in m for m in messages), messages
+    assert any("salvage step 2/4 ok (git commit" in m for m in messages), messages
+    assert any("salvage step 3/4 ok (branch renamed" in m for m in messages), messages
+    # No remote is configured in the fixture, so push must fail loudly.
+    assert any("salvage step 4/4 FAILED (git push" in m for m in messages), messages
 
 
 def test_salvage_diff_is_recoverable_from_branch(

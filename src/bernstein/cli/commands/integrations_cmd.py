@@ -33,6 +33,11 @@ FORMAT_JSON = "json"
 DOCS_INDEX = "docs/adapters/index.md"
 CONFIG_KNOB = "cli"
 
+#: Synthetic listing entry (not a registered adapter) for the self-hosted
+#: OpenAI-compatible endpoint path. Sourced from ``USE_CASES`` and appended in
+#: :func:`_enumerate_rows`.
+SELF_HOSTED_ENDPOINTS_KEY = "self-hosted-endpoints"
+
 
 def _fallback_headline(adapter_obj: object) -> str:
     """Use the first line of the module docstring when no curated copy exists.
@@ -68,9 +73,17 @@ def _binary_for(name: str, use_case: AdapterUseCase | None) -> str:
     """Pick the binary name to probe via ``shutil.which``.
 
     Priority: explicit use-case entry, then the override table in
-    :mod:`bernstein.cli.commands.adapter_cmd`, then the registry key
-    itself. Empty string means "no external binary" (in-process or
-    SDK-only adapters).
+    :mod:`bernstein.cli.commands.adapter_cmd`, then the adapter's
+    capability profile (which already declares its binary), then the
+    registry key itself. Empty string means "no external binary"
+    (in-process or SDK-only adapters).
+
+    Consulting the profile keeps this surface consistent with
+    ``report._binary_for_adapter`` and ``adapter_cmd._binary_for_adapter``:
+    a factory-built adapter whose binary differs from its registry key
+    (for example ``pydantic_ai`` -> ``clai``) is probed under its real
+    binary even without a curated use-case entry, so it is not silently
+    misreported as not installed.
     """
     if use_case is not None:
         return use_case.binary
@@ -79,7 +92,9 @@ def _binary_for(name: str, use_case: AdapterUseCase | None) -> str:
     overrides = importlib.import_module("bernstein.cli.commands.adapter_cmd")._BINARY_OVERRIDES
     if name in overrides:
         return overrides[name]
-    return name
+    from bernstein.adapters.capability_profile import profile_binary_for
+
+    return profile_binary_for(name) or name
 
 
 def _enumerate_rows() -> list[dict[str, object]]:
@@ -99,6 +114,15 @@ def _enumerate_rows() -> list[dict[str, object]]:
     if "generic" not in seen:
         generic_mod = importlib.import_module("bernstein.adapters.generic")
         rows.append(_row_for("generic", generic_mod.GenericAdapter))
+
+    # The self-hosted OpenAI-compatible endpoint path is a capability, not an
+    # adapter binary: point an OpenAI-compatible adapter at a self-hosted
+    # server and certify it. Surface it so operators find the path in the
+    # listing instead of by reading adapter source. Its curated use-case
+    # entry supplies the headline, so ``_row_for`` never dereferences the
+    # (absent) adapter object.
+    if SELF_HOSTED_ENDPOINTS_KEY not in seen and SELF_HOSTED_ENDPOINTS_KEY in USE_CASES:
+        rows.append(_row_for(SELF_HOSTED_ENDPOINTS_KEY, None))
 
     rows.sort(key=lambda r: str(r["name"]))
     return rows
@@ -218,6 +242,7 @@ __all__ = [
     "DOCS_INDEX",
     "FORMAT_JSON",
     "FORMAT_TABLE",
+    "SELF_HOSTED_ENDPOINTS_KEY",
     "_enumerate_rows",
     "_filter_installed",
     "_row_for",

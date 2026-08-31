@@ -11,24 +11,25 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 from bernstein.core.models import Complexity, ModelConfig, Scope, Task
 from bernstein.core.routing.router_policies import ModelPolicy, PolicyFilter
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from bernstein.core.quota_probe import QuotaSnapshot
 
 logger = logging.getLogger(__name__)
 
 
-# Shared cast-type constants to avoid string duplication (Sonar S1192).
-_CAST_DICT_STR_ANY = "dict[str, Any]"
+# Shared cast-type alias to avoid string duplication (Sonar S1192).
+type _CAST_DICT_STR_ANY = dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # budget-aware routing
@@ -37,7 +38,7 @@ _CAST_DICT_STR_ANY = "dict[str, Any]"
 # When the run is close to its budget cap, ``_check_opus_override`` refuses to
 # escalate a task to opus/max (which can cost ~$1.50 per 200k-token task) and
 # lets the downstream heuristics pick sonnet instead.  The flag is on by
-# default — a single opus task near the cap can overshoot by 150% or more.
+# default - a single opus task near the cap can overshoot by 150% or more.
 # Callers can disable the behaviour per-run via ``set_budget_context`` or by
 # passing ``budget_aware_routing_enabled=False`` directly into ``route_task``.
 #
@@ -57,7 +58,9 @@ BUDGET_AWARE_OPUS_MARGIN: float = 2.0
 
 
 _budget_context_state: dict[str, Any] = {
-    "budget_remaining_usd": None,  # float | None — ``None`` = unknown / disabled
+    # ``budget_remaining_usd`` holds an Optional float; the None default means
+    # the budget is unknown or budget-aware routing has been disabled.
+    "budget_remaining_usd": None,
     "enabled": True,
     "estimated_opus_cost_usd": DEFAULT_OPUS_TASK_COST_USD,
 }
@@ -436,7 +439,7 @@ class TierAwareRouter:
                 and p.health.success_rate >= self.state.min_health_score
             ]
 
-        # Apply model policy filter — denied providers are never returned
+        # Apply model policy filter - denied providers are never returned
         providers = self.policy_filter.filter_providers(providers)
 
         # Sort by score (health * cost efficiency)
@@ -882,6 +885,7 @@ def route_task(
     *,
     budget_remaining_usd: float | None = None,
     budget_aware_routing_enabled: bool | None = None,
+    default_model: str | None = None,
 ) -> ModelConfig:
     """Select model and effort based on task metadata.
 
@@ -910,16 +914,29 @@ def route_task(
         workdir: Optional project root for effectiveness scorer data.
         budget_remaining_usd: Remaining run budget in USD.
         budget_aware_routing_enabled: Feature flag for downgrade.
+        default_model: Operator-configured fallback model. When ``None`` and
+            no other source configures a model, routing raises
+            :class:`ModelNotConfiguredError` instead of defaulting to Claude.
 
     Returns:
         ModelConfig with selected model and effort (and is_batch flag).
     """
+    print(
+        f"[SPAWNER-DEBUG] route_task: ENTRY task.id={getattr(task, 'id', '?')!r}, "
+        f"task.role={getattr(task, 'role', '?')!r}, task.model={getattr(task, 'model', None)!r}, "
+        f"task.effort={getattr(task, 'effort', None)!r}, bandit_metrics_dir={bandit_metrics_dir!r}, "
+        f"workdir={workdir!r}, budget_remaining_usd={budget_remaining_usd!r}, "
+        f"budget_aware_routing_enabled={budget_aware_routing_enabled!r}",
+        file=sys.stderr,
+        flush=True,
+    )
     cfg = _select_model_config(
         task,
         bandit_metrics_dir,
         workdir,
         budget_remaining_usd=budget_remaining_usd,
         budget_aware_routing_enabled=budget_aware_routing_enabled,
+        default_model=default_model,
     )
     if task.batch_eligible and task.priority != 1:
         logger.debug("Batch routing task %s (%s/%s)", task.id, cfg.model, cfg.effort)
@@ -971,7 +988,7 @@ def _check_opus_override(
 
     when ``budget_aware_routing_enabled`` (default: module-level
     flag) is True and ``budget_remaining_usd`` < 2x estimated opus task cost,
-    the override returns None so the caller routes to sonnet instead — a
+    the override returns None so the caller routes to sonnet instead - a
     single opus task near the cap can overshoot by 150%+.  Explicit keyword
     arguments take precedence over ``set_budget_context`` module state.
 
@@ -1022,7 +1039,7 @@ def _check_opus_override(
         estimated_opus_cost_usd=opus_cost,
     ):
         logger.info(
-            "Task %s: budget-aware downgrade from opus/max (remaining=$%.2f < %.1fx $%.2f) — reason: %s",
+            "Task %s: budget-aware downgrade from opus/max (remaining=$%.2f < %.1fx $%.2f) - reason: %s",
             task.id,
             float(remaining) if remaining is not None else float("nan"),
             BUDGET_AWARE_OPUS_MARGIN,
@@ -1035,13 +1052,27 @@ def _check_opus_override(
 
 
 def _try_l1_fast_path(task: Task) -> ModelConfig | None:
-    """Try L1 fast-path routing for simple tasks."""
+    """Try L1 fast-path routing for simple tasks.
+
+    Returns None (fall through to the remaining routing sources) when
+    ``fast_path.l1_model`` is not configured, so an operator-configured
+    ``default_model`` still applies to L1-classified tasks. If no source
+    at all configures a model, the heuristic fallback in
+    ``_select_model_config`` raises ``ModelNotConfiguredError``.
+    """
     from bernstein.core.fast_path import TaskLevel, classify_task, get_l1_model_config
 
     classification = classify_task(task)
     if classification.level != TaskLevel.L1:
         return None
-    l1_cfg = get_l1_model_config()
+    try:
+        l1_cfg = get_l1_model_config()
+    except ModelNotConfiguredError:
+        logger.info(
+            "Task %s classified L1 but fast_path.l1_model is not configured - falling through to standard routing",
+            task.id,
+        )
+        return None
     logger.info(
         "Task %s: Selected %s/%s (L1 fast-path: role=%s, scope=%s, %s)",
         task.id,
@@ -1068,7 +1099,19 @@ def _try_bandit_selection(
         bandit = EpsilonGreedyBandit.load(bandit_metrics_dir)
         _seed_bandit_with_effectiveness(bandit, task, workdir, bandit_metrics_dir)
 
-        candidates = ["sonnet", "opus"] if task.complexity == Complexity.HIGH else list(CASCADE)
+        # Bandit arms are Claude tier names (haiku/sonnet/opus) - this path only
+        # ever runs for the Claude-compatible bandit/cascade routing scheme, so
+        # tier names are the correct vocabulary here (see spawner_core.py's
+        # retry-escalation comments for the same convention). The single
+        # source of truth for the arm set is CASCADE (bernstein.core.cost),
+        # not a re-hardcoded literal - both branches previously duplicated
+        # CASCADE's exact contents (["sonnet", "opus"]), so the HIGH-complexity
+        # special case was dead code; using CASCADE directly for all
+        # complexities removes the redundant hardcoded literal while keeping
+        # this Claude-adapter-specific behavior intact. Operators who need a
+        # different arm set configure it via CASCADE/cost.py, not by patching
+        # this call site.
+        candidates = list(CASCADE)
         selected = bandit.select(role=task.role, candidate_models=candidates)
         effort = "max" if selected == "opus" else "high"
         logger.info(
@@ -1156,16 +1199,39 @@ def _select_model_config(
     *,
     budget_remaining_usd: float | None = None,
     budget_aware_routing_enabled: bool | None = None,
+    default_model: str | None = None,
 ) -> ModelConfig:
     """Internal: select model/effort without applying batch flag.
 
     When ``budget_aware_routing_enabled`` is True and remaining budget cannot
     absorb another opus task, the opus override is skipped and
     the task lands on sonnet via the heuristic path.
+
+    Args:
+        default_model: Operator-configured fallback model (e.g. from the
+            seed config or adapter default). Bernstein has no built-in
+            default - when this is ``None`` and the task carries no model
+            of its own, routing raises :class:`ModelNotConfiguredError`
+            rather than silently picking Claude Sonnet/Opus.
     """
+    print(
+        f"[SPAWNER-DEBUG] _select_model_config: ENTRY task.id={getattr(task, 'id', '?')!r}, "
+        f"task.role={getattr(task, 'role', '?')!r}, task.model={getattr(task, 'model', None)!r}, "
+        f"task.effort={getattr(task, 'effort', None)!r}, task.scope={getattr(task, 'scope', None)!r}, "
+        f"task.priority={getattr(task, 'priority', None)!r}, "
+        f"task.complexity={getattr(task, 'complexity', None)!r}",
+        file=sys.stderr,
+        flush=True,
+    )
     # Manager-specified overrides take precedence
     if task.model or task.effort:
-        model = task.model or "sonnet"
+        model = task.model or default_model
+        if model is None:
+            raise ModelNotConfiguredError(
+                f"Task {task.id} has effort={task.effort!r} but no model, and no "
+                "default_model is configured (role_model_policy/seed/adapter default). "
+                "Refusing to guess a model - configure one explicitly.",
+            )
         effort = task.effort or "high"
         logger.info(
             "Task %s: Selected %s/%s (manager override: role=%s, priority=%d, complexity=%s)",
@@ -1186,7 +1252,7 @@ def _select_model_config(
     if criterion_result is not None:
         return criterion_result
 
-    # High-stakes roles/scope/priority skip bandit — always use premium models
+    # High-stakes roles/scope/priority skip bandit - always use premium models
     # (unless budget-aware routing downgrades the call: ).
     opus_reason = _check_opus_override(
         task,
@@ -1194,8 +1260,14 @@ def _select_model_config(
         budget_aware_routing_enabled=budget_aware_routing_enabled,
     )
     if opus_reason is not None:
-        logger.info("Task %s: Selected opus/max (%s)", task.id, opus_reason)
-        return ModelConfig(model="opus", effort="max")
+        if default_model is None:
+            raise ModelNotConfiguredError(
+                f"Task {task.id} triggered a high-stakes opus override ({opus_reason}) but "
+                "no default_model is configured. Refusing to guess a model - configure one "
+                "explicitly (role_model_policy/seed/adapter default).",
+            )
+        logger.info("Task %s: Selected %s/max (%s)", task.id, default_model, opus_reason)
+        return ModelConfig(model=default_model, effort="max")
 
     # L1 fast-path: route simple tasks to the cheapest model
     l1_result = _try_l1_fast_path(task)
@@ -1207,25 +1279,36 @@ def _select_model_config(
     if bandit_result is not None:
         return bandit_result
 
-    # Heuristic fallback
+    # Heuristic fallback - no built-in default model; the operator must
+    # configure one (role_model_policy/seed/adapter default) or routing
+    # refuses rather than silently spending on Claude Sonnet.
+    if default_model is None:
+        raise ModelNotConfiguredError(
+            f"Task {task.id} (role={task.role}, complexity={task.complexity.value}) has no "
+            "model configured on the task and no default_model was supplied to the router. "
+            "Refusing to guess a model - configure one explicitly.",
+        )
+
     if task.complexity == Complexity.HIGH:
         logger.info(
-            "Task %s: Selected sonnet/high (heuristic fallback: complexity=%s, role=%s, priority=%d)",
+            "Task %s: Selected %s/high (heuristic fallback: complexity=%s, role=%s, priority=%d)",
             task.id,
+            default_model,
             task.complexity.value,
             task.role,
             task.priority,
         )
-        return ModelConfig(model="sonnet", effort="high")
+        return ModelConfig(model=default_model, effort="high")
 
     logger.info(
-        "Task %s: Selected sonnet/high (default: role=%s, complexity=%s, priority=%d)",
+        "Task %s: Selected %s/high (default: role=%s, complexity=%s, priority=%d)",
         task.id,
+        default_model,
         task.role,
         task.complexity.value,
         task.priority,
     )
-    return ModelConfig(model="sonnet", effort="high")
+    return ModelConfig(model=default_model, effort="high")
 
 
 def load_model_policy_from_yaml(path: Path, router: TierAwareRouter) -> None:
@@ -1349,6 +1432,10 @@ def load_providers_from_yaml(path: Path, router: TierAwareRouter) -> None:
         return
 
     data: dict[str, Any] = cast(_CAST_DICT_STR_ANY, data_raw)
+    # Remove pending_upgrades if present
+    if "pending_upgrades" in data:
+        data.pop("pending_upgrades")
+        logger.warning("Ignoring leftover pending_upgrades in %s", path)
     providers_data: Any = data["providers"]
     if not isinstance(providers_data, dict):
         return
@@ -1370,10 +1457,36 @@ _default_router: TierAwareRouter | None = None
 
 
 def get_default_router() -> TierAwareRouter:
-    """Get or create the default router instance with pre-configured providers."""
+    """Get or create the default router instance with pre-configured providers.
+
+    Prefers ``<cwd>/.sdd/config/providers.yaml`` (the same convention used by
+    the orchestrator/server/CLI entry points) over the hardcoded example
+    catalog below. The hardcoded catalog only exists as a documented,
+    clearly-logged last resort for callers (e.g. ``hijacker.py``'s
+    ``router or get_default_router()`` fallback) that construct a router with
+    no workdir/config context at all - it is never used silently when a real
+    providers.yaml is present.
+    """
     global _default_router
     if _default_router is None:
         _default_router = TierAwareRouter()
+
+        providers_yaml = Path.cwd() / ".sdd" / "config" / "providers.yaml"
+        if providers_yaml.exists():
+            logger.info(
+                "get_default_router: loading config-supplied providers from %s",
+                providers_yaml,
+            )
+            load_providers_from_yaml(providers_yaml, _default_router)
+            return _default_router
+
+        logger.warning(
+            "get_default_router: no providers.yaml found at %s - falling back to "
+            "the built-in example provider catalog (openrouter_free/anthropic_standard/"
+            "anthropic_premium/google_ai). Configure .sdd/config/providers.yaml to "
+            "override these hardcoded example models/tiers.",
+            providers_yaml,
+        )
 
         # Free tier provider (e.g., OpenRouter free models)
         _default_router.register_provider(

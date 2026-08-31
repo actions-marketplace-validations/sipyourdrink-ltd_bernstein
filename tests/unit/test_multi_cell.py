@@ -1,4 +1,4 @@
-"""Tests for bernstein.core.multi_cell — CellStatus tracking, VP coordination, rebalancing."""
+"""Tests for bernstein.core.multi_cell - CellStatus tracking, VP coordination, rebalancing."""
 
 from __future__ import annotations
 
@@ -19,10 +19,14 @@ from bernstein.core.models import (
 from bernstein.core.multi_cell import (
     CellStatus,
     MultiCellOrchestrator,
+    MultiCellTickResult,
     cell_status,
 )
 from bernstein.core.orchestrator import TickResult
 from bernstein.core.spawner import AgentSpawner
+
+from bernstein.core.security.audit_chain import AuditChainStore
+from bernstein.core.security.run_closure import RunClosureOutcome, RunClosureStatus, project_run_closure
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -156,9 +160,23 @@ class TestRegisterRemoveCell:
         orch.register_cell(cell2)
         assert orch.cells["alpha"].name == "Second"
 
+    def test_run_stop_writes_cancelled_journal_closure(self, tmp_path: Path) -> None:
+        orch = self._make_orchestrator(tmp_path)
+
+        def one_tick() -> MultiCellTickResult:
+            orch.stop()
+            return MultiCellTickResult()
+
+        orch.tick = one_tick  # type: ignore[method-assign]
+        orch.run()
+        closure = project_run_closure(AuditChainStore(tmp_path / ".sdd" / "audit"), orch._run_id)
+        assert closure.status is RunClosureStatus.CLOSED
+        assert closure.outcome is RunClosureOutcome.CANCELLED
+        assert closure.anchor_kind == "run_journal"
+
 
 # ---------------------------------------------------------------------------
-# MultiCellOrchestrator.tick — bulletin board
+# MultiCellOrchestrator.tick - bulletin board
 # ---------------------------------------------------------------------------
 
 
@@ -460,7 +478,7 @@ class TestTickCell:
         mock_spawner.spawn_for_tasks.assert_not_called()
 
     def test_spawn_exception_records_error_and_continues(self, tmp_path: Path) -> None:
-        """First spawn fails, second succeeds — both are handled."""
+        """First spawn fails, second succeeds - both are handled."""
         mock_client = MagicMock()
         mock_client.get.return_value = _mock_response(
             [
@@ -530,7 +548,7 @@ class TestReapDeadWorkers:
         )
 
     def test_already_dead_workers_are_removed_not_reaped(self, tmp_path: Path) -> None:
-        """Workers already marked dead are silently dropped — not counted as reaped."""
+        """Workers already marked dead are silently dropped - not counted as reaped."""
         mock_spawner = MagicMock(spec=AgentSpawner)
         mock_spawner.check_alive.return_value = True
 

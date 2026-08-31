@@ -1,6 +1,6 @@
 """Idle detection, stale checks, signal management.
 
-Extracted from ``agent_lifecycle`` — recycling idle agents, processing
+Extracted from ``agent_lifecycle`` - recycling idle agents, processing
 kill signals, sending shutdown signals, and stale/stall detection.
 """
 
@@ -33,11 +33,11 @@ _IDLE_GRACE_S: float = 30.0
 
 #: Default no-heartbeat idle threshold (seconds).
 #: CLI agents (claude, qwen) need time to boot, read context, and start
-#: producing heartbeats — 90s was too aggressive and caused a death spiral.
+#: producing heartbeats - 90s was too aggressive and caused a death spiral.
 _IDLE_HEARTBEAT_THRESHOLD_S: float = 300.0
 
 #: Idle threshold used when evolve mode is active.
-#: Was 120s which was too aggressive — agents killed before their first
+#: Was 120s which was too aggressive - agents killed before their first
 #: stream-json event, causing a WIP-commit / resume / kill death spiral.
 _IDLE_HEARTBEAT_THRESHOLD_EVOLVE_S: float = 300.0
 
@@ -88,7 +88,7 @@ def recycle_idle_agents(
       slot can be used by under-served roles (rebalancing).
 
     Recycling protocol:
-    1. Send SHUTDOWN signal — agent has 30 s to save WIP and exit cleanly.
+    1. Send SHUTDOWN signal - agent has 30 s to save WIP and exit cleanly.
     2. If still alive after 30 s → SIGKILL.
     3. Clear signal files and release the slot.
 
@@ -109,7 +109,7 @@ def recycle_idle_agents(
 
         completion_file = completed_dir / session.id
         if completion_file.exists():
-            logger.info("Agent %s has completion marker — reaping immediately", session.id)
+            logger.info("Agent %s has completion marker - reaping immediately", session.id)
             _reap_completed_agent(orch, session, completion_file)
             continue
 
@@ -158,9 +158,33 @@ def _detect_idle_reason(
     # Case 2: stale heartbeat
     hb = orch._signal_mgr.read_heartbeat(session.id)
     if hb is not None and (now - hb.timestamp) >= hb_idle_s:
+        hb_age = now - hb.timestamp
         pid = session.pid
-        if pid is not None and _is_process_alive(pid) and (now - hb.timestamp) < _IDLE_LIVENESS_EXTENSION_S:
+        if pid is not None and _is_process_alive(pid) and hb_age < _IDLE_LIVENESS_EXTENSION_S:
             return None  # still alive, within extended window
+
+        # Liveness gate (issue #4314): a stale heartbeat FILE must not
+        # out-vote heartbeat_escalation's own liveness verdict for the same
+        # agent. heartbeat.py's _escalate_heartbeat declines to SIGTERM a
+        # stuck agent whose log/git tree changed within the grace window;
+        # this recycler used to ignore that signal entirely and SIGKILL the
+        # SAME agent seconds later for heartbeat-file age alone, so whichever
+        # of the two disagreeing subsystems was harsher always won - agents
+        # got killed mid-edit. Reuse the exact verdict heartbeat_escalation
+        # uses so the two paths can no longer disagree.
+        # _agent_has_fresh_liveness_signal always logs the per-signal ages it
+        # checked (its own "liveness_judgment" line), so a recycle decision
+        # here is diagnosable the same way a deferred escalation already is.
+        has_fresh_liveness = heartbeat_protocol._agent_has_fresh_liveness_signal(orch, session)
+        if has_fresh_liveness and heartbeat_protocol._liveness_signal_may_defer(hb_age):
+            logger.info(
+                "agent_recycling: NOT recycling agent %s despite heartbeat age %.0fs -- "
+                "fresh log/git liveness signal within grace window (same verdict "
+                "heartbeat_escalation uses)",
+                session.id,
+                hb_age,
+            )
+            return None
         return f"no_heartbeat_{int(hb_idle_s)}s"
 
     # Case 3: no assigned tasks and role queue empty
@@ -190,12 +214,37 @@ def _reap_completed_agent(orch: Any, session: AgentSession, completion_file: Pat
     _save_partial_work(orch._spawner, session)
     with contextlib.suppress(Exception):
         orch._spawner.kill(session)
+    # Bug fix (2026-07-04): every forced-kill path must reap the session's
+    # backgrounded heartbeat shell loop (see heartbeat.py's
+    # _reap_session_heartbeat_loop / Defect-10), not just the two stall-kill
+    # paths inside heartbeat.py itself - otherwise the loop outlives the
+    # agent it was monitoring.
+    with contextlib.suppress(Exception):
+        heartbeat_protocol._reap_session_heartbeat_loop(orch, session, reason="completed_reap")
     _propagate_abort_to_children(orch, session.id)
     orch._idle_shutdown_ts.pop(session.id, None)
     with contextlib.suppress(OSError):
         orch._signal_mgr.clear_signals(session.id)
     with contextlib.suppress(OSError):
         completion_file.unlink()
+    # Preserve the runner transcript/manifest BEFORE the worktree (and the
+    # ``.sdd/runtime/<session_id>*.log`` inside it) is destroyed. D2 MiniMax
+    # attempt-3 (2026-07-03): the manager completed cleanly, was reaped via
+    # this idle-recycle path, and its runner log - the only artifact carrying
+    # its usage/usage_missing cost diagnostics - was deleted with the
+    # worktree because only the crash paths in agent_lifecycle.py preserved
+    # logs. Mirrors agent_lifecycle.py's _handle_dead_agent/reap paths.
+    # Imported lazily: agent_lifecycle re-imports this module at its EOF for
+    # back-compat re-exports, so a top-level import here would deepen the
+    # existing agent_recycling <-> agent_lifecycle cycle.
+    from bernstein.core.agents.agent_lifecycle import _preserve_runner_logs
+
+    _preserved_dir = _preserve_runner_logs(orch, session)
+    logger.info(
+        "Runner log preservation before worktree cleanup for completed agent %s: %s",
+        session.id,
+        _preserved_dir if _preserved_dir is not None else "nothing to preserve",
+    )
     with contextlib.suppress(Exception):
         orch._spawner.cleanup_worktree(session.id)
     get_collector().end_agent(session.id)
@@ -217,21 +266,21 @@ def _recycle_or_kill(orch: Any, session: AgentSession, now: float, reason: str) 
     shutdown_sent_ts: float = orch._idle_shutdown_ts.get(session.id, 0.0)
 
     if shutdown_sent_ts == 0:
-        # First detection — send SHUTDOWN and record timestamp
+        # First detection - send SHUTDOWN and record timestamp
         task_title = ", ".join(session.task_ids) if session.task_ids else "unknown task"
         with contextlib.suppress(OSError):
             orch._signal_mgr.write_shutdown(session.id, reason=reason, task_title=task_title)
         orch._idle_shutdown_ts[session.id] = now
         logger.info(
-            "Idle agent %s detected (%s) — SHUTDOWN signal sent, waiting %ds",
+            "Idle agent %s detected (%s) - SHUTDOWN signal sent, waiting %ds",
             session.id,
             reason,
             int(_IDLE_GRACE_S),
         )
     elif now - shutdown_sent_ts >= _IDLE_GRACE_S:
-        # Grace period elapsed — force-kill
+        # Grace period elapsed - force-kill
         logger.warning(
-            "Recycled idle agent %s (%s — no exit after %ds SHUTDOWN grace)",
+            "Recycled idle agent %s (%s - no exit after %ds SHUTDOWN grace)",
             session.id,
             reason,
             int(_IDLE_GRACE_S),
@@ -239,10 +288,26 @@ def _recycle_or_kill(orch: Any, session: AgentSession, now: float, reason: str) 
         _save_partial_work(orch._spawner, session)
         with contextlib.suppress(Exception):
             orch._spawner.kill(session)
+        # Bug fix (2026-07-04): reap the heartbeat loop on every forced kill
+        # (see _reap_completed_agent above for full rationale).
+        with contextlib.suppress(Exception):
+            heartbeat_protocol._reap_session_heartbeat_loop(orch, session, reason="idle_recycle_kill")
         _propagate_abort_to_children(orch, session.id)
         orch._idle_shutdown_ts.pop(session.id, None)
         with contextlib.suppress(OSError):
             orch._signal_mgr.clear_signals(session.id)
+        # Preserve the runner transcript/manifest BEFORE the worktree is
+        # destroyed (same rationale as _reap_completed_agent above; mirrors
+        # agent_lifecycle.py's crash-path preservation). Lazy import: see
+        # _reap_completed_agent for the cycle rationale.
+        from bernstein.core.agents.agent_lifecycle import _preserve_runner_logs
+
+        _preserved_dir = _preserve_runner_logs(orch, session)
+        logger.info(
+            "Runner log preservation before worktree cleanup for recycled agent %s: %s",
+            session.id,
+            _preserved_dir if _preserved_dir is not None else "nothing to preserve",
+        )
         with contextlib.suppress(Exception):
             orch._spawner.cleanup_worktree(session.id)
         get_collector().end_agent(session.id)
@@ -276,6 +341,10 @@ def check_kill_signals(orch: Any, result: Any) -> None:
             continue
         logger.info("Kill signal received for %s, terminating", session_id)
         orch._spawner.kill(session)
+        # Bug fix (2026-07-04): reap the heartbeat loop on every forced kill
+        # (see _reap_completed_agent above for full rationale).
+        with contextlib.suppress(Exception):
+            heartbeat_protocol._reap_session_heartbeat_loop(orch, session, reason="kill_signal")
         _propagate_abort_to_children(orch, session_id)
         result.reaped.append(session_id)
 
@@ -359,7 +428,7 @@ def _recover_loops(orch: Any, detector: Any, lock_mgr: Any) -> None:
         if session is None or session.status == "dead":
             continue
         logger.warning(
-            "Loop detected: agent %s edited '%s' %d times in %.0fs — killing agent",
+            "Loop detected: agent %s edited '%s' %d times in %.0fs - killing agent",
             loop.agent_id,
             loop.file_path,
             loop.edit_count,
@@ -367,6 +436,10 @@ def _recover_loops(orch: Any, detector: Any, lock_mgr: Any) -> None:
         )
         with contextlib.suppress(Exception):
             orch._spawner.kill(session)
+        # Bug fix (2026-07-04): reap the heartbeat loop on every forced kill
+        # (see _reap_completed_agent above for full rationale).
+        with contextlib.suppress(Exception):
+            heartbeat_protocol._reap_session_heartbeat_loop(orch, session, reason="edit_loop_kill")
         _propagate_abort_to_children(orch, loop.agent_id)
         detector.clear_wait(loop.agent_id)
         if lock_mgr is not None:
@@ -376,13 +449,13 @@ def _recover_loops(orch: Any, detector: Any, lock_mgr: Any) -> None:
 def check_loops_and_deadlocks(orch: Any) -> None:
     """Detect and recover from agent edit loops and file-lock deadlocks.
 
-    **Loop detection** — polls modification times of files currently locked by
+    **Loop detection** - polls modification times of files currently locked by
     active agents.  When a file's mtime advances since the last poll, the edit
     is recorded.  If the same agent edits the same file more than
     :data:`~bernstein.core.loop_detector.LOOP_EDIT_THRESHOLD` times within the
     detection window, the agent is killed so the task can be retried.
 
-    **Deadlock detection** — builds a wait-for graph from the
+    **Deadlock detection** - builds a wait-for graph from the
     :class:`~bernstein.core.file_locks.FileLockManager` and any pending
     lock-wait entries recorded via
     :meth:`~bernstein.core.loop_detector.LoopDetector.record_lock_wait`.
@@ -416,7 +489,7 @@ def check_loops_and_deadlocks(orch: Any) -> None:
 
     for deadlock in detector.detect_deadlocks(lock_mgr):
         logger.warning(
-            "%s — releasing locks for victim agent %s",
+            "%s - releasing locks for victim agent %s",
             deadlock.description,
             deadlock.victim_agent_id,
         )

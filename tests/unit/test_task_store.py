@@ -21,6 +21,7 @@ def _task_request(
     scope: str = "medium",
     complexity: str = "medium",
     depends_on: list[str] | None = None,
+    parent_context: str | None = None,
 ) -> Any:
     """Build a create-task request object with the TaskCreate attributes TaskStore expects."""
     return SimpleNamespace(
@@ -41,6 +42,7 @@ def _task_request(
         batch_eligible=False,
         completion_signals=[],
         slack_context=None,
+        parent_context=parent_context,
     )
 
 
@@ -112,6 +114,34 @@ async def test_replay_jsonl_reconstructs_latest_task_state(tmp_path: Path) -> No
 
 
 @pytest.mark.anyio
+async def test_replay_jsonl_preserves_subtask_parent_context(tmp_path: Path) -> None:
+    """A subtask's parent_context survives the JSONL write/replay round-trip.
+
+    The parent agent's context summary is the only thing tying a subtask to
+    the exploration that produced it. If the serialiser drops it, the subtask
+    is silently rebuilt without that context after a restart and the spawned
+    agent starts cold.
+    """
+    jsonl_path = tmp_path / "runtime" / "tasks.jsonl"
+    store = TaskStore(jsonl_path)
+    parent_context = "Parent explored src/parser.py and chose a recursive-descent design."
+
+    task = await store.create(_task_request(parent_context=parent_context))
+    await store.flush_buffer()
+
+    in_memory = store.get_task(task.id)
+    assert in_memory is not None
+    assert in_memory.parent_context == parent_context
+
+    replayed = TaskStore(jsonl_path)
+    replayed.replay_jsonl()
+    restored = replayed.get_task(task.id)
+
+    assert restored is not None
+    assert restored.parent_context == parent_context
+
+
+@pytest.mark.anyio
 async def test_claim_by_id_rejects_stale_expected_version(tmp_path: Path) -> None:
     """claim_by_id enforces optimistic locking on task version."""
     store = TaskStore(tmp_path / "runtime" / "tasks.jsonl")
@@ -148,6 +178,30 @@ async def test_list_tasks_filters_open_tasks_by_completed_dependencies(tmp_path:
 
     assert blocked.id not in open_before
     assert blocked.id in open_after
+
+
+@pytest.mark.anyio
+async def test_closed_dependency_still_satisfies_dependents(tmp_path: Path) -> None:
+    """A dependency that moved done -> closed keeps its dependents claimable.
+
+    Done tasks transition to closed once their agent is reaped and its branch
+    merged (soft-archive via status). Dependents must stay visible in the
+    open listing and remain claimable after that transition.
+    """
+    store = TaskStore(tmp_path / "runtime" / "tasks.jsonl")
+
+    dependency = await store.create(_task_request(title="dependency"))
+    blocked = await store.create(_task_request(title="blocked", depends_on=[dependency.id]))
+
+    await store.claim_by_id(dependency.id, expected_version=dependency.version)
+    await store.complete(dependency.id, "done")
+    await store.close(dependency.id)
+
+    open_ids = {task.id for task in store.list_tasks(status="open")}
+    assert blocked.id in open_ids
+
+    claimed = await store.claim_by_id(blocked.id, expected_version=blocked.version)
+    assert claimed.status == TaskStatus.CLAIMED
 
 
 @pytest.mark.anyio
@@ -218,3 +272,72 @@ async def test_replay_progress_restores_entries_and_snapshots_after_restart(tmp_
     assert progress_file.exists()
     lines = progress_file.read_text().splitlines()
     assert len(lines) == 13  # 10 entries + 3 snapshots
+
+
+def _write_archive(archive_path: Path, records: list[dict[str, Any]]) -> None:
+    """Write archive rows verbatim, as a hand edit or an older writer would."""
+    import json
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def test_read_archive_does_not_coerce_a_stored_tenant_id(tmp_path: Path) -> None:
+    """A non-string tenant id is a row that cannot be read, not one to convert.
+
+    The archive is JSON, so the field holds whatever was written. Coercing
+    before validating turns `true` into `"True"` and `null` into `"None"`,
+    both of which satisfy the identifier rules, and the row is then handed to
+    whichever tenant happens to carry that name.
+    """
+    archive_path = tmp_path / "archive" / "tasks.jsonl"
+    _write_archive(
+        archive_path,
+        [
+            {"task_id": "boolean-row", "tenant_id": True},
+            {"task_id": "numeric-row", "tenant_id": 123},
+            {"task_id": "owned-row", "tenant_id": "True"},
+        ],
+    )
+    store = TaskStore(tmp_path / "runtime" / "tasks.jsonl", archive_path=archive_path)
+
+    records = store.read_archive(limit=50, tenant_id="True")
+
+    assert [record["task_id"] for record in records] == ["owned-row"]
+
+
+def test_read_archive_keeps_filtering_out_malformed_tenant_ids(tmp_path: Path) -> None:
+    """A string that no longer normalizes still matches no tenant."""
+    archive_path = tmp_path / "archive" / "tasks.jsonl"
+    _write_archive(
+        archive_path,
+        [
+            {"task_id": "legacy-row", "tenant_id": "../escape"},
+            {"task_id": "owned-row", "tenant_id": "team-a"},
+        ],
+    )
+    store = TaskStore(tmp_path / "runtime" / "tasks.jsonl", archive_path=archive_path)
+
+    records = store.read_archive(limit=50, tenant_id="team-a")
+
+    assert [record["task_id"] for record in records] == ["owned-row"]
+
+
+@pytest.mark.anyio
+async def test_count_tasks_matches_len_list_tasks(tmp_path: Path) -> None:
+    """count_tasks returns the exact same number len(list_tasks) returns across filters."""
+    store = TaskStore(tmp_path / "runtime" / "tasks.jsonl")
+
+    t1 = await store.create(_task_request(title="task 1"))
+    t2 = await store.create(_task_request(title="task 2"))
+    await store.claim_by_id(t1.id, expected_version=t1.version)
+    await store.complete(t1.id, "done")
+
+    assert store.count_tasks() == len(store.list_tasks())
+    assert store.count_tasks(status="open") == len(store.list_tasks(status="open"))
+    assert store.count_tasks(status="done") == len(store.list_tasks(status="done"))
+    assert store.count_tasks(status="nonexistent") == len(store.list_tasks(status="nonexistent"))
+    assert store.count_tasks(tenant_id=t2.tenant_id) == len(store.list_tasks(tenant_id=t2.tenant_id))

@@ -18,9 +18,11 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from bernstein.core.models import TaskType
+from bernstein.core.models import TaskStatus, TaskType
 from bernstein.core.orchestration.evolution import UpgradeStatus
 from bernstein.core.platform_compat import kill_process_group
+from bernstein.core.tasks.auto_spawn_guard import AutoSpawnGuard
+from bernstein.evolution.upgrade_targets import upgrade_owned_files
 
 if TYPE_CHECKING:
     from bernstein.core.orchestration.tick_pipeline import (
@@ -44,6 +46,28 @@ _EVOLVE_FOCUS_AREAS: list[str] = [
 
 _REPLENISH_COOLDOWN_S: float = 60.0
 _REPLENISH_MAX_TASKS: int = 5
+
+# Statuses that count as "still open" for auto-spawn dedupe purposes -- a
+# terminal task (done/closed/failed/cancelled/abandoned) shouldn't block a
+# fresh upgrade task with the same title.
+_OPEN_TASK_STATUSES = {
+    TaskStatus.PLANNED,
+    TaskStatus.OPEN,
+    TaskStatus.CLAIMED,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.WAITING_FOR_SUBTASKS,
+    TaskStatus.PENDING_APPROVAL,
+    TaskStatus.BLOCKED,
+}
+
+# Statuses that count as a "terminal baseline" for AutoSpawnGuard's
+# no-terminal-baseline check (#4226): the evolve loop has an actual outcome
+# to improve on once at least one task in the run has finished, successfully
+# or not.
+_TERMINAL_BASELINE_STATUSES = {
+    TaskStatus.DONE,
+    TaskStatus.FAILED,
+}
 
 
 def _run_governance_step(
@@ -475,6 +499,7 @@ def evolve_auto_commit(orch: Any) -> bool:
         stage_all_except,
         status_porcelain,
     )
+    from bernstein.core.quality.run_config_gate import check_commit
 
     try:
         changed = status_porcelain(orch._workdir)
@@ -500,6 +525,16 @@ def evolve_auto_commit(orch: Any) -> bool:
         result = conventional_commit(orch._workdir, evolve=True)
         if not result.ok:
             logger.warning("Evolve: commit failed: %s", result.stderr)
+            return False
+
+        # This is the one path that pushes straight to the default branch, so
+        # the commit is checked before it leaves the machine: a run's own
+        # configuration inside it would rewrite the repository's configuration
+        # for every user of it (issue #4485). The commit stays on the local
+        # branch for an operator to inspect rather than being amended away.
+        run_config_verdict = check_commit(orch._workdir)
+        if not run_config_verdict.ok:
+            logger.error("Evolve: refusing to push - %s", run_config_verdict.details)
             return False
 
         safe_push(orch._workdir, "main")
@@ -563,8 +598,8 @@ def evolve_spawn_manager(
     description = (
         f"You are a PRODUCT DIRECTOR in EVOLVE mode (cycle {cycle_number}). "
         "Think strategically: what would make this project genuinely useful "
-        "to developers? What do competitors lack? What's the shortest path "
-        "to a feature that gets people excited?\n\n"
+        "to developers? Which gaps are unaddressed today? What is the shortest path "
+        "to a feature developers would actually use?\n\n"
         "Create tasks for specialist agents to implement. "
         "You plan, they code.\n\n"
         f"## This cycle's focus: {focus_area.replace('_', ' ')}\n"
@@ -714,14 +749,14 @@ def run_evolution_cycle(orch: Any, result: Any) -> None:
             cycle_risk_scores.append(risk_score.composite_risk)
             if orch._risk_scorer.is_high_risk(risk_score):
                 logger.info(
-                    "Proposal %s (%s) flagged high-risk (%.2f) — routing to sandbox",
+                    "Proposal %s (%s) flagged high-risk (%.2f) - routing to sandbox",
                     proposal.id,
                     proposal.title,
                     risk_score.composite_risk,
                 )
             else:
                 logger.info(
-                    "Proposal %s (%s) low-risk (%.2f) — fast-tracking",
+                    "Proposal %s (%s) low-risk (%.2f) - fast-tracking",
                     proposal.id,
                     proposal.title,
                     risk_score.composite_risk,
@@ -749,13 +784,46 @@ def run_evolution_cycle(orch: Any, result: Any) -> None:
 
 
 def _create_upgrade_tasks(orch: Any, proposals: list[Any], result: Any) -> None:
-    """Create tasks from eligible upgrade proposals."""
+    """Create tasks from eligible upgrade proposals.
+
+    Gated by AutoSpawnGuard to prevent unbounded duplicate "Upgrade: ..."
+    tasks (e.g. the same low-success-rate opportunity being re-proposed every
+    analysis cycle with no dedupe or cap -- see
+    work/agent-reports/2026-07-02-run9-attempt9-audit.md).
+    """
     _task_eligible_statuses = {UpgradeStatus.PENDING, UpgradeStatus.APPROVED}
     base = orch._config.server_url
+    guard = AutoSpawnGuard(orch._workdir)
+    latest_tasks_raw = getattr(orch, "_latest_tasks_by_id", {})
+    latest_tasks = latest_tasks_raw if isinstance(latest_tasks_raw, dict) else {}
+    existing_open_titles = [
+        task.title
+        for task in latest_tasks.values()
+        if getattr(task, "task_type", None) == TaskType.UPGRADE_PROPOSAL
+        and getattr(task, "status", None) in _OPEN_TASK_STATUSES
+    ]
+    # Run health for the guard's terminal-baseline check (#4226): an
+    # upgrade_proposal has nothing to improve on until something in the run
+    # has actually finished. Computed once here from the run's full task set
+    # (not just UPGRADE_PROPOSAL tasks) and passed to the guard rather than
+    # having the guard reach for task-store state itself.
+    has_terminal_task = any(
+        getattr(task, "status", None) in _TERMINAL_BASELINE_STATUSES for task in latest_tasks.values()
+    )
     for proposal in proposals:
         if proposal.status not in _task_eligible_statuses:
             continue
         try:
+            title = f"Upgrade: {proposal.title}"
+            decision = guard.evaluate(
+                kind="upgrade_proposal",
+                title=title,
+                source_title=None,
+                existing_open_titles=existing_open_titles,
+                has_terminal_task=has_terminal_task,
+            )
+            if not decision.allowed:
+                continue
             target_files = proposal.risk_assessment.affected_components
             diff_estimate = max(len(proposal.proposed_change) // 10, 10)
             risk_score = orch._risk_scorer.score_proposal(
@@ -764,8 +832,19 @@ def _create_upgrade_tasks(orch: Any, proposals: list[Any], result: Any) -> None:
                 test_coverage_delta=0.0,
             )
             is_high = orch._risk_scorer.is_high_risk(risk_score)
+            # The category's applicator targets are the task's declared scope;
+            # without them every file-collision guard short-circuits on the
+            # empty "no scope declared" value (issue #3398). A missing mapping
+            # is recorded rather than refused: refusal fires unconditionally
+            # when the source is empty by construction (#3397).
+            owned_files = upgrade_owned_files(proposal.category)
+            if not owned_files:
+                result.errors.append(
+                    f"evolution_task: {proposal.id} spawned without owned_files "
+                    f"(no target mapping for category {proposal.category!r})"
+                )
             task_body = {
-                "title": f"Upgrade: {proposal.title}",
+                "title": title,
                 "description": proposal.description,
                 "role": "backend",
                 "priority": 1 if is_high else 2,
@@ -773,16 +852,22 @@ def _create_upgrade_tasks(orch: Any, proposals: list[Any], result: Any) -> None:
                 "complexity": "high" if is_high else "medium",
                 "estimated_minutes": 60 if is_high else 30,
                 "task_type": TaskType.UPGRADE_PROPOSAL.value,
+                "owned_files": owned_files,
             }
             resp = orch._client.post(f"{base}/tasks", json=task_body)
             resp.raise_for_status()
+            existing_open_titles.append(title)
             logger.info(
                 "Created upgrade task for proposal %s: %s (risk=%.2f)",
                 proposal.id,
                 proposal.title,
                 risk_score.composite_risk,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, OSError) as exc:
+            # OSError covers AutoSpawnGuard._save_count() raising on a
+            # transient .sdd/runtime write failure (guard.evaluate() above);
+            # without it here, one bad write aborted the ENTIRE upgrade-
+            # proposal batch instead of just skipping this one proposal.
             logger.warning(
                 "Failed to create upgrade task for proposal %s: %s",
                 proposal.id,

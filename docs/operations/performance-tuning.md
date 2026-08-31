@@ -22,15 +22,9 @@ The right `max_agents` value depends on your provider's rate limits, not just yo
 
 ### Claude (Anthropic)
 
-| Subscription tier | Rate limit (approx.) | Recommended `max_agents` | Notes |
-|---|---|---|---|
-| **Free** | 50 req/day, ~5 req/min | 1 | Serial only; limited to experimentation |
-| **Plus** | 1,000 req/day, ~50 req/min | 2–3 | Light workloads; expect throttling on bursts |
-| **Pro** | 5,000 req/day, ~100 req/min | 4–6 | Default sweet spot; handles medium projects |
-| **Enterprise / Tier 2+** | Custom SLA | 8–16 | Negotiate limits with your Anthropic account team |
-| **Unlimited / Bedrock** | No hard cap | 16–32 | Limit by hardware and cost budget only |
+Rate limits vary by plan and change over time; consult your provider console (for Anthropic, the usage and limits pages) for your actual quota rather than any published table. As a rule of thumb: start at `max_agents: 1` on trial or entry-level tiers, 4-6 on a standard paid API tier, and 8+ only on enterprise or Bedrock-style deployments where the cap is hardware and cost budget.
 
-> **Tip:** Check your actual quota with `bernstein status --provider` or via the Anthropic console. Bernstein reads `X-RateLimit-*` headers and backs off automatically, but it cannot predict limits — set `max_agents` below your burst ceiling.
+> **Tip:** `bernstein status` shows a provider/quota table once the orchestrator has recorded provider snapshots. Bernstein reads `X-RateLimit-*` headers and backs off automatically, but it cannot predict limits - set `max_agents` below your burst ceiling.
 
 ### OpenAI / Gemini / Others
 
@@ -91,16 +85,16 @@ Routing tasks to the cheapest model that can handle them cuts cost dramatically.
 # bernstein.yaml
 role_model_policy:
   docs:
-    model: haiku        # $1/$5 per 1M tokens — documentation, formatting
+    model: haiku        # $1/$5 per 1M tokens - documentation, formatting
     effort: low
   backend:
-    model: sonnet       # $3/$15 per 1M tokens — feature implementation
+    model: sonnet       # $3/$15 per 1M tokens - feature implementation
     effort: high
   qa:
     model: sonnet
     effort: high
   architect:
-    model: opus         # $5/$25 per 1M tokens — design, architecture review
+    model: opus         # $5/$25 per 1M tokens - design, architecture review
     effort: max
   security:
     model: opus
@@ -153,9 +147,9 @@ Cache write costs slightly more than a regular input token. Break-even is at 2 r
 ### What gets cached
 
 Bernstein automatically caches:
-- **System prompt** (role template + project context) — reused on every turn
-- **File snapshots** injected into the prompt — reused if the file hasn't changed
-- **Bulletin board contents** — shared findings across agents
+- **System prompt** (role template + project context) - reused on every turn
+- **File snapshots** injected into the prompt - reused if the file hasn't changed
+- **Bulletin board contents** - shared findings across agents
 
 ### Configuration
 
@@ -170,7 +164,7 @@ cache:
 ### Maximizing cache hit rate
 
 1. **Keep system prompts stable.** Every change to a role template busts the cache. Finalize prompts before long runs.
-2. **Avoid dynamic timestamps in system prompts.** Injecting `datetime.now()` into the system prompt creates a unique prompt on every spawn — zero cache hits.
+2. **Avoid dynamic timestamps in system prompts.** Injecting `datetime.now()` into the system prompt creates a unique prompt on every spawn - zero cache hits.
 3. **Pass shared context as early context.** Files referenced in the first 1024+ tokens are cached; files appended late are not.
 4. **Use `context_files` in `bernstein.yaml`** to preload stable reference files that all agents share:
 
@@ -206,7 +200,7 @@ main branch
 ```
 
 **Advantages:**
-- True filesystem isolation — agents cannot step on each other's uncommitted changes.
+- True filesystem isolation - agents cannot step on each other's uncommitted changes.
 - Merge happens only at task completion, not continuously.
 - Supports sparse checkout for monorepos (only relevant paths checked out).
 
@@ -215,7 +209,7 @@ main branch
 - Symlinks (`.venv`, `node_modules`) reduce duplication but require Developer Mode on Windows.
 
 ```yaml
-# bernstein.yaml — tune worktree setup
+# bernstein.yaml - tune worktree setup
 worktree_setup:
   symlink_dirs:
     - .venv
@@ -407,13 +401,17 @@ curl http://127.0.0.1:8052/status | jq '.metrics'
 
 ### Prometheus
 
+The task server exposes `GET /metrics` in Prometheus exposition format on its own port (default 8052); there is no separate metrics config block. Point your Prometheus scraper (which itself typically listens on 9090) at the task server:
+
 ```yaml
-prometheus:
-  enabled: true
-  port: 9090
+# prometheus.yml (scraper config, not bernstein.yaml)
+scrape_configs:
+  - job_name: bernstein
+    static_configs:
+      - targets: ["localhost:8052"]
 ```
 
-Metrics at `http://localhost:9090/metrics` in Prometheus exposition format. Grafana dashboards are included in `deploy/grafana/`.
+Metrics at `http://localhost:8052/metrics`. A ready-made scrape config lives in `deploy/prometheus/`, and Grafana dashboards are included in `deploy/grafana/`.
 
 ### CPU profiling
 

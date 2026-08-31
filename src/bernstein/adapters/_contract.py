@@ -2,7 +2,7 @@
 
 For every Bernstein adapter we ship a YAML contract under
 ``tests/contract/contracts/<adapter>.yaml`` describing the *required*
-surface of the upstream CLI binary — the flags and subcommands the
+surface of the upstream CLI binary - the flags and subcommands the
 adapter always passes when it invokes the CLI.
 
 This module loads those contracts and asserts the local binary's
@@ -39,16 +39,34 @@ from typing import Any, TypedDict
 import yaml
 
 # Repo-root anchor. We compute the repo root from this file's location so
-# the loader works under editable installs and from the wheel-installed
-# package (in which case the contracts simply aren't packaged and the
-# loader raises FileNotFoundError, the expected behaviour off-dev).
+# the loader works under editable installs and from a source checkout.
 _THIS_FILE = Path(__file__).resolve()
 _REPO_ROOT = _THIS_FILE.parents[3]
-CONTRACTS_DIR = _REPO_ROOT / "tests" / "contract" / "contracts"
+_DEV_CONTRACTS_DIR = _REPO_ROOT / "tests" / "contract" / "contracts"
+# Wheel-bundled copy. The contracts are force-included into the package tree
+# at build time (see ``[tool.hatch.build.targets.wheel.force-include]`` in
+# ``pyproject.toml``), so a pip install resolves them without a checkout -
+# without them every adapter's admission verdict is a `no_contract` refusal
+# (issue #3547).
+_PACKAGED_CONTRACTS_DIR = _THIS_FILE.parents[1] / "_default_templates" / "adapter_contracts"
+CONTRACTS_DIR = _DEV_CONTRACTS_DIR if _DEV_CONTRACTS_DIR.is_dir() else _PACKAGED_CONTRACTS_DIR
 
 # Per-subprocess timeouts. Plenty for any well-behaved CLI.
 _HELP_TIMEOUT_SECONDS = 30
 _MODELS_TIMEOUT_SECONDS = 60
+
+
+class AuthBasis(StrEnum):
+    """Authentication mechanism declared by an adapter contract."""
+
+    #: Adapter authenticates via an API key (e.g. ANTHROPIC_API_KEY).
+    API_KEY = "api_key"
+    #: Adapter is local-only, no remote authentication required.
+    LOCAL = "local"
+    #: OAuth-based subscription authentication.
+    SUBSCRIPTION_OAUTH = "subscription_oauth"
+    #: Unknown or unspecified authentication mechanism.
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -75,6 +93,24 @@ class ContractSpec:
     #: orchestrator state for cross-reference but pass no flag. See
     #: ``docs/adapters/session_isolation.md``.
     session_id_flag: str | None = None
+    #: Full ordered allow-list of secret env vars the adapter accepts (highest
+    #: precedence first). ``auth_secret_env`` is the highest-precedence entry,
+    #: kept singular for back-compat; this carries the complete set when the
+    #: contract lists more than one.
+    auth_secret_envs: tuple[str, ...] = ()
+    #: Minimum-safe upstream version this adapter may be spawned against, or
+    #: ``None`` when no floor is curated. Sourced at load time from
+    #: :data:`bernstein.adapters.advisories.ADAPTER_MIN_SAFE_VERSIONS` so the
+    #: advisory map stays the single source of truth (a floor bump is a
+    #: data-only edit there, never a contract-YAML edit). The spawn preflight
+    #: (:mod:`bernstein.adapters.security_floor`) enforces this floor and seals
+    #: a chain-anchored refusal receipt; the canary refuses to certify below
+    #: it. See issue #2515.
+    security_floor: str | None = None
+    #: Bernstein-local advisory id backing :attr:`security_floor`, or ``None``.
+    security_advisory_id: str | None = None
+    #: Authentication mechanism declared in the contract YAML.
+    auth_basis: AuthBasis = AuthBasis.UNKNOWN
 
     @classmethod
     def load(cls, name: str, contracts_dir: Path | None = None) -> ContractSpec:
@@ -91,6 +127,28 @@ class ContractSpec:
         expected = data.get("expected_models") or {}
         raw_session_flag = data.get("session_id_flag")
         session_id_flag = str(raw_session_flag) if raw_session_flag else None
+        # ``secret_env`` accepts either a single name or an ordered allow-list
+        # (highest precedence first). The singular ``auth_secret_env`` mirrors
+        # the highest-precedence entry for back-compat with existing consumers.
+        raw_secret = auth.get("secret_env")
+        if isinstance(raw_secret, (list, tuple)):
+            secret_envs = tuple(str(s) for s in raw_secret if s)
+        elif raw_secret:
+            secret_envs = (str(raw_secret),)
+        else:
+            secret_envs = ()
+        # Security floor is sourced from the advisory map, not the contract
+        # YAML, so the floor lives in exactly one place and a bump stays a
+        # data-only edit there (issue #2515). Imported lazily to keep the
+        # contract loader importable without pulling the advisories module in
+        # environments that only parse YAML.
+        from bernstein.adapters.advisories import ADAPTER_MIN_SAFE_VERSIONS
+
+        _advisory = ADAPTER_MIN_SAFE_VERSIONS.get(str(data.get("adapter", name)))
+        security_floor = _advisory.min_safe_version if _advisory is not None else None
+        security_advisory_id = _advisory.advisory_id if _advisory is not None else None
+        raw_auth_basis = auth.get("basis")
+        auth_basis = AuthBasis(raw_auth_basis) if raw_auth_basis else AuthBasis.UNKNOWN
         return cls(
             adapter=str(data.get("adapter", name)),
             binary=str(data.get("binary", name)),
@@ -98,13 +156,17 @@ class ContractSpec:
             install_spec=str(install.get("spec", "")),
             auth_required_for_help=bool(auth.get("required_for_help", False)),
             auth_required_for_models=bool(auth.get("required_for_models", False)),
-            auth_secret_env=str(auth.get("secret_env", "") or ""),
+            auth_secret_env=secret_envs[0] if secret_envs else "",
             required_flags=tuple(data.get("required_flags") or ()),
             required_subcommands=tuple(data.get("required_subcommands") or ()),
             help_command=tuple(data.get("help_command") or ()),
             models_command=tuple(expected.get("command") or ()),
             models_required_present=tuple(expected.get("required_present") or ()),
             session_id_flag=session_id_flag,
+            auth_secret_envs=secret_envs,
+            security_floor=security_floor,
+            security_advisory_id=security_advisory_id,
+            auth_basis=auth_basis,
         )
 
     def resolved_help_command(self) -> list[str]:
@@ -165,7 +227,7 @@ def _sandbox_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
     Equivalent to ``env -i`` plus the runtime variables a CLI typically
     needs (``PATH``, ``HOME``, locale, ``TERM``). Auth-bearing variables
-    are passed through only when ``extra`` opts them in — the help check
+    are passed through only when ``extra`` opts them in - the help check
     deliberately runs without auth.
     """
     keep = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER", "LOGNAME")
@@ -225,25 +287,90 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+#: Characters that can continue a flag name. A required flag only counts as
+#: advertised when neither the character before nor the character after the
+#: match is one of these, so ``-m`` is not found inside ``--model`` and
+#: ``--instruction`` is not found inside ``--instructions``. Trailing ``=``,
+#: ``,``, ``<`` and end-of-line all remain valid terminators.
+_FLAG_NAME_CHARS = r"[A-Za-z0-9_-]"
+
+
+def _flag_pattern(flag: str) -> re.Pattern[str]:
+    """Compile a case-insensitive, token-bounded matcher for one flag."""
+    return re.compile(
+        rf"(?<!{_FLAG_NAME_CHARS}){re.escape(flag)}(?!{_FLAG_NAME_CHARS})",
+        re.IGNORECASE,
+    )
+
+
 def _capability_failures(spec: ContractSpec, help_text: str) -> list[str]:
     """Compute the list of human-readable capability failures.
 
-    Flag match is case-insensitive substring. The leading dashes already
-    make a flag unambiguous. Subcommand match is case-insensitive and
-    requires a token boundary (start/end of line or whitespace) so that
-    ``runs`` does not falsely satisfy ``run``.
+    Flag and subcommand matches are both case-insensitive and both require a
+    token boundary, so that ``runs`` does not falsely satisfy ``run`` and
+    ``--instructions`` does not falsely satisfy ``--instruction``.
+
+    The leading dashes anchor only the *start* of a flag; they say nothing
+    about where it ends. A plain substring match therefore treats a required
+    flag as present whenever upstream renames it to something that merely
+    contains it -- pluralising ``--instruction`` to ``--instructions``, or
+    dropping a ``-m`` alias while keeping ``--model``. That is the exact
+    rename that keeps a probe green against a CLI which rejects the declared
+    flag outright, so both ends are anchored here.
     """
     failures: list[str] = []
     haystack = _strip_ansi(help_text)
-    haystack_lower = haystack.lower()
     for flag in spec.required_flags:
-        if flag.lower() not in haystack_lower:
+        if not re.search(_flag_pattern(flag), haystack):
             failures.append(f"missing required flag {flag!r} in `{spec.binary} --help`")
     for sub in spec.required_subcommands:
         pattern = rf"(?im)(^|\s){re.escape(sub)}(\s|$)"
         if not re.search(pattern, haystack):
             failures.append(f"missing required subcommand {sub!r} in `{spec.binary} --help`")
     return failures
+
+
+#: Minimum number of required tokens below which the "every required token
+#: missing" signal cannot be told apart from ordinary single-flag drift. A
+#: one-token contract that loses its one token is genuine drift, not a broken
+#: probe, so the classification below only applies at two or more tokens.
+_BROKEN_PROBE_MIN_REQUIRED = 2
+
+
+def probe_failure_reason(spec: ContractSpec, help_text: str) -> str | None:
+    """Classify ``help_text`` as a broken/degraded probe rather than drift.
+
+    Returns a short reason phrase when the captured ``--help`` output looks
+    like a probe or upstream runtime failure -- the CLI crashed before
+    emitting help, paginated it away, was redesigned/renamed wholesale, or a
+    shim binary is shadowing ``PATH`` -- and ``None`` when the output is real
+    help text that should drive normal flag matching.
+
+    Signals, in order:
+
+    * **No output.** An installed binary whose ``--help`` prints nothing is
+      broken, not drifted.
+    * **Every required token absent at once.** A working binary cannot
+      legitimately drop its *entire* declared required surface in one
+      release; when all of ``>= _BROKEN_PROBE_MIN_REQUIRED`` required tokens
+      vanish together the likelier cause is a broken or wholesale-redesigned
+      ``--help``. Reporting each token as "missing" would page an operator
+      with a misleading per-flag "every flag removed" finding (issue #2488).
+
+    A single-token contract is exempt from the second signal: losing its one
+    token is indistinguishable from ordinary drift, so it stays drift. This
+    is independent of the process exit code -- some CLIs emit a redesigned or
+    paginated help and still exit 0.
+    """
+    total_required = len(spec.required_flags) + len(spec.required_subcommands)
+    if total_required == 0:
+        return None
+    if not _strip_ansi(help_text).strip():
+        return "no output"
+    failures = _capability_failures(spec, help_text)
+    if len(failures) == total_required and total_required >= _BROKEN_PROBE_MIN_REQUIRED:
+        return "no required tokens advertised"
+    return None
 
 
 def _model_failures(spec: ContractSpec, models_text: str) -> list[str]:
@@ -294,39 +421,40 @@ def check_contract(spec: ContractSpec) -> ContractResult:
     rc, help_text = _run_capture(spec.resolved_help_command(), timeout=_HELP_TIMEOUT_SECONDS)
     result.help_exit_code = rc
     if rc == 127:
-        # Race between shutil.which() and spawn — extremely rare but
+        # Race between shutil.which() and spawn - extremely rare but
         # we report it cleanly.
         result.binary_installed = False
         result.skipped_reason = help_text.strip()
         return result
 
-    # Guard: a non-zero help exit that fails to advertise the required
-    # contract surface is a CLI runtime failure, not contract drift.
+    # Guard: a help exit that fails to advertise the required contract
+    # surface is a CLI runtime/probe failure, not contract drift.
     # Reporting every required flag as "missing" against an empty (or
     # truncated) haystack produces misleading drift issues (one failure
     # line per required flag) when the real problem is a broken --help.
-    # Cover two patterns seen in real CI:
+    # Covers the patterns seen in real CI:
     #   * help_text empty (CLI crashed before emitting anything).
     #   * help_text non-empty but ALL required flags missing (CLI emitted
-    #     a stub or error preamble and bailed before the flag section).
-    # Surface the runtime failure on a dedicated field so the CLI can
-    # exit with a "checker error" status rather than a drift status; the
-    # workflow distinguishes the two and only treats real drift as
-    # contract regression.
+    #     a stub or error preamble, or a redesigned/paginated help, and
+    #     advertised none of the required tokens).
+    # This is independent of the exit code: some CLIs ship a redesigned or
+    # paginated --help that still exits 0, so gating on a non-zero exit
+    # would miss exactly the regression that opened issue #2488. Surface
+    # the runtime failure on a dedicated field so the CLI can exit with a
+    # "checker error" status rather than a drift status; the workflow
+    # distinguishes the two and only treats real drift as contract
+    # regression.
     stripped_help = _strip_ansi(help_text).strip()
-    raw_failures = _capability_failures(spec, help_text)
-    total_required = len(spec.required_flags) + len(spec.required_subcommands)
-    all_required_missing = total_required > 0 and len(raw_failures) == total_required
-    if rc != 0 and (not stripped_help or all_required_missing):
+    probe_reason = probe_failure_reason(spec, help_text)
+    if probe_reason is not None:
         snippet = stripped_help[:300] or "<no output>"
-        reason = "no output" if not stripped_help else "no required tokens advertised"
         result.runtime_failure = (
-            f"`{' '.join(spec.resolved_help_command())}` exited {rc} with {reason}; "
+            f"`{' '.join(spec.resolved_help_command())}` exited {rc} with {probe_reason}; "
             f"upstream CLI runtime failure, not contract drift: {snippet}"
         )
         return result
 
-    result.capability_failures = raw_failures
+    result.capability_failures = _capability_failures(spec, help_text)
 
     # 2. Optional model-presence check.
     if spec.models_required_present and spec.models_command:
@@ -369,7 +497,7 @@ def list_contracts(contracts_dir: Path | None = None) -> list[str]:
 # Per-adapter strategy enums (issue #1627)
 # ---------------------------------------------------------------------------
 #
-# Every CLI agent expresses the same three concepts differently:
+# Every CLI agent expresses the same four concepts differently:
 #
 #   * resume        - ``--resume <id>`` for some, ``--session-id <id>`` for
 #                     others, a subcommand ``<cli> resume <id>`` for a third
@@ -380,6 +508,9 @@ def list_contracts(contracts_dir: Path | None = None) -> list[str]:
 #   * event channel  - the surface Bernstein observes for lifecycle signals:
 #                     stream-json, the canonical ``BERNSTEIN:<KIND>`` text
 #                     grammar, upstream hooks, or PTY polling.
+#   * output mode    - what the adapter's run *produces* as its unit of work:
+#                     a git commit on the worktree branch, or a canonical
+#                     artifact recorded as a signed lineage entry.
 #
 # Capturing each axis as a typed per-adapter enum compresses the scattered
 # ``if adapter == "X"`` conditionals into one dispatch per axis and makes
@@ -426,18 +557,62 @@ class EventChannel(StrEnum):
     TEXT_SIGNALS = "text-signals"
     #: Upstream fires hooks/callbacks Bernstein registers against.
     HOOKS = "hooks"
+    #: Upstream speaks the Agent Client Protocol; Bernstein consumes typed
+    #: JSON-RPC lifecycle events over the stdio client transport and journals
+    #: each event content-addressed. No stdout text parser at all.
+    ACP = "acp"
     #: No structured channel; Bernstein polls a PTY/log for liveness.
     POLL_PTY = "poll-pty"
     #: No event channel at all (process-exit detection only).
     NONE = "none"
 
 
+class OutputMode(StrEnum):
+    """What an adapter's run produces as the completion unit for a task.
+
+    The axis decides which completion check owns the verdict. ``git_diff``
+    tasks complete on workspace HEAD movement (see
+    :mod:`bernstein.core.orchestration.commit_completion`). ``artifact`` tasks
+    have no commit to check: the completion identity is the signed lineage
+    entry hash recorded from the produced artifact's canonical bytes
+    (see :mod:`bernstein.core.tasks.artifact_completion`).
+    """
+
+    #: The run's product is a commit on the worktree branch (the coding path).
+    GIT_DIFF = "git-diff"
+    #: The run's product is a canonical artifact recorded as a signed lineage
+    #: entry - a report, dataset, action log, or ops result.
+    ARTIFACT = "artifact"
+
+
+class SessionState(StrEnum):
+    """Whether an adapter reaches agent-side state that outlives a single spawn.
+
+    Every other axis describes how Bernstein *drives* a run. This one
+    describes what the run leaves behind on the agent's side, which is what
+    decides whether a replay of the same inputs can be expected to reproduce
+    the same outputs.
+    """
+
+    #: Each spawn starts from the inputs Bernstein supplies and nothing else.
+    #: An operator may assume a replay of those inputs is reproducible: there
+    #: is no agent-side memory carried in from an earlier run.
+    STATELESS = "stateless"
+    #: The agent keeps state of its own across spawns - a server-side session,
+    #: a memory store, a persistent thread. An operator may NOT assume a replay
+    #: is reproducible, because inputs Bernstein never saw can influence the
+    #: run.
+    PERSISTENT_AGENT = "persistent-agent"
+
+
 class StrategyView(TypedDict):
-    """JSON-serialisable view of an :class:`AdapterStrategy`'s three axes."""
+    """JSON-serialisable view of an :class:`AdapterStrategy`'s five axes."""
 
     resume: str
     dangerous_mode: str
     event_channel: str
+    output_mode: str
+    session_state: str
 
 
 class StrategyRow(StrategyView):
@@ -448,11 +623,18 @@ class StrategyRow(StrategyView):
 
 @dataclass(frozen=True)
 class AdapterStrategy:
-    """The declared strategy of a single adapter across all three axes."""
+    """The declared strategy of a single adapter across all five axes."""
 
     resume: ResumeStrategy = ResumeStrategy.UNSUPPORTED
     dangerous_mode: DangerousModeStrategy = DangerousModeStrategy.UNSUPPORTED
     event_channel: EventChannel = EventChannel.TEXT_SIGNALS
+    #: Defaults to ``git_diff``: every shipped CLI coding agent completes by
+    #: committing. An adapter driving a non-coding worker declares ``artifact``
+    #: so the completion path reads its canonical output instead of HEAD.
+    output_mode: OutputMode = OutputMode.GIT_DIFF
+    #: Defaults to ``stateless``, so every existing row keeps its meaning: an
+    #: adapter that does carry agent-side state across spawns must say so.
+    session_state: SessionState = SessionState.STATELESS
 
     def to_dict(self) -> StrategyView:
         """Return a JSON-serialisable view for operator-facing tables."""
@@ -460,6 +642,8 @@ class AdapterStrategy:
             "resume": str(self.resume),
             "dangerous_mode": str(self.dangerous_mode),
             "event_channel": str(self.event_channel),
+            "output_mode": str(self.output_mode),
+            "session_state": str(self.session_state),
         }
 
 
@@ -509,12 +693,28 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
         dangerous_mode=DangerousModeStrategy.CLI_FLAG,
         event_channel=EventChannel.STREAM_JSON,
     ),
+    # agy is the successor CLI for the discontinued non-enterprise hosted
+    # gemini backend; separate adapter (single binary, print mode, sandbox
+    # pinned) -- see docs/adapters/agy.md. Dangerous mode is
+    # --dangerously-skip-permissions; print mode emits plain text (no
+    # structured event stream), so the channel is text signals. The CLI
+    # has --conversation <id> resume, but native reattach is not wired
+    # yet, so resume stays declared unsupported (fresh-session fallback).
+    "agy": AdapterStrategy(
+        resume=ResumeStrategy.UNSUPPORTED,
+        dangerous_mode=DangerousModeStrategy.CLI_FLAG,
+        event_channel=EventChannel.TEXT_SIGNALS,
+    ),
     # CLI-flag dangerous mode, text-signal channel, fresh-session resume.
     "cline": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     "charm": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     "kimi": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     "rovo": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
-    "letta_code": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
+    "letta_code": AdapterStrategy(
+        dangerous_mode=DangerousModeStrategy.CLI_FLAG,
+        event_channel=EventChannel.STREAM_JSON,
+        session_state=SessionState.PERSISTENT_AGENT,
+    ),
     # Codex drives unattended via its sandbox/full-auto flag.
     "codex": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     # Everyone else - no native resume, text-signal channel. Dangerous-mode
@@ -525,31 +725,114 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     "auggie": AdapterStrategy(),
     "autohand": AdapterStrategy(),
     "clm": AdapterStrategy(),
-    "cloudflare": AdapterStrategy(event_channel=EventChannel.HOOKS),
     "codebuff": AdapterStrategy(),
+    # Fronts a third-party autonomous browser / computer-use agent (issue
+    # #2606). The external agent owns its own loop, so Bernstein neither
+    # resumes it natively nor reads a structured lifecycle stream: liveness is
+    # polled and the per-action record is the signed lineage chain, not stdout
+    # text. Dangerous-mode is the external agent's own concern. Its unit of
+    # work is that recorded action stream, not a commit on the worktree
+    # branch, so it declares ``artifact`` output (#3110): completion is the
+    # signed lineage receipt and the commit check never fires for it.
+    "computer_use": AdapterStrategy(event_channel=EventChannel.POLL_PTY, output_mode=OutputMode.ARTIFACT),
     "cody": AdapterStrategy(),
     "composio": AdapterStrategy(event_channel=EventChannel.HOOKS),
     "continue": AdapterStrategy(),
-    "copilot": AdapterStrategy(),
+    # Copilot drives unattended via --allow-all-tools / --no-ask-user in print
+    # mode; the deterministic session id is pinned through --session-id.
+    "copilot": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     "devin_terminal": AdapterStrategy(event_channel=EventChannel.POLL_PTY),
     "droid": AdapterStrategy(),
     "forge": AdapterStrategy(),
     "generic": AdapterStrategy(),
-    "goose": AdapterStrategy(),
+    # Goose emits NDJSON under --output-format stream-json whose events carry
+    # tokens/cost_usd and an error event (the authoritative failure signal;
+    # status:'completed' is a constant not a verdict). Dangerous mode is the
+    # GOOSE_MODE env var (auto/approve/smart_approve/chat), set explicitly by
+    # the adapter, not a CLI flag.
+    "goose": AdapterStrategy(
+        event_channel=EventChannel.STREAM_JSON,
+        dangerous_mode=DangerousModeStrategy.ENV_VAR,
+    ),
     "gptme": AdapterStrategy(),
-    "hermes": AdapterStrategy(),
+    # Hermes is driven through its one-shot mode, which auto-bypasses approvals
+    # rather than exposing a flag to do so - the CLI is unattended by
+    # construction there, so the axis is always-on, not unsupported. Declaring
+    # it unsupported reads as "cannot be driven unattended", which understates
+    # what an operator is authorising when they select this adapter.
+    "hermes": AdapterStrategy(dangerous_mode=DangerousModeStrategy.ALWAYS_ON),
+    # HolmesGPT is a read-only investigation CLI. It has no native resume,
+    # runs non-interactively with --no-interactive, and emits lifecycle
+    # signals as a JSON output file rather than a structured stream. Its
+    # unit of work is the investigation artifact (conclusion + observations),
+    # not a commit, so completion is the signed lineage receipt.
+    "holmesgpt": AdapterStrategy(
+        resume=ResumeStrategy.UNSUPPORTED,
+        dangerous_mode=DangerousModeStrategy.UNSUPPORTED,
+        event_channel=EventChannel.TEXT_SIGNALS,
+        output_mode=OutputMode.ARTIFACT,
+    ),
     "iac": AdapterStrategy(),
     "junie": AdapterStrategy(),
-    "kilo": AdapterStrategy(),
+    # Kilo documents native ACP support; it declares the ACP event channel so
+    # lifecycle events arrive as schema-validated JSON-RPC frames rather than
+    # a bespoke stdout parser.
+    "kilo": AdapterStrategy(event_channel=EventChannel.ACP),
+    # Kimchi runs as an ACP agent over JSON-RPC on stdio (--mode acp) and
+    # completes by committing in the worktree (GIT_DIFF). Dangerous mode is
+    # --yolo, passed on every spawn. The CLI has --session <path> resume, but
+    # no spawn path supplies that file, so resume stays declared unsupported
+    # (fresh-session fallback) - same reasoning as ``agy`` above. Declaring it
+    # here would make checkpoint_retry_capability offer a warm retry, and a
+    # warm retry sends only the corrective instruction on the assumption the
+    # prior session is reattached.
+    "kimchi": AdapterStrategy(
+        resume=ResumeStrategy.FLAG,
+        dangerous_mode=DangerousModeStrategy.CLI_FLAG,
+        event_channel=EventChannel.ACP,
+        output_mode=OutputMode.GIT_DIFF,
+    ),
     "kiro": AdapterStrategy(),
     "mistral": AdapterStrategy(),
     "mock": AdapterStrategy(),
+    # Muse Code is driven through its headless mode with --disable-approval
+    # on every spawn (approval prompts would hang an unattended worker); the
+    # vendor sandbox stays on. A --session-id resume flag exists upstream but
+    # no spawn path supplies one, so resume stays declared unsupported.
+    # Completion rides the shared GIT_DIFF path every text-signal coding
+    # adapter uses, including its documented fail-open auto-commit behavior
+    # (core/routes/task_crud.py); this row adds no completion logic of its
+    # own, and tightening that shared path is its own change, not an
+    # adapter addition.
+    "muse": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     "ollama": AdapterStrategy(),
     "open_interpreter": AdapterStrategy(),
-    "opencode": AdapterStrategy(),
+    # Resume and dangerous mode are backed by flags ``opencode.py`` passes:
+    # ``--continue`` and ``--auto`` plus an explicit permission policy. The
+    # event channel stays ``text-signals``: the CLI does emit NDJSON under
+    # ``--format json``, but nothing consumes it yet, and declaring a channel
+    # no parser reads would claim a surface that does not exist.
+    "opencode": AdapterStrategy(
+        resume=ResumeStrategy.FLAG,
+        dangerous_mode=DangerousModeStrategy.CLI_FLAG,
+    ),
     "openhands": AdapterStrategy(),
     "pi": AdapterStrategy(),
     "plandex": AdapterStrategy(),
+    # Generic Python-invoked agent runtime adapter (#2959).
+    "python_runtime": AdapterStrategy(
+        resume=ResumeStrategy.UNSUPPORTED,
+        dangerous_mode=DangerousModeStrategy.ALWAYS_ON,
+        event_channel=EventChannel.STREAM_JSON,
+        output_mode=OutputMode.GIT_DIFF,
+    ),
+    # Built from a declarative capability profile rather than a
+    # hand-written module (see
+    # :mod:`bernstein.adapters.capability_profile`). The row stays here
+    # because STRATEGY_MATRIX is the authoritative declaration every
+    # derived capability matrix is computed from; the profile test suite
+    # asserts the profile and this row agree, so the two cannot drift.
+    "pydantic_ai": AdapterStrategy(),
     "q_dev": AdapterStrategy(),
     "qwen": AdapterStrategy(),
     "ralphex": AdapterStrategy(),
@@ -565,7 +848,6 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
 #: to their registry key need no entry here.
 _NAMESPACE_ALIASES: dict[str, str] = {
     "claude code": "claude",
-    "cloudflare agents": "cloudflare",
     "composio agent orchestrator": "composio",
     "continue.dev": "continue",
     "github copilot": "copilot",
@@ -608,7 +890,7 @@ def undeclared_strategies(adapter_names: list[str]) -> list[str]:
 def strategy_table(adapter_names: list[str] | None = None) -> list[StrategyRow]:
     """Return one row per adapter for the operator-facing strategy table.
 
-    Each row is a :class:`StrategyRow` (``adapter`` plus the three axes).
+    Each row is a :class:`StrategyRow` (``adapter`` plus the four axes).
     Rows are sorted by adapter name so operators can compare adapters at a
     glance (issue #1627 AC #4). When ``adapter_names`` is ``None`` the full
     matrix is rendered.
@@ -655,3 +937,420 @@ def resume_capability(adapter_name: str) -> str:
 #: callers that imported the dict directly. Adapters absent are assumed
 #: :data:`RESUME_FALLBACK_FRESH`.
 RESUME_CAPABILITY_MATRIX: dict[str, str] = {name: resume_capability(name) for name in STRATEGY_MATRIX}
+
+
+# ---------------------------------------------------------------------------
+# Checkpointed-retry capability map (issue #2359)
+# ---------------------------------------------------------------------------
+#
+# A failed task's retry can continue the prior native agent session (warm),
+# branch a new session off the recorded checkpoint (fork), or restart from
+# zero (cold). What a given adapter can offer is a pure function of the
+# resume axis it already declares in :data:`STRATEGY_MATRIX` -- a single
+# source of truth, so the retry surface can never claim a warm resume that
+# ``bernstein resume`` would refuse.
+
+
+class CheckpointRetryCapability(StrEnum):
+    """What kind of checkpointed retry an adapter's native sessions support."""
+
+    #: The adapter can reattach to the prior session (warm continuation).
+    RESUME = "resume"
+    #: The adapter can additionally branch a fresh session off a recorded
+    #: checkpoint, leaving the original session intact.
+    FORK = "fork"
+    #: No native session continuation; every retry is a cold restart.
+    NONE = "none"
+
+
+#: Registry keys of adapters whose native session store supports branching a
+#: new session from an existing one (a superset of plain resume). Kept as an
+#: explicit declaration: fork support is a stronger upstream contract than
+#: the resume flag alone proves.
+_FORK_CAPABLE_ADAPTERS: frozenset[str] = frozenset({"claude", "claude_routine"})
+
+
+def checkpoint_retry_capability(adapter_name: str) -> CheckpointRetryCapability:
+    """Return the checkpointed-retry capability for ``adapter_name``.
+
+    Derived from :data:`STRATEGY_MATRIX`: an adapter whose declared
+    :class:`ResumeStrategy` is :attr:`ResumeStrategy.UNSUPPORTED` can never
+    be warm/fork capable (:attr:`CheckpointRetryCapability.NONE`). Adapters
+    with native resume are :attr:`CheckpointRetryCapability.RESUME`, upgraded
+    to :attr:`CheckpointRetryCapability.FORK` when the adapter is in the
+    explicit fork-capable set. Unknown adapters degrade to ``NONE`` so an
+    undeclared adapter never accidentally resumes a provider-side session.
+    """
+    key = _NAMESPACE_ALIASES.get(adapter_name, adapter_name)
+    strategy = strategy_for(key)
+    if strategy.resume is ResumeStrategy.UNSUPPORTED:
+        return CheckpointRetryCapability.NONE
+    if key in _FORK_CAPABLE_ADAPTERS:
+        return CheckpointRetryCapability.FORK
+    return CheckpointRetryCapability.RESUME
+
+
+#: Full per-adapter checkpointed-retry capability map, one row per declared
+#: adapter. Derived, never hand-maintained: a new adapter picks up its row
+#: from the strategy matrix it must already declare.
+CHECKPOINT_RETRY_CAPABILITY_MATRIX: dict[str, CheckpointRetryCapability] = {
+    name: checkpoint_retry_capability(name) for name in STRATEGY_MATRIX
+}
+
+
+# ---------------------------------------------------------------------------
+# In-process verification-gate capability map (issue #2360)
+# ---------------------------------------------------------------------------
+#
+# An adapter with a *blocking* in-session hook surface can run our completion
+# verification and path allowlist the moment a worker believes it is done,
+# refusing the cheap miss before the turn ends. The scheduler-side evidence
+# gate stays authoritative regardless -- the in-process gate is defence in
+# depth -- so an adapter without such a surface simply degrades to that gate
+# with no policy weakening. Capability is a stronger upstream contract than the
+# event channel alone proves, so it is an explicit declaration.
+
+
+class InProcessGateCapability(StrEnum):
+    """Whether an adapter can enforce a verification gate in-session."""
+
+    #: The adapter exposes a blocking hook surface (a completion gate that can
+    #: refuse to end the turn plus a tool-permission matcher that can refuse an
+    #: out-of-scope write) Bernstein renders its policy into.
+    BLOCKING = "blocking"
+    #: No blocking hook surface; the gate runs scheduler-side only.
+    NONE = "none"
+
+
+#: Registry keys of adapters that drive the Claude Code hook surface (settings
+#: ``hooks`` with PreToolUse permission decisions and a blocking Stop hook).
+#: Both entries are Claude Code driver adapters -- the second (``claude_routine``)
+#: reuses the identical surface in routine/scheduled mode -- so the renderer
+#: handles the family uniformly.
+_IN_PROCESS_GATE_BLOCKING_ADAPTERS: frozenset[str] = frozenset({"claude", "claude_routine"})
+
+
+def in_process_gate_capability(adapter_name: str) -> InProcessGateCapability:
+    """Return the in-process gate capability for ``adapter_name``.
+
+    Accepts a registry key or the session-namespace form (resolved through
+    :data:`_NAMESPACE_ALIASES`). Adapters in the explicit blocking set map to
+    :attr:`InProcessGateCapability.BLOCKING`; every other adapter -- declared or
+    unknown -- degrades to :attr:`InProcessGateCapability.NONE` so an
+    undeclared adapter never claims an in-session enforcement surface it lacks.
+    """
+    key = _NAMESPACE_ALIASES.get(adapter_name, adapter_name)
+    if key in _IN_PROCESS_GATE_BLOCKING_ADAPTERS:
+        return InProcessGateCapability.BLOCKING
+    return InProcessGateCapability.NONE
+
+
+#: Full per-adapter in-process gate capability map, one row per declared
+#: adapter. Derived, never hand-maintained: a new adapter picks up its row from
+#: the strategy matrix it must already declare.
+IN_PROCESS_GATE_CAPABILITY_MATRIX: dict[str, InProcessGateCapability] = {
+    name: in_process_gate_capability(name) for name in STRATEGY_MATRIX
+}
+
+
+# ---------------------------------------------------------------------------
+# Cost-aware scheduling capability maps (issue #2354)
+# ---------------------------------------------------------------------------
+#
+# Cost-aware scheduling routes non-interactive work to a provider's batch
+# surface and schedules cache-window fan-outs. Both are provider contracts an
+# adapter either honours or does not; like the strategy matrix, they are
+# *declared* here as the single source of truth, never probed at runtime, so
+# the scheduler can never route batch work to an adapter that has no batch
+# endpoint or assume a prompt-cache TTL an adapter does not offer. The default
+# on every axis is the conservative one (no batch surface, no cache window),
+# so an undeclared or third-party adapter is never routed unsafely.
+
+
+class BatchDispatchCapability(StrEnum):
+    """Whether an adapter exposes a non-interactive batch dispatch surface."""
+
+    #: The adapter routes through a provider batch endpoint (large discount,
+    #: asynchronous, non-interactive) for batch-eligible work.
+    NATIVE = "native"
+    #: No batch surface; every call is dispatched interactively.
+    NONE = "none"
+
+
+#: Registry keys of adapters whose priced upstream exposes a batch API that
+#: Bernstein dispatches through. Kept explicit: a batch surface is a stronger
+#: provider contract than the interactive path and must be declared, not
+#: inferred from the model string. Conservative by construction -- an adapter
+#: absent here is treated as non-batch.
+_BATCH_CAPABLE_ADAPTERS: frozenset[str] = frozenset(
+    {
+        "claude",
+        "claude_routine",
+        "openai_agents",
+    }
+)
+
+
+def batch_dispatch_capability(adapter_name: str) -> BatchDispatchCapability:
+    """Return the batch-dispatch capability for ``adapter_name``.
+
+    Accepts either a registry key or the session-namespace form (resolved
+    through :data:`_NAMESPACE_ALIASES` first). An adapter in
+    :data:`_BATCH_CAPABLE_ADAPTERS` reports
+    :attr:`BatchDispatchCapability.NATIVE`; every other adapter -- including
+    unknown / third-party adapters -- reports
+    :attr:`BatchDispatchCapability.NONE`, so batch-eligible work is never
+    routed to an adapter that cannot honour it.
+    """
+    key = _NAMESPACE_ALIASES.get(adapter_name, adapter_name)
+    if key in _BATCH_CAPABLE_ADAPTERS:
+        return BatchDispatchCapability.NATIVE
+    return BatchDispatchCapability.NONE
+
+
+#: Full per-adapter batch-dispatch capability map, one row per declared
+#: adapter. Derived from :data:`_BATCH_CAPABLE_ADAPTERS`; a new adapter picks
+#: up its row automatically from the strategy matrix it must already declare.
+BATCH_DISPATCH_CAPABILITY_MATRIX: dict[str, BatchDispatchCapability] = {
+    name: batch_dispatch_capability(name) for name in STRATEGY_MATRIX
+}
+
+
+class CacheWindowCapability(StrEnum):
+    """Whether an adapter honours a prompt-cache TTL window for fan-out."""
+
+    #: The adapter's upstream caches a shared prompt prefix under a short TTL,
+    #: so a single warm-up call primes the cache for a fan-out of workers that
+    #: share the prefix.
+    SUPPORTED = "supported"
+    #: No documented prompt-cache window; fan-out warm-up is a no-op and the
+    #: scheduler must not assume cache hits.
+    NONE = "none"
+
+
+#: Registry keys of adapters whose upstream documents a prompt-cache TTL
+#: window Bernstein can schedule a fan-out inside. Explicit and conservative:
+#: an adapter absent here has no cache window, so the scheduler never issues a
+#: warm-up call expecting hits that will not happen.
+_CACHE_WINDOW_ADAPTERS: frozenset[str] = frozenset(
+    {
+        "claude",
+        "claude_routine",
+    }
+)
+
+
+def cache_window_capability(adapter_name: str) -> CacheWindowCapability:
+    """Return the cache-window capability for ``adapter_name``.
+
+    Accepts either a registry key or the session-namespace form. An adapter in
+    :data:`_CACHE_WINDOW_ADAPTERS` reports
+    :attr:`CacheWindowCapability.SUPPORTED`; every other adapter reports
+    :attr:`CacheWindowCapability.NONE`. Note the capability only says an
+    adapter *can* honour a cache window -- the scheduler still requires an
+    explicit opt-in (conservative default off) before it issues a warm-up.
+    """
+    key = _NAMESPACE_ALIASES.get(adapter_name, adapter_name)
+    if key in _CACHE_WINDOW_ADAPTERS:
+        return CacheWindowCapability.SUPPORTED
+    return CacheWindowCapability.NONE
+
+
+#: Full per-adapter cache-window capability map, one row per declared adapter.
+CACHE_WINDOW_CAPABILITY_MATRIX: dict[str, CacheWindowCapability] = {
+    name: cache_window_capability(name) for name in STRATEGY_MATRIX
+}
+
+
+# ---------------------------------------------------------------------------
+# System-addendum delivery channel (issue #4256)
+# ---------------------------------------------------------------------------
+#
+# ``system_addendum`` is the channel that carries protocol-critical text into a
+# spawn: the completion curl, the heartbeat loop, the signal check. Which
+# surface an adapter delivers it on used to be recorded only in that adapter's
+# own docstring, so an adapter that discarded it was indistinguishable from one
+# that honoured it -- and the ambiguity only resolved minutes later, when the
+# supervisor gave up waiting for signals the agent had never been told to emit.
+# Declared here, on the same axis footing as every other adapter capability,
+# and asserted against the adapter sources by the conformance suite.
+
+
+class SystemAddendumChannel(StrEnum):
+    """Where an adapter delivers ``system_addendum`` at the process boundary."""
+
+    #: A real system-prompt channel the upstream CLI exposes, e.g. Claude
+    #: Code's ``--append-system-prompt``. Survives user-prompt truncation.
+    SYSTEM_PROMPT = "system-prompt"
+    #: No separate system prompt; the text is appended to the user prompt.
+    #: The instructions do arrive, but inside a truncatable payload.
+    PROMPT_APPEND = "prompt-append"
+    #: The adapter has no surface for it at all: the text is dropped.
+    IGNORED = "ignored"
+
+
+#: Registry keys of adapters that deliver the addendum on a real system-prompt
+#: channel. Explicit rather than inferred: a system prompt is a stronger
+#: delivery guarantee than a prompt append and must be declared to be relied on.
+_SYSTEM_PROMPT_ADDENDUM_ADAPTERS: frozenset[str] = frozenset(
+    {
+        "claude",
+        "claude_routine",
+        "openai_agents",
+    }
+)
+
+#: Registry keys of adapters with no separate system prompt that nevertheless
+#: append the addendum to the user prompt, so the instructions still reach the
+#: model. The base ``CLIAdapter.spawn`` contract permits this fallback.
+_PROMPT_APPEND_ADDENDUM_ADAPTERS: frozenset[str] = frozenset(
+    {
+        "devin_terminal",
+        "junie",
+        "muse",
+        "python_runtime",
+        "q_dev",
+        "ralphex",
+    }
+)
+
+
+def system_addendum_channel(adapter_name: str) -> SystemAddendumChannel:
+    """Return the declared ``system_addendum`` delivery channel for an adapter.
+
+    Accepts either a registry key or the session-namespace form (resolved
+    through :data:`_NAMESPACE_ALIASES` first). Any adapter absent from both
+    declaration sets -- including unknown / third-party adapters -- reports
+    :attr:`SystemAddendumChannel.IGNORED`, so the orchestrator assumes the
+    protocol instructions were dropped and says so at spawn rather than
+    assuming a delivery the adapter never promised.
+    """
+    key = _NAMESPACE_ALIASES.get(adapter_name, adapter_name)
+    if key in _SYSTEM_PROMPT_ADDENDUM_ADAPTERS:
+        return SystemAddendumChannel.SYSTEM_PROMPT
+    if key in _PROMPT_APPEND_ADDENDUM_ADAPTERS:
+        return SystemAddendumChannel.PROMPT_APPEND
+    return SystemAddendumChannel.IGNORED
+
+
+#: Full per-adapter system-addendum channel map, one row per declared adapter.
+SYSTEM_ADDENDUM_CHANNEL_MATRIX: dict[str, SystemAddendumChannel] = {
+    name: system_addendum_channel(name) for name in STRATEGY_MATRIX
+}
+
+
+# ---------------------------------------------------------------------------
+# Scanner adapter capability declarations (issue #3617, slice 2 of #2953)
+# ---------------------------------------------------------------------------
+
+
+class ScannerDeterminism(StrEnum):
+    """The determinism tier a scanner adapter promises.
+
+    An adapter that declares the wrong tier fails conformance rather than
+    degrading quietly.  The tier drives what the conformance suite *demands*,
+    not what the scanner happens to produce on any given run.
+
+    ``deterministic``           -- two runs on identical input yield identical
+                                  finding hashes (no clock / PID / random noise).
+    ``feed_pinned``            -- reproducible as-of a recorded feed digest:
+                                  identical hashes given the *same* recorded digest.
+    ``transcript_anchored``    -- not byte-deterministic; a transcript is recorded
+                                  that a later verify step can diff.
+    """
+
+    DETERMINISTIC = "deterministic"
+    FEED_PINNED = "feed_pinned"
+    TRANSCRIPT_ANCHORED = "transcript_anchored"
+
+
+class ScannerOutputFormat(StrEnum):
+    """The parseable output format the scanner emits."""
+
+    SARIF = "sarif"
+    JSON = "json"
+    XML = "xml"
+
+
+class ScannerCategory(StrEnum):
+    """The class of analysis the scanner performs."""
+
+    SAST = "sast"
+    SCA = "sca"
+    SECRET = "secret"
+    IAC = "iac"
+    RECON = "recon"
+    DAST = "dast"
+
+
+#: Per-scanner capability declarations, keyed by registry name.
+#: Scanner adapters declare their capabilities directly on the class (output_format,
+#: determinism, pinned_inputs, category); this matrix is the authoritative
+#: declaration registry so the conformance suite can look up any adapter
+#: without instantiating it.
+_SCANNER_CAPABILITIES: dict[str, dict[str, Any]] = {}
+
+
+def register_scanner_capabilities(
+    name: str,
+    output_format: ScannerOutputFormat,
+    determinism: ScannerDeterminism,
+    pinned_inputs: tuple[str, ...],
+    category: ScannerCategory,
+) -> None:
+    """Register a scanner adapter's capability declaration.
+
+    Call this once per scanner module (after the class definition) so the
+    conformance suite can look up capabilities without instantiating the adapter.
+    """
+    _SCANNER_CAPABILITIES[name] = {
+        "output_format": output_format,
+        "determinism": determinism,
+        "pinned_inputs": pinned_inputs,
+        "category": category,
+    }
+
+
+def scanner_capabilities(name: str) -> dict[str, Any] | None:
+    """Return the capability declaration for scanner ``name``, or None if unregistered."""
+    return _SCANNER_CAPABILITIES.get(name)
+
+
+def scanner_determinism(name: str) -> ScannerDeterminism:
+    """Return the declared determinism tier for scanner ``name``."""
+    cap = _SCANNER_CAPABILITIES.get(name)
+    if cap is not None:
+        return ScannerDeterminism(cap["determinism"])
+    return ScannerDeterminism.TRANSCRIPT_ANCHORED
+
+
+def scanner_output_format(name: str) -> ScannerOutputFormat:
+    """Return the declared output format for scanner ``name``."""
+    cap = _SCANNER_CAPABILITIES.get(name)
+    if cap is not None:
+        return ScannerOutputFormat(cap["output_format"])
+    return ScannerOutputFormat.JSON
+
+
+def scanner_pinned_inputs(name: str) -> tuple[str, ...]:
+    """Return the declared pinned_inputs for scanner ``name``."""
+    cap = _SCANNER_CAPABILITIES.get(name)
+    if cap is not None:
+        return tuple(cap["pinned_inputs"])
+    return ()
+
+
+def scanner_category(name: str) -> ScannerCategory:
+    """Return the declared category for scanner ``name``."""
+    cap = _SCANNER_CAPABILITIES.get(name)
+    if cap is not None:
+        return ScannerCategory(cap["category"])
+    return ScannerCategory.SAST
+
+
+def undeclared_scanner_capabilities(scanner_names: list[str]) -> list[str]:
+    """Return the subset of scanner names absent from the capability registry.
+
+    An empty list means every scanner has declared its capabilities.
+    """
+    return sorted(name for name in scanner_names if name not in _SCANNER_CAPABILITIES)

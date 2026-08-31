@@ -1,4 +1,4 @@
-"""Agent inspection routes — logs, kill signals, and SSE output streams."""
+"""Agent inspection routes - logs, kill signals, and SSE output streams."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import StreamingResponse
 
+from bernstein.core.routes._sse import SSE_RESPONSES
 from bernstein.core.server import AgentKillResponse, AgentLogsResponse, read_log_tail
 
 if TYPE_CHECKING:
@@ -23,7 +24,7 @@ router = APIRouter()
 _MAX_IDLE_TICKS = 30
 _POLL_INTERVAL = 1.0
 
-# Session-id sanitiser — only allow chars that can legitimately appear in an
+# Session-id sanitiser - only allow chars that can legitimately appear in an
 # agent session id (role, dashes, hex). Blocks path traversal payloads such as
 # ``../../etc/passwd`` and absolute paths like ``/etc/shadow``.
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
@@ -69,7 +70,7 @@ def _is_synthetic(session_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# GET /agents — list of all known agent sessions (web GUI list view)
+# GET /agents - list of all known agent sessions (web GUI list view)
 # ---------------------------------------------------------------------------
 
 
@@ -136,13 +137,17 @@ def _serialize_agent(store: Any, sid: str, s: Any, now: float) -> dict[str, Any]
     }
 
 
-def _synthesize_agents_from_tasks(store: Any, now: float) -> list[dict[str, Any]]:
-    """Fabricate one agent entry per claimed/in-progress task.
+def _synthesize_agents_from_tasks(store: Any, now: float, tenant_id: str) -> list[dict[str, Any]]:
+    """Fabricate one agent entry per claimed/in-progress task in *tenant_id*.
 
     Mock adapters never call ``TaskStore.heartbeat()``, so ``store.agents`` is
     empty even when the orchestrator has obviously claimed work. Without this
     fallback the GUI would render an empty grid and the "live" counter would
     perpetually read zero, despite the backlog clearly being in flight.
+
+    Each fabricated entry carries the id and title of the task it was built
+    from, so ``tenant_id`` is required rather than defaulted and is pushed
+    into ``list_tasks``: a row outside the scope never becomes an entry.
     """
     if not hasattr(store, "list_tasks"):
         return []
@@ -150,7 +155,7 @@ def _synthesize_agents_from_tasks(store: Any, now: float) -> list[dict[str, Any]
     seen: set[str] = set()
     for status_value in ("claimed", "in_progress"):
         try:
-            tasks = store.list_tasks(status=status_value)
+            tasks = store.list_tasks(status=status_value, tenant_id=tenant_id)
         # bot-ack: pre-existing-1723 (best-effort task synthesis for GUI fallback)
         except Exception:
             tasks = []
@@ -208,21 +213,36 @@ def list_agents(request: Request) -> list[dict[str, Any]]:
     claimed/in-progress task, marked with ``"synthetic": true``. That keeps
     the GUI grid populated during demos and avoids the dreaded "0 sessions"
     empty state when work is obviously in flight.
+
+    Both branches render the id and title of the task a session is on, so
+    both narrow to the caller's tenant scope: the live sessions carry no
+    tenant of their own and are placed by the task they name, while the
+    synthesised entries are built from a scoped read in the first place.
     """
+    from bernstein.core.routes.task_crud import _resolve_request_tenant_scope, task_ids_outside_tenant_scope
+
     store = _task_store(request)
     sessions = getattr(store, "agents", {}) or {}
 
     now = time.time()
-    out: list[dict[str, Any]] = [_serialize_agent(store, sid, s, now) for sid, s in sessions.items()]
+    out_of_scope = task_ids_outside_tenant_scope(
+        request,
+        [str(task_id) for s in sessions.values() for task_id in (getattr(s, "task_ids", None) or [])],
+    )
+    out: list[dict[str, Any]] = [
+        _serialize_agent(store, sid, s, now)
+        for sid, s in sessions.items()
+        if not any(str(task_id) in out_of_scope for task_id in (getattr(s, "task_ids", None) or []))
+    ]
 
     if not out:
-        out = _synthesize_agents_from_tasks(store, now)
+        out = _synthesize_agents_from_tasks(store, now, _resolve_request_tenant_scope(request))
 
     return out
 
 
 # ---------------------------------------------------------------------------
-# GET /agents/comparison — pairwise compare two sessions for the GUI overlay
+# GET /agents/comparison - pairwise compare two sessions for the GUI overlay
 # ---------------------------------------------------------------------------
 
 
@@ -280,7 +300,7 @@ def agent_logs(
     """
     _validate_session_id(session_id)
     if _is_synthetic(session_id):
-        # Synthetic agents have no on-disk log — return an empty payload
+        # Synthetic agents have no on-disk log - return an empty payload
         # rather than 404 so the GUI can render a friendly placeholder.
         return AgentLogsResponse(session_id=session_id, content="", size=0)
     runtime_dir = _runtime_dir(request)
@@ -318,7 +338,7 @@ def agent_kill(request: Request, session_id: str) -> AgentKillResponse:
     """
     _validate_session_id(session_id)
     if _is_synthetic(session_id):
-        # Synthetic sessions don't correspond to a real spawned process —
+        # Synthetic sessions don't correspond to a real spawned process -
         # acknowledge the request so the UI doesn't show a hard failure,
         # but mark it as a no-op.
         return AgentKillResponse(session_id=session_id, kill_requested=False)
@@ -333,7 +353,7 @@ def agent_kill(request: Request, session_id: str) -> AgentKillResponse:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/agents/{session_id}/stream")
+@router.get("/agents/{session_id}/stream", response_class=StreamingResponse, responses=SSE_RESPONSES)
 def agent_stream(request: Request, session_id: str) -> StreamingResponse:
     """Server-Sent Events stream of agent output for the given session.
 

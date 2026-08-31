@@ -12,11 +12,13 @@ operator opted into yolo-mode for a class of safety prompts (e.g.
 ``Continue? [y/N]``) and the agent stalls on one of those prompts, the
 watchdog answers ``y`` once and emits an audit event. Prompts that look
 like the model asking the operator a clarifying question are explicitly
-*not* auto-answered — those escalate.
+*not* auto-answered - those escalate.
 
 Out of slice (deferred)
 -----------------------
-- Context-pressure ``/compact`` recovery.
+- Context-pressure ``/compact`` recovery: now handled by the proactive
+  compaction lane (:mod:`bernstein.core.orchestration.proactive_compaction`),
+  which runs in the token-monitor tick and receipts every compaction.
 - ``redacted_thinking`` corruption restart-with-replay.
 - Stuck-class ML classifier.
 - Dashboard surfacing / per-session recovery counters in
@@ -67,7 +69,7 @@ Off by default so existing runs keep their current behaviour.
 
 # Patterns that look like the agent waiting on an operator confirmation
 # the operator has *already* said yes to in yolo mode. These are
-# deliberately conservative — the right side of the bracketed default
+# deliberately conservative - the right side of the bracketed default
 # (uppercase ``N``) marks the keystroke we'd send.
 DEFAULT_SAFETY_PROMPT_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"continue\?\s*\[y/n\]\s*$", re.IGNORECASE | re.MULTILINE),
@@ -91,9 +93,9 @@ PromptKind = str
 
 One of:
 
-- ``"safety"`` — pre-approved confirmation; safe to auto-answer.
-- ``"model_question"`` — model asking the operator; never auto-answer.
-- ``"none"`` — no prompt currently awaited.
+- ``"safety"`` - pre-approved confirmation; safe to auto-answer.
+- ``"model_question"`` - model asking the operator; never auto-answer.
+- ``"none"`` - no prompt currently awaited.
 """
 
 
@@ -109,8 +111,8 @@ class SessionSnapshot:
     Attributes:
         session_id: Stable identifier for the live adapter session.
         recent_output: The last few hundred bytes of streamed stdout
-            from the agent. The watchdog only inspects the tail —
-            specifically whatever shows up after the last newline — so
+            from the agent. The watchdog only inspects the tail -
+            specifically whatever shows up after the last newline - so
             callers may pass the full ring-buffer slice without
             trimming.
         is_paused: ``True`` when the session is blocked on an awaited
@@ -180,7 +182,7 @@ class WatchdogResult:
         recoveries: All recoveries the watchdog attempted this tick.
             One per session that hit a rule.
         skipped_model_questions: Sessions where a model-question
-            prompt was detected — auto-answer was suppressed and the
+            prompt was detected - auto-answer was suppressed and the
             caller should escalate via the existing notifier path.
     """
 
@@ -224,7 +226,7 @@ def classify_prompt(
 
     The classifier inspects the last line of ``recent_output``. It
     returns ``"model_question"`` whenever the line looks like the model
-    asking the operator a question — that branch wins even if a safety
+    asking the operator a question - that branch wins even if a safety
     pattern would also match, because mis-classifying a model question
     as a safety prompt is the worst failure mode for this primitive.
 
@@ -251,7 +253,7 @@ def classify_prompt(
 def _emit_audit_event(audit_path: Path, event: str, payload: dict[str, object]) -> None:
     """Append one JSONL audit event.
 
-    Failures are swallowed — the watchdog is a best-effort supervisor,
+    Failures are swallowed - the watchdog is a best-effort supervisor,
     so a write error must not crash the tick.
     """
     try:
@@ -304,6 +306,14 @@ def _try_recover_safety_prompt(
         delivered = False
     outcome_event = "watchdog.recover.succeeded" if delivered else "watchdog.recover.failed"
     _emit_audit_event(audit_path, outcome_event, base_payload.copy())
+    logger.info(
+        "watchdog recovery %s: session=%s rule=%s action=%s recovery_id=%s",
+        "SUCCEEDED" if delivered else "FAILED",
+        session.session_id,
+        recovery.rule,
+        recovery.action,
+        recovery.recovery_id,
+    )
     return recovery
 
 
@@ -337,13 +347,42 @@ def tick(
 
     recoveries: list[RecoveryAction] = []
     skipped: list[str] = []
+    sessions = list(sessions)
+    paused_count = sum(1 for s in sessions if s.is_paused)
+    logger.debug(
+        "watchdog tick: probing %d session(s), %d paused",
+        len(sessions),
+        paused_count,
+    )
 
     for session in sessions:
         if not session.is_paused:
             continue
         kind = classify_prompt(session.recent_output)
+        # Bug fix (2026-07-04): the raw agent-stdout tail (`_last_line`) can
+        # contain secrets, API tokens, or file contents an operator never
+        # intended to persist to logs/log-aggregation - this fired on
+        # EVERY paused-session probe tick, not just failures. INFO now
+        # carries only the classifier's verdict (safe to persist); the raw
+        # tail is only emitted at DEBUG for deep debugging.
+        logger.info(
+            "watchdog probe: session=%s is_paused=True classified=%s approved_classes=%s",
+            session.session_id,
+            kind,
+            sorted(session.approved_prompt_classes),
+        )
+        logger.debug(
+            "watchdog probe raw tail: session=%s last_line=%r",
+            session.session_id,
+            _last_line(session.recent_output),
+        )
         if kind == "model_question":
             skipped.append(session.session_id)
+            logger.warning(
+                "watchdog: session=%s prompt classified as model_question -- "
+                "auto-answer suppressed, escalating to operator",
+                session.session_id,
+            )
             _emit_audit_event(
                 audit_path,
                 "watchdog.recover.skipped",
@@ -360,6 +399,11 @@ def tick(
         if recovery is not None:
             recoveries.append(recovery)
 
+    logger.info(
+        "watchdog tick complete: %d recoveries attempted, %d model-question escalations",
+        len(recoveries),
+        len(skipped),
+    )
     return WatchdogResult(
         recoveries=tuple(recoveries),
         skipped_model_questions=tuple(skipped),

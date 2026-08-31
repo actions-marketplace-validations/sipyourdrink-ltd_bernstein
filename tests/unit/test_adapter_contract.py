@@ -1,9 +1,9 @@
-"""Parameterized contract tests — all adapters satisfy CLIAdapter interface.
+"""Parameterized contract tests - all adapters satisfy CLIAdapter interface.
 
 The adapter list is discovered dynamically from the registry so that newly
 registered adapters are automatically exercised by the contract suite.  A
 second suite replays recorded golden transcripts (``tests/golden/*.yaml``)
-and asserts the actual Popen argv still matches — this catches silent CLI
+and asserts the actual Popen argv still matches - this catches silent CLI
 flag regressions that pure interface checks miss.
 """
 
@@ -42,7 +42,7 @@ def _popen_path(adapter: CLIAdapter) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Adapter factories — dynamically discovered from the adapter registry.
+# Adapter factories - dynamically discovered from the adapter registry.
 #
 # The mock adapter is excluded because it spawns a real subprocess (it is
 # the fixture backing live conformance tests) rather than going through the
@@ -56,24 +56,34 @@ def _discover_registered_names() -> list[str]:
     """Return sorted adapter names registered in the adapter registry.
 
     Excludes:
-    - ``mock`` — spawns a real subprocess (live conformance fixture).
-    - ``generic`` — constructed with explicit kwargs below.
-    - ``iac`` — spawn() raises RuntimeError unless terraform or pulumi is
+    - ``mock`` - spawns a real subprocess (live conformance fixture).
+    - ``generic`` - constructed with explicit kwargs below.
+    - ``iac`` - spawn() raises RuntimeError unless terraform or pulumi is
       on PATH; CI runners (especially macOS) don't have these and the
       contract test mocks Popen but can't mock the binary-availability
       check.  The adapter has its own integration test that skips when
       no tool is installed.
-    - ``clm`` — spawn() raises ClmConfigError unless CLM_ENDPOINT/TOKEN/MODEL
+    - ``clm`` - spawn() raises ClmConfigError unless CLM_ENDPOINT/TOKEN/MODEL
       are set; the contract test mocks Popen but can't satisfy the runtime
       config requirement.  Covered by ``test_adapter_clm.py`` and the
       integration suite under ``tests/integration/adapters/``.
-    - ``q_dev`` — spawn() raises SpawnError unless a ``q login`` cache
+    - ``q_dev`` - spawn() raises SpawnError unless a ``q login`` cache
       exists on disk; CI runners don't have one and the contract test
       mocks Popen but can't fake an authenticated AWS Builder ID
       session.  Covered by ``test_adapter_q_dev.py`` which monkeypatches
       ``Path.home`` to stand up a fake cache directory.
+    - ``python_runtime`` - spawn() raises RuntimeConfigError unless
+      ``mcp_config`` names the runtime module to drive; the adapter has no
+      runtime of its own, and this suite calls spawn() with no mcp_config.
+      Covered by ``tests/unit/adapters/test_python_runtime_adapter.py``,
+      which exercises both the configured spawn and every refusal.
+    - ``muse`` - single-model vendor lineup; spawn() raises ValueError for
+      foreign logical model names (such as the ``sonnet`` this suite
+      passes) instead of silently remapping them onto the vendor default.
+      Covered by ``test_adapter_muse.py``, which exercises spawn with the
+      vendor model plus every refusal path.
     """
-    return sorted(n for n in _ADAPTERS if n not in {"mock", "generic", "iac", "clm", "q_dev"})
+    return sorted(n for n in _ADAPTERS if n not in {"mock", "generic", "iac", "clm", "q_dev", "python_runtime", "muse"})
 
 
 def _make_factory(name: str) -> Any:
@@ -105,7 +115,7 @@ _ADAPTER_FACTORIES: list[tuple[str, Any]] = [
 class TestAdapterContract:
     """Every adapter must satisfy the CLIAdapter abstract interface.
 
-    The watchdog-threads fixture is applied class-wide — the contract
+    The watchdog-threads fixture is applied class-wide - the contract
     suite parameterizes across every registered adapter, and each
     ``spawn()`` call would otherwise arm a daemon Timer that outlives
     the test and eventually hits the runner's thread limit on CI.
@@ -147,14 +157,32 @@ class TestAdapterContract:
         assert callable(adapter.detect_tier)
 
     def test_spawn_signature_matches_base(self, name: str, factory: Any) -> None:
+        """Every base parameter must be untouched; adapter-specific extras
+        must be keyword-only with a default.
+
+        The spawner threads optional capabilities (e.g. ``explicit_max_turns``)
+        to adapters by inspecting ``spawn()`` signatures, so adapters may
+        extend the base contract - but only in a way that keeps every
+        base-shaped call site working unchanged.
+        """
         adapter = factory()
-        sig = inspect.signature(adapter.spawn)
-        params = list(sig.parameters.keys())
-        assert "prompt" in params
-        assert "workdir" in params
-        assert "model_config" in params
-        assert "session_id" in params
-        assert "mcp_config" in params
+        base_sig = inspect.signature(CLIAdapter.spawn)
+        adapter_sig = inspect.signature(type(adapter).spawn)
+        assert adapter_sig.return_annotation == base_sig.return_annotation, (
+            f"{name}.spawn() changed the return annotation"
+        )
+        for pname, param in base_sig.parameters.items():
+            assert pname in adapter_sig.parameters, f"{name}.spawn() is missing base parameter {pname!r}"
+            assert adapter_sig.parameters[pname] == param, f"{name}.spawn() altered base parameter {pname!r}"
+        for pname, param in adapter_sig.parameters.items():
+            if pname in base_sig.parameters:
+                continue
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+                f"{name}.spawn() extra parameter {pname!r} must be keyword-only"
+            )
+            assert param.default is not inspect.Parameter.empty, (
+                f"{name}.spawn() extra parameter {pname!r} must have a default"
+            )
 
     def test_spawn_returns_spawn_result(self, name: str, factory: Any, tmp_path: Path) -> None:
         adapter = factory()
@@ -183,12 +211,12 @@ class TestAdapterContract:
 
     def test_kill_does_not_raise(self, name: str, factory: Any) -> None:
         adapter = factory()
-        with patch("bernstein.adapters.base.kill_process_group_graceful"):
+        with patch("bernstein.adapters.base.reap_process_group"):
             adapter.kill(999)  # must not raise
 
     def test_kill_suppresses_oserror(self, name: str, factory: Any) -> None:
         adapter = factory()
-        with patch("bernstein.adapters.base.kill_process_group_graceful", return_value=False):
+        with patch("bernstein.adapters.base.reap_process_group", return_value=False):
             adapter.kill(99999)  # must not raise
 
     def test_detect_tier_returns_none_or_api_tier_info(self, name: str, factory: Any) -> None:
@@ -202,7 +230,7 @@ class TestAdapterContract:
 
 
 # ---------------------------------------------------------------------------
-# Golden transcript replay — catches CLI flag regressions that interface
+# Golden transcript replay - catches CLI flag regressions that interface
 # checks miss.  Each transcript records the inner CLI argv (after the
 # ``bernstein-worker -- `` separator) and the set of credential env keys
 # the adapter declared via ``build_filtered_env``.
@@ -319,6 +347,20 @@ class TestGoldenReplay:
         if hasattr(adapter_module, "build_filtered_env"):
             monkeypatch.setattr(adapter_module, "build_filtered_env", _spy)
 
+        # Gemini adapter consults `shutil.which` to pick between the
+        # `antigravity` and `gemini` binaries (#1740 cascade). On hosts
+        # where only one happens to be installed, the recorded golden
+        # would drift from the actual argv. Pin the resolver to "neither
+        # installed" so non-strict discovery returns the first cascade
+        # entry deterministically across local + CI runs. Scoped to the
+        # gemini adapter to avoid leaking into other tests' subprocess
+        # lookups (shutil is a shared module).
+        if adapter_cls.__module__ == "bernstein.adapters.gemini":
+            monkeypatch.setattr(
+                "bernstein.adapters.gemini.resolve_google_cli_binary",
+                lambda **_kw: "antigravity",
+            )
+
         default_role = str(transcript.get("session_role") or "replay")
         for step_idx, step in enumerate(transcript.get("steps", [])):
             prompt = str(step["prompt"])
@@ -353,7 +395,7 @@ class TestGoldenReplay:
 
             if expected_argv is not None:
                 expected_list = [str(x) for x in expected_argv]
-                # Strip payload args for JSON-valued flags — their content is
+                # Strip payload args for JSON-valued flags - their content is
                 # version-sensitive; the flag's presence is asserted below.
                 stripped_inner = _strip_json_payloads(inner, required_json_flags)
                 stripped_expected = _strip_json_payloads(expected_list, required_json_flags)

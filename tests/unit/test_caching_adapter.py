@@ -13,6 +13,7 @@ from bernstein.core.semantic_cache import ResponseCacheManager
 
 from bernstein.adapters.base import CLIAdapter, SpawnResult
 from bernstein.adapters.caching_adapter import CachingAdapter
+from bernstein.core.agents.multimodal import ModalityType, MultiModalContext, MultiModalInput
 
 
 @pytest.fixture
@@ -80,6 +81,41 @@ def test_cache_hit_returns_pid_0_without_inner_call(adapter: CachingAdapter, moc
     # Inner spawn should NOT have been called (it was only called by Orchestrator usually,
     # but here we are testing the adapter's own bypass).
     assert mock_inner.spawn.call_count == 0
+
+
+def test_multimodal_context_delegates_even_on_cache_hit(adapter: CachingAdapter, mock_inner: MagicMock) -> None:
+    """Multimodal context is part of task input and must reach the inner adapter."""
+    prompt = "Inspect attached screenshot"
+    context = MultiModalContext(
+        inputs=(
+            MultiModalInput(
+                modality=ModalityType.IMAGE,
+                content_base64="ZmFrZQ==",
+                mime_type="image/png",
+                description="screenshot",
+            ),
+        ),
+        primary_modality=ModalityType.IMAGE,
+    )
+    cache = _response_cache(adapter)
+    cache.store(
+        cache.task_key("mock-adapter", prompt[:100], prompt),
+        "Cached text-only result",
+        verified=True,
+    )
+    cache.save()
+
+    res = adapter.spawn(
+        prompt=prompt,
+        workdir=Path("/tmp"),
+        model_config=_model_config("sonnet"),
+        session_id="session-2",
+        multimodal_context=context,
+    )
+
+    assert res.pid == 1234
+    assert mock_inner.spawn.call_count == 1
+    assert mock_inner.spawn.call_args.kwargs["multimodal_context"] is context
 
 
 def test_ttl_expiry_causes_re_delegation(tmp_path: Path, mock_inner: MagicMock) -> None:
@@ -180,6 +216,43 @@ def test_spawn_forwards_budget_multiplier_and_system_addendum(
     assert kwargs["prompt"] == "task that will miss the cache"
     assert kwargs["session_id"] == "audit-129"
     assert kwargs["task_scope"] == "medium"
+
+
+def test_forwards_consumes_heartbeat_dir_flag_from_inner(tmp_path: Path) -> None:
+    """Regression for bug #11: capability flags must survive the wrapper.
+
+    ``CachingAdapter`` previously exposed only the attributes/methods it
+    explicitly defined, so ``getattr(wrapped, "consumes_heartbeat_dir",
+    False)`` always returned the default ``False`` even when the wrapped
+    adapter declared ``consumes_heartbeat_dir = True`` (e.g. openai_agents).
+    That silently disabled heartbeat_dir injection for every caching-wrapped
+    spawn, orphaning heartbeats in the worktree and causing false
+    no_heartbeat kills. ``__getattr__`` delegation must make the flag
+    visible through the wrapper.
+    """
+    inner = MagicMock(spec=CLIAdapter)
+    inner.name.return_value = "mock-adapter"
+    inner.consumes_heartbeat_dir = True
+
+    wrapped = CachingAdapter(inner, tmp_path)
+
+    assert getattr(wrapped, "consumes_heartbeat_dir", False) is True
+
+
+def test_does_not_forward_flag_when_inner_lacks_it(tmp_path: Path) -> None:
+    """Adapters that never declared the flag still default to False."""
+    inner = MagicMock(spec=CLIAdapter)
+    inner.name.return_value = "mock-adapter"
+
+    wrapped = CachingAdapter(inner, tmp_path)
+
+    assert getattr(wrapped, "consumes_heartbeat_dir", False) is False
+
+
+def test_unknown_attribute_still_raises_attribute_error(adapter: CachingAdapter) -> None:
+    """__getattr__ delegation must not swallow genuinely missing attributes."""
+    with pytest.raises(AttributeError):
+        _ = adapter.definitely_not_a_real_attribute
 
 
 def test_concurrency_safe_spawns(adapter: CachingAdapter, mock_inner: MagicMock) -> None:

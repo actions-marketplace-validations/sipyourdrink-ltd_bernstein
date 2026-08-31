@@ -2,7 +2,7 @@
 
 This page describes practical compatibility boundaries for Bernstein integrations.
 
-Last updated: 2026-05-10
+Last updated: 2026-07-16
 
 ---
 
@@ -10,7 +10,7 @@ Last updated: 2026-05-10
 
 - Python: project targets Python 3.12+.
 - Task server/API: FastAPI-based local or remote server operation.
-- CLI adapters: 44 total (43 named adapters in `registry.py` plus the `generic` catch-all) in `src/bernstein/adapters/`, including the OpenAI Agents SDK v2 adapter (`openai_agents`), CLM gateway adapter (`clm`), Devin Terminal adapter (`devin_terminal`), JetBrains Junie (`junie`), AWS Q Developer (`q_dev`), and the DeepSeek V4 family routed through the `ollama` adapter.
+- CLI adapters: the full roster registered in `registry.py` (plus the `generic` catch-all) in `src/bernstein/adapters/`, including the OpenAI Agents SDK v2 adapter (`openai_agents`), CLM gateway adapter (`clm`), Devin Terminal adapter (`devin_terminal`), JetBrains Junie (`junie`), AWS Q Developer (`q_dev`), and the DeepSeek V4 family routed through the `ollama` adapter. Run `bernstein integrations list` for the current set.
 
 ### Supported CLI agent adapters
 
@@ -19,6 +19,8 @@ Last updated: 2026-05-10
 | `claude` | Anthropic | JSON schema enforced | Yes |
 | `codex` | OpenAI | JSON (`--json`) | No |
 | `gemini` | Google | JSON (`--output-format json`) | No |
+| `antigravity` | Google (alias of `gemini`, enterprise / API-key lane) | JSON (`--output-format json`) | No |
+| `agy` | Google (Antigravity successor CLI, consumer lane) | JSON (`--output-format json`) | No |
 | `openai_agents` | OpenAI (Agents SDK v2) | JSONL event stream | Yes (Bernstein-bridged) |
 | `clm` | Customer-side NIM / vLLM gateway | No | No |
 | `devin_terminal` | Cognition | No | No |
@@ -31,30 +33,24 @@ Last updated: 2026-05-10
 | `cody` | Sourcegraph | No | No |
 | `cursor` | Cursor | No | Yes |
 | `goose` | Block | No | No |
+| `muse` | Meta | JSONL (`--json`, not consumed) | No |
 | `continue` | Multi | No | No |
 | `opencode` | Multi | JSON (`--format json`) | No |
+| `pydantic_ai` | Multi (`<provider>:<model>`) | No | No |
 | `kiro` | AWS | No | No |
 | `kilo` | Stackblitz | No | Yes (ACP/MCP) |
-| `cloudflare` | Cloudflare | No | No |
 | `iac` | N/A (Terraform/Pulumi) | No | No |
 | `generic` | Any | Depends on CLI | No |
 
-The full 44-row matrix with cost tier, reasoning grade, and recommended use cases lives in [`ADAPTER_GUIDE.md`](ADAPTER_GUIDE.md).
+The detailed comparison matrix with cost tier, reasoning grade, and recommended use cases lives in [`ADAPTER_GUIDE.md`](ADAPTER_GUIDE.md).
+
+### Auth basis and volunteer-mode status
+
+Every adapter contract declares an `auth.basis` (`api_key`, `local`, `subscription_oauth`, or `unknown`). Volunteer donor budgets gate selection by auth basis and `local_models`: `local_only=True` budgets admit only local-capable adapters; `subscription_oauth` adapters are refused under `local_only`. See [`auth-basis-volunteer-mode.md`](auth-basis-volunteer-mode.md) for the full table.
 
 ### Support modules
 
-| Module | Purpose |
-|--------|---------|
-| `caching_adapter` | Prompt prefix deduplication and response reuse |
-| `claude_agents` | Subagent definitions for Claude Code `--agents` flag |
-| `claude_exit_codes` | Exit code to lifecycle enum mapping |
-| `claude_stream_parser` | Stream-JSON event parsing |
-| `conformance` | Golden-transcript replay and adapter conformance testing |
-| `env_isolation` | Environment variable filtering for credential safety |
-| `manager` | Internal ManagerAgent spawner |
-| `plugin_sdk` | Third-party adapter plugin base classes |
-| `registry` | Adapter discovery and registration |
-| `skills_injector` | Per-task Claude Code skill injection |
+The adapter package also ships cross-cutting support modules (caching, conformance testing, environment isolation, plugin SDK, registry, skill injection, and more). The canonical table lives in [`ADAPTER_GUIDE.md`](ADAPTER_GUIDE.md#support-modules).
 
 Compatibility details can vary by adapter version and local toolchain.
 
@@ -94,26 +90,28 @@ Compatibility details can vary by adapter version and local toolchain.
 
 ## Quality gates
 
-Bernstein v1.8.4 ships an expanded quality gate pipeline in `src/bernstein/core/quality/`:
+Bernstein ships an expanded quality gate pipeline in `src/bernstein/core/quality/`:
 
-- Standard gates: lint, type-check, tests, coverage
-- Architecture conformance (`arch_conformance.py`, `arch_rules.py`)
-- Benchmark gate (`benchmark_gate.py`, `perf_benchmark_gate.py`)
-- Mutation testing (`mutation_testing.py`, `test_mutation_verify.py`)
+- Standard gates: lint, type-check, tests, coverage (`quality_gates.py`, `coverage_gate.py`)
+- Architecture conformance (`arch_conformance.py`)
+- Benchmark gate (`benchmark_gate.py`)
 - Dead code detection (`dead_code_detector.py`)
 - Dependency scanning (`dependency_scan.py`, `dep_validator.py`)
 - Flaky test detection (`flaky_detector.py`)
 - Integration test generation (`integration_test_gen.py`)
 - Cross-model verification (`cross_model_verifier.py`)
-- Consensus verification (`consensus_verifier.py`)
-- LLM judge (`llm_judge.py`)
-- Gate caching (`gate_cache.py`) and plugin system (`gate_plugins.py`)
+- Review consensus scoring (`review_consensus.py`)
+- Pipeline structure, cached incremental runner, and plugin system
+  (`gate_pipeline.py`, `gate_runner.py`, `gate_plugins.py`)
+- Serialized gate execution (`quality_gate_coalescer.py`)
+
+The LLM judge used for eval scoring lives outside this package, in
+`src/bernstein/eval/judge.py`.
 
 ---
 
 ## Cost and quota management
 
-- Peak-hour scheduling (`cost/peak_hour_router.py`) for time-of-day cost optimization
 - Cost anomaly detection, forecasting, and root cause analysis
 - Budget actions and completion budgets
 - Cost arbitrage across providers
@@ -126,10 +124,10 @@ Bernstein v1.8.4 ships an expanded quality gate pipeline in `src/bernstein/core/
 Use environment-specific validation instead of relying on static matrices:
 
 1. Run `bernstein doctor`.
-2. Run your target CLI adapter smoke checks (`bernstein test-adapter <name>`).
+2. Run your target CLI adapter smoke checks (`bernstein test-adapter --adapter <name> --task "<prompt>"`).
 3. Validate required API endpoints (`/status`, `/tasks`, `/metrics`, protocol-specific routes).
 4. If using remote workers, validate cluster endpoints and auth paths.
-5. Generate a debug bundle (`bernstein debug`) for comprehensive triage information.
+5. Generate a debug bundle (`bernstein debug bundle`) for comprehensive triage information.
 
 ---
 

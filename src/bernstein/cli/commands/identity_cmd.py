@@ -1,21 +1,24 @@
-"""``bernstein identity`` — operator-side install-rev fingerprint commands.
+"""``bernstein identity`` - operator-side install-rev fingerprint commands.
 
 Subcommands:
 
-* ``bernstein identity show`` — print the current install's token (or the
+* ``bernstein identity show`` - print the current install's token (or the
   disabled sentinel when emission is off / kill switch is set).  Used to
   let users see exactly what string lands in their public artefacts.
-* ``bernstein identity decode <token>`` — alias for ``verify``.  Confirms
+* ``bernstein identity decode <token>`` - alias for ``verify``.  Confirms
   a discovered token came from a real Bernstein install.  Requires the
   operator's seed in ``BERNSTEIN_IDENTITY_SEED`` (hex-encoded 32 bytes).
 * ``bernstein identity verify <token> [--nonce HEX] [--version-major N]``
-  — same as ``decode`` but accepts an optional debug-bundle nonce for
+  - same as ``decode`` but accepts an optional debug-bundle nonce for
   full HMAC-strength verification.
-* ``bernstein identity disable`` — print the env-var line the user can
+* ``bernstein identity disable`` - print the env-var line the user can
   paste into their shell to suppress all emit sites.
+* ``bernstein identity attest show|verify --run <id>`` - project or verify a
+  run-attestation receipt without overloading install-rev verification.
 
-The CLI is read-only and never opens a network connection.  This is the
-project's hard rule: no telemetry, ever.
+The install-rev verbs are read-only and never open a network connection.  This
+is the project's hard rule: no telemetry, ever.  The nested ``attest verify``
+verb may write a verified receipt into the operator-selected evidence directory.
 
 See ``docs/operations/install-fingerprint.md`` for the full operator
 playbook (seed generation, storage, rotation, decode).
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 import click
 
+from bernstein.cli.commands.identity_attest_cmd import attest_group
 from bernstein.core.identity import install_rev as _identity
 from bernstein.core.identity.install_rev import (
     DISABLED_SENTINEL,
@@ -44,7 +48,7 @@ def identity_group() -> None:
     \b
     The install-rev token is a 16-character base32 string embedded in
     artefacts the user voluntarily publishes (yaml configs, trace JSONL,
-    role-prompt md footers).  No network egress, ever — operator-side
+    role-prompt md footers).  No network egress, ever - operator-side
     discovery uses public GitHub code search (``gh search code
     'bernstein-rev:'``).
 
@@ -55,6 +59,8 @@ def identity_group() -> None:
       bernstein identity verify c4j2k7n8p3q5r9s7 \\
           --nonce 0123456789abcdef0123 --version-major 1
       bernstein identity disable
+      bernstein identity attest show --run r-1234 \\
+          --signing-key-path key.pem
     """
 
 
@@ -65,13 +71,13 @@ def show_cmd() -> None:
     click.echo(token)
     if not _identity.IDENTITY_EMISSION_ENABLED:
         click.echo(
-            "(emission disabled — set IDENTITY_EMISSION_ENABLED=True after "
+            "(emission disabled - set IDENTITY_EMISSION_ENABLED=True after "
             "operator seed is in place; users do not need this)",
             err=True,
         )
     elif token == DISABLED_SENTINEL:
         click.echo(
-            "(token is the disabled sentinel — kill switch is set, or BERNSTEIN_IDENTITY_SEED is unset/malformed)",
+            "(token is the disabled sentinel - kill switch is set, or BERNSTEIN_IDENTITY_SEED is unset/malformed)",
             err=True,
         )
 
@@ -150,6 +156,25 @@ def verify_cmd(token: str, nonce_hex: str | None, version_major: int | None) -> 
     raise SystemExit(_verify_impl(token, nonce_hex=nonce_hex, version_major=version_major))
 
 
+@identity_group.command("keydir")
+def keydir_cmd() -> None:
+    """Print the install-identity key directory (JWKS) as JSON.
+
+    This is the local view of what the server publishes at
+    ``/.well-known/http-message-signatures-directory`` - the Ed25519 public
+    key(s) a verifier uses to validate the HTTP Message Signatures Bernstein
+    places on its outbound agent-facing requests (issue #2305). Each key is
+    advertised under its RFC 7638 thumbprint, which is the ``keyid`` those
+    signatures carry.
+    """
+    import json
+
+    from bernstein.core.identity import http_signing
+
+    keydir = http_signing.build_key_directory(http_signing.default_keystore())
+    click.echo(json.dumps(keydir, indent=2, sort_keys=True))
+
+
 @identity_group.command("disable")
 def disable_cmd() -> None:
     """Print the environment line that suppresses every emit site.
@@ -159,3 +184,10 @@ def disable_cmd() -> None:
     disabled sentinel without touching code.
     """
     click.echo("export BERNSTEIN_DISABLE_IDENTITY=1")
+
+
+# ``identity attest`` is a separate group rather than new verbs here because
+# ``identity verify`` above checks an install-rev fingerprint token, which is a
+# different object from a run's attestation evidence; sharing the verb would
+# give one noun two meanings.
+identity_group.add_command(attest_group, "attest")

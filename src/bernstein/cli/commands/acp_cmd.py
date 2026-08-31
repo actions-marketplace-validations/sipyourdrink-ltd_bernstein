@@ -14,10 +14,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from typing import TYPE_CHECKING
 
 import click
 
 from bernstein.cli.helpers import SERVER_URL, console
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 from bernstein.core.protocols.acp.server import (
     ACPServer,
     build_default_server,
@@ -77,7 +81,7 @@ def _parse_addr(addr: str) -> tuple[str, int]:
         addr: The address string.
 
     Returns:
-        ``(host, port)`` — host defaults to ``127.0.0.1`` when omitted.
+        ``(host, port)`` - host defaults to ``127.0.0.1`` when omitted.
 
     Raises:
         click.UsageError: If the address is malformed.
@@ -220,7 +224,7 @@ async def _write_streaming_response(
     writer: asyncio.StreamWriter,
     status: int,
     headers: dict[str, str],
-    chunks: object,
+    chunks: AsyncIterator[bytes],
 ) -> None:
     """Write an HTTP/1.1 chunked-transfer streaming response.
 
@@ -236,7 +240,7 @@ async def _write_streaming_response(
         header_lines.append(f"{key}: {value}")
     writer.write(("\r\n".join(header_lines) + "\r\n\r\n").encode("latin-1"))
     await writer.drain()
-    async for chunk in chunks:  # type: ignore[union-attr]
+    async for chunk in chunks:
         writer.write(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
         await writer.drain()
     writer.write(b"0\r\n\r\n")

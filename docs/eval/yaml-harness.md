@@ -11,10 +11,9 @@ The harness lives in `src/bernstein/eval/yaml_runner.py`. The CLI surface is
 
 ## Why YAML
 
-Paid eval platforms ship the same affordances behind a $39 - $249 / seat / month
-paywall. Bernstein already had the primitives. The YAML wrapper is integration
+Bernstein already had the primitives. The YAML wrapper is integration
 glue: the spec is small enough to keep in git next to the prompts and large
-enough to reproduce a paid-tier eval suite end to end.
+enough to reproduce a full eval suite end to end, offline.
 
 ## TL;DR
 
@@ -164,7 +163,7 @@ Every run writes a lineage stub (`*.lineage.json`) next to its JSON output:
 ```
 
 The stub is intentionally minimal so it can be emitted from offline runs
-(no HMAC, no signing material). When wired into `LineageRecorder`, the same
+(no HMAC, no signing material). When wired into the signed-write path, the same
 `artefact_path` + `content_hash` flow into the full lineage log entry.
 
 ## Python API
@@ -174,7 +173,7 @@ from pathlib import Path
 from bernstein.eval.yaml_runner import YAMLRunner, load_spec, save_report
 
 spec = load_spec(Path("eval/specs/my-suite.yaml"))
-runner = YAMLRunner()                      # default: deterministic mock
+runner = YAMLRunner()  # default: deterministic mock
 report = runner.run(spec, base_dir=Path("eval/specs"))
 json_path, md_path = save_report(report, state_dir=Path(".sdd"))
 

@@ -131,7 +131,7 @@ _FAILURE_DETECTORS: list[
         _detect_missing_file,
         CIFailureKind.MISSING_FILE,
         _summary_for_missing_file,
-        "Check .gitignore — required files may be excluded from the repo",
+        "Check .gitignore - required files may be excluded from the repo",
     ),
     (
         _detect_import_error,
@@ -300,7 +300,7 @@ def write_ci_fix_task(backlog_dir: Path, failures: list[CIFailure], run_url: str
 
 _HOOK_SCRIPT = """\
 #!/usr/bin/env bash
-# bernstein pre-push hook — runs fast CI checks before push
+# bernstein pre-push hook - runs fast CI checks before push
 # Install: cp this to .git/hooks/pre-push && chmod +x .git/hooks/pre-push
 
 set -e
@@ -315,7 +315,7 @@ uv run ruff check src/ || { echo "[bernstein] FAIL: ruff lint errors. Run: uv ru
 echo "[bernstein] ruff format..."
 uv run ruff format --check src/ || { echo "[bernstein] FAIL: format issues. Run: uv run ruff format src/"; exit 1; }
 
-# 3. Tests (unit only — fast)
+# 3. Tests (unit only - fast)
 echo "[bernstein] pytest unit tests..."
 uv run python scripts/run_tests.py -x || {
     echo "[bernstein] FAIL: tests failed. Run: uv run python scripts/run_tests.py -x"
@@ -349,72 +349,84 @@ def install_pre_push_hook(repo_root: Path, force: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_TOOL_PROBE_TIMEOUT_SECONDS = 10
+
+
+def _check_tool_version(name: str, *, detail_limit: int = 60) -> dict[str, str]:
+    """Run ``uv run <name> --version`` and report the result as a check dict.
+
+    Every way the probe can fail to produce an answer is reported as a failed
+    check rather than raised, because reporting which tools are unusable *is*
+    the job here and the caller (``bernstein doctor``) serialises the whole
+    check list at the very end. An exception escaping this function aborts the
+    doctor before it writes anything at all, so ``--json`` consumers get an
+    empty stream instead of a payload -- indistinguishable from a clean run.
+    Three ways it can fail to answer:
+
+    - ``uv`` is absent (``FileNotFoundError``, ``WinError 2`` on Windows);
+    - ``uv`` is present but unlaunchable (any other ``OSError``);
+    - ``uv`` runs but blows the time budget (``TimeoutExpired``) -- ``uv run``
+      serialises on a shared cache lock, so concurrent invocations on a loaded
+      host queue up behind each other.
+
+    Args:
+        name: Tool to check (``ruff``, ``pytest``, ``pyright``, ...).
+        detail_limit: Max characters of stdout to keep in ``detail`` on success.
+
+    Returns:
+        Check result dict with keys: name, ok (bool), detail, fix.
+    """
+    try:
+        result = subprocess.run(
+            ["uv", "run", name, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_TOOL_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "name": name,
+            "ok": "False",
+            "detail": f"probe timed out after {_TOOL_PROBE_TIMEOUT_SECONDS}s",
+            "fix": f"Re-run when the host is less loaded, or check 'uv run {name} --version' by hand",
+        }
+    except FileNotFoundError:
+        return {
+            "name": name,
+            "ok": "False",
+            "detail": "uv not found on PATH",
+            "fix": "Install uv (https://docs.astral.sh/uv/) and ensure it is on PATH",
+        }
+    except OSError as exc:
+        return {
+            "name": name,
+            "ok": "False",
+            "detail": f"could not run uv: {exc}"[:80],
+            "fix": "Check that uv is executable and on PATH",
+        }
+
+    ok = result.returncode == 0
+    return {
+        "name": name,
+        "ok": str(ok),
+        "detail": result.stdout.strip()[:detail_limit] if ok else result.stderr.strip()[:80],
+        "fix": "" if ok else f"Add {name} to [dependency-groups] dev in pyproject.toml",
+    }
+
+
 def check_test_dependencies() -> list[dict[str, str]]:
     """Check that all CI tool dependencies are importable/executable.
 
     Returns:
         List of check result dicts with keys: name, ok (bool), detail, fix.
     """
-    checks: list[dict[str, str]] = []
-
-    # ruff
-    result = subprocess.run(
-        ["uv", "run", "ruff", "--version"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
-    ruff_ok = result.returncode == 0
-    checks.append(
-        {
-            "name": "ruff",
-            "ok": str(ruff_ok),
-            "detail": result.stdout.strip() if ruff_ok else result.stderr.strip()[:80],
-            "fix": "" if ruff_ok else "Add ruff to [dependency-groups] dev in pyproject.toml",
-        }
-    )
-
-    # pytest
-    result = subprocess.run(
-        ["uv", "run", "pytest", "--version"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
-    pytest_ok = result.returncode == 0
-    checks.append(
-        {
-            "name": "pytest",
-            "ok": str(pytest_ok),
-            "detail": result.stdout.strip()[:60] if pytest_ok else result.stderr.strip()[:80],
-            "fix": "" if pytest_ok else "Add pytest to [dependency-groups] dev in pyproject.toml",
-        }
-    )
-
-    # pyright
-    result = subprocess.run(
-        ["uv", "run", "pyright", "--version"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
-    pyright_ok = result.returncode == 0
-    checks.append(
-        {
-            "name": "pyright",
-            "ok": str(pyright_ok),
-            "detail": result.stdout.strip()[:60] if pyright_ok else result.stderr.strip()[:80],
-            "fix": "" if pyright_ok else "Add pyright to [dependency-groups] dev in pyproject.toml",
-        }
-    )
-
-    return checks
+    return [
+        _check_tool_version("ruff"),
+        _check_tool_version("pytest"),
+        _check_tool_version("pyright"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +533,7 @@ class CIFixPipeline:
 
         This is a single-shot method: it downloads the log once, parses
         it, and creates at most one fix task.  To retry after the agent
-        has pushed a fix, call this method again — the pipeline tracks
+        has pushed a fix, call this method again - the pipeline tracks
         attempts internally via the returned list.
 
         Args:
@@ -587,7 +599,7 @@ class CIFixPipeline:
             if last and last.result == CIFixResult.NO_FAILURES:
                 break
         else:
-            # Exhausted retries — mark the last attempt.
+            # Exhausted retries - mark the last attempt.
             if attempts and attempts[-1].result == CIFixResult.TASK_CREATED:
                 attempts.append(
                     CIFixAttempt(
@@ -689,7 +701,7 @@ class CIFixPipeline:
 
 
 # ---------------------------------------------------------------------------
-# CI Autofix Pipeline — integrates CIMonitor with task creation and PR flow
+# CI Autofix Pipeline - integrates CIMonitor with task creation and PR flow
 # ---------------------------------------------------------------------------
 
 

@@ -1,430 +1,292 @@
 <div align="center">
 
-[English](../../README.md) | [Español (Spanish)](README.es.md) | [中文 (Chinese)](README.zh.md) | [العربية (Arabic)](README.ar.md) | [Português (Portuguese)](README.pt.md) | [Bahasa Indonesia (Indonesian)](README.id.md) | [Français (French)](README.fr.md) | **日本語 (Japanese)** | [Русский (Russian)](README.ru.md) | [Deutsch (German)](README.de.md) | [עברית (Hebrew)](README.he.md) | [יידיש (Yiddish)](README.yi.md)
-
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="../../docs/assets/logo-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="../../docs/assets/logo-light.svg">
-  <img alt="Bernstein" src="../../docs/assets/logo-light.svg" width="340">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/logo-light.svg">
+  <img alt="Bernstein" src="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/logo-light.svg" width="340">
 </picture>
 
 <br>
 
-> *「偉大なことを成し遂げるには、二つのものが必要だ。計画と、少しだけ足りない時間である。」* — Leonard Bernstein
+<img alt="Bernstein - the open-source governance layer for AI agents" src="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/banner-readme.webp" width="820">
 
-### あらゆる AI コーディングエージェントを統制する。あらゆるモデルを。たった一つのコマンドで。
+<br>
+
+> *"To achieve great things, two things are needed: a plan and not quite enough time."* - [attributed to](https://quoteinvestigator.com/2020/08/19/plan-time/) Leonard Bernstein
+
+### AIエージェントのためのオープンソース・ガバナンスレイヤー
+<!-- l10n: en="the open-source governance layer for AI agents" hash="sha256:739f0a7ad1af" -->
 
 [![CI](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/ci.yml/badge.svg)](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/bernstein)](https://pypi.org/project/bernstein/)
+[![GHCR](https://img.shields.io/badge/ghcr.io-bernstein-2496ed?logo=docker&logoColor=white)](https://ghcr.io/sipyourdrink-ltd/bernstein)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776ab?logo=python&logoColor=white)](https://python.org)
-[![License](https://img.shields.io/github/license/sipyourdrink-ltd/bernstein)](../../LICENSE)
-[![MseeP.ai](https://img.shields.io/badge/MseeP.ai-verified-2496ed)](https://mseep.ai/app/chernistry-bernstein)
+[![License](https://img.shields.io/github/license/sipyourdrink-ltd/bernstein)](https://github.com/sipyourdrink-ltd/bernstein/blob/main/LICENSE)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/sipyourdrink-ltd/bernstein/badge)](https://scorecard.dev/viewer/?uri=github.com/sipyourdrink-ltd/bernstein)
+[![CodeQL](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/codeql.yml)
+[![Open in Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/sipyourdrink-ltd/bernstein?quickstart=1)
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.sipyourdrink-ltd%2Fbernstein.svg)](https://mcptoplist.com/server/io.github.sipyourdrink-ltd%2Fbernstein)
+<a href="https://deepwiki.com/sipyourdrink-ltd/bernstein"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 
-[Website](https://bernstein.run?utm_source=github.com&utm_medium=readme&utm_campaign=bernstein-readme) &middot; [ドキュメント](https://bernstein.readthedocs.io/) &middot; [はじめに](../../docs/getting-started/GETTING_STARTED.md) &middot; [用語集](../../docs/reference/GLOSSARY.md) &middot; [既知の制限](../../docs/reference/KNOWN_LIMITATIONS.md)
+[website](https://bernstein.run) &middot; [docs](https://bernstein.readthedocs.io/) &middot; [install](https://bernstein.readthedocs.io/en/latest/getting-started/install/) &middot; [first run](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/getting-started/first-run.md) &middot; [glossary](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/GLOSSARY.md) &middot; [limitations](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/KNOWN_LIMITATIONS.md) &middot; [name policy](https://github.com/sipyourdrink-ltd/bernstein/blob/main/TRADEMARKS.md) &middot; [sponsor](https://github.com/sponsors/chernistry)
+
+[简体中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.zh-Hans.md) &middot; [繁體中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.zh-TW.md) &middot; [日本語](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.ja.md) &middot; [한국어](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.ko.md) &middot; [हिन्दी](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.hi.md) &middot; [বাংলা](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.bn.md) &middot; [Русский](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.ru.md) &middot; [Español](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.es.md) &middot; [Português](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.pt.md) &middot; [Deutsch](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.de.md) &middot; [Français](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.fr.md) &middot; [Italiano](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.it.md) &middot; [Nederlands](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.nl.md) &middot; [Polski](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.pl.md) &middot; [Svenska](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.sv.md) &middot; [Suomi](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.fi.md) &middot; [Українська](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.uk.md) &middot; [Türkçe](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.tr.md) &middot; [العربية](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.ar.md) &middot; [עברית](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.he.md) &middot; [Bahasa Indonesia](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.id.md) &middot; [Tiếng Việt](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.vi.md) &middot; [ไทย](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/i18n/README.th.md)
 
 </div>
 
 ---
 
-Bernstein は決定的な Python スケジューラーです。CLI コーディングエージェント (Claude Code、Codex、Gemini CLI、ほか 40 種類) のチームを並列の git worktree で 1 つのゴールに対して走らせ、すべての操作に HMAC 署名された監査チェーンを付与します。
+> **ステータス: beta。** 単独メンテナンスで、活発に開発中。バージョン番号が数えているのはリリース回数であって成熟度ではない。マイナーバージョンでもインターフェースが変わりうる。依存するものはバージョンを固定すること。リグレッションは速やかに直すので、[報告してほしい](https://github.com/sipyourdrink-ltd/bernstein/issues)。
 
-### 30 秒でインストール
+Bernstein は AI エージェントのためのオープンソース・ガバナンスレイヤーです。決定論的スケジューラ - 調整ループにモデルは入らない - がエージェントを並列に走らせ、成果物をゲートで検査し、全ステップを記録します。だから実行は事後に、オフラインで、アーティファクトだけから検証できます。CLI コーディングエージェントはそのまま動き(Claude Code、Codex、Gemini CLI ほか 40+)、同じレイヤーがあらゆるエージェントワークロードをガバナンスします: 成果物は diff でも、調査レポートでも、データセットでも、監査エビデンスパックでも構いません。エアギャップ用インストールプロファイル同梱。Apache-2.0。
 
-```bash
-pipx install bernstein
-bernstein init
-bernstein run -g "fix the failing test in tests/test_foo.py"
-```
+### 概要
+<!-- l10n: en="at a glance" hash="sha256:97aa8e70f076" -->
 
-### 60 秒で見る
+他と違う点は 4 つ。以降はすべて詳細である。
 
-以下のクリップは 1 回の実行を通しで収めています。マネージャーがゴールを分解し、3 つのエージェントが並列で作業し、監査チェーンが各 handoff を記録し、janitor が検証し、PR が開きます。
+- **協調ループに LLM がいない。** スケジューリングは素の Python なので、実行は端から端まで再現できる。昨日のプランをリプレイすれば、昨日のタスクグラフが出てくる。
+- **事後に検証できる。** リプレイジャーナルがすべての実行を記録し、常時稼働のリネージ・スパインがリネージを持つ各ステップを記録する。オプトインの HMAC チェーン監査ログ（`BERNSTEIN_AUDIT=1`）は、オフラインで検証できるレシートを追加する。非決定性は再実行のゆらぎではなく、該当ステップちょうどでのハッシュ不一致として表面化する。コード以外の成果物も同じ扱いを受ける。タスクはアーティファクト契約（レポート、データセット、アクションログ、運用結果）を宣言でき、git コミットではなく署名済みリネージレシートをもって完了する。
+- **構造として隔離されている。** コーディングタスクはそれぞれマージゲートの背後にある自分の git worktree を得る。アーティファクトモードのタスクは `.sdd/workspaces/` 配下の作業ディレクトリを得る。エージェントは既定で可変ワークスペースを共有しない。共有される状態はタスクバックログだけで、これはアトミックに取得される。より厳しいファイルシステム強制はオプトインで、[サンドボックスバックエンド](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/architecture/sandbox.md)から選ぶ。worktree を無効にすれば、すべてのタスクは共有チェックアウトで走る。
+- **広く、そしてローカル。** 40 以上の CLI エージェントアダプタに加え、汎用の `--prompt` ラッパー、ファイルベースの状態、SaaS 経由なし、サードパーティのデータプレーンなし。
 
-<p align="center">
-  <img alt="Bernstein 60 秒デモ: マネージャーがゴールを分解し、3 つのエージェントが並列実行し、監査チェーンが各 handoff を記録し、PR が開く" src="../../docs/demo/demo.gif" width="800">
-</p>
+全一覧は[ケーパビリティのページ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/capabilities.md)に、網羅的な索引は[機能マトリクス](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/FEATURE_MATRIX.md)にある。
 
-実行後、Bernstein はコスト・テスト結果・lineage・監査ハッシュチェーンを含む構造化コメントを PR に投稿します。
+### 実行はこう見える
+<!-- l10n: en="what a run looks like" hash="sha256:980d54d982be" -->
 
-<p align="center">
-  <img alt="Bernstein の PR コメント: サマリー、コスト、Lineage、テスト、監査チェーンの各セクション" src="../../docs/demo/screenshot-pr-comment.svg" width="720">
-</p>
-
-> GIF は [`docs/demo/demo.tape`](../../docs/demo/demo.tape) から [vhs](https://github.com/charmbracelet/vhs) で生成しています。`vhs docs/demo/demo.tape` でローカル再生成できます。
-
-### 比較
-
-| 機能                                       | Bernstein   | Archon   | LangGraph |
-|--------------------------------------------|-------------|----------|-----------|
-| マルチエージェント (並列アダプタ)          | あり        | 1 つ     | あり      |
-| 署名付き lineage / 監査チェーン            | あり        | なし     | なし      |
-| エアギャップ / 主権デプロイ                | あり        | 一部     | なし      |
-| ビジュアルワークフロー YAML                | あり [^yaml]| あり     | なし      |
-| ホスト型ダッシュボード / SaaS              | なし        | 一部     | なし      |
-
-[^yaml]: ワークフロー YAML サポートは [PR #1108](https://github.com/sipyourdrink-ltd/bernstein/pull/1108) (この回) で着地します。それまでは Python で書くか、`bernstein run plan.yaml` で旧スキーマに対して動かしてください。
-
-CrewAI、AutoGen、LangGraph、および Bernstein と同じカテゴリの 4 つの CLI エージェントオーケストレーターに対するさらに詳細な機能マトリクスは、下の [詳細比較](#detailed-comparison) セクションにあります。
-
----
-
-### これは何ですか、一段落で
-
-作りたいものを Bernstein に伝えると、複数の AI コーディングエージェントに作業を分担させ、隔離された git worktree で並列に走らせ、各 handoff を HMAC でチェーンされた監査ログに記録し、テストを実行し、実際に通ったコードをマージします。戻ってきたときには、グリーンの PR が手元にあります。
-
-Forward-deployed engineering を、スウォーム形式で。クライアントのリポジトリに Bernstein を投入すれば、ファイルベースの状態、エージェントごとの認証スコープ、署名付き audit trail を備えたマルチエージェントチームを、クライアントが既に信頼している CLI エージェント上で動かせます。
-
-### その他のインストール方法
-
-```bash
-curl -fsSL https://bernstein.run/install.sh | sh        # macOS / Linux のワンライナー
-irm https://bernstein.run/install.ps1 | iex             # Windows PowerShell
-pip install bernstein                                   # pip
-uv tool install bernstein                               # uv
-brew tap chernistry/tap && brew install bernstein       # Homebrew
-```
-
-`dnf copr`、`npx`、オプションの extras、エアギャップサイト向けの wheelhouse パスは [インストールマトリクス](#install) を参照してください。
-
-### スケジューラーが素の Python である理由
-
-ほとんどのエージェントオーケストレーターは、誰が何をやるかを LLM に判断させます。これは非決定的で、コードではなくスケジューリングのためにトークンを消費します。Bernstein はゴールを分解するために LLM を一度だけ呼び出し、それ以降 (エージェントの並列実行、Git ブランチの隔離、テスト実行、リトライのルーティング) はすべて素の Python で行います。すべての実行は再現可能です。すべてのステップはログに記録され、再生可能です。
-
-学ぶべきフレームワークはありません。ベンダーロックインもありません。エージェントもモデルもプロバイダも、自由に差し替えられます。
-
-<img alt="Bernstein 動作中: 並列 AI エージェントをリアルタイムにオーケストレーション" src="../../docs/assets/in-action-small.gif" width="700">
-
-実行中に表示される様子:
-
-```
-$ bernstein -g "Add JWT auth"
-[manager] decomposed into 4 tasks
-[agent-1] claude-sonnet: src/auth/middleware.py  (done, 2m 14s)
-[agent-2] codex:         tests/test_auth.py      (done, 1m 58s)
-[verify]  all gates pass. merging to main.
-```
-
-## 対応エージェント
-
-Bernstein はインストール済みの CLI エージェントを自動で検出します。同じ実行内で混在させることもできます。定型処理には安価なローカルモデル、アーキテクチャ設計には強力なクラウドモデルといった使い分けが可能です。
-
-43 個の CLI エージェントアダプター: 40 個のサードパーティラッパーに加え、`--prompt` を受け付けるあらゆるツール用の汎用ラッパーが付属しています。
-
-| Agent | Models | Install |
-|-------|--------|---------|
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Opus 4, Sonnet 4.6, Haiku 4.5 | `npm install -g @anthropic-ai/claude-code` |
-| [Codex CLI](https://github.com/openai/codex) | GPT-5, GPT-5 mini | `npm install -g @openai/codex` |
-| [OpenAI Agents SDK v2](https://openai.github.io/openai-agents-python/) | GPT-5, GPT-5 mini, o4 | `pip install 'bernstein[openai]'` |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | Copilot-managed (GPT-5, Sonnet 4.6) | `npm install -g @github/copilot` |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Gemini 2.5 Pro, Gemini Flash | `npm install -g @google/gemini-cli` |
-| [Cursor](https://www.cursor.com) | Sonnet 4.6, Opus 4, GPT-5 | [Cursor app](https://www.cursor.com) |
-| [Aider](https://aider.chat) | OpenAI/Anthropic 互換のあらゆるモデル | `pip install aider-chat` |
-| [Amp](https://ampcode.com) | Amp が管理 | `npm install -g @sourcegraph/amp` |
-| [Cody](https://sourcegraph.com/cody) | Sourcegraph がホスト | `npm install -g @sourcegraph/cody` |
-| [Continue](https://continue.dev) | OpenAI/Anthropic 互換のあらゆるモデル | `npm install -g @continuedev/cli` (バイナリ名: `cn`) |
-| [Goose](https://block.github.io/goose/) | Goose が対応する任意のプロバイダ | [Goose docs](https://block.github.io/goose/) を参照 |
-| [IaC](https://www.terraform.io/) (Terraform/Pulumi) | ベースエージェントが利用する任意のプロバイダ | 組み込み |
-| [Kilo](https://kilo.dev) | Kilo がホスト | [Kilo docs](https://kilo.dev) を参照 |
-| [Kiro](https://kiro.dev) | Kiro がホスト | [Kiro docs](https://kiro.dev) を参照 |
-| [Ollama](https://ollama.ai) + Aider | ローカルモデル (オフライン) | `brew install ollama` |
-| [OpenCode](https://opencode.ai) | OpenCode が対応する任意のプロバイダ | [OpenCode docs](https://opencode.ai) を参照 |
-| [Qwen](https://github.com/QwenLM/qwen-code) | Qwen Code モデル | `npm install -g @qwen-code/qwen-code` |
-| [Cloudflare Agents](https://developers.cloudflare.com/agents/) | Workers AI モデル | `bernstein cloud login` |
-| [OpenHands](https://github.com/OpenHands/OpenHands) | LiteLLM 対応の任意のプロバイダ (Anthropic、OpenAI、…) | `uv tool install openhands --python 3.12` |
-| [Open Interpreter](https://github.com/OpenInterpreter/open-interpreter) | 任意 (LiteLLM ベース) | `pip install open-interpreter` |
-| [gptme](https://github.com/gptme/gptme) | Anthropic、OpenAI、OpenRouter | `pipx install gptme` |
-| [Plandex](https://github.com/plandex-ai/plandex) | Plandex Cloud またはセルフホストモデル | `curl -sL https://plandex.ai/install.sh \| bash` |
-| [AIChat](https://github.com/sigoden/aichat) | OpenAI、Anthropic、OpenRouter、Groq、Gemini | `cargo install aichat` |
-| [Letta Code](https://github.com/letta-ai/letta-code) | Letta 経由 (Anthropic、OpenAI) | `npm install -g @letta-ai/letta-code` |
-| **Generic** | `--prompt` を持つ任意の CLI | 組み込み |
-
-#### オーケストレーター委任 (リーフノード)
-
-別カテゴリに属する、より小さなアダプター群で、**他の CLI オーケストレーター** を単一エージェントのようにラップします。Bernstein はラップ対象のツールにプロンプトやプランを渡し、最終的な終了コードのみを受け取ります。ラップされたオーケストレーター内部のサブエージェントのコストや品質ゲートは Bernstein からは見えません。これらのツールで構築済みの既存ワークフローを、より大きな Bernstein プランの 1 ステップとして組み込みたいときに便利です。
-
-| Orchestrator | Wrapped as | Install |
-|--------------|------------|---------|
-| [Composio Agent Orchestrator](https://github.com/ComposioHQ/agent-orchestrator) (`@aoagents/ao`) | `composio` | `npm install -g @aoagents/ao` |
-| [umputun/ralphex](https://github.com/umputun/ralphex) | `ralphex` | `go install github.com/umputun/ralphex/cmd/ralphex@latest` |
-
-どのアダプターも **内部スケジューラ LLM** として動作させられます。特定のプロバイダに依存せずスタック全体を実行できます:
+1 つの YAML ファイルが実行全体を宣言します: フェーズ、ロール、依存関係、そしてノードが実行される条件。スケジューラはそれを素の Python として実行します - ファイルの中にプロンプトは一切なく、次に何が起きるかをモデルが決めることもありません。このグラフは監査エビデンスパックを生成します。完全なファイルは [`.bernstein/workflows/audit-evidence-pack.yaml`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/.bernstein/workflows/audit-evidence-pack.yaml) にあります。
 
 ```yaml
-internal_llm_provider: gemini            # or qwen, ollama, codex, goose, ...
-internal_llm_model: gemini-3.1-pro
+name: audit-evidence-pack
+version: "1.0.0"
+
+phases:
+  - name: scope
+    allowed_roles: [manager, architect]
+  - name: collect
+  - name: validate
+    allowed_roles: [qa, security]
+  - name: deliver
+    allowed_roles: [security, manager]
+
+nodes:
+  define-control-inventory:
+    phase: scope
+    role: architect
+
+  collect-audit-logs:
+    phase: collect
+    role: security
+    depends_on: [define-control-inventory]
+
+  # three more evidence streams collect in parallel:
+  # collect-sboms-and-attestations, collect-runbooks-and-policies,
+  # collect-eval-results
+
+  assemble-pack:
+    phase: validate
+    role: docs
+    depends_on:
+      - collect-audit-logs
+      - collect-sboms-and-attestations
+      - collect-runbooks-and-policies
+      - collect-eval-results
+
+  mock-auditor-pass:
+    phase: validate
+    role: qa
+    depends_on: [assemble-pack]
+
+  remediate-findings:
+    phase: collect
+    role: docs
+    depends_on:
+      - source: mock-auditor-pass
+        condition: "status == 'failed'"
+    retry:
+      max_attempts: 3
+      until: "status == 'done'"
+
+  sign-and-deliver:
+    phase: deliver
+    role: security
+    depends_on:
+      - source: mock-auditor-pass
+        condition: "status == 'done'"
 ```
 
-> [!TIP]
-> CI パイプラインでは `bernstein --headless` を使ってください。TUI なし、構造化された JSON 出力、失敗時は非ゼロ終了コードを返します。
+```mermaid
+flowchart LR
+    inv[define-control-inventory] --> logs[collect-audit-logs]
+    inv --> sbom[collect-sboms-and-attestations]
+    inv --> rb[collect-runbooks-and-policies]
+    inv --> ev[collect-eval-results]
+    logs --> pack[assemble-pack]
+    sbom --> pack
+    rb --> pack
+    ev --> pack
+    pack --> gate{mock-auditor-pass}
+    gate -->|failed| fix["remediate-findings (retry x3)"]
+    gate -->|done| sign[sign-and-deliver]
+```
 
-## クイックスタート
+各ノードは、フェーズが許可するロールを持つエージェントが取ります。ロールの柵と承認ゲートは、エージェントがタスク内で何をしようと保持されます。コードのノードは自分専用の git worktree でマージゲートの先に完了します。上のノードは違う終わり方をします: [アーティファクト契約](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/artifacts.md)が成果物(レポート、データセット、スキャン、アクションログ)を名指しし、ノードはコミットではなく署名付き lineage レシートで閉じます。同じスケジューラ、同じジャーナル、同じオフライン検証 - グラフが運ぶのがコードでも、調査でも、ops 変更でも、その混在でも。ソフトウェア、リサーチ、ドキュメント、エンタープライズ、コントリビューターワークフロー向けの既製グラフは [`.bernstein/scenarios/`](https://github.com/sipyourdrink-ltd/bernstein/tree/main/.bernstein/scenarios) にあります。
+
+### 30 秒でインストール
+<!-- l10n: en="install in 30 seconds" hash="sha256:81b04220e0ff" -->
+
+```bash
+uv tool install bernstein    # or: pipx install bernstein
+bernstein init
+bernstein doctor             # checks a CLI agent is installed and authenticated
+bernstein -g "fix the failing test in tests/test_foo.py"
+```
+
+pipx、pip、brew、dnf、npm、Docker については[インストールガイド](https://bernstein.readthedocs.io/en/latest/getting-started/install/)を参照。エアギャップ環境向けの wheelhouse には専用の[エアギャップガイド](https://bernstein.readthedocs.io/en/latest/installation/air-gap/)がある。
+
+<img alt="A real bernstein demo run: mock agents fix four seeded bugs, ending on the run's signed receipt verifying offline" src="https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/demo-run/demo.gif" width="820">
+
+上の録画は実際の実行であり、それ自身の証拠を伴って配布されている。キャスト、その実行のジャーナルから導出した署名済み実行レシート、それを固定する公開鍵はすべて [`docs/assets/demo-run/`](https://github.com/sipyourdrink-ltd/bernstein/tree/main/docs/assets/demo-run) にある。いま見た実行を、オフラインで検証できる:
+
+```bash
+bernstein verify receipt docs/assets/demo-run/run-receipt.json \
+    --public-key docs/assets/demo-run/run-receipt.pub.pem
+```
+
+CI は main への push ごとにコミット済みレシートを再検証し、改竄されたコピーが失敗することも証明する。公開された証拠が飾りのファイルに腐っていかないのはそのためだ。`scripts/record_demo.sh` は録画・レシート・鍵を新しい実際の実行から作り直す。ターミナルの中身に合成されたものはない。
+
+実行中の様子は、どちらのオペレーター向け画面からも見られる。両者は同じタスク API を読んでいるので、一方が他方の遅れたミラーになることはない。
+
+| ![A two-column terminal dashboard - agents with their live logs on the left, the task board on the right - with a full-width activity feed and a cost line underneath](https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/tui-agents.png) | ![A browser dashboard listing sixty-two tasks with eleven running, one of them opened to its working-tree diff](https://raw.githubusercontent.com/sipyourdrink-ltd/bernstein/main/docs/assets/webui-agents-diffs.png) |
+|:---:|:---:|
+| `bernstein live` — ターミナルダッシュボード | `bernstein gui serve` — ブラウザダッシュボード |
+
+### 実行を証明する
+<!-- l10n: en="prove a run" hash="sha256:a97100ca1818" -->
+
+ここでの決定性は、信じるものではなく確かめるものである。監査を有効にして一度走らせ、記録された内容を検証する:
+
+```bash
+BERNSTEIN_AUDIT=1 bernstein -g "fix the failing test in tests/test_foo.py"
+bernstein replay list                 # run ids recorded on disk
+bernstein replay latest --verify      # recompute the journal head, name the first divergent step
+bernstein lineage verify <run_id>     # recompute the always-on lineage spine
+bernstein audit verify                # HMAC chain + Merkle seal (written because audit was enabled)
+bernstein audit diagnose <run_id> --signal gate --sign-key KEY
+                                      # name the exact step a failure entered the run, as a signed receipt
+bernstein verify run <run_id> --signing-key-path key.pem   # sign one portable run receipt
+bernstein verify receipt .sdd/runs/<run_id>/run-receipt.json  # verify it offline: file only
+```
+
+ジャーナルは毎回の実行で書かれる。リネージ・スパインは常時稼働で、リネージを持つステップごとにエントリが増えるため、短い実行が有効かつ空のスパインで終わることもある。`bernstein audit verify` が検査できるチェーンを持つのは、実行が `BERNSTEIN_AUDIT=1`、コンプライアンスプリセット、または `bernstein run --audit` で開始された場合だけである。`--audit` フラグは `bernstein run` のものなので、上の `bernstein -g` の形では環境変数を設定すること。
+
+1 つの実行レシートは、ジャーナルヘッド、実行がスパインエントリを書いた場合はリネージ・スパインヘッド、そしてオプトインで監査チェーンの範囲を、単一の Ed25519 署名対象のもとに束ね、公開鍵を埋め込む。そのファイルとオペレーターの公開鍵を持つレビュアーは、埋め込まれた動作とチェーンが改変されていないことを確認できる。HMAC 鍵も、生きた `.sdd/` も要らない。改竄されていれば終了コード `2` で最初に食い違ったステップを名指しする。このレシートが同定するのは、埋め込まれたジャーナル状態そのものである。その状態が完結したジャーナルの全体だと示すには、独立したヘッド／件数のシールが別に要る。ファイルだけで `--public-key` による固定がない場合、検査は整合性のみになる。レシートが内部的に一貫していることは証明するが、誰が署名したかは証明しない。判定にもそう書かれる。詳細は[決定論的リプレイ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/deterministic-replay.md#signed-run-receipt-one-file-offline-verification)にある。
+
+同じ検証可能性は評価の数値にも当てはまる。`bernstein bench run <suite> --reliability k`（`bernstein eval --reliability k` とも書ける）は各タスクを固定された協調のもとで `k` 回実行し、`pass^k` の下限（`k` 回すべてが通ること）を `pass@1` の上限と並べて報告する。その結果は署名済みレシートに封じられ、`bernstein bench reliability-verify` がオフラインで再計算するので、捏造された下限は検証に落ちる。詳細: [pass^k 信頼性下限](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/eval/reliability.md)。
+
+### 仕組み
+<!-- l10n: en="how it works" hash="sha256:f818df2e6cbb" -->
+
+ゴールは 4 つの段階を通る:
+
+1. **分解する**。マネージャーがゴールをタスクに割り、ロール、所有ファイル、完了シグナルを与える。LLM 呼び出しはここ 1 回だけで、あとは素の Python である。
+2. **起動する**。エージェントは隔離された [git worktree](https://git-scm.com/docs/git-worktree) で、コーディングタスク 1 つにつき 1 つ起動する。アーティファクトモードのタスクは代わりに素の作業ディレクトリを得る。main ブランチはきれいなまま保たれる。
+3. **検証する**。ジャニターが具体的なシグナルを確認する。テストが通るか、ファイルが存在するか、lint がきれいか、型が正しいか。
+4. **マージする**。検証を通った成果が main に入る。落ちたタスクはリトライされるか、別のモデルに回される。
+
+スケジューラーが素の Python である理由と、それが何を諦めているかは[なぜ決定論的か](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/architecture/WHY_DETERMINISTIC.md)にある。
+
+### 日常のコマンド
+<!-- l10n: en="everyday commands" hash="sha256:7d149b09b9bc" -->
 
 ```bash
 cd your-project
-bernstein init                    # creates .sdd/ workspace + bernstein.yaml
+bernstein init                    # creates .sdd/ workspace, bernstein.yaml + templates/
 bernstein -g "Add rate limiting"  # agents spawn, work in parallel, verify, exit
 bernstein live                    # watch progress in the TUI dashboard
+bernstein run plan.yaml           # multi-stage plan: skip LLM planning, execute directly
 bernstein stop                    # graceful shutdown with drain
 ```
 
-複数ステージのプロジェクトでは、YAML プランを定義します:
+オペレーター向けの全機能（PR 自動化、スケジュール、チャットブリッジ、autofix デーモン）は[オペレーターコマンド](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/commands.md)にある。
+
+`bernstein workflow` はエージェント / コマンド / ループのノードから成る宣言的 YAML DAG を実行し、中断した実行の再開にも対応する:
 
 ```bash
-bernstein run plan.yaml           # skips LLM planning, goes straight to execution
-bernstein run --dry-run plan.yaml # preview tasks and estimated cost
+bernstein workflow run idea-to-pr -g "Add JWT auth"   # prints run_id
+bernstein workflow resume <run_id>                    # picks up at the first non-completed node
 ```
 
-## 仕組み
+実行状態はノードごとに `.sdd/runs/<run_id>/` にチェックポイントされる。再開は実行開始時にマニフェストのダイジェストを検証するので、仕様が変わっていれば、別のマニフェストを黙って実行するのではなく拒否される。[ワークフローマニフェスト](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/workflows.md) を参照。
 
-1. **分解**。マネージャがゴールを役割・所有ファイル・完了シグナル付きのタスクへ分解します。
-2. **起動**。エージェントは隔離された Git worktree でタスクごとに起動します。main ブランチはクリーンに保たれます。
-3. **検証**。ジャニターが具体的なシグナル — テスト合格、ファイル存在、Lint クリーン、型整合 — を確認します。
-4. **マージ**。検証済みの成果物は main に取り込まれます。失敗したタスクは再試行されるか、別のモデルへ振り直されます。
+リポジトリ衛生のゲート: `bernstein readme-l10n verify` は、翻訳版 README が英語の原文からずれた PR を（古くなったセクション名を挙げて）失敗させる。`bernstein readme-l10n sync` は英語を編集したあとに束ね直す。[readme-l10n](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/playbooks/readme-l10n.md) を参照。
 
-オーケストレーターは LLM ではなく Python のスケジューラです。スケジューリングは決定的で、監査可能で、再現可能です。
+### 対応エージェント
+<!-- l10n: en="supported agents" hash="sha256:c3a0c276b6b6" -->
 
-## クラウド実行 (Cloudflare)
+Claude Code、Codex CLI、Gemini CLI、GitHub Copilot CLI、Cursor、Aider、Goose、Muse Code、OpenAI Agents SDK、Amp、Cody、Continue、Devin Terminal、Junie、Kilo、Kiro、AWS Q Developer、Ollama、OpenCode、OpenHands、Open Interpreter、gptme、Plandex、AIChat、Letta Code、Qwen ほか。[アダプタ索引](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/adapters/index.md)はそのうち 30 個のインストールコマンドを載せている。`bernstein integrations list` は `src/bernstein/adapters/registry.py` から、配線済みの統合 52 件すべてを列挙する。このファイルが「何が解決されるか」の唯一の情報源である。うち 50 件は選択可能なエージェントアダプタで、残り 2 行は `mock` テストスタブと `self-hosted-endpoints` エンドポイントプロファイルである。`--prompt` フラグを持つそれ以外のものは、汎用ラッパー経由で動く。
 
-Bernstein はエージェントをローカルではなく Cloudflare Workers 上で実行できます。デプロイとライフサイクルは `bernstein cloud` CLI が扱います。
+同じ実行の中でエージェントを混ぜられる。定型作業には安価なローカルモデル、設計には重いクラウドモデルというように。`bernstein integrations list --installed` は自分のマシンで使えるものを表示する。
 
-- **Workers**。Cloudflare のエッジでエージェントを実行。多段タスク向けの Durable Workflows と自動リトライに対応します。
-- **V8 サンドボックス分離**。各エージェントは独自の isolate で動作し、コンテナのオーバーヘッドはありません。
-- **R2 ワークスペース同期**。ローカル worktree の状態を R2 オブジェクトストレージへ同期し、クラウドエージェントが同じファイルを参照できます。
-- **Workers AI** (実験的)。Cloudflare がホストするモデルを LLM プロバイダとして利用でき、外部 API キーは不要です。
-- **D1 アナリティクス**。タスクメトリクスとコストデータを D1 に保存して問い合わせできます。
-- **Vectorize**。Cloudflare のベクターデータベースに支えられたセマンティックキャッシュ。
-- **ブラウザレンダリング**。Web 出力を確認したいエージェント向けに、Workers 上のヘッドレス Chrome を提供します。
-- **MCP リモートトランスポート**。Cloudflare ネットワーク越しに MCP サーバーを公開・利用できます。
+### ボランティア計算資源
+<!-- l10n: en="volunteer compute" hash="sha256:f0bd4a22affd" -->
+
+プロジェクトは issue をボランティアに開放されているものとして印を付けられ、誰でもその一つを自分のマシンで実行できます。アカウントも調整役も必要ありません。タスクに何を許すかは `volunteer.json` マニフェストで宣言され — サンドボックスのバックエンド、許可するネットワーク先、実時間とメモリの上限 — 提供者自身の制限はそれを狭めることしかできず、広げることはできません。完了したタスクが生む受領書は、結果をそれが動いた封じ込めの決定に結び付けるため、メンテナは数か月後でも、その作業が実際に何に触れることを許されていたかを確認できます。
 
 ```bash
-bernstein cloud login      # authenticate with Bernstein Cloud
-bernstein cloud deploy     # push agent workers
-bernstein cloud run plan.yaml  # execute a plan on Cloudflare
+bernstein volunteer verify .
+bernstein volunteer browse --budget 60
 ```
 
-## 機能
+[提供者ガイド](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/volunteer/donor-guide.md) はワーカーの実行と自分で設定する予算を、[プロジェクトガイド](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/volunteer/project-guide.md) はマニフェストの宣言を、[脅威モデル](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/volunteer/threat-model.md) は各境界が何を守り何を守らないかを扱います。単一コマンドのランナーはまだ出荷されていません。現在動くサブコマンドは `verify`、`browse`、`hub` です。
 
-**コアオーケストレーション**。並列実行、Git worktree 分離、ジャニターによる検証、品質ゲート (Lint、型、PII スキャン)、クロスモデルコードレビュー、挙動が怪しいエージェント向けのサーキットブレーカー、自動介入付きのトークン増加監視。
+### 表紙の先へ
+<!-- l10n: en="beyond the front page" hash="sha256:ee01fbaaebd6" -->
 
-**インテリジェンス**。モデル/努力レベル選択のための文脈的バンディットルーター。コードベースへの影響分析のための知識グラフ。繰り返しパターンでトークンを節約するセマンティックキャッシュ。コスト異常検知 (バーンレートアラート)。Z スコアによる挙動異常検知。
+踏み込んだ内容はすべて[ドキュメントサイト](https://bernstein.readthedocs.io/)にある:
 
-**サンドボックス**。プラガブルな [`SandboxBackend`](../../docs/architecture/sandbox.md) プロトコル — エージェントをローカル Git worktree (デフォルト)、Docker コンテナ、[E2B](https://e2b.dev) Firecracker microVM、または [Modal](https://modal.com) サーバーレスコンテナ (オプションで GPU) で実行できます。プラグイン作成者は `bernstein.sandbox_backends` エントリーポイントグループ経由で独自バックエンドを登録できます。`bernstein agents sandbox-backends` でインストール済みバックエンドを確認できます。
+| ページ | 扱う内容 |
+|---|---|
+| [ケーパビリティ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/capabilities.md) | 全機能一覧: MCP サーバーモード、署名済みエージェントカード、サンドボックスバックエンド、アーティファクトシンク、規制対応マッピング |
+| [誰のためのものか](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/use-cases.md) | 価値が出る場所と、Bernstein が不適切な場面 |
+| [ワークフロー](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/workflow-manifests.md) | エージェント / コマンド / ループのノードから成る宣言的 YAML DAG |
+| [Web UI](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/gui/index.md) | TUI と同じ API 上で動くブラウザダッシュボード |
+| [クラウド実行](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/cloudflare/cloudflare-overview.md) | 実験的: 自分のアカウントで Cloudflare Workers 上のエージェントを R2 ワークスペース同期とともに走らせる。ホステッドの `api.bernstein.run` サービスはまだ提供されていない |
+| [データソース](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/datasources.md) | 読み取り専用のクエリレシート、および各結果を導出元のスキーマスナップショットに結び付けるクエリドライバ |
+| [エージェントカタログ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/agent-catalogs.md) | 組み込みテンプレート以外のエージェント定義をロールから参照する。汎用の YAML/SKILL.md ディレクトリ、または Claude Code のプラグインレイアウトのツリー |
+| [セキュリティ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/security.md) | スコアカード、ファジング、ハードニング |
+| [アーキテクチャ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/architecture/ARCHITECTURE.md) | 内部の仕組み |
 
-**アーティファクトストレージ**。`.sdd/` の状態はプラガブルな [`ArtifactSink`](../../docs/architecture/storage.md) バックエンドへ流せます: ローカルファイルシステム (デフォルト)、S3、Google Cloud Storage、Azure Blob、Cloudflare R2。`BufferedSink` はまずローカルへ fsync 付きで書き、その後リモートへ非同期にミラーすることで WAL のクラッシュ安全性契約を維持します。
+### 名前の由来
+<!-- l10n: en="why the name?" hash="sha256:2444448b9e03" -->
 
-**スキルパック**。漸進開示型の [スキル](../../docs/architecture/skills.md) (OpenAI Agents SDK パターン): すべての起動時のシステムプロンプトにはコンパクトなスキルインデックスのみが載り、エージェントは必要に応じて `load_skill` MCP ツールで本体を取得します。組み込みのロールパック 17 個に加え、サードパーティの `bernstein.skill_sources` エントリーポイントもあります。
+Bernstein の名は、アメリカの指揮者・作曲家レナード・バーンスタインに由来する。このプロジェクトが CLI コーディングエージェントの一団を指揮するさまは、バーンスタインがニューヨーク・フィルハーモニックを振ったのと同じである。奏者はそれぞれの合図で入り、スコアは決定論的で、指揮者は結果に責任を負う。
 
-**コントロール**。HMAC でチェーンされた監査ログ、ポリシーエンジン、PII 出力ゲーティング、WAL によるクラッシュ復旧 (実験的なマルチワーカー安全性)、OAuth 2.0 PKCE。
+i wrote bernstein because i was paying $400/month in claude bills running three coding agents in parallel and getting nondeterministic merges. Apache 2.0、単独メンテナンス。稼働統計: [bernstein.run](https://bernstein.run)。
 
-**可観測性**。Prometheus `/metrics`、OTel エクスポーターのプリセット、Grafana ダッシュボード。モデル別のコストトラッキング (`bernstein cost`)。ターミナル TUI と Web ダッシュボード。`ps` 上でのエージェントプロセス可視化。
+### 掲載
+<!-- l10n: en="mentioned in" hash="sha256:e1dfaf62cb5d" -->
 
-**エコシステム**。MCP サーバーモード、A2A プロトコル対応、GitHub App 連携、pluggy ベースのプラグインシステム、複数リポジトリのワークスペース、分散実行用のクラスタモード、`--evolve` (実験的) による自己進化。
-
-機能マトリクスの全量: [FEATURE_MATRIX.md](../../docs/reference/FEATURE_MATRIX.md) &middot; 直近の機能: [What's New](../../docs/whats-new.md)
-
-## v1.9 の新機能
-
-**ACP ブリッジ** — `bernstein acp serve --stdio` により、Agent Communication Protocol を話す任意のエディタ (Zed など) から Bernstein を利用できるようになりました。エディタ側にプラグインコードは不要です。
-
-**自律的な CI 修復** — `bernstein autofix` が公開中の Bernstein PR を監視し、CI が赤くなったときに自動でフィクサーエージェントを起動します。緑になり次第、修正をプッシュしてレビューを再依頼します。
-
-**クレデンシャルボールト** — `bernstein connect <provider>` が API キーを OS のキーチェーンへ書き込み、`bernstein creds` で一覧表示・ローテーションできます。エージェントは環境変数を介さずスコープ付きの認証情報を継承します。
-
-**プレビュートンネル** — `bernstein preview start` がサンドボックス化された開発サーバーを起動し、公開 URL を表示します。ステージングへデプロイせずに動作中のブランチをレビュアーへ共有したいときに便利です。
-
-完全な変更履歴: [docs/whats-new.md](../../docs/whats-new.md)
-
-## オペレーターコマンド
-
-ほとんどのチームが実行回りで自前で書いてしまう「のり付けコード」を不要にするコマンド群です。
-
-| Command | What it does |
-|---------|--------------|
-| `bernstein pr` | 完了したセッションから GitHub PR を自動作成。本文にはジャニターのゲート結果と、トークン/USD のコスト内訳が含まれます。 |
-| `bernstein from-ticket <url>` | Linear / GitHub Issues / Jira のチケットを Bernstein タスクとして取り込みます。ラベルベースで役割とスコープを推論。`--dry-run` と `--run` をサポート。 |
-| `bernstein ticket import <url>` | スクリプト用途向けの `from-ticket` のエイリアス/グループ形式。 |
-| `bernstein remote` | SSH サンドボックスバックエンド。`remote test <host>`、`remote run <host> <path>`、`remote forget <host>`。連続呼び出しを高速化するため ControlMaster ソケットを再利用します。 |
-| `bernstein hooks` | `pre_task`、`post_task`、`pre_merge`、`post_merge`、`pre_spawn`、`post_spawn` のライフサイクルフック — シェルスクリプトまたは pluggy の `@hookimpl`。`hooks list`、`hooks run <event>`、`hooks check`。 |
-| `bernstein chat serve --platform=telegram\|discord\|slack` | チャットから `/run`、`/status`、`/approve`、`/reject`、`/switch`、`/stop` で実行を操作します。 |
-| `bernstein approve-tool` / `bernstein reject-tool` | 実行中のツール呼び出しを対話的に承認。`--latest`、`--id`、`--always`。 |
-| `bernstein tunnel start <port> [--provider auto\|cloudflared\|ngrok\|bore\|tailscale]` | 4 種のトンネルプロバイダを 1 つでラップ。`tunnel list`、`tunnel stop <name>\|--all` も。ControlMaster 風のプロセス再利用。 |
-| `bernstein daemon install [--user\|--system] [--command="..."] [--env KEY=VAL]...` | 自動起動用に systemd (Linux) / launchd (macOS) ユニットをインストール。`daemon start/stop/restart/status/uninstall` も。 |
-| `bernstein connect <provider>` / `bernstein creds` | OS キーチェーンに API クレデンシャルを保存・ローテーション。エージェントは実行ごとにスコープ付きキーを継承します。 |
-| `bernstein autofix` | 公開中の Bernstein PR を監視するデーモン。CI 失敗時にフィクサーエージェントを起動して、修正を自動プッシュします。 |
-| `bernstein preview start` | 現在のブランチでサンドボックス化された開発サーバーを起動し、共有可能な公開トンネル URL を表示します。 |
-
-## 比較
-
-| Feature | Bernstein | CrewAI | AutoGen [^autogen] | LangGraph |
-|---------|-----------|--------|---------|-----------|
-| オーケストレーター | 決定的なコード | LLM 主導 (+ コードフロー) | LLM 主導 | グラフ + LLM |
-| 連携対象 | あらゆる CLI エージェント (43 アダプター) | Python SDK クラス | Python エージェント | LangChain ノード |
-| Git 分離 | エージェントごとの Worktree | 非対応 | 非対応 | 非対応 |
-| プラガブルなサンドボックス | Worktree、Docker、E2B、Modal | 非対応 | 非対応 | 非対応 |
-| 検証 | ジャニター + 品質ゲート | ガードレール + Pydantic 出力 | 終了条件 | 条件付きエッジ |
-| コストトラッキング | 組み込み | `usage_metrics` | `RequestUsage` | LangSmith 経由 |
-| 状態モデル | ファイルベース (.sdd/) | インメモリ + SQLite チェックポイント | インメモリ | Checkpointer |
-| リモートアーティファクトシンク | S3、GCS、Azure Blob、R2 | 非対応 | 非対応 | 非対応 |
-| 自己進化 | 組み込み (実験的) | 非対応 | 非対応 | 非対応 |
-| 宣言的プラン (YAML) | 対応 | 対応 (`agents.yaml`、`tasks.yaml`) | 非対応 | 部分対応 (`langgraph.json`) |
-| タスク単位のモデルルーティング | 対応 | エージェント単位の LLM | エージェント単位の `model_client` | ノード単位 (手動) |
-| MCP サポート | 対応 (クライアント + サーバー) | 対応 | 対応 (クライアント + workbench) | 対応 (クライアント + サーバー) |
-| エージェント間チャット | 掲示板方式 | 対応 (Crew プロセス) | 対応 (グループチャット) | 対応 (supervisor、swarm) |
-| Web UI | TUI + Web ダッシュボード | CrewAI AMP | AutoGen Studio | LangGraph Studio + LangSmith |
-| クラウドホスト版 | あり (Cloudflare) | あり (CrewAI AMP) | なし | あり (LangGraph Cloud) |
-| 組み込み RAG/検索 | 対応 (コードベース FTS5 + BM25) | `crewai_tools` | `autogen_ext` retriever | LangChain 経由 |
-
-*最終確認: 2026-04-19。詳細な機能マトリクスは [比較ページ全文](../../docs/compare/README.md) を参照。*
-
-上記の表は、LLM オーケストレーションフレームワーク (LLM 呼び出しをオーケストレーションするもの) と Bernstein を比較しています。下記の表はより近いカテゴリ — **CLI コーディングエージェント** をオーケストレーションする他ツールとの比較です:
-
-| Feature | Bernstein | [awslabs/cli-agent-orchestrator](https://github.com/awslabs/cli-agent-orchestrator) | [ComposioHQ/agent-orchestrator](https://github.com/ComposioHQ/agent-orchestrator) | [emdash](https://github.com/generalaction/emdash) | [umputun/ralphex](https://github.com/umputun/ralphex) |
-|---------|-----------|-----------|-----------|-----------|-----------|
-| 形態 | Python CLI + ライブラリ + MCP サーバー | Python CLI + tmux セッション + Web UI | TypeScript CLI + ローカルダッシュボード | Electron デスクトップアプリ | Go CLI |
-| 主要言語 | Python | Python | TypeScript | TypeScript | Go |
-| インストール | `pipx install bernstein` | `uv tool install cli-agent-orchestrator` | `npm install -g @aoagents/ao` | `.dmg` / `.msi` / `.AppImage` | `go install` / 単一バイナリ |
-| エージェントアダプター | 43 | 5 (Kiro、Claude Code、Codex、Gemini、Kimi) | 3 (Claude Code、Codex、Aider) | 24 | 1 (Claude Code のみ) |
-| 並列マルチエージェント実行 | 対応 | 対応 (エージェントごとの tmux セッション) | 対応 | 対応 | 非対応 (単一の逐次セッション) |
-| エージェントごとの Git worktree | 対応 | 非対応 (計画中、[#100](https://github.com/awslabs/cli-agent-orchestrator/issues/100)) | 対応 | 対応 | オプション (`--worktree` フラグ) |
-| MCP サーバーモード (自身を MCP として公開) | 対応 (stdio + HTTP/SSE) | 対応 (エージェント間通信) | 非対応 | 非対応 | 非対応 |
-| コーディネータ | 決定的な Python スケジューラ | 階層的 LLM スーパーバイザー | LLM 主導 | ドキュメント未記載 | 線形プラン実行 |
-| HMAC チェーン監査リプレイ | 対応 | 非対応 | 非対応 | 非対応 | 非対応 |
-| クロスモデル検証 / 品質ゲート | 対応 (多段) | 非対応 | 非対応 | 非対応 | 多フェーズレビュー (Claude 限定) |
-| 自律 CI 修復 / PR フロー | 対応 (`bernstein autofix`) | 非対応 | 対応 | 非対応 | 非対応 |
-| ビジュアルダッシュボード | TUI + Web | Web UI + tmux | Web | デスクトップアプリ | Web (`--serve`) |
-| 通知シンク | Telegram/Slack/Discord/メール/Webhook/シェル | — | 非対応 | 非対応 | Telegram / メール / Slack / Webhook |
-| バッキング | 個人 OSS | AWS Labs | 出資あり (Composio.dev) | YC W26 | 個人 OSS |
-| ライセンス | Apache 2.0 | Apache 2.0 | MIT | Apache 2.0 | MIT |
-
-このカテゴリにおける Bernstein の強み: **Python ネイティブ、MCP サーバーファースト、最も広いアダプターカバレッジ、真のマルチエージェント並列性、コーディネーションループに LLM を持たない決定的スケジューラ**。AWS と整合した tmux セッション分離と階層的 LLM スーパーバイザーが欲しいなら AWS Labs の `cao` が近い選択肢です。スタックが TypeScript でダッシュボード付きの製品が欲しいなら Composio の `@aoagents/ao` が向いています。洗練されたデスクトップ ADE が欲しいなら emdash、Claude Code だけを使いプランを上から下へ歩く単一 Go バイナリが欲しいなら ralphex が適しています。Python に取り込めるプリミティブで、MCP 経由で任意のクライアントへ自身を公開し、多数のエージェントを並列実行し、全エージェント (Qwen、Goose、Ollama、OpenAI Agents SDK、Cloudflare Agents、ほか) を網羅したいなら — Bernstein です。
-
-[^autogen]: AutoGen はメンテナンスモードで、後継は Microsoft Agent Framework 1.0 です。
-
-## モニタリング
-
-```bash
-bernstein live       # TUI dashboard
-bernstein dashboard  # web dashboard
-bernstein status     # task summary
-bernstein ps         # running agents
-bernstein cost       # spend by model/task
-bernstein doctor     # pre-flight checks
-bernstein recap      # post-run summary
-bernstein trace <ID> # agent decision trace
-bernstein run-changelog --hours 48  # changelog from agent-produced diffs
-bernstein explain <cmd>  # detailed help with examples
-bernstein dry-run    # preview tasks without executing
-bernstein dep-impact # API breakage + downstream caller impact
-bernstein aliases    # show command shortcuts
-bernstein config-path    # show config file locations
-bernstein init-wizard    # interactive project setup
-bernstein debug-bundle   # collect logs, config, and state for bug reports
-bernstein skills list    # discoverable skill packs (progressive disclosure)
-bernstein skills show <name>  # print a skill body with its references
-```
-
-```bash
-bernstein fingerprint build --corpus-dir ~/oss-corpus  # build local similarity index
-bernstein fingerprint check src/foo.py                 # check generated code against the index
-```
-
-## インストール
-
-| Method | Command |
-|--------|---------|
-| **ワンライナー (macOS / Linux)** | `curl -fsSL https://bernstein.run/install.sh \| sh` |
-| **ワンライナー (Windows)** | `irm https://bernstein.run/install.ps1 \| iex` |
-| **pip** | `pip install bernstein` |
-| **pipx** | `pipx install bernstein` |
-| **uv** | `uv tool install bernstein` |
-| **Homebrew** | `brew tap chernistry/tap && brew install bernstein` |
-| **Fedora / RHEL** | `sudo dnf copr enable alexchernysh/bernstein && sudo dnf install bernstein` |
-| **npm** (ラッパー) | `npx bernstein-orchestrator` |
-
-ワンライナースクリプトは Python 3.12+ を確認し、pipx が無ければブートストラップし、現在のセッションの PATH を整え、`bernstein` をインストール (またはアップグレード) します。brew 管理の macOS 環境や Windows の `py -3` ランチャーへのフォールバックも処理します。スクリプトのソース: [install.sh](../../scripts/install.sh) · [install.ps1](../../scripts/install.ps1)。
-
-### オプションのエクストラ
-
-ベースインストールを軽量に保つため、プロバイダの SDK はオプションです。必要なものだけ選んでください:
-
-| Extra | Enables |
-|-------|---------|
-| `bernstein[openai]` | OpenAI Agents SDK v2 アダプター (`openai_agents`) |
-| `bernstein[docker]` | Docker サンドボックスバックエンド |
-| `bernstein[e2b]` | [E2B](https://e2b.dev) microVM サンドボックスバックエンド (`E2B_API_KEY` が必要) |
-| `bernstein[modal]` | [Modal](https://modal.com) サンドボックスバックエンド、オプションで GPU (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` が必要) |
-| `bernstein[s3]` | S3 アーティファクトシンク (`boto3` 経由) |
-| `bernstein[gcs]` | Google Cloud Storage アーティファクトシンク |
-| `bernstein[azure]` | Azure Blob アーティファクトシンク |
-| `bernstein[r2]` | Cloudflare R2 アーティファクトシンク (S3 互換 `boto3`) |
-| `bernstein[grpc]` | gRPC ブリッジ |
-| `bernstein[k8s]` | Kubernetes 連携 |
-
-エクストラはブラケットで結合できます。例: `pip install 'bernstein[openai,docker,s3]'`。
-
-エディタ拡張: [VS Marketplace](https://marketplace.visualstudio.com/items?itemName=alex-chernysh.bernstein) &middot; [Open VSX](https://open-vsx.org/extension/alex-chernysh/bernstein)
-
-## コントリビューション
-
-PR を歓迎します。セットアップとコードスタイルは [CONTRIBUTING.md](../../CONTRIBUTING.md) を参照してください。
-
-## サポート
-
-Bernstein で時間が節約できたら: [GitHub Sponsors](https://github.com/sponsors/chernistry)
-
-連絡先: [forte@bernstein.run](mailto:forte@bernstein.run)
-
-## 掲載・参照
-
-Bernstein を取り上げたキュレーションリスト、ニュースレター、関連プロジェクト:
-
-- [**Python Weekly #742**](https://www.pythonweekly.com/p/python-weekly-issue-742-april-23-2026) (2026 年 4 月 23 日) — ニュースレター掲載。
-- [**Augment Code — 9 Open-Source Agent Orchestrators for AI Coding (2026)**](https://www.augmentcode.com/tools/open-source-agent-orchestrators) — 編集部によるまとめ記事。「このまとめの中で最もアーキテクチャ的に興味深いツール」と評価。
-- [**nibzard/awesome-agentic-patterns**](https://github.com/nibzard/awesome-agentic-patterns/blob/main/patterns/deterministic-zero-llm-orchestration.md) — Bernstein は「決定的ゼロ LLM オーケストレーション」パターンの実運用実装として引用されています。
-- [**Jenqyang/Awesome-AI-Agents**](https://github.com/Jenqyang/Awesome-AI-Agents)
-- [**jamesmurdza/awesome-ai-devtools**](https://github.com/jamesmurdza/awesome-ai-devtools)
-- [**jim-schwoebel/awesome_ai_agents**](https://github.com/jim-schwoebel/awesome_ai_agents)
-- [**Piebald-AI/awesome-gemini-cli**](https://github.com/Piebald-AI/awesome-gemini-cli)
-- [**ComposioHQ/awesome-codex-skills**](https://github.com/ComposioHQ/awesome-codex-skills)
-- [**jxzhangjhu/Awesome-LLM-RAG**](https://github.com/jxzhangjhu/Awesome-LLM-RAG)
-- [**rohitg00/awesome-claude-code-toolkit**](https://github.com/rohitg00/awesome-claude-code-toolkit)
-- [**numtide/llm-agents.nix**](https://github.com/numtide/llm-agents.nix) — Nix flake 配布。
+[vinta/awesome-python](https://github.com/vinta/awesome-python) に掲載、Augment Code の[オープンソースのエージェントオーケストレーター](https://www.augmentcode.com/tools/open-source-agent-orchestrators)まとめで紹介、[Python Weekly #742](https://www.pythonweekly.com/p/python-weekly-issue-742-april-23-2026) にも掲載。このアプローチは awesome-agentic-patterns に [deterministic zero-LLM orchestration](https://github.com/nibzard/awesome-agentic-patterns/blob/main/patterns/deterministic-zero-llm-orchestration.md) パターンとして書き起こしている。
 
 <details>
-<summary>その他の awesome リスト・コミュニティキュレーション</summary>
+<summary>掲載一覧: 20 以上の awesome リスト、ディレクトリ、ニュースレター、被引用</summary>
+<br>
 
-- [andyrewlee/awesome-agent-orchestrators](https://github.com/andyrewlee/awesome-agent-orchestrators)
-- [bradAGI/awesome-cli-coding-agents](https://github.com/bradAGI/awesome-cli-coding-agents)
-- [milisp/awesome-codex-cli](https://github.com/milisp/awesome-codex-cli)
-- [yaolifeng0629/Awesome-independent-tools](https://github.com/yaolifeng0629/Awesome-independent-tools) (中文 + EN)
-- [caramaschiHG/awesome-ai-agents-2026](https://github.com/caramaschiHG/awesome-ai-agents-2026)
-- [ai-for-developers/awesome-vibe-coding](https://github.com/ai-for-developers/awesome-vibe-coding)
-- [killop/anything_about_game](https://github.com/killop/anything_about_game) (`AI.md`)
-- [Glama MCP Catalog](https://glama.ai/mcp/servers/sipyourdrink-ltd/bernstein) — 編集部による MCP サーバー紹介。
-- ミラー: [icopy-site/awesome](https://github.com/icopy-site/awesome)、[icopy-site/awesome-cn](https://github.com/icopy-site/awesome-cn)、[trackawesomelist/trackawesomelist](https://github.com/trackawesomelist/trackawesomelist)。
+awesome リストの項目、カタログ掲載、先行研究としての引用、ニュースレター言及をすべて含む追跡中の全一覧は [docs/mentions.md](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/mentions.md) にある。見つかり次第追加している。訂正は issue または PR で歓迎する。
 
 </details>
 
-<details>
-<summary>関連プロジェクトから先行事例として引用</summary>
+### コントリビュート、サポート、ライセンス
+<!-- l10n: en="contributing, support, license" hash="sha256:94b6541e4b15" -->
 
-- [**mkb23/overcode**](https://github.com/mkb23/overcode/blob/main/docs/design/bakeoffs/overcode-vs-bernstein.md) — Bernstein をリファレンス実装として扱う詳細な比較記事。
-- [**Vintersong/NOVA-Cognition-Framework**](https://github.com/Vintersong/NOVA-Cognition-Framework) — `BERNSTEIN_PATTERNS.md`、「借用に値するパターン」。
-- [**AJV009/drupal-contrib-workbench**](https://github.com/AJV009/drupal-contrib-workbench) — マネージャ/ジャニター分離に関する研究ノート。
-- [**danielvaughan/codex-blog**](https://github.com/danielvaughan/codex-blog/blob/main/_posts/2026-04-09-loki-mode-autonomous-execution.md) — Bernstein を決定的サイドに位置付ける比較記事。
+PR を歓迎する。セットアップとコードスタイルは [CONTRIBUTING.md](https://github.com/sipyourdrink-ltd/bernstein/blob/main/CONTRIBUTING.md) にある。セキュリティ報告は [SECURITY.md](https://github.com/sipyourdrink-ltd/bernstein/blob/main/SECURITY.md) の手順で。Bernstein が時間の節約になったなら: [GitHub Sponsors](https://github.com/sponsors/chernistry)。連絡先: [forte@bernstein.run](mailto:forte@bernstein.run)。
 
-</details>
-
-## スター履歴
-
-[![Star History Chart](https://api.star-history.com/svg?repos=sipyourdrink-ltd/bernstein&type=Date)](https://star-history.com/#sipyourdrink-ltd/bernstein&Date)
-
-## ライセンス
-
-[Apache License 2.0](../../LICENSE)
+引用用のメタデータは [CITATION.cff](https://github.com/sipyourdrink-ltd/bernstein/blob/main/CITATION.cff) にある。ライセンス: [Apache-2.0](https://github.com/sipyourdrink-ltd/bernstein/blob/main/LICENSE)。プロジェクト名については [TRADEMARKS.md](https://github.com/sipyourdrink-ltd/bernstein/blob/main/TRADEMARKS.md) で別途扱っている。
 
 ---
 
-Made with love by [Alex Chernysh](https://alexchernysh.com) &middot; [GitHub](https://github.com/chernistry) &middot; [X](https://x.com/alex_chernysh) &middot; [bernstein.run](https://bernstein.run?utm_source=github.com&utm_medium=readme&utm_campaign=bernstein-readme)
+[Alex Chernysh](https://alexchernysh.com) &middot; [GitHub](https://github.com/chernistry) &middot; [X](https://x.com/alex_chernysh) &middot; [bernstein.run](https://bernstein.run)
 
 <!-- mcp-name: io.github.sipyourdrink-ltd/bernstein -->

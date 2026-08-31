@@ -6,15 +6,15 @@ Vite + React + Tailwind + shadcn/ui SPA. Built artifacts ship inside the wheel u
 
 Two terminals.
 
-**Terminal 1** — Bernstein API server with mock orchestration:
+**Terminal 1** - Bernstein API server with mock orchestration:
 
 ```bash
 # from repo root
-cd /Users/sasha/IdeaProjects/personal_projects/bernstein_playground
+cd /path/to/bernstein
 bernstein run --idle    # spawns mock agents continuously
 ```
 
-**Terminal 2** — Vite dev server (HMR + React Refresh, proxies `/api/*` to FastAPI on `:8000`):
+**Terminal 2** - Vite dev server (HMR + React Refresh, proxies `/api/*` to FastAPI on `:8000`):
 
 ```bash
 cd web
@@ -55,7 +55,8 @@ web/
 └── src/
     ├── main.tsx              # React entry
     ├── App.tsx               # Router + providers
-    ├── index.css             # Tailwind + shadcn token defaults
+    ├── index.css             # Tailwind + shadcn token defaults, @font-face
+    ├── fonts/                # vendored woff2 + provenance (see fonts/README.md)
     ├── lib/
     │   ├── utils.ts          # cn() helper
     │   ├── api.ts            # fetch wrapper (TODO Phase 1.3)
@@ -67,10 +68,27 @@ web/
     └── routes/               # Tasks, Agents, Approvals, Audit, Costs, Fleet, Settings, Overview
 ```
 
+## Fonts
+
+Inter Tight and JetBrains Mono are committed under `src/fonts/` and declared as
+`@font-face` in `src/index.css`. Nothing is fetched from a font host at view
+time.
+
+This is not a typography preference. The `@import` this replaced blocked its own
+stylesheet from finishing, and that stylesheet blocked the module script after
+it — with no route to the font host the page committed, `DOMContentLoaded` never
+fired and `#root` stayed empty. A blank dashboard, on the air-gapped installs
+this project ships a profile for. Provenance and licence:
+[`src/fonts/README.md`](src/fonts/README.md).
+
+`tests/unit/test_webui_no_external_assets.py` fails if an external host returns
+to the shipped CSS, so a dependency or a style refactor cannot bring it back
+quietly.
+
 ## Stack pin reasoning
 
-- **Vite 6** — fast dev, no SSR overhead, builds to plain JS/CSS suitable for static serving.
-- **React 18** — matches Bernstein's broader frontend ecosystem; React 19 deferred until shadcn/Radix peer-dep alignment lands.
-- **Tailwind 3 + shadcn/ui** — operator can read raw classes without a brittle theme abstraction.
-- **TanStack Query 5** — handles cache + retries + SSE refetches uniformly.
-- **react-router 6** — `basename="/ui"` so the SPA works under FastAPI mount.
+- **Vite 6** - fast dev, no SSR overhead, builds to plain JS/CSS suitable for static serving.
+- **React 18** - matches Bernstein's broader frontend ecosystem; React 19 deferred until shadcn/Radix peer-dep alignment lands.
+- **Tailwind 3 + shadcn/ui** - operator can read raw classes without a brittle theme abstraction.
+- **TanStack Query 5** - handles cache + retries + SSE refetches uniformly.
+- **react-router 8** - `basename="/ui"` so the SPA works under FastAPI mount; declarative `BrowserRouter` only, imported from `react-router` (the `react-router-dom` shim is gone in v8).

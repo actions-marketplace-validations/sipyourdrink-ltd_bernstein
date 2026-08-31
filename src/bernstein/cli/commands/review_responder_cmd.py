@@ -1,4 +1,4 @@
-"""``bernstein review-responder`` — manage the PR review responder daemon.
+"""``bernstein review-responder`` - manage the PR review responder daemon.
 
 The CLI is intentionally thin.  Heavy logic lives in
 :mod:`bernstein.core.review_responder`; this module just glues click
@@ -6,12 +6,12 @@ flags to the responder primitives and prints a status summary.
 
 Subcommands:
 
-* ``start`` — show the configuration the daemon would use, optionally
+* ``start`` - show the configuration the daemon would use, optionally
   arrange a tunnel via :mod:`bernstein.core.tunnels`, and (when run
   with ``--foreground``) actually serve the webhook listener.
-* ``status`` — describe the persisted dedup queue for a given PR so an
+* ``status`` - describe the persisted dedup queue for a given PR so an
   operator can see which comments have already been addressed.
-* ``tick`` — run a single polling pass synchronously; useful in tests
+* ``tick`` - run a single polling pass synchronously; useful in tests
   and as a last-resort manual trigger.
 """
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -31,6 +31,7 @@ from bernstein.core.review_responder import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from bernstein.core.review_responder import ReviewComment
@@ -125,7 +126,7 @@ def start_cmd(
 
     queue: list[ReviewComment] = []
 
-    def _on_payload(payload: dict[str, object]) -> None:  # pragma: no cover - exercised by integration
+    def _on_payload(payload: Mapping[str, Any]) -> None:  # pragma: no cover - exercised by integration
         from bernstein.core.review_responder import normalise_webhook_payload
 
         try:
@@ -157,7 +158,7 @@ def status_cmd(pr_number: int | None) -> None:
         )
     if pr_number is not None:
         # Without storing pr_number in the dedup record we cannot filter
-        # here directly — keep the option as a no-op but mention it.
+        # here directly - keep the option as a no-op but mention it.
         console.print(f"[dim]Note: dedup records do not carry pr_number; --pr {pr_number} is informational only.[/dim]")
     if not rows:
         console.print("[dim]No review-responder activity recorded yet.[/dim]")

@@ -17,6 +17,7 @@ from typing_extensions import TypedDict
 
 from bernstein.core.backlog_parser import parse_backlog_text
 from bernstein.core.context_collapse import staged_context_collapse
+from bernstein.core.defaults import ORCHESTRATOR
 from bernstein.core.models import Task, TaskType
 from bernstein.core.orchestration.best_of_n import is_best_of_n, task_n
 
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 # Fair scheduling: age threshold in seconds after which lower-priority tasks get boosted
 _PRIORITY_AGE_THRESHOLD_SECONDS = 300  # 5 minutes
 _PRIORITY_BOOST_AMOUNT = 1  # Boost priority by 1 (lower value = higher priority)
+_MAX_PRIORITY_AGE_BOOST = 2  # Maximum cumulative boost allowed from aging (#4675)
 
 
 def _task_affinity_config(task: Task) -> dict[str, object]:
@@ -113,7 +115,7 @@ def _groups_can_merge(left: list[Task], right: list[Task], agent_affinity: dict[
     """Return True when two groups are compatible for batching.
 
     Tasks with different per-step ``cli:`` or ``model:`` directives must
-    spawn separate agents — a single ``spawn_for_tasks`` call only consults
+    spawn separate agents - a single ``spawn_for_tasks`` call only consults
     ``tasks[0].cli``/``tasks[0].model``, so merging would silently drop the
     second task's routing hints.
     """
@@ -257,6 +259,38 @@ def block_task(client: httpx.Client, base_url: str, task_id: str, reason: str) -
     client.post(f"{base_url}/tasks/{task_id}/block", json={"reason": reason}).raise_for_status()
 
 
+def fetch_active_holds(client: httpx.Client, base_url: str) -> list[dict[str, Any]]:
+    """GET /orchestrator/holds and return the active hold list.
+
+    Used by the orchestrator's quiescence check (``orchestrator.py``) to
+    decide whether to skip a self-stop even when ``open_tasks == 0`` and
+    ``active_agents == 0`` - see ``bernstein.core.orchestration.holds`` for
+    the hold/release registry this reads from.
+
+    Args:
+        client: httpx client.
+        base_url: Server base URL.
+
+    Returns:
+        List of hold dicts (``{id, reason, created_at, ttl_seconds,
+        expires_at}``). Empty list on any error - a hold-fetch failure must
+        never itself block the orchestrator's quiescence decision; it just
+        means holds are treated as absent for this tick.
+    """
+    try:
+        resp = client.get(f"{base_url}/orchestrator/holds")
+        resp.raise_for_status()
+        body = resp.json()
+        holds = cast("list[dict[str, Any]]", body.get("holds", []))
+        logger.debug("fetch_active_holds: %d active hold(s)", len(holds))
+        return holds
+    except Exception as exc:  # intentional-broad-except: must never block the tick loop
+        logger.warning(
+            "fetch_active_holds: failed to fetch holds from %s (%s) - treating as no active holds", base_url, exc
+        )
+        return []
+
+
 def close_task(client: httpx.Client, base_url: str, task_id: str) -> None:
     """POST /tasks/{task_id}/close to mark a verified task as closed.
 
@@ -307,7 +341,7 @@ def complete_task(
             if attempt < max_retries:
                 delay = 2**attempt  # 1s, 2s, 4s
                 logger.warning(
-                    "complete_task %s attempt %d/%d failed (server unreachable): %s — retrying in %ds",
+                    "complete_task %s attempt %d/%d failed (server unreachable): %s - retrying in %ds",
                     task_id,
                     attempt + 1,
                     max_retries + 1,
@@ -364,7 +398,7 @@ def prioritize_starving_roles(
 
 def _build_file_affinity_groups(
     role_tasks: list[Task],
-    agent_affinity: dict[str, str] | None,
+    agent_affinity: dict[str, str],
 ) -> list[list[Task]]:
     """Group tasks by transitive file-ownership overlap.
 
@@ -400,7 +434,7 @@ def _build_file_affinity_groups(
 
 def _merge_agent_affinity_groups(
     affinity_groups: list[list[Task]],
-    agent_affinity: dict[str, str] | None,
+    agent_affinity: dict[str, str],
 ) -> None:
     """Merge affinity groups that share a preferred agent (in-place).
 
@@ -432,7 +466,7 @@ def _merge_agent_affinity_groups(
 def _pack_affinity_groups_into_batches(
     affinity_groups: list[list[Task]],
     max_per_batch: int,
-    agent_affinity: dict[str, str] | None,
+    agent_affinity: dict[str, str],
 ) -> list[list[Task]]:
     """Pack affinity groups into batches of up to max_per_batch tasks.
 
@@ -467,6 +501,10 @@ def group_by_role(
     agent_affinity: dict[str, str] | None = None,
     cost_estimates: dict[str, float] | None = None,
     budget_remaining_usd: float | None = None,
+    *,
+    age_threshold_seconds: float | None = None,
+    boost_amount: int | None = None,
+    max_age_boost: int | None = None,
 ) -> list[list[Task]]:
     """Group open tasks by role into batches of up to max_per_batch.
 
@@ -483,8 +521,9 @@ def group_by_role(
     If alive_per_role is provided, batches are further reordered to prioritize
     roles with zero alive agents (starving roles) before well-served roles.
 
-    Fair scheduling: tasks waiting longer than PRIORITY_AGE_THRESHOLD_SECONDS
-    get their effective priority boosted to prevent P1 tasks from starving P2/P3.
+    Fair scheduling: tasks waiting longer than priority_age_threshold_s
+    get their effective priority boosted up to max_priority_age_boost steps
+    to prevent P1 tasks from indefinitely starving P2/P3 tasks (#4675).
 
     Agent affinity: when agent_affinity is provided, tasks that prefer the same
     agent (downstream of a completed task) are merged into the same affinity
@@ -512,6 +551,9 @@ def group_by_role(
             so expensive work runs earlier while budget is still available.
         budget_remaining_usd: Current budget remaining. Used only to disable the
             cost-aware secondary sort once no spend remains.
+        age_threshold_seconds: Optional override for age threshold in seconds.
+        boost_amount: Optional override for priority boost step per threshold period.
+        max_age_boost: Optional override for maximum cumulative priority boost steps.
 
     Returns:
         List of batches, each a list of same-role tasks, round-robin interleaved.
@@ -525,6 +567,21 @@ def group_by_role(
 
     # Calculate current time for age-based priority boosting
     current_time = time.time() if task_created_at else None
+    effective_threshold = (
+        age_threshold_seconds
+        if age_threshold_seconds is not None
+        else getattr(ORCHESTRATOR, "priority_age_threshold_s", _PRIORITY_AGE_THRESHOLD_SECONDS)
+    )
+    effective_boost_amount = (
+        boost_amount
+        if boost_amount is not None
+        else getattr(ORCHESTRATOR, "priority_boost_step", _PRIORITY_BOOST_AMOUNT)
+    )
+    effective_max_boost = (
+        max_age_boost
+        if max_age_boost is not None
+        else getattr(ORCHESTRATOR, "max_priority_age_boost", _MAX_PRIORITY_AGE_BOOST)
+    )
 
     def _sort_key(t: Task) -> tuple[float, float, float, int, str]:
         # Priority boost for upgrade proposals: subtract 1 from priority value
@@ -539,9 +596,10 @@ def group_by_role(
         age_boost = 0
         if current_time is not None and task_created_at and t.id in task_created_at:
             age_seconds = current_time - task_created_at[t.id]
-            if age_seconds > _PRIORITY_AGE_THRESHOLD_SECONDS:
-                # Boost priority by 1 for each threshold period exceeded
-                age_boost = int(age_seconds / _PRIORITY_AGE_THRESHOLD_SECONDS) * _PRIORITY_BOOST_AMOUNT
+            if effective_threshold > 0 and age_seconds > effective_threshold:
+                # Boost priority by boost_amount for each threshold period exceeded, capped at max_age_boost
+                raw_boost = int(age_seconds / effective_threshold) * effective_boost_amount
+                age_boost = min(raw_boost, effective_max_boost) if effective_max_boost is not None else raw_boost
 
         # Effective priority: lower is better
         effective_priority = priority_boost - age_boost
@@ -607,6 +665,13 @@ def parse_backlog_file(filename: str, content: str) -> dict[str, Any]:
 
     Returns:
         Dict suitable for POST /tasks.
+
+    Raises:
+        BacklogParseError: The file declares a malformed ``artifact_spec``
+            block (#3110). Fail-closed on purpose: the defaults fallback below
+            applies to files that are not task files at all, never to a task
+            file whose declaration is wrong - that would silently turn a
+            declared artifact task into a code_diff task.
     """
     parsed = parse_backlog_text(filename, content)
     if parsed is None:
@@ -717,36 +782,6 @@ def compute_total_spent(workdir: Path) -> float:
 # ---------------------------------------------------------------------------
 
 
-def check_nudges_during_tick() -> None:
-    """Check and process orchestrator nudges during tick (T567)."""
-    from bernstein.core.orchestration.orchestrator import get_orchestrator_nudges
-
-    nudges = get_orchestrator_nudges(priority_threshold=2)  # Medium+ priority
-
-    for nudge in nudges:
-        logger.info(f"Processing orchestrator nudge: {nudge.nudge_type} - {nudge.message}")
-
-        # Process different nudge types
-        match nudge.nudge_type:
-            case "increase_parallelism":
-                logger.info("Nudge: Increasing parallelism for better throughput")
-                # Implementation would adjust parallelism settings
-            case "reduce_cost":
-                logger.info("Nudge: Reducing cost by using cheaper models")
-                # Implementation would adjust model selection
-            case "improve_quality":
-                logger.info("Nudge: Improving quality with more thorough verification")
-                # Implementation would adjust quality gates
-            case "speed_up":
-                logger.info("Nudge: Speeding up with faster models")
-                # Implementation would adjust speed/quality tradeoff
-
-        # Acknowledge the nudge
-        from bernstein.core.orchestration.orchestrator import nudge_manager
-
-        nudge_manager.acknowledge_nudge(nudge)
-
-
 # ---------------------------------------------------------------------------
 # Context collapse integration (T418)
 # ---------------------------------------------------------------------------
@@ -802,7 +837,7 @@ def collapse_prompt_sections(
     # "token" here counts LLM context tokens, not credentials.
     # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
     logger.info(
-        "Prompt sections exceed token budget%s: %d > %d tokens — applying staged collapse",
+        "Prompt sections exceed token budget%s: %d > %d tokens - applying staged collapse",
         task_ctx,
         total_tokens,
         token_budget,
@@ -840,7 +875,7 @@ def partition_best_of_n(tasks: list[Task]) -> tuple[list[Task], list[tuple[Task,
     caller can hand them to a :class:`bernstein.core.orchestration.best_of_n.BestOfNRunner`
     instead of the legacy single-agent path.  When the global flag is
     off, every task lands in ``single_agent`` and the fan-out list is
-    empty — the legacy assignment loop is unaffected.
+    empty - the legacy assignment loop is unaffected.
     """
     single: list[Task] = []
     fan_out: list[tuple[Task, int]] = []

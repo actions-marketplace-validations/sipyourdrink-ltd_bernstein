@@ -15,11 +15,14 @@ import json
 import logging
 import secrets
 import time
+from enum import StrEnum
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
+
+from bernstein.core.routes._unconfigured import UNCONFIGURED_STATUS
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,19 @@ router = APIRouter(
 # ---------------------------------------------------------------------------
 
 
+class LoginProvider(StrEnum):
+    """SSO providers accepted by ``GET /auth/login``.
+
+    Typing the ``provider`` query param with this enum lets FastAPI
+    reject unknown values with a ``422`` at the validation layer instead
+    of the handler falling through to a generic error for an input it
+    was never going to support.
+    """
+
+    OIDC = "oidc"
+    SAML = "saml"
+
+
 class AuthProvidersResponse(BaseModel):
     """Available authentication providers."""
 
@@ -44,7 +60,7 @@ class AuthProvidersResponse(BaseModel):
 
 
 class DeviceCodeRequest(BaseModel):
-    """Body for POST /auth/cli/device — initiate device auth flow."""
+    """Body for POST /auth/cli/device - initiate device auth flow."""
 
     client_name: str = "bernstein-cli"
 
@@ -60,7 +76,7 @@ class DeviceCodeResponse(BaseModel):
 
 
 class DevicePollRequest(BaseModel):
-    """Body for POST /auth/cli/token — poll for device authorization."""
+    """Body for POST /auth/cli/token - poll for device authorization."""
 
     device_code: str
     grant_type: str = "urn:ietf:params:oauth:grant-type:device_code"
@@ -77,7 +93,7 @@ class DevicePollResponse(BaseModel):
 
 
 class DeviceAuthorizeRequest(BaseModel):
-    """Body for POST /auth/cli/authorize — authorize a device code."""
+    """Body for POST /auth/cli/authorize - authorize a device code."""
 
     user_code: str
 
@@ -124,11 +140,18 @@ class LogoutRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Answer for every SSO route when no provider is configured on this
+#: deployment. See ``bernstein.core.routes._unconfigured`` for why this
+#: is a 4xx and not a 5xx.
+SSO_NOT_CONFIGURED_STATUS = UNCONFIGURED_STATUS
+SSO_NOT_CONFIGURED_DETAIL = "SSO authentication is not configured on this server"
+
+
 def _get_auth_service(request: Request) -> Any:
     """Get the AuthService from app state."""
     svc = getattr(request.app.state, "auth_service", None)
     if svc is None:
-        raise HTTPException(status_code=503, detail="SSO authentication is not configured")
+        raise HTTPException(status_code=SSO_NOT_CONFIGURED_STATUS, detail=SSO_NOT_CONFIGURED_DETAIL)
     return svc
 
 
@@ -174,14 +197,14 @@ def auth_providers(request: Request) -> AuthProvidersResponse:
     "/login",
     responses={
         400: {"description": "Authentication provider not enabled"},
-        503: {"description": "SSO authentication not configured"},
+        404: {"description": "SSO authentication is not configured on this server"},
     },
 )
-async def login(request: Request, provider: str = "oidc") -> Response:
+async def login(request: Request, provider: LoginProvider = LoginProvider.OIDC) -> Response:
     """Initiate SSO login. Redirects to IdP."""
     svc = _get_auth_service(request)
 
-    if provider == "oidc" and svc.config.oidc.enabled:
+    if provider == LoginProvider.OIDC and svc.config.oidc.enabled:
         state = secrets.token_urlsafe(32)
         # Store state for CSRF validation (in-memory is fine for this)
         if not hasattr(request.app.state, "_oidc_states"):
@@ -192,14 +215,14 @@ async def login(request: Request, provider: str = "oidc") -> Response:
         auth_url = svc.get_oidc_auth_url(state=state, discovery=discovery)
         return RedirectResponse(url=auth_url, status_code=302)
 
-    if provider == "saml" and svc.config.saml.enabled:
+    if provider == LoginProvider.SAML and svc.config.saml.enabled:
         relay_state = secrets.token_urlsafe(16)
         redirect_url = svc.get_saml_auth_redirect_url(relay_state=relay_state)
         return RedirectResponse(url=redirect_url, status_code=302)
 
     raise HTTPException(
         status_code=400,
-        detail=f"Authentication provider '{provider}' is not enabled",
+        detail=f"Authentication provider '{provider.value}' is not enabled",
     )
 
 
@@ -207,7 +230,7 @@ async def login(request: Request, provider: str = "oidc") -> Response:
     "/oidc/callback",
     responses={
         400: {"description": "Missing or invalid authorization code or state"},
-        503: {"description": "SSO authentication not configured"},
+        404: {"description": "SSO authentication is not configured on this server"},
     },
 )
 async def oidc_callback(request: Request) -> Response:
@@ -286,7 +309,10 @@ window.location.href = '/dashboard';
 
 @router.post(
     "/saml/acs",
-    responses={400: {"description": "Missing SAMLResponse"}, 503: {"description": "SSO authentication not configured"}},
+    responses={
+        400: {"description": "Missing SAMLResponse"},
+        404: {"description": "SSO authentication is not configured on this server"},
+    },
 )
 async def saml_acs(request: Request) -> Response:
     """SAML Assertion Consumer Service (ACS) endpoint.
@@ -315,7 +341,7 @@ async def saml_acs(request: Request) -> Response:
     return _login_success_page(user.display_name, user.role.value, token)
 
 
-@router.get("/saml/metadata", responses={503: {"description": "SSO authentication not configured"}})
+@router.get("/saml/metadata", responses={404: {"description": "SSO authentication is not configured on this server"}})
 def saml_metadata(request: Request) -> Response:
     """SAML SP metadata endpoint for IdP configuration."""
     metadata = _get_auth_service(request).get_saml_sp_metadata()
@@ -329,7 +355,7 @@ def saml_metadata(request: Request) -> Response:
 
 @router.post(
     "/cli/device",
-    responses={503: {"description": "SSO authentication not configured"}},
+    responses={404: {"description": "SSO authentication is not configured on this server"}},
 )
 def device_code_request(request: Request, body: DeviceCodeRequest) -> DeviceCodeResponse:
     """Initiate device authorization flow for CLI login.
@@ -352,7 +378,7 @@ def device_code_request(request: Request, body: DeviceCodeRequest) -> DeviceCode
 
 @router.post(
     "/cli/token",
-    responses={503: {"description": "SSO authentication not configured"}},
+    responses={404: {"description": "SSO authentication is not configured on this server"}},
 )
 def device_token_poll(request: Request, body: DevicePollRequest) -> DevicePollResponse:
     """Poll for device authorization status.
@@ -382,7 +408,7 @@ def device_token_poll(request: Request, body: DevicePollRequest) -> DevicePollRe
     responses={
         400: {"description": "Invalid or expired user code"},
         401: {"description": "Authentication required"},
-        503: {"description": "SSO authentication not configured"},
+        404: {"description": "SSO authentication is not configured on this server"},
     },
 )
 def device_authorize(request: Request, body: DeviceAuthorizeRequest) -> JSONResponse:
@@ -426,7 +452,7 @@ def get_profile(request: Request) -> UserProfileResponse:
     )
 
 
-@router.post("/logout", responses={503: {"description": "SSO authentication not configured"}})
+@router.post("/logout", responses={404: {"description": "SSO authentication is not configured on this server"}})
 def logout(request: Request) -> JSONResponse:
     """Logout and revoke the current session."""
     session_id = getattr(request.state, "auth_claims", {}).get("session_id", "")
@@ -445,7 +471,7 @@ def logout(request: Request) -> JSONResponse:
 
 @router.get(
     "/group-mappings",
-    responses={503: {"description": "SSO authentication not configured"}},
+    responses={404: {"description": "SSO authentication is not configured on this server"}},
 )
 def get_group_mappings(request: Request) -> GroupMappingsResponse:
     """Get current SSO group → role mappings."""
@@ -459,7 +485,7 @@ def get_group_mappings(request: Request) -> GroupMappingsResponse:
         400: {"description": "Invalid role value"},
         401: {"description": "Authentication required"},
         403: {"description": "Admin role required"},
-        503: {"description": "SSO authentication not configured"},
+        404: {"description": "SSO authentication is not configured on this server"},
     },
 )
 def update_group_mappings(request: Request, body: GroupMappingsUpdateRequest) -> JSONResponse:
@@ -503,7 +529,7 @@ def update_group_mappings(request: Request, body: GroupMappingsUpdateRequest) ->
     responses={
         401: {"description": "Authentication required"},
         403: {"description": "Admin role required"},
-        503: {"description": "SSO authentication not configured"},
+        404: {"description": "SSO authentication is not configured on this server"},
     },
 )
 def list_users(request: Request) -> JSONResponse:

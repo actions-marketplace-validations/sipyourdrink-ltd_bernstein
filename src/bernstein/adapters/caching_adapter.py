@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,8 @@ from bernstein.core.semantic_cache import ResponseCacheManager
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from bernstein.adapters.plugin_sdk import AdapterPluginInfo
+    from bernstein.core.config.platform_compat import ProcessReapReceipt
     from bernstein.core.models import ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -106,6 +109,10 @@ class CachingAdapter(CLIAdapter):
         task_scope: str = "medium",
         budget_multiplier: float = 1.0,
         system_addendum: str = "",
+        multimodal_context: Any | None = None,
+        task_id: str = "",
+        task_title: str = "",
+        explicit_max_turns: int | None = None,
     ) -> SpawnResult:
         """Spawn agent with caching: process prompt, check response cache, then delegate.
 
@@ -120,7 +127,7 @@ class CachingAdapter(CLIAdapter):
         Returns:
             SpawnResult (pid=0 if cache hit, otherwise from the inner adapter).
         """
-        # 1. Prompt prefix caching (Anthropic-style) — pass session_id for per-agent tracking
+        # 1. Prompt prefix caching (Anthropic-style) - pass session_id for per-agent tracking
         cache_res = self._caching_mgr.process_prompt(prompt, session_id=session_id)
 
         # 2. Emit cache break event when prefix is new
@@ -128,7 +135,7 @@ class CachingAdapter(CLIAdapter):
             import hashlib as _hashlib
 
             # The component fingerprint is a short hash of the reason class and
-            # new cache key — agents that receive the same upstream change (e.g.
+            # new cache key - agents that receive the same upstream change (e.g.
             # same template update) will produce identical fingerprints, enabling
             # cross-agent systemic-break correlation.
             _reason = CacheBreakReason.SYSTEM
@@ -165,7 +172,7 @@ class CachingAdapter(CLIAdapter):
         )
         cached_entry, similarity = self._response_cache.lookup_entry(key)
 
-        if cached_entry and cached_entry.verified:
+        if multimodal_context is None and cached_entry and cached_entry.verified:
             logger.info(
                 "Response cache hit (similarity=%.3f) for session %s -- skipping spawn",
                 similarity,
@@ -180,9 +187,38 @@ class CachingAdapter(CLIAdapter):
 
         # 4. Cache miss: delegate to inner adapter.
         # Forward ALL kwargs from the base CLIAdapter.spawn interface explicitly
-        # so that type checkers catch future drift — missing budget_multiplier
+        # so that type checkers catch future drift - missing budget_multiplier
         # or system_addendum silently broke retry budgets and role-scoped
         # system prompts.
+        # Task identity sits outside the base interface, so it is relayed
+        # only when the inner adapter's spawn() accepts it - the same
+        # signature gate the spawner applies. Production always wraps the
+        # adapter in this class, so without the relay the spawner would gate
+        # on the wrapper's signature and the identity would never reach an
+        # inner adapter that wants it. explicit_max_turns hits the same wall:
+        # the spawner forwards it gated on *this* wrapper's signature, so a
+        # missing parameter here makes the operator's per-task turn cap
+        # silently vanish on every cached spawn while the fallback warning
+        # blames the inner adapter, which actually supports it.
+        _identity_kwargs: dict[str, Any] = {}
+        _inner_params = inspect.signature(self._inner.spawn).parameters
+        if task_id and "task_id" in _inner_params:
+            _identity_kwargs["task_id"] = task_id
+        if task_title and "task_title" in _inner_params:
+            _identity_kwargs["task_title"] = task_title
+        if explicit_max_turns is not None:
+            if "explicit_max_turns" in _inner_params:
+                _identity_kwargs["explicit_max_turns"] = explicit_max_turns
+            else:
+                # Inner adapter cannot carry the cap; drop it quietly at
+                # debug level. The spawner's warning can no longer fire here
+                # (its gate now sees the wrapper's accepting signature), so
+                # this is the only trace that the cap was not applied.
+                logger.debug(
+                    "CachingAdapter: inner adapter %s spawn() does not accept explicit_max_turns; dropping cap %d",
+                    self._inner.name(),
+                    explicit_max_turns,
+                )
         return self._inner.spawn(
             prompt=prompt,
             workdir=workdir,
@@ -193,11 +229,28 @@ class CachingAdapter(CLIAdapter):
             task_scope=task_scope,
             budget_multiplier=budget_multiplier,
             system_addendum=system_addendum,
+            multimodal_context=multimodal_context,
+            **_identity_kwargs,
         )
 
     def name(self) -> str:
         """Return inner adapter's name."""
         return self._inner.name()
+
+    def plugin_info(self) -> AdapterPluginInfo:
+        """Delegate plugin metadata to the wrapped adapter.
+
+        Capability gates (e.g. ``ensure_sampling_params_supported``)
+        duck-type on ``plugin_info`` to read declared capabilities, so the
+        caching wrapper must be transparent here or the inner adapter's
+        capabilities become invisible and valid spawns are refused.
+
+        Raises:
+            AttributeError: When the wrapped adapter is not a plugin
+                adapter (has no ``plugin_info``), so callers see exactly
+                the behaviour of the unwrapped adapter.
+        """
+        return self._inner.plugin_info()  # type: ignore[attr-defined]
 
     def is_alive(self, pid: int) -> bool:
         """Delegate to inner adapter (always False for cached PID 0)."""
@@ -205,12 +258,43 @@ class CachingAdapter(CLIAdapter):
             return False
         return self._inner.is_alive(pid)
 
-    def kill(self, pid: int) -> None:
-        """Delegate to inner adapter."""
+    def kill(self, pid: int) -> ProcessReapReceipt | None:
+        """Delegate to inner adapter (no receipt for cached PID 0)."""
         if pid == 0:
-            return
-        self._inner.kill(pid)
+            return None
+        return self._inner.kill(pid)
 
     def detect_tier(self) -> Any:
         """Delegate to inner adapter."""
         return self._inner.detect_tier()
+
+    def __getattr__(self, name: str) -> Any:
+        """Fall back to the wrapped adapter for any attribute not found here.
+
+        ``CLIAdapter`` subclasses declare capability flags as plain class
+        attributes (e.g. ``consumes_heartbeat_dir``, and any future
+        capability flag not yet known to this wrapper). Callers duck-type
+        on those attributes via ``getattr(adapter, "flag", False)``.
+        Without this delegation, wrapping an adapter in ``CachingAdapter``
+        silently resets every such flag to its ``getattr`` default because
+        Python attribute lookup never reaches the inner adapter's class -
+        the capability appears to vanish with no error (bug #11: the
+        spawner stopped injecting ``heartbeat_dir`` for every
+        caching-wrapped openai_agents spawn, orphaning heartbeats in the
+        worktree and triggering false ``no_heartbeat`` kills).
+
+        ``__getattr__`` only fires when normal attribute lookup (instance
+        ``__dict__`` plus the ``CachingAdapter``/``CLIAdapter`` MRO) fails,
+        so it never shadows an attribute or method this class already
+        defines - it is a pure fallback, not an override.
+
+        Raises:
+            AttributeError: When the wrapped adapter also lacks the
+                attribute, matching the error Python would give for a
+                direct lookup on this class.
+        """
+        try:
+            inner = self.__dict__["_inner"]
+        except KeyError:
+            raise AttributeError(name) from None
+        return getattr(inner, name)

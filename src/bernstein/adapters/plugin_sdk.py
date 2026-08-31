@@ -57,6 +57,165 @@ class AdapterCapability(Enum):
     RATE_LIMIT_DETECTION = "rate_limit_detection"
     STRUCTURED_OUTPUT = "structured_output"
     BATCH_MODE = "batch_mode"
+    #: Coarse "honours the full SAMPLING_PARAM_KEYS surface" capability.
+    #: Declaring this means every key in :data:`SAMPLING_PARAM_KEYS` -
+    #: temperature, top_p, top_k, base_url, api_key_env - is genuinely
+    #: wired through to the underlying CLI/SDK call. Adapters that only
+    #: wire a subset (for example a CLI that exposes ``--temperature``
+    #: but has no top_p/top_k flag) must declare the narrower
+    #: ``SUPPORTS_TEMPERATURE``/``SUPPORTS_TOP_P``/``SUPPORTS_TOP_K``
+    #: capabilities instead - see :func:`ensure_sampling_params_supported`
+    #: for how the two are reconciled at the spawn-time gate.
+    SUPPORTS_SAMPLING_PARAMS = "supports_sampling_params"
+    #: Adapter wires an incoming ``temperature`` override to a real CLI
+    #: flag or SDK parameter (PR3, issue: sampling-fields-plumbing).
+    SUPPORTS_TEMPERATURE = "supports_temperature"
+    #: Adapter wires an incoming ``top_p`` override to a real CLI flag or
+    #: SDK parameter (PR3).
+    SUPPORTS_TOP_P = "supports_top_p"
+    #: Adapter wires an incoming ``top_k`` override to a real CLI flag or
+    #: SDK parameter (PR3).
+    SUPPORTS_TOP_K = "supports_top_k"
+    #: Adapter wires an incoming ``max_tokens`` override to a real CLI flag
+    #: or SDK parameter (PR3).
+    SUPPORTS_MAX_TOKENS = "supports_max_tokens"
+
+
+# Per-spawn keys in ``mcp_config`` that request sampling or endpoint
+# overrides.  An adapter must declare
+# :attr:`AdapterCapability.SUPPORTS_SAMPLING_PARAMS` (or, since PR3, the
+# narrower per-key capability - see :data:`_SAMPLING_KEY_CAPABILITY`)
+# before any of these are honoured - see
+# :func:`ensure_sampling_params_supported`.
+SAMPLING_PARAM_KEYS: tuple[str, ...] = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "base_url",
+    "api_key_env",
+)
+
+# Maps a :data:`SAMPLING_PARAM_KEYS` entry to the narrow capability that
+# covers it in isolation. Keys absent from this mapping (``base_url``,
+# ``api_key_env``) have no narrow capability - an adapter that does not
+# declare the coarse :attr:`AdapterCapability.SUPPORTS_SAMPLING_PARAMS` can
+# never honour an endpoint override, regardless of what per-sampling-field
+# capabilities it declares. This reflects reality: swapping the target
+# endpoint is a bigger commitment than accepting one more generation
+# parameter, and no adapter shipped so far wires it half-way.
+_SAMPLING_KEY_CAPABILITY: dict[str, AdapterCapability] = {
+    "temperature": AdapterCapability.SUPPORTS_TEMPERATURE,
+    "top_p": AdapterCapability.SUPPORTS_TOP_P,
+    "top_k": AdapterCapability.SUPPORTS_TOP_K,
+    "max_tokens": AdapterCapability.SUPPORTS_MAX_TOKENS,
+}
+
+
+class SamplingParamsRefusal(RuntimeError):
+    """Raised when sampling params are requested for an incapable adapter.
+
+    Attributes:
+        adapter_name: The adapter that was asked.
+        requested_keys: The sampling/endpoint keys present in the request.
+    """
+
+    def __init__(self, adapter_name: str, requested_keys: tuple[str, ...]) -> None:
+        self.adapter_name = adapter_name
+        self.requested_keys = requested_keys
+        super().__init__(
+            f"Adapter {adapter_name!r} does not declare the "
+            f"{AdapterCapability.SUPPORTS_SAMPLING_PARAMS.value!r} capability "
+            f"but sampling/endpoint parameters were requested: "
+            f"{', '.join(requested_keys)}. Refusing to spawn instead of "
+            f"silently dropping them."
+        )
+
+
+def ensure_sampling_params_supported(
+    adapter: CLIAdapter,
+    mcp_config: dict[str, Any] | None,
+) -> None:
+    """Refuse sampling/endpoint overrides for adapters that cannot honour them.
+
+    Silently dropping a requested ``temperature`` or ``base_url`` would run
+    the task with parameters the operator did not ask for, so the spawn path
+    calls this gate before dispatching to the adapter.
+
+    Args:
+        adapter: The adapter selected for the spawn attempt.
+        mcp_config: Per-spawn configuration that may carry keys from
+            :data:`SAMPLING_PARAM_KEYS`.
+
+    Raises:
+        SamplingParamsRefusal: When any sampling/endpoint key is present and
+            the adapter does not declare
+            :attr:`AdapterCapability.SUPPORTS_SAMPLING_PARAMS`, and (since
+            PR3) does not cover that specific key via a narrower
+            per-sampling-field capability - see
+            :data:`_SAMPLING_KEY_CAPABILITY`.
+    """
+    if not mcp_config:
+        logger.debug("ensure_sampling_params_supported: no mcp_config, nothing to gate")
+        return
+    requested = tuple(k for k in SAMPLING_PARAM_KEYS if mcp_config.get(k) is not None)
+    if not requested:
+        logger.debug("ensure_sampling_params_supported: mcp_config has no sampling/endpoint keys")
+        return
+    adapter_name = adapter.name()
+    logger.debug(
+        "ensure_sampling_params_supported: adapter=%r requested_keys=%s",
+        adapter_name,
+        requested,
+    )
+    # Duck-type on ``plugin_info`` instead of ``isinstance(adapter,
+    # PluginAdapter)``: wrappers such as CachingAdapter are plain
+    # CLIAdapters that forward ``plugin_info()`` to the adapter they wrap,
+    # and an isinstance check would hide the inner adapter's declared
+    # capabilities and refuse spawns it should allow.
+    capabilities: tuple[AdapterCapability, ...] = ()
+    plugin_info = getattr(adapter, "plugin_info", None)
+    if callable(plugin_info):
+        try:
+            capabilities = plugin_info().capabilities
+        except Exception:  # defensive against bad plugins / non-plugin inners
+            logger.warning("ensure_sampling_params_supported: plugin_info() raised for %r", adapter_name, exc_info=True)
+            capabilities = ()
+    logger.debug("ensure_sampling_params_supported: adapter=%r declares capabilities=%s", adapter_name, capabilities)
+
+    if AdapterCapability.SUPPORTS_SAMPLING_PARAMS in capabilities:
+        logger.info(
+            "ensure_sampling_params_supported: adapter=%r declares coarse SUPPORTS_SAMPLING_PARAMS, "
+            "honouring all requested keys=%s",
+            adapter_name,
+            requested,
+        )
+        return
+
+    # PR3: no coarse capability, but the adapter may still honour a subset
+    # of the requested keys via a narrow per-field capability (for example
+    # a CLI that wires ``--temperature`` but has no top_p/top_k flag).
+    # ``base_url``/``api_key_env`` have no narrow capability (see
+    # :data:`_SAMPLING_KEY_CAPABILITY`) - they require the coarse flag.
+    unsupported = tuple(k for k in requested if _SAMPLING_KEY_CAPABILITY.get(k) not in capabilities)
+    supported = tuple(k for k in requested if k not in unsupported)
+    if supported:
+        logger.info(
+            "ensure_sampling_params_supported: adapter=%r honours narrow-capability keys=%s via per-field capabilities",
+            adapter_name,
+            supported,
+        )
+    if not unsupported:
+        return
+    logger.warning(
+        "ensure_sampling_params_supported: REFUSING spawn - adapter=%r does not declare capability "
+        "for requested keys=%s (declared capabilities=%s). This was previously a silent-drop bug; "
+        "now a loud, structured refusal.",
+        adapter_name,
+        unsupported,
+        capabilities,
+    )
+    raise SamplingParamsRefusal(adapter_name, unsupported)
 
 
 @dataclass(frozen=True)
@@ -141,6 +300,7 @@ class PluginAdapter(CLIAdapter):
         task_scope: str = "medium",
         budget_multiplier: float = 1.0,
         system_addendum: str = "",
+        multimodal_context: Any | None = None,
     ) -> SpawnResult:
         """Launch an agent process with the given prompt."""
         ...

@@ -8,17 +8,20 @@ Workflow: `.github/workflows/static-analysis-extended.yml`.
 
 ## TL;DR
 
-| Job          | Tool      | Gate           | SARIF | Where findings show |
-|--------------|-----------|----------------|-------|---------------------|
-| `semgrep`    | Semgrep CE| Fail on new    | Yes   | Security tab        |
-| `trivy-fs`   | Trivy     | Fail HIGH/CRIT | Yes   | Security tab        |
-| `trivy-iac`  | Trivy     | Fail HIGH/CRIT | Yes   | Security tab        |
-| `vulture`    | vulture   | Advisory       | Yes   | Security tab        |
-| `refurb`     | refurb    | Advisory       | Yes   | Security tab        |
-| `perflint`   | pylint+perflint | Advisory | Yes   | Security tab        |
+| Job          | Tool      | Lane                     | Gate           | SARIF | Where findings show |
+|--------------|-----------|--------------------------|----------------|-------|---------------------|
+| `semgrep`    | Semgrep CE| push-to-main / cron      | Fail on new    | Yes   | Security tab        |
+| `trivy-fs`   | Trivy     | push-to-main / cron      | Fail HIGH/CRIT | Yes   | Security tab        |
+| `trivy-iac`  | Trivy     | push-to-main / cron      | Fail HIGH/CRIT | Yes   | Security tab        |
+| `vulture`    | vulture   | weekly cron only         | Advisory       | Yes   | Security tab        |
+| `refurb`     | refurb    | weekly cron only         | Advisory       | Yes (error-level only) | Security tab |
+| `perflint`   | pylint+perflint | weekly cron only   | Advisory       | Yes   | Security tab        |
 
 All jobs run in parallel; total wall-clock is dominated by Semgrep
-(under 5 minutes for the current `src/` tree).
+(under 5 minutes for the current `src/` tree). The advisory
+style-and-hygiene jobs (vulture, refurb, perflint) run on the weekly
+schedule and `workflow_dispatch` only, so the code-scanning alert feed
+stays a security signal (issue #2764).
 
 ## What each tool catches
 
@@ -36,21 +39,27 @@ the surface those tools do not cover.
 
 ## Triggers
 
-- `push` to `main` (path-filtered to source / config / IaC / workflow).
-- `pull_request` (same path filter).
-- Weekly cron Sunday 05:23 UTC as a safety net for dormant findings.
-- `workflow_dispatch` for ad-hoc runs.
+- `push` to `main` (path-filtered to source / config / IaC / workflow):
+  security-signal jobs only.
+- Weekly cron Sunday 05:23 UTC: all jobs, including the advisory
+  vulture / refurb / perflint lane.
+- `workflow_dispatch` for ad-hoc runs: all jobs.
+
+Not on `merge_group`, deliberately: the queue's only required context
+is `CI gate`, so this lane never gated a queue merge, and Code Scanning
+uploads target the run's ref - a merge-queue ref is deleted the moment
+its entry merges or the queue reshuffles, which regularly failed the
+upload after the scan itself had passed. Push-to-main runs scan the
+same commits against a ref that persists.
 
 ## Baseline policy
 
 ### Semgrep
 
-`.semgrep/baseline.yml` records pre-existing findings on `main` for
-transparency and audit. The actual gate is git-baseline based:
-`semgrep scan --baseline-commit=<base-sha>` on pull requests so only
-new findings introduced by the PR fail the job.
+The gate is git-baseline based: `semgrep scan --baseline-commit=<base-sha>`
+on pull requests, so only new findings introduced by the PR fail the job.
 
-To regenerate the snapshot file:
+To list the current findings on any ref:
 
 ```
 uv tool run semgrep scan \
@@ -61,9 +70,6 @@ uv tool run semgrep scan \
     > /tmp/semgrep.json
 ```
 
-Then either update `.semgrep/baseline.yml` by hand or write a small
-script to convert the JSON.
-
 ### Trivy
 
 No baseline. HIGH / CRITICAL findings fail the job immediately;
@@ -71,10 +77,14 @@ findings below that threshold still surface in the Security tab.
 
 ### vulture / refurb / perflint
 
-No baseline; jobs are advisory. SARIF uploads still happen so
-findings unify in Code Scanning. Promote a job to a hard gate by
-removing the trailing `|| true` in the relevant step once the
-existing backlog drops to zero.
+No baseline; jobs are advisory and run on the weekly schedule (plus
+`workflow_dispatch`) only. SARIF uploads still happen so findings
+unify in Code Scanning, with one exception: the refurb upload keeps
+error-level results only, so its style findings do not create
+code-scanning alerts that bury real security findings (issue #2764).
+The full refurb text output stays available as a workflow artifact.
+Promote a job to a hard gate by removing the trailing `|| true` in
+the relevant step once the existing backlog drops to zero.
 
 ## SARIF conversion
 

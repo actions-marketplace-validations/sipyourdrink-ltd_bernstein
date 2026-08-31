@@ -122,7 +122,7 @@ def save_session_state(orch: Any) -> None:
         orch: The orchestrator instance.
     """
     try:
-        from bernstein.core.session import SessionState, save_session
+        from bernstein.core.session import SessionState, read_session_regardless_of_age, save_session
 
         resp = orch._client.get(f"{orch._config.server_url}/tasks")
         resp.raise_for_status()
@@ -137,16 +137,39 @@ def save_session_state(orch: Any) -> None:
 
         done_ids: list[str] = [str(t["id"]) for t in task_list if t.get("status") == "done"]
         pending_ids: list[str] = [str(t["id"]) for t in task_list if t.get("status") in ("claimed", "in_progress")]
+        # Capture still-open tasks too (issue #2798): dropping them made a
+        # resumed run look finished when it had been paused mid-flight.
+        open_ids: list[str] = [str(t["id"]) for t in task_list if t.get("status") == "open"]
+
+        # Carry the goal forward rather than overwriting it. The orchestrator
+        # never sees the goal, so the only copy is the one the run wrote at
+        # start; a stop that rewrote this file with an empty goal is what left
+        # every PR titled from nothing. The read ignores the resume-staleness
+        # window on purpose - a run longer than that window still owns its own
+        # goal. When the file is gone or unreadable there is nothing to carry,
+        # and that is said out loud instead of being written away silently.
+        prior = read_session_regardless_of_age(orch._workdir)
+        carried_goal = prior.goal if prior is not None else ""
+        if not carried_goal:
+            logger.warning(
+                "Session state has no goal to carry forward; the PR this run opens will have none either.",
+            )
 
         state = SessionState(
             saved_at=time.time(),
-            goal="",
+            goal=carried_goal,
             completed_task_ids=done_ids,
             pending_task_ids=pending_ids,
+            open_task_ids=open_ids,
             cost_spent=orch._cost_tracker.spent_usd,
         )
         save_session(orch._workdir, state)
-        logger.info("Session state saved (%d done, %d pending)", len(done_ids), len(pending_ids))
+        logger.info(
+            "Session state saved (%d done, %d pending, %d open)",
+            len(done_ids),
+            len(pending_ids),
+            len(open_ids),
+        )
     except Exception:
         logger.debug("Failed to save session state (best-effort)", exc_info=True)
 
@@ -174,16 +197,29 @@ def cleanup(orch: Any) -> None:
     if orch._audit_mode and orch._audit_log is not None:
         try:
             from bernstein.core.merkle import compute_seal, save_seal
+            from bernstein.core.persistence.chain_checkpoint import record_checkpoint
+            from bernstein.core.security.audit import load_or_create_audit_key
 
             audit_dir = orch._workdir / ".sdd" / "audit"
             merkle_dir = audit_dir / "merkle"
             _tree, seal = compute_seal(audit_dir)
             seal_path = save_seal(seal, merkle_dir)
             logger.info("Merkle audit seal written: %s (root=%s)", seal_path, seal["root_hash"])
+            try:
+                record_checkpoint(audit_dir, seal, key=load_or_create_audit_key())
+            except Exception:
+                # The seal above is written and valid; only the pin did not
+                # advance. Point the operator at the conflict, not the seal.
+                logger.warning(
+                    "Audit checkpoint not advanced on shutdown (seal written to %s); "
+                    "run 'bernstein audit verify' to see the conflict",
+                    seal_path,
+                    exc_info=True,
+                )
         except Exception:
             logger.warning("Merkle seal generation on shutdown failed", exc_info=True)
 
-    # Full git hygiene on shutdown. Never force-delete unmerged branches —
+    # Full git hygiene on shutdown. Never force-delete unmerged branches -
     # agents shutting down may have unpushed work we need to preserve.
     try:
         from bernstein.core.git_hygiene import run_hygiene

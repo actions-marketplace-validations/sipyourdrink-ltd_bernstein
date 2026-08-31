@@ -1,4 +1,4 @@
-"""Git hygiene — mechanical cleanup of worktrees, branches, and stale state.
+"""Git hygiene - mechanical cleanup of worktrees, branches, and stale state.
 
 This module handles ONLY the safe, mechanical operations:
 - Removing stale worktree directories
@@ -6,7 +6,7 @@ This module handles ONLY the safe, mechanical operations:
 - Pruning git worktree registry
 - Cleaning stale PID files
 
-It does NOT commit, merge, or push — those decisions require an intelligent
+It does NOT commit, merge, or push - those decisions require an intelligent
 agent that can review diffs and make judgment calls. The orchestrator spawns
 a dedicated "hygiene" task for that when needed.
 
@@ -145,7 +145,7 @@ def run_hygiene(
             committed to by live agents).
         force_unmerged: **Dangerous.** When True, delete agent branches even
             if they are not merged into ``target_branch``. This is a
-            privileged opt-in — automated periodic/bootstrap/shutdown
+            privileged opt-in - automated periodic/bootstrap/shutdown
             cleanup must never set it. Only an explicit CLI command with a
             ``--force`` flag should pass ``True``.
 
@@ -176,11 +176,14 @@ def run_hygiene(
     # 3. Prune git worktree registry
     run_git(["worktree", "prune"], workdir, timeout=10)
 
+    # 4. Clear stale skip-worktree / assume-unchanged files (e.g. CLAUDE.md from crashed runs, issue #4394)
+    _clean_skip_worktree_files(workdir)
+
     if full:
-        # 4. Drop stale stashes (shutdown only)
+        # 5. Drop stale stashes (shutdown only)
         stats["stash_dropped"] = _drop_stale_stashes(workdir)
 
-        # 5. Clean stale runtime state
+        # 6. Clean stale runtime state
         _clean_stale_runtime(workdir)
 
     total = sum(stats.values())
@@ -216,7 +219,7 @@ def _clean_stale_worktrees(workdir: Path) -> int:
         if not entry.is_dir():
             continue
         if str(entry) not in tracked_paths:  # noqa: SIM102
-            # Stale directory — not tracked by git
+            # Stale directory - not tracked by git
             if _rmtree_windows_safe(entry):
                 cleaned += 1
                 logger.debug("Removed stale worktree dir: %s", entry.name)
@@ -228,7 +231,7 @@ def _is_branch_merged(workdir: Path, branch: str, target_branch: str) -> bool:
     """Return True when *branch* is fully contained in *target_branch*.
 
     Uses ``git merge-base --is-ancestor`` which reports success (exit 0)
-    only when every commit on *branch* is reachable from *target_branch* —
+    only when every commit on *branch* is reachable from *target_branch* -
     i.e. there is no unmerged work that would be lost by deleting *branch*.
 
     Args:
@@ -240,7 +243,7 @@ def _is_branch_merged(workdir: Path, branch: str, target_branch: str) -> bool:
         True iff *branch* is an ancestor of *target_branch*; False when the
         branch still has unique commits or the check could not be run
         (missing target, transient git failure). When in doubt we return
-        False — callers must preserve the branch on uncertainty.
+        False - callers must preserve the branch on uncertainty.
     """
     result = run_git(
         ["merge-base", "--is-ancestor", branch, target_branch],
@@ -263,6 +266,75 @@ def _session_id_from_branch(branch: str) -> str:
     return branch.removeprefix("agent/")
 
 
+def _resolve_run_id(workdir: Path | None = None) -> str:
+    """Resolve active run id from runtime state or generate a fallback timestamp."""
+    if workdir is not None:
+        run_id_file = workdir / ".sdd" / "runtime" / "run.id"
+        if run_id_file.exists():
+            with contextlib.suppress(OSError):
+                val = run_id_file.read_text(encoding="utf-8").strip()
+                if val:
+                    return val
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
+def safe_force_delete_branch(
+    workdir: Path,
+    branch: str,
+    *,
+    target_branch: str = DEFAULT_TARGET_BRANCH,
+    run_id: str | None = None,
+    is_merged: bool | None = None,
+) -> tuple[bool, str | None]:
+    """Safely force-delete a git branch, creating a rescue ref if unmerged (#4677).
+
+    Before force-deleting *branch*, checks whether its tip is an ancestor of
+    *target_branch*. If it is unmerged, creates a rescue ref at
+    ``refs/rescue/<run-id>/<branch>`` so the unmerged work remains recoverable.
+    Merged branches are deleted without creating a rescue ref.
+
+    Args:
+        workdir: Repository root.
+        branch: Branch name to delete (e.g. ``agent/abc123``).
+        target_branch: Target branch to check merge ancestry against (defaults to ``main``).
+        run_id: Run identifier for the rescue ref namespace. If not provided,
+            resolves from runtime state or defaults to a timestamp.
+        is_merged: Optional pre-computed ancestry status. If None, checks ancestry
+            via ``git merge-base --is-ancestor``.
+
+    Returns:
+        ``(deleted, rescue_ref)`` where ``deleted`` is True if the branch was
+        successfully removed, and ``rescue_ref`` is the ref string created if
+        unmerged (or None if merged/failed).
+    """
+    merged = is_merged if is_merged is not None else _is_branch_merged(workdir, branch, target_branch)
+    rescue_ref: str | None = None
+
+    if not merged:
+        eff_run_id = run_id or _resolve_run_id(workdir)
+        rescue_ref = f"refs/rescue/{eff_run_id}/{branch}"
+        update_res = run_git(["update-ref", rescue_ref, branch], workdir, timeout=10)
+        if not update_res.ok:
+            logger.warning(
+                "Failed to create rescue ref %s for unmerged branch %s: refusing to delete unmerged work",
+                rescue_ref,
+                branch,
+            )
+            return False, None
+        logger.info("Rescued unmerged branch %s at %s", branch, rescue_ref)
+
+    del_res = run_git(["branch", "-D", branch], workdir, timeout=10)
+    if del_res.ok:
+        return True, rescue_ref
+
+    logger.warning(
+        "Failed to delete agent branch %s: %s",
+        branch,
+        del_res.stderr.strip() or del_res.stdout.strip(),
+    )
+    return False, rescue_ref
+
+
 def _delete_merged_agent_branches(
     workdir: Path,
     *,
@@ -277,7 +349,7 @@ def _delete_merged_agent_branches(
     1. Its session id is NOT in *active_session_ids* (no live agent is
        committing to it).
     2. Every commit on it is already reachable from *target_branch* (i.e.
-       ``git merge-base --is-ancestor`` succeeds) — unless *force_unmerged*
+       ``git merge-base --is-ancestor`` succeeds) - unless *force_unmerged*
        is explicitly True.
 
     Args:
@@ -291,7 +363,7 @@ def _delete_merged_agent_branches(
             that explicitly opt in; automated cleanup MUST leave this False.
 
     Returns:
-        ``(deleted_count, skipped_count)`` — skipped counts branches that
+        ``(deleted_count, skipped_count)`` - skipped counts branches that
         were preserved because they were unmerged or in use.
     """
     result = run_git(["branch", "--list", "agent/*"], workdir, timeout=10)
@@ -305,11 +377,11 @@ def _delete_merged_agent_branches(
         if not branch.startswith("agent/"):
             continue
 
-        # Guard 1: live agents own these branches — never touch them.
+        # Guard 1: live agents own these branches - never touch them.
         session_id = _session_id_from_branch(branch)
         if session_id in active_session_ids:
             logger.info(
-                "Preserving agent branch %s — session %s is active",
+                "Preserving agent branch %s - session %s is active",
                 branch,
                 session_id,
             )
@@ -320,7 +392,7 @@ def _delete_merged_agent_branches(
         merged = _is_branch_merged(workdir, branch, target_branch)
         if not merged and not force_unmerged:
             logger.warning(
-                "Preserving unmerged agent branch %s — not an ancestor of %s; "
+                "Preserving unmerged agent branch %s - not an ancestor of %s; "
                 "pass force_unmerged=True via a privileged CLI path to override",
                 branch,
                 target_branch,
@@ -328,17 +400,28 @@ def _delete_merged_agent_branches(
             skipped += 1
             continue
 
-        del_args = ["branch", "-D"] if (force_unmerged and not merged) else ["branch", "-d"]
-        del_result = run_git([*del_args, branch], workdir, timeout=10)
+        if force_unmerged and not merged:
+            del_ok, rescue_ref = safe_force_delete_branch(
+                workdir,
+                branch,
+                target_branch=target_branch,
+                is_merged=merged,
+            )
+            if del_ok:
+                deleted += 1
+                logger.warning(
+                    "Force-deleted UNMERGED agent branch %s (rescued at %s)",
+                    branch,
+                    rescue_ref,
+                )
+            else:
+                skipped += 1
+            continue
+
+        del_result = run_git(["branch", "-d", branch], workdir, timeout=10)
         if del_result.ok:
             deleted += 1
-            if merged:
-                logger.info("Deleted merged agent branch: %s", branch)
-            else:
-                logger.warning(
-                    "Force-deleted UNMERGED agent branch %s (force_unmerged=True)",
-                    branch,
-                )
+            logger.info("Deleted merged agent branch: %s", branch)
         else:
             logger.warning(
                 "Failed to delete agent branch %s: %s",
@@ -381,3 +464,54 @@ def _clean_stale_runtime(workdir: Path) -> None:
     if agents_json.exists():
         with contextlib.suppress(OSError):
             agents_json.unlink()
+
+
+def _clean_skip_worktree_files(workdir: Path) -> int:
+    """Clear stale skip-worktree / assume-unchanged bits and restore tracked files to HEAD.
+
+    Interrupted runs leave task-specific CLAUDE.md files with the skip-worktree
+    bit set in git's index, making them invisible to ``git status`` and immune to
+    ``git reset --hard`` / ``git clean -fd`` (#4394). This sweeps ``git ls-files -v``
+    for 'S'/'s' entries, clears the bit, and checks out the HEAD version.
+    """
+    result = run_git(["ls-files", "-v"], workdir, timeout=10)
+    restored = 0
+    if result.ok and result.stdout.strip():
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                continue
+            flag, rel_path = parts[0], parts[1].strip()
+            if flag in ("S", "s"):
+                if flag == "S":
+                    run_git(["update-index", "--no-skip-worktree", rel_path], workdir, timeout=10)
+                else:
+                    run_git(["update-index", "--no-assume-unchanged", rel_path], workdir, timeout=10)
+                run_git(["checkout", "HEAD", "--", rel_path], workdir, timeout=10)
+                restored += 1
+                logger.info(
+                    "Cleared stale %s flag on %s and restored from HEAD",
+                    "skip-worktree" if flag == "S" else "assume-unchanged",
+                    rel_path,
+                )
+
+    # Also restore CLAUDE.md if it was left modified with an agent shim header
+    claude_md = workdir / "CLAUDE.md"
+    if claude_md.exists():
+        try:
+            header = claude_md.read_text(encoding="utf-8", errors="ignore")[:300]
+            if (
+                header.startswith("# Bernstein Agent:")
+                or "This file was auto-generated by Bernstein for this agent session." in header
+            ):
+                run_git(["update-index", "--no-skip-worktree", "CLAUDE.md"], workdir, timeout=10)
+                run_git(["checkout", "HEAD", "--", "CLAUDE.md"], workdir, timeout=10)
+                restored += 1
+                logger.info("Restored agent-shim CLAUDE.md to HEAD in %s", workdir)
+        except OSError as exc:
+            logger.debug("Failed reading CLAUDE.md during hygiene: %s", exc)
+
+    return restored

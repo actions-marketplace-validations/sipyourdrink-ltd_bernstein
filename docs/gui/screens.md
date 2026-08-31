@@ -1,6 +1,6 @@
 ---
 title: Screens
-description: One section per route — what data it shows, what actions it supports, which TUI widget it replaces.
+description: One section per route - what data it shows, what actions it supports, which TUI widget it replaces.
 tags:
   - gui
   - reference
@@ -8,13 +8,27 @@ tags:
 
 # Screens
 
-Five routes. Source: `web/src/routes/`. Design reference: `.sdd/backlog/open/frontend/design_handoff_bernstein_phase1/README.md` §6.
+Eight routes. Source: `web/src/routes/`. Design tokens: `web/src/index.css`.
 
 ## Screenshots
 
 ![Tasks page with Diff drawer open](../assets/webui-agents-diffs.png)
 
 ![Agents grid with token meter drawer](../assets/webui-agents-panel.png)
+
+![Tasks — empty state, filter chips and Run new task button](../assets/webui-tasks.png)
+
+![Agents — agent card grid view](../assets/webui-agents.png)
+
+![Approvals — empty approvals queue](../assets/webui-approvals.png)
+
+![Audit — audit log with chain status and filters](../assets/webui-audit.png)
+
+![Costs — KPI cards, sparkline and by-adapter table](../assets/webui-costs.png)
+
+![Fleet — fleet management scaffold](../assets/webui-fleet.png)
+
+![Settings — settings placeholder screen](../assets/webui-settings.png)
 
 ## Tasks (`/ui/tasks`, default route)
 
@@ -23,7 +37,7 @@ Five routes. Source: `web/src/routes/`. Design reference: `.sdd/backlog/open/fro
 - **Data shown:** task ID, title + branch, agent, role pill, duration (color-coded if stalled), progress bar, cost.
 - **Filter chips:** All · Running · Queued · Stalled · Done · 24h · Failed (with counts).
 - **Operator search syntax:** mono input parses `agent:` / `status:` / `role:` token prefixes.
-- **Drawer tabs:** Summary · Diff · Gates · Logs · Deps · Trace.
+- **Drawer tabs:** Summary · Diff · Gates · Logs · Deps · Trace · Steer (Steer disabled with a reason on terminal tasks).
 - **Actions:** Cancel run · Re-run · Change model · Change role · Kill session.
 - **Endpoints:** `GET /api/v1/tasks?status=&agent=&page=`, `POST /api/v1/tasks/{id}/{cancel,retry,prioritize,kill}`, `POST /api/v1/tasks/batch-ops`. SSE: `task_update`, `task_progress` over `/api/v1/events`.
 - **Replaces TUI widget:** `task_list.py` + `task_detail_overlay.py` + `dependency_graph.py`.
@@ -51,22 +65,31 @@ Five routes. Source: `web/src/routes/`. Design reference: `.sdd/backlog/open/fro
 
 ## Audit (`/ui/audit`)
 
-- **Source:** `web/src/routes/Audit.tsx` (when present; otherwise scaffolded).
+- **Source:** `web/src/routes/Audit.tsx`.
 - **Layout:** single column, full-width.
-- **Chain status banner:** 4-col card grid — chain status (verified), head (#ID + truncated hash), Sigstore anchor (rekor entry), rotated (age + chunk).
+- **Chain status banner:** 4-col card grid - chain status (verified), head (#ID + truncated hash), Sigstore anchor (rekor entry), rotated (age + chunk).
 - **Filters bar:** search · actor · action · time, separated by hairline dividers, mono uppercase labels above each value, "Reset" ghost button on right.
 - **Table:** Timestamp (ISO mono, color-coded operator vs system) · Actor · Action · Resource · Hash (mono truncated `…`) · Chain status icon (verified / rebuilt).
 - **Verify chain modal:** triggered by primary "Verify chain". Shows last verified head, walked range, sigstore transparency anchor pointer, "Re-verify from chunk #" button.
 - **Endpoints:** `GET /api/v1/audit?event_type=&search=&from=&to=&page=&page_size=` → `{items,total,page,page_size}`. Export: `POST /api/v1/audit/export?format=csv|jsonl`.
-- **Replaces TUI widget:** none — audit chain inspection had no TUI surface.
+- **Replaces TUI widget:** none - audit chain inspection had no TUI surface.
 
 ## Costs (`/ui/costs`)
 
-- **Source:** `web/src/routes/Costs.tsx` (when present; otherwise scaffolded).
+- **Source:** `web/src/routes/Costs.tsx`.
 - **Layout:** single column, fluid grid.
-- **Top KPI row:** 4 cards (`1fr 1fr 1fr 1.4fr`) — today · 7 d · projected month · daily-budget gauge with 5 px progress bar.
+- **Top KPI row:** 4 cards (`1fr 1fr 1fr 1.4fr`) - today · 7 d · projected month · daily-budget gauge with 5 px progress bar.
 - **24 h sparkline:** recharts `<BarChart>`, 8 px bars / 2 px gap, last bar full accent. Dashed gridlines at 25 / 50 / 75 %. Mono x-axis labels (`−24h / −18h / −12h / −6h / now`).
 - **By-adapter table:** Adapter (mono) · Calls · Tokens · Cost · Share (progress + %) · Δ 7 d (mono colored: green if reduced, warning if > +20 %).
 - **Top 10 tasks:** index column (mono `01`–`10`) · title + agent meta · cost (mono bold right).
 - **Endpoints:** `GET /api/v1/costs/current`, `/costs/history`, `/costs/by-tag`, `/costs/forecast`. Live ticks: `GET /api/v1/events/cost`.
 - **Replaces TUI widget:** `cost_sparkline.py`.
+
+## Missions (`/ui/missions`)
+
+- **Source:** `web/src/routes/Missions.tsx`.
+- **What it shows:** the outcome-level timeline over a multi-day run - phase lanes with per-phase state, gate receipt, and envelope burn.
+- **Provenance:** every element links to the receipt / evidence bundle it was derived from; the `mission_status_hash` is shown so two operators can confirm they are looking at the same state.
+- **Unverified state:** when work-ledger chain verification fails (`ledger_verified === false`) the screen switches to an explicit unverified banner instead of best-effort rendering.
+- **Endpoints:** `GET /api/v1/missions/*` (`src/bernstein/core/routes/missions.py`) - a deterministic projection folded from the mission's work-ledger chain; the server holds no mission-side state.
+- **Replaces TUI widget:** none - mission timelines had no TUI surface.

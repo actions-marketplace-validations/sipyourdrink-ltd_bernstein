@@ -22,8 +22,11 @@ Usage::
 
 from __future__ import annotations
 
+import ast
 import importlib
+import inspect
 import json
+import textwrap
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -208,7 +211,7 @@ class StrategyDeclarationError(AssertionError):
     """Raised when a shipped adapter is missing its strategy declaration.
 
     Issue #1627 AC #2: every adapter under the registry must declare its
-    resume / dangerous-mode / event-channel strategy. A missing row in
+    resume / dangerous-mode / event-channel / output-mode strategy. A missing row in
     :data:`bernstein.adapters._contract.STRATEGY_MATRIX` is a hard failure
     surfaced by :func:`assert_strategies_declared`.
     """
@@ -238,7 +241,150 @@ def assert_strategies_declared(adapter_names: list[str] | None = None) -> None:
     if missing:
         raise StrategyDeclarationError(
             "adapters missing a strategy declaration in STRATEGY_MATRIX "
-            f"(resume / dangerous-mode / event-channel): {', '.join(missing)}"
+            f"(resume / dangerous-mode / event-channel / output-mode): {', '.join(missing)}"
+        )
+
+
+class SystemAddendumDeclarationError(AssertionError):
+    """Raised when an adapter's ``system_addendum`` handling contradicts its declaration.
+
+    Issue #4256: the delivery bucket is declared in
+    :data:`bernstein.adapters._contract.SYSTEM_ADDENDUM_CHANNEL_MATRIX`, not in
+    docstring prose. This is the check that keeps the declaration honest: an
+    adapter that starts (or stops) delivering the addendum without moving its
+    row fails here instead of failing three minutes into a run, when the
+    supervisor gives up waiting for signals the agent was never told to emit.
+    """
+
+
+def _own_spawn_source(entry: type[CLIAdapter] | CLIAdapter) -> str | None:
+    """Return the source of the ``spawn`` implementation an adapter actually uses.
+
+    Walks the MRO to the class that defines ``spawn`` and unwraps the
+    base-class preflight wrapper, so a subclass inheriting its parent's spawn
+    is checked against the parent's body rather than reported as missing.
+
+    Args:
+        entry: A registry entry - an adapter class or a pre-built instance.
+
+    Returns:
+        The defining implementation's source, or ``None`` when it cannot be
+        retrieved (dynamically generated code, a C extension, a stripped
+        install). An unreadable adapter is skipped, never failed.
+    """
+    cls = entry if isinstance(entry, type) else type(entry)
+    for klass in cls.__mro__:
+        spawn = klass.__dict__.get("spawn")
+        if spawn is None:
+            continue
+        try:
+            return inspect.getsource(inspect.unwrap(spawn))
+        except (OSError, TypeError):
+            return None
+    return None
+
+
+def _spawn_body_uses_addendum(source: str) -> bool | None:
+    """Whether a ``spawn`` implementation references ``system_addendum`` in its body.
+
+    The parameter list and the docstring do not count - both are present on
+    every adapter, which is exactly why the docstring never distinguished a
+    delivering adapter from a discarding one.
+
+    Args:
+        source: Source text of one ``spawn`` implementation.
+
+    Returns:
+        ``True``/``False`` for a parseable implementation, ``None`` when the
+        source cannot be parsed into a function definition.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if "system_addendum" not in {a.arg for a in node.args.args + node.args.kwonlyargs}:
+            continue
+        body = node.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]
+        for stmt in body:
+            for child in ast.walk(stmt):
+                if isinstance(child, ast.Name) and child.id == "system_addendum":
+                    return True
+                if isinstance(child, ast.keyword) and child.arg == "system_addendum":
+                    return True
+        return False
+    return None
+
+
+def system_addendum_channel_discrepancies(
+    adapter_entries: list[tuple[str, type[CLIAdapter] | CLIAdapter]] | None = None,
+) -> list[str]:
+    """Return one message per adapter whose spawn contradicts its declared channel.
+
+    A declared delivering adapter (system-prompt or prompt-append channel) must
+    reference ``system_addendum`` in its ``spawn`` body; a declared-ignoring
+    adapter must not. Adapters whose source cannot be read or parsed are
+    skipped rather than reported.
+
+    Args:
+        adapter_entries: ``(name, class-or-instance)`` pairs to check. When
+            ``None`` the live registry is enumerated.
+
+    Returns:
+        Human-readable discrepancy messages, empty when every adapter matches
+        its declaration.
+    """
+    from bernstein.adapters._contract import SystemAddendumChannel, system_addendum_channel
+
+    if adapter_entries is None:
+        from bernstein.adapters.registry import iter_adapter_specs
+
+        adapter_entries = list(iter_adapter_specs())
+
+    failures: list[str] = []
+    for name, entry in adapter_entries:
+        source = _own_spawn_source(entry)
+        if source is None:
+            continue
+        uses = _spawn_body_uses_addendum(source)
+        if uses is None:
+            continue
+        channel = system_addendum_channel(name)
+        declared_delivering = channel is not SystemAddendumChannel.IGNORED
+        if declared_delivering and not uses:
+            failures.append(
+                f"{name}: declared {channel} but its spawn() body never reads system_addendum - "
+                "the completion/heartbeat instructions are dropped"
+            )
+        elif not declared_delivering and uses:
+            failures.append(
+                f"{name}: declared {channel} but its spawn() body does read system_addendum - "
+                "declare the channel it delivers on"
+            )
+    return failures
+
+
+def assert_system_addendum_channels_declared(
+    adapter_entries: list[tuple[str, type[CLIAdapter] | CLIAdapter]] | None = None,
+) -> None:
+    """Fail when any adapter's ``system_addendum`` handling contradicts its declaration.
+
+    Args:
+        adapter_entries: ``(name, class-or-instance)`` pairs to check; the live
+            registry when ``None``.
+
+    Raises:
+        SystemAddendumDeclarationError: One or more adapters disagree with
+            their declared channel. The message lists every offender.
+    """
+    failures = system_addendum_channel_discrepancies(adapter_entries)
+    if failures:
+        raise SystemAddendumDeclarationError(
+            f"adapters whose system_addendum handling contradicts SYSTEM_ADDENDUM_CHANNEL_MATRIX: {'; '.join(failures)}"
         )
 
 
@@ -278,6 +424,55 @@ def check_terminal_signal(stdout_lines: list[str], *, run_id: str) -> MissingTer
     if has_terminal_signal(signals):
         return None
     return MissingTerminalSignal(f"adapter run {run_id!r} did not emit a terminal stream signal (COMPLETED or FAILED)")
+
+
+# ---------------------------------------------------------------------------
+# ACP lifecycle conformance (event-schema fixtures)
+# ---------------------------------------------------------------------------
+#
+# For adapters that declare EventChannel.ACP, lifecycle conformance is an
+# event-schema fixture - a recorded sequence of JSON-RPC frames - rather than
+# a pinned stdout golden transcript. The frames are replayed through the same
+# schema-validated, content-addressed client transport an ACP adapter uses at
+# runtime, so the fixture proves the exact ingress path the adapter relies on
+# and shrinks the conformance surface: no text transcript the upstream CLI
+# never promised to keep stable.
+
+
+def load_acp_event_fixture(path: Path) -> list[bytes]:
+    """Load an ACP lifecycle fixture as a list of raw JSON-RPC frame lines.
+
+    Args:
+        path: Path to a ``*.jsonl`` fixture, one JSON-RPC frame per line.
+
+    Returns:
+        The non-empty lines as UTF-8 bytes (trailing newline included), ready
+        to feed to :func:`bernstein.core.protocols.acp.client.drive_acp_lifecycle`.
+    """
+    return [(raw + "\n").encode("utf-8") for raw in path.read_text(encoding="utf-8").splitlines() if raw.strip()]
+
+
+def replay_acp_event_fixture(path: Path, *, sdd_dir: Path) -> Any:
+    """Replay an ACP lifecycle fixture through the content-addressed transport.
+
+    Validates every frame at the schema boundary and journals each event
+    content-addressed into a fresh run journal under *sdd_dir*, then returns
+    the lifecycle result. A malformed frame raises ``ACPSchemaError`` (the
+    conformance failure mode for an ACP adapter), mirroring runtime ingress.
+
+    Args:
+        path: Path to a ``*.jsonl`` event-schema fixture.
+        sdd_dir: Directory to anchor the throwaway run journal under.
+
+    Returns:
+        A :class:`bernstein.core.protocols.acp.client.AcpLifecycleResult`.
+    """
+    from bernstein.core.protocols.acp.client import ACPEventJournalSink, drive_acp_lifecycle
+    from bernstein.core.replay.journal import EventJournal
+
+    journal = EventJournal(f"acp-conf-{path.stem}", sdd_dir)
+    sink = ACPEventJournalSink(journal)
+    return drive_acp_lifecycle(load_acp_event_fixture(path), sink)
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +625,7 @@ class ConformanceHarness:
                     f"log_path {result.log_path!s} does not end with expected suffix {step.expected_log_suffix!r}"
                 ),
             )
-        return StepResult(step_index=step_index, passed=True, message=f"OK — pid={result.pid}")
+        return StepResult(step_index=step_index, passed=True, message=f"OK - pid={result.pid}")
 
     def replay_step(
         self,
@@ -575,6 +770,9 @@ class {class_name}(CLIAdapter):
         mcp_config: dict[str, Any] | None = None,
         timeout_seconds: int = 1800,
         task_scope: str = "medium",
+        budget_multiplier: float = 1.0,
+        system_addendum: str = "",
+        multimodal_context: Any | None = None,
     ) -> SpawnResult:
         """Launch {cli_name} with the given prompt.
 
@@ -585,10 +783,15 @@ class {class_name}(CLIAdapter):
             session_id: Unique session identifier.
             mcp_config: Optional MCP tool configuration.
             timeout_seconds: Maximum runtime before kill.
+            task_scope: Task scope for adapters that support budget caps.
+            budget_multiplier: Scope budget multiplier.
+            system_addendum: Extra system prompt text for adapters that support it.
+            multimodal_context: Optional multimodal attachments.
 
         Returns:
             SpawnResult with PID and log path.
         """
+        self.refuse_multimodal_if_needed(multimodal_context)
         log_path = workdir / f"{adapter_id}-{{session_id}}.log"
         cmd = ["{cli_command}", "--prompt", prompt]
         proc = subprocess.Popen(

@@ -10,6 +10,10 @@ Thresholds:
 - 30 days  -> soft warning (printed, exit 0)
 - 60 days  -> hard fail when invoked with ``--strict`` (exit 1)
 
+An inventory entry whose file is not on disk fails on every invocation,
+``--strict`` or not: unlike a stale date, a path that no longer exists is
+silently checking nothing and does not fix itself with time.
+
 The strict mode is intended for the push-to-main branch of the
 ``docs-drift`` workflow under a non-required check name
 ``docs-data-freshness``; the soft mode is intended for pull-request runs.
@@ -39,10 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # inventory table in docs/playbooks/docs-drift.md.
 INVENTORY: tuple[str, ...] = (
     "README.md",
-    "docs/adapter-deferred.md",
     "docs/llm-citation-surface.md",
-    "docs/compare/bernstein-vs-github-agent-hq.md",
-    "docs/compare/index.html",
 )
 
 SOFT_THRESHOLD_DAYS = 30
@@ -61,6 +62,18 @@ def _parse_date(token: str) -> date | None:
         return datetime.strptime(token, "%Y-%m-%d").date()
     except ValueError:
         return None
+
+
+def missing_inventory_entries() -> list[str]:
+    """Return the inventory entries whose file is not on disk.
+
+    ``_scan_file`` used to return an empty result for a path that does not
+    exist, so a renamed or deleted doc quietly stopped being checked while the
+    script kept reporting that every marker was fresh. A missing entry is
+    either a stale list entry to remove or a file that went missing; both need
+    a human, and neither resolves itself the way a stale date does.
+    """
+    return [rel_path for rel_path in INVENTORY if not (REPO_ROOT / rel_path).exists()]
 
 
 def _scan_file(rel_path: str, today: date) -> list[tuple[int, str, int]]:
@@ -102,6 +115,21 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         today = parsed_today
 
+    missing = missing_inventory_entries()
+    if missing:
+        print(f"::group::data-freshness missing inventory entries ({len(missing)})")
+        for rel_path in missing:
+            print(f"::error file=scripts/check_data_freshness.py::inventory entry has no file on disk: {rel_path}")
+        print("::endgroup::")
+        print(
+            f"data-freshness: {len(missing)} inventory entry/entries point at a file that "
+            "does not exist, so those paths are not being checked at all. Remove the stale "
+            "entry from INVENTORY (and the table in docs/playbooks/docs-drift.md), or "
+            "restore the file.",
+            file=sys.stderr,
+        )
+        return 1
+
     soft_hits: list[tuple[str, int, str, int]] = []
     hard_hits: list[tuple[str, int, str, int]] = []
 
@@ -121,8 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     if soft_hits:
         print(f"::group::data-freshness soft warning (>= {SOFT_THRESHOLD_DAYS} days)")
         for rel_path, line_no, line_text, age_days in soft_hits:
-            print(f"::warning file={rel_path},line={line_no}::"
-                  f"{age_days} days old: {line_text}")
+            print(f"::warning file={rel_path},line={line_no}::{age_days} days old: {line_text}")
         print("::endgroup::")
 
     if not soft_hits and not hard_hits:
