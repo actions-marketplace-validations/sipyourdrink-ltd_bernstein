@@ -55,36 +55,36 @@ dependencies = [
     # through the ``include_router`` wrappers FastAPI keeps from 0.137 onward,
     # so it resolves the same templates on both sides of that change.
     # ``tests/unit/test_route_table.py`` holds the floor.
-    "fastapi>=0.115",
+    "fastapi>=0.146.0",
     # Direct floor for the Starlette ASGI layer so the resolved lockfile stays
     # above PYSEC-2026-161 even when pulled through FastAPI or MCP.
-    "starlette>=1.0.1",
-    "uvicorn>=0.30",
+    "starlette>=1.9.0",
+    "uvicorn>=0.54.0",
     "httpx>=0.27",
-    "cryptography>=50.0.0",
+    "cryptography>=50.0.2",
     "pyyaml>=6.0",
     "rich>=13.0",
     "textual>=1.0",
-    "click>=8.3.3",
+    "click>=8.5.0",
     "openai>=2.36.0",
-    "pydantic-settings>=2.13.1",
-    "python-dotenv>=1.2.2",
-    "setproctitle>=1.3",
+    "pydantic-settings>=2.16.0",
+    "python-dotenv>=1.2.4",
+    "setproctitle>=1.3.8",
     "prometheus-client>=0.21",
-    "pluggy>=1.5",
+    "pluggy>=1.7.0",
     "mcp>=1.28.1,<2",
     "watchdog>=4.0",
-    "opentelemetry-api>=1.41.1",
+    "opentelemetry-api>=1.45.1",
     "opentelemetry-sdk>=1.41.1",
     "opentelemetry-exporter-otlp>=1.41.1",
     "pillow>=12.3.0",
     "pyfiglet>=1.0",
     "terminaltexteffects>=0.11",
-    "websockets>=14.0",
+    "websockets>=17.2",
     # SAML XML signature verification. Pure-Python via lxml+cryptography.
     # Required to validate IdP assertions in src/bernstein/core/security/auth.py;
     # enabling SAML without this library installed is a hard error.
-    "signxml>=4.0",
+    "signxml>=5.2.0",
     # Hardened XML parser. Used in src/bernstein/core/security/auth.py to
     # parse SAML assertions without expanding internal entities. Mitigates
     # billion-laughs / quadratic-blowup DoS on unauthenticated IdP responses.
@@ -109,7 +109,7 @@ dependencies = [
     # MIT-licensed; deterministic-encoding mode gives byte-identical receipt
     # replay. Used by ``bernstein.core.security.audit_receipt`` and the
     # standalone ``tools/verify_audit_receipt.py`` verifier.
-    "cbor2>=5.6",
+    "cbor2>=6.1.5",
     # Pure-Python PDF generation for the EU AI Act Article 12 evidence pack
     # rendered by `bernstein compliance pack`. MIT-licensed, no native deps.
     # Used exclusively by ``bernstein.core.compliance.article12``.
@@ -123,7 +123,7 @@ dependencies = [
     # Pulled in transitively by httpx / anyio. Pin directly to >=3.15 so we
     # stay above the CVE-2026-45409 floor regardless of which transitive
     # owner resolves first; pip-audit gates the production closure on this.
-    "idna>=3.15",
+    "idna>=3.20",
     # PEP 440 version parsing/comparison. Imported directly at runtime by the
     # ``bernstein doctor`` last-green advisory (``cli/commands/doctor_cmd.py``)
     # and the adapter security-floor / advisory gates
@@ -155,29 +155,29 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-benchmark>=4.0",
     "pytest-timeout>=2.4.0",
-    "hypothesis>=6.100",
+    "hypothesis>=6.170.2",
     "respx>=0.22",
-    "ruff>=0.9",
-    "pyright>=1.1",
+    "ruff>=0.17.1",
+    "pyright>=1.1.414",
     # Declared so `uv run mypy` resolves the project interpreter instead of
     # falling through to whatever `mypy` sits on PATH. A PATH mypy bound to
     # Python < 3.12 cannot parse PEP 695 `type` aliases and aborts the run.
-    "mypy>=1.18.2",
-    "import-linter>=2.0",  # Architecture contracts (`uv run lint-imports`)
+    "mypy>=2.4.0",
+    "import-linter>=2.15",  # Architecture contracts (`uv run lint-imports`)
     # CI hardening 2026 - see docs/contributing/testing.md.
-    "schemathesis>=4.18.1",  # OpenAPI fuzz / contract sweep on FastAPI app
-    "crosshair-tool>=0.0.95",  # Concolic execution on pure security fns
+    "schemathesis>=4.32.0",  # OpenAPI fuzz / contract sweep on FastAPI app
+    "crosshair-tool>=0.0.111",  # Concolic execution on pure security fns
     "bandit>=1.8",  # Static security analyzer (HIGH-severity gate)
     "pip-audit>=2.7",  # PyPI dep CVE scanner (production strict)
-    "beartype>=0.21",  # Test-time runtime type enforcement
-    "syrupy>=4.6",  # Snapshot testing for JSONL/audit/prompt drift
-    "diff-cover>=9.0",  # Per-PR diff coverage gate
+    "beartype>=0.23.1",  # Test-time runtime type enforcement
+    "syrupy>=6.1.1",  # Snapshot testing for JSONL/audit/prompt drift
+    "diff-cover>=10.6.0",  # Per-PR diff coverage gate
     # PDF re-parse for tests that assert reportlab-emitted Article 12
     # PDFs are well-formed (tests/unit/compliance/test_article12.py).
     # Floor raised to the patched release for CVE-2026-59935 (fixed
     # 6.14.2) and CVE-2026-59936 (fixed 6.14.1): crafted-PDF inline-image
     # denial of service.
-    "pypdf>=6.14.2",
+    "pypdf>=6.21.1",
     # Resource-leak / RSS / fd-count probes for the TC-C stress suite
     # (tests/stress/*). Pure-Python wrappers around platform APIs, MIT-
     # licensed, no native compile required. Tests degrade gracefully when
@@ -193,7 +193,7 @@ dev = [
     "pytest-xflaky>=1.0.3",
     "pytest-json-report>=1.5",
     # TRACE 0.2 Trust Record emitter tests.
-    "agentrust-trace-tests>=0.5,<0.6",
+    "agentrust-trace-tests>=0.6.2,<0.7",
     # Error-telemetry SDK for the operator-managed Sentry-protocol-compatible
     # error sink. Imported lazily in src/bernstein/cli/main.py and only
     # initialised when BERNSTEIN_TELEMETRY_DSN is set. Kept in dev so the
@@ -207,7 +207,7 @@ dev = [
     "croniter>=6.0",
     # Rendering-fetcher tests (#3120) exercise the headless browser against
     # a local fixture server. Runtime extra: bernstein[research-render].
-    "playwright>=1.62.0",
+    "playwright>=1.64.0",
     # NOTE: semgrep is intentionally NOT a dev dep. Its transitive pins
     # (click<8.2, opentelemetry-sdk<1.38) collide with our production
     # floors (click>=8.3.3, opentelemetry-sdk>=1.41.1). Install via
@@ -227,14 +227,14 @@ dev = [
     "types-psutil>=7.2.2.20260518",  # psutil
     "types-croniter>=6.2.4.20260711",  # croniter
     "types-qrcode>=8.2.0.20260518",  # qrcode (gui extra)
-    "types-grpcio>=1.82.1.20260724",  # grpcio (grpc extra)
+    "types-grpcio>=1.84.0.20260928",  # grpcio (grpc extra)
     "types-grpcio-reflection>=1.0.0.20260508",  # grpcio-reflection (grpc extra)
     "lxml-stubs>=0.5.1",  # lxml, via signxml (SAML assertion parsing)
-    "boto3-stubs>=1.43.56",  # boto3 (s3 / r2 extras), published by the mypy_boto3 project
-    "botocore-stubs>=1.43.14",  # botocore, same publisher
+    "boto3-stubs>=1.43.114",  # boto3 (s3 / r2 extras), published by the mypy_boto3 project
+    "botocore-stubs>=1.43.114",  # botocore, same publisher
 ]
-grpc = ["grpcio>=1.68", "grpcio-tools>=1.68", "grpcio-reflection>=1.68", "protobuf>=7.35.1"]
-voice = ["faster-whisper>=1.0.0", "sounddevice>=0.4.0", "numpy>=1.20.0"]
+grpc = ["grpcio>=1.84.0", "grpcio-tools>=1.84.0", "grpcio-reflection>=1.84.0", "protobuf>=7.35.1"]
+voice = ["faster-whisper>=1.0.0", "sounddevice>=0.4.0", "numpy>=2.5.4"]
 k8s = ["kubernetes>=35.0.0"]
 # SPIFFE/SPIRE workload-identity integration
 # (src/bernstein/core/identity/spiffe/workload_api.py). The py-spiffe SDK talks
@@ -242,8 +242,8 @@ k8s = ["kubernetes>=35.0.0"]
 # default self-contained Ed25519 identity path stays dependency-free and works
 # with a truthy regression suite when the extra is absent. Enable with:
 #   pip install 'bernstein[spiffe]'
-spiffe = ["spiffe>=0.2"]
-ml = ["scikit-learn>=1.5"]
+spiffe = ["spiffe>=0.3.2"]
+ml = ["scikit-learn>=1.9.1"]
 # Browser activity driver (src/bernstein/core/orchestration/browser_driver.py).
 # Declared empty (like `graphics` below) so a default install and the project
 # lock stay lean and license-clean: the live `browser-use` backend pulls a large
@@ -262,15 +262,15 @@ openai = ["openai-agents>=0.4.0"]
 # Sandbox backend extras. Each pulls in the provider SDK for the
 # corresponding SandboxBackend. Kept optional so minimal installs stay lean.
 docker = ["docker>=7.1.0"]
-e2b = ["e2b-code-interpreter>=1.0"]
-modal = ["modal>=1.4.2"]
+e2b = ["e2b-code-interpreter>=2.11.0"]
+modal = ["modal>=1.6.2"]
 # Cloud artifact storage sinks. Each extra pulls in the provider SDK
 # needed by the corresponding ArtifactSink. Kept optional so local-only
 # installs stay lean. R2 reuses boto3 under the hood.
-s3 = ["boto3>=1.43.6"]
-gcs = ["google-cloud-storage>=3.10.1"]
-azure = ["azure-storage-blob>=12.20"]
-r2 = ["boto3>=1.43.6"]
+s3 = ["boto3>=1.43.114"]
+gcs = ["google-cloud-storage>=3.17.1"]
+azure = ["azure-storage-blob>=12.31.0"]
+r2 = ["boto3>=1.43.114"]
 # Chat-control bridge backends. Enable with:
 #   pip install 'bernstein[telegram]'
 # Standard Telegram bot integration via long-poll: configure the bot
@@ -282,7 +282,7 @@ telegram = ["python-telegram-bot>=22.7"]
 # enable Socket Mode, and set ``BERNSTEIN_SLACK_TOKEN`` (xoxb-...) plus
 # ``BERNSTEIN_SLACK_APP_TOKEN`` (xapp-...) before invoking ``bernstein
 # chat serve --platform=slack``.
-slack = ["slack-sdk>=3.27", "aiohttp>=3.9"]
+slack = ["slack-sdk>=3.45.0", "aiohttp>=3.14.5"]
 # Discord bidirectional driver over the gateway. Enable with:
 #   pip install 'bernstein[discord]'
 # Configure a Discord bot application in the developer portal, copy the
@@ -294,19 +294,19 @@ discord = ["discord.py>=2.4"]
 # Register a bot in the Azure Bot Service, copy the app id and password, and
 # set ``BERNSTEIN_TEAMS_TOKEN`` (app id) plus ``BERNSTEIN_TEAMS_APP_PASSWORD``
 # (client secret) before invoking ``bernstein chat serve --platform=teams``.
-teams = ["botbuilder-core>=4.15", "aiohttp>=3.9"]
+teams = ["botbuilder-core>=4.15", "aiohttp>=3.14.5"]
 # Contamination-resistant eval harness (SWE-bench Pro / Terminal-Bench 2.0 /
 # SWE-rebench). Kept optional so production installs don't pull HuggingFace
 # datasets unless the operator opts into the nightly leaderboard path.
 # Enable with: pip install 'bernstein[eval]'
-eval = ["datasets>=4.8.5", "huggingface-hub>=0.24"]
+eval = ["datasets>=5.1.0", "huggingface-hub>=0.24"]
 # Web GUI (Vite + React SPA + FastAPI mount). Static assets ship with the
 # wheel under src/bernstein/gui/static/ (see artifacts). Python deps stay
 # minimal so TUI users keep zero overhead. Enable with:
 #   pip install 'bernstein[gui]'
 # then: bernstein gui serve
 gui = [
-    "sse-starlette>=2.1.0",
+    "sse-starlette>=3.5.0",
     # Terminal QR rendering for ``bernstein gui qr`` and the
     # ``--tunnel`` flag of ``bernstein gui serve`` (#1218). Pure Python,
     # MIT-licensed, no native deps. The qr renderer ships a fallback
@@ -331,12 +331,12 @@ observability = [
     "sentry-sdk[fastapi]>=2.20",
 ]
 research-render = [
-    "playwright>=1.62.0",
+    "playwright>=1.64.0",
 ]
 # TRACE 0.2 Trust Record emitter (src/bernstein/core/observability/trust_record.py).
 # Optional so minimal installs stay dependency-free. Enable with:
 #   pip install 'bernstein[trace]'
-trace = ["agentrust-trace>=0.9,<0.10"]
+trace = ["agentrust-trace>=0.11.0,<0.12"]
 
 [project.scripts]
 bernstein = "bernstein.cli.main:cli"
@@ -850,34 +850,34 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-benchmark>=4.0",
     "pytest-timeout>=2.4.0",
-    "hypothesis>=6.100",
+    "hypothesis>=6.170.2",
     "respx>=0.22",
-    "ruff>=0.9",
-    "pyright>=1.1",
+    "ruff>=0.17.1",
+    "pyright>=1.1.414",
     # Declared so `uv run mypy` resolves the project interpreter instead of
     # falling through to whatever `mypy` sits on PATH. A PATH mypy bound to
     # Python < 3.12 cannot parse PEP 695 `type` aliases and aborts the run.
     # Mirror of [project.optional-dependencies].dev.
-    "mypy>=1.18.2",
-    "scikit-learn>=1.5",
+    "mypy>=2.4.0",
+    "scikit-learn>=1.9.1",
     # Pinned to the 3.x line - the focused harness in
     # scripts/mutmut_critical.py / scripts/mutmut_lineage.py is validated
     # against 3.5.0. mutmut's config surface and CLI moved between 2.x
     # and 3.x; bump the upper bound deliberately when validating 4.x.
-    "mutmut>=3.5,<4",
-    "import-linter>=2.0",  # Architecture contracts (`uv run lint-imports`)
+    "mutmut>=3.8.0,<4",
+    "import-linter>=2.15",  # Architecture contracts (`uv run lint-imports`)
     # CI hardening 2026 - keep this section in sync with [project.optional-dependencies].dev.
-    "schemathesis>=4.18.1",
-    "crosshair-tool>=0.0.95",
+    "schemathesis>=4.32.0",
+    "crosshair-tool>=0.0.111",
     "bandit>=1.8",
     "pip-audit>=2.7",
-    "beartype>=0.21",
-    "syrupy>=4.6",
-    "diff-cover>=9.0",
+    "beartype>=0.23.1",
+    "syrupy>=6.1.1",
+    "diff-cover>=10.6.0",
     # PDF re-parse for Article 12 evidence tests (mirror of
     # [project.optional-dependencies].dev).  Floor raised to the patched
     # release for CVE-2026-59935 / CVE-2026-59936 (crafted-PDF DoS).
-    "pypdf>=6.14.2",
+    "pypdf>=6.21.1",
     # Resource-leak probes for the TC-C stress suite (mirror of
     # [project.optional-dependencies].dev).  Optional at runtime - the
     # stress suite ``importorskip``s when missing.
@@ -917,12 +917,12 @@ dev = [
     "types-psutil>=7.2.2.20260518",  # psutil
     "types-croniter>=6.2.4.20260711",  # croniter
     "types-qrcode>=8.2.0.20260518",  # qrcode (gui extra)
-    "types-grpcio>=1.82.1.20260724",  # grpcio (grpc extra)
+    "types-grpcio>=1.84.0.20260928",  # grpcio (grpc extra)
     "types-grpcio-reflection>=1.0.0.20260508",  # grpcio-reflection (grpc extra)
     "lxml-stubs>=0.5.1",  # lxml, via signxml (SAML assertion parsing)
-    "boto3-stubs>=1.43.56",  # boto3 (s3 / r2 extras), published by the mypy_boto3 project
-    "botocore-stubs>=1.43.14",  # botocore, same publisher
-    "playwright>=1.62.0",
+    "boto3-stubs>=1.43.114",  # boto3 (s3 / r2 extras), published by the mypy_boto3 project
+    "botocore-stubs>=1.43.114",  # botocore, same publisher
+    "playwright>=1.64.0",
 ]
 
 [tool.uv]
