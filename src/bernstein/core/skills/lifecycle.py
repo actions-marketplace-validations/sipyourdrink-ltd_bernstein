@@ -57,7 +57,7 @@ from bernstein.core.security.path_containment import (
     PathContainmentError,
     contained_subpath,
 )
-from bernstein.core.skills.lint import LintSeverity, lint_skill
+from bernstein.core.skills.lint import LintFinding, LintSeverity, lint_skill
 from bernstein.core.skills.manifest import SkillManifest, parse_skill_md
 from bernstein.core.skills.packaging import tree_content_hash
 from bernstein.core.skills.plugin_schema import PLUGIN_SCHEMA_ID, schema_errors
@@ -95,6 +95,21 @@ _SUPPORTED_SOURCES: frozenset[str] = frozenset({"local"})
 
 class SkillLifecycleError(RuntimeError):
     """Raised when an install / remove / sync operation fails."""
+
+
+class SkillLintRefusedError(SkillLifecycleError):
+    """Raised when strict lint refuses an install, carrying the blocking findings.
+
+    A subclass so callers that need the machine-readable finding codes -- the
+    catalog install path records a refusal receipt whose ``reason_code``
+    depends on them -- can read them off the exception instead of re-parsing
+    the message. Callers that only catch :class:`SkillLifecycleError` are
+    unaffected.
+    """
+
+    def __init__(self, message: str, *, findings: tuple[LintFinding, ...]) -> None:
+        super().__init__(message)
+        self.findings = findings
 
 
 class SkillsTomlError(SkillLifecycleError):
@@ -439,6 +454,27 @@ class _ScaffoldManifestData(TypedDict):
     assets: list[str]
 
 
+def _skill_dir_in_root(dest_root: Path, dirname: str, *, skill_name: str) -> Path:
+    """Return ``dest_root / dirname`` once it is shown to be a direct child of *dest_root*.
+
+    Every path this module writes, replaces or deletes under a skills root
+    is built from a skill name, and that name can arrive from a catalog
+    entry, a lock file or the CLI. The candidate is resolved (following any
+    symlink already sitting at it) and must land directly inside the
+    resolved root, so no name can reach a sibling, a parent, or a tree a
+    planted symlink points at.
+
+    Raises:
+        SkillLifecycleError: If the path would fall outside *dest_root*.
+    """
+    candidate = dest_root / dirname
+    if not dirname or candidate.resolve().parent != dest_root.resolve():
+        raise SkillLifecycleError(
+            f"{skill_name!r}: skill path {candidate} resolves outside the skills root {dest_root}"
+        )
+    return candidate
+
+
 def _detect_skill_name(source: Path) -> str:
     """Derive the canonical name for a local source.
 
@@ -554,7 +590,10 @@ def _raise_for_strict_lint_errors(skill_dir: Path, *, skill_name: str) -> None:
     if not errors:
         return
     details = "; ".join(f"{finding.code}: {finding.message}" for finding in errors)
-    raise SkillLifecycleError(f"{skill_name}: strict lint failed: {details}")
+    raise SkillLintRefusedError(
+        f"{skill_name}: strict lint failed: {details}",
+        findings=tuple(errors),
+    )
 
 
 def _raise_for_invisible_unicode(
@@ -651,12 +690,14 @@ def install_local(
 
     name = override_name or _detect_skill_name(source)
     dest_root = scope_root(scope, workdir=workdir, home=home)
-    install_dir = dest_root / name
-    dest_root.mkdir(parents=True, exist_ok=True)
+    # Both targets are checked before anything is created, replaced or
+    # deleted: a name is only a directory name, never a path.
+    install_dir = _skill_dir_in_root(dest_root, name, skill_name=name)
     # Stage into a sibling temp directory first so a previously working
     # install is preserved if validation or copy fails. The final swap is
     # atomic via Path.replace.
-    staging_dir = dest_root / f".{name}.tmp"
+    staging_dir = _skill_dir_in_root(dest_root, f".{name}.tmp", skill_name=name)
+    dest_root.mkdir(parents=True, exist_ok=True)
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True)
@@ -1130,8 +1171,11 @@ def remove_skill(
 
     Returns:
         ``True`` if the skill was removed; ``False`` if nothing was there.
+
+    Raises:
+        SkillLifecycleError: If *name* resolves outside the scope root.
     """
-    install_dir = scope_root(scope, workdir=workdir, home=home) / name
+    install_dir = _skill_dir_in_root(scope_root(scope, workdir=workdir, home=home), name, skill_name=name)
     if not install_dir.exists():
         return False
     shutil.rmtree(install_dir)
@@ -1414,6 +1458,7 @@ __all__ = [
     "LockEntry",
     "SkillDigest",
     "SkillLifecycleError",
+    "SkillLintRefusedError",
     "SkillsToml",
     "SkillsTomlEntry",
     "SkillsTomlError",

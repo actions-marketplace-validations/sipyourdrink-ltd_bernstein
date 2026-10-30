@@ -119,6 +119,12 @@ _NONTRIVIAL_SIGNAL_TYPES = frozenset(
         # A grounded report proves the figures trace to signed sources - strong
         # evidence of real work, on par with a passing test (issue #2888).
         "figures_grounded",
+        # A verified absence proves a search actually covered a named corpus
+        # (issue #3650). It is the one signal that legitimately accompanies an
+        # empty diff - "nothing to change, and here is what was searched" - so
+        # a passing one must count as evidence rather than leave the task
+        # looking like a rubber stamp.
+        "absence_verified",
     }
 )
 
@@ -338,6 +344,20 @@ def evaluate_signal(
         case "llm_judge":
             # llm_judge requires async evaluation - use judge_task() instead.
             return False, "llm_judge requires async evaluation via judge_task()"
+        case "absence_verified":
+            # The absence-shaped signal (issue #3650): the value names the tool
+            # call that reported "nothing found", and the claim is only
+            # readable as verified when that call's own anchored coverage says
+            # what it covered. Fails closed on every missing or mismatched
+            # piece, so an unrecorded absence reads as unverified, never as a
+            # plain success.
+            from bernstein.core.quality.absence_coverage import verify_anchored_absence_claim
+
+            return verify_anchored_absence_claim(
+                tool_call_id=signal.value.strip(),
+                workdir=workdir,
+                lineage_store=lineage_store,
+            )
         case _ if signal.type in _ARTIFACT_SIGNAL_TYPES:
             # Artifact-mode criteria operate on the produced artifact's canonical
             # bytes (and, for figures_grounded, on lineage reads), not the
@@ -358,7 +378,7 @@ def evaluate_artifact_signals(
     lineage_root: Path | None = None,
     operator_secret: bytes | None = None,
 ) -> list[tuple[str, bool, str]]:
-    """Evaluate a task's artifact-mode completion signals against ``artifact``.
+    """Evaluate declared artifact criteria and completion signals against ``artifact``.
 
     ``artifact`` is the raw produced artifact (str / bytes / list / mapping, or
     a :class:`~bernstein.core.tasks.figures.ReportBundle` for a figures report);
@@ -380,17 +400,21 @@ def evaluate_artifact_signals(
     from bernstein.core.tasks.artifacts import evaluate_criterion
 
     kind = task.artifact_spec.kind
+    criteria: list[tuple[str, str]] = [(criterion.type, criterion.value) for criterion in task.artifact_spec.criteria]
+    criteria.extend(
+        (signal.type, signal.value) for signal in task.completion_signals if signal.type in _ARTIFACT_SIGNAL_TYPES
+    )
     results: list[tuple[str, bool, str]] = []
-    for signal in task.completion_signals:
-        if signal.type not in _ARTIFACT_SIGNAL_TYPES:
-            continue
-        desc = f"{signal.type}: {signal.value}"
-        if signal.type == "figures_grounded":
+    # Stable union: a contract need not be repeated in completion_signals,
+    # and a repeated gate must not run twice or inflate the result count.
+    for criterion_type, value in dict.fromkeys(criteria):
+        desc = f"{criterion_type}: {value}"
+        if criterion_type == "figures_grounded":
             passed, detail = _evaluate_figures_grounded_signal(
-                artifact, signal.value, lineage_root=lineage_root, operator_secret=operator_secret
+                artifact, value, lineage_root=lineage_root, operator_secret=operator_secret
             )
         else:
-            passed, detail = evaluate_criterion(signal.type, signal.value, artifact=artifact, kind=kind)
+            passed, detail = evaluate_criterion(criterion_type, value, artifact=artifact, kind=kind)
         results.append((desc, passed, detail))
     return results
 
@@ -1377,8 +1401,9 @@ async def create_fix_tasks(
         "scope": task.scope.value,
         "complexity": task.complexity.value,
         "estimated_minutes": task.estimated_minutes,
-        "depends_on": [],
+        "depends_on": list(task.depends_on),
         "owned_files": task.owned_files,
+        "completion_signals": [{"type": signal.type, "value": signal.value} for signal in task.completion_signals],
     }
 
     try:
@@ -1641,8 +1666,9 @@ async def _create_judge_fix_task(
         "scope": task.scope.value,
         "complexity": task.complexity.value,
         "estimated_minutes": task.estimated_minutes,
-        "depends_on": [],
+        "depends_on": list(task.depends_on),
         "owned_files": task.owned_files,
+        "completion_signals": [{"type": signal.type, "value": signal.value} for signal in task.completion_signals],
     }
 
     try:

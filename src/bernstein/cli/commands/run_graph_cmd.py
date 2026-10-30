@@ -37,6 +37,7 @@ import click
 from rich.tree import Tree
 
 from bernstein.cli.helpers import console
+from bernstein.core.security.audit import load_or_create_audit_key
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -49,12 +50,6 @@ __all__ = ["parse_run_ids", "resolve_receipt_path", "run_graph_cmd"]
 RECEIPT_RELDIR = Path(".sdd") / "run-graph"
 
 _HASH_PREFIX = "sha256:"
-
-
-def _load_hmac_key() -> bytes:
-    from bernstein.core.security.audit import load_or_create_audit_key
-
-    return load_or_create_audit_key()
 
 
 def parse_run_ids(pairs: tuple[str, ...]) -> dict[str, str]:
@@ -134,7 +129,7 @@ def _render(receipt_path: Path, receipt_body: Mapping[str, object], rows: list[t
     tree = Tree(f"[bold]{receipt_path.stem}[/bold]")
     tree.add(f"graph root  {receipt_body.get('graph_root_hash', '?')}")
     tree.add(f"anchored at {receipt_body.get('journal_entry_hash') or '[red]nothing[/red]'}")
-    branches = tree.add(f"branches ({len(rows)} on the tree, {len(receipt_body.get('node_hashes', []) or [])} sealed)")
+    branches = tree.add(f"branches ({len(rows)} on the tree, {len(receipt_body.get('node_hashes', []) or [])} sealed)")  # type: ignore[arg-type]
     for session_id, state, detail in rows:
         style = _STATE_STYLE[state]
         branches.add(f"[{style}]{state:<10}[/{style}] {session_id}  {detail}")
@@ -201,7 +196,7 @@ def run_graph_cmd(
         raise click.ClickException(msg) from exc
 
     run_ids = parse_run_ids(run_id_pairs)
-    hmac_key = _load_hmac_key()
+    hmac_key = load_or_create_audit_key()
     lineage_root = root / ".sdd" / "lineage"
     graph = build_run_graph(root, run_ids=run_ids, lineage_root=lineage_root, hmac_key=hmac_key)
     rows = _branch_rows(graph, lineage_root, hmac_key)

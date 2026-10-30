@@ -21,8 +21,11 @@ Design notes:
   found in either causes a 200 OK no-op response so trackers do not
   retry indefinitely.
 * Recovery: ``replay_recent_via_poll`` runs a single poll at startup for
-  events newer than ``last_processed_ts`` so missed deliveries during
-  bernstein downtime are not lost.
+  events newer than a per-source watermark persisted by
+  ``PollWatermarks``, so missed deliveries during bernstein downtime are
+  not lost and a restart does not replay the same window again.
+  ``replay_recent_via_poll_all`` drives several sources under one
+  wall-clock bound with per-source error isolation.
 
 The module deliberately exposes small primitives.  The FastAPI route is
 in :mod:`bernstein.core.routes.tracker_webhooks` and is the only place
@@ -36,18 +39,24 @@ import hmac
 import json
 import logging
 import os
+import random
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+from bernstein.core.log_safe import for_log
 from bernstein.core.security.sanitize import sanitize_log
-from bernstein.core.trackers.contract import RoutingHint, Ticket
+from bernstein.core.trackers.contract import RateLimited, RoutingHint, Ticket
+from bernstein.core.trackers.event_catalogue import (
+    SHAPE_NOTE,
+    get_event_catalogue_runtime,
+)
 from bernstein.core.webhook_signatures import verify_hmac_sha256
 
 logger = logging.getLogger(__name__)
@@ -68,12 +77,19 @@ class TrackerEvent:
 
     Attributes:
         adapter: Short adapter name (``jira_cloud``, ``github``, ...).
-        action: Event action (``created``, ``updated``, ``transitioned``).
+        action: Tracker-supplied action string when the payload carries one
+            (e.g. ``opened``, ``created``); otherwise the catalogue
+            canonical id for the mapped source event (``github.issues``,
+            …). Unmapped source events do not produce a ``TrackerEvent`` —
+            they are counted (and logged on first sight) then ignored.
         ticket: Normalised ticket payload.
         delivery_id: Stable per-delivery identifier used for replay
             protection.  Falls back to a hash of the raw body when the
             tracker does not send one.
         received_ts: Unix seconds the receiver accepted the event.
+        catalogue_content_hash: SHA-256 of the event-type catalogue used
+            to classify this event; ``None`` when the adapter does not
+            yet map through the catalogue.
     """
 
     adapter: str
@@ -81,6 +97,7 @@ class TrackerEvent:
     ticket: Ticket
     delivery_id: str
     received_ts: float = field(default_factory=time.time)
+    catalogue_content_hash: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -191,12 +208,20 @@ class ReplayLedger:
         with self._lock:
             return delivery_id in self._seen
 
-    def remember(self, delivery_id: str, *, ts: float | None = None) -> bool:
+    def remember(
+        self,
+        delivery_id: str,
+        *,
+        ts: float | None = None,
+        catalogue_content_hash: str | None = None,
+    ) -> bool:
         """Record ``delivery_id``.  Return ``True`` if it was new.
 
         The on-disk append is best-effort; failures log a warning but do
         not raise so a transient disk error does not surface as a 5xx to
-        the tracker.
+        the tracker.  When ``catalogue_content_hash`` is set it is written
+        onto the journal row so replay can bind the classification to the
+        catalogue bytes that produced it (#5132).
         """
 
         ts_value = float(ts if ts is not None else time.time())
@@ -211,8 +236,11 @@ class ReplayLedger:
         if self._path is not None:
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
+                row: dict[str, object] = {"delivery_id": delivery_id, "ts": ts_value}
+                if catalogue_content_hash is not None:
+                    row["catalogue_content_hash"] = catalogue_content_hash
                 with self._path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"delivery_id": delivery_id, "ts": ts_value}) + "\n")
+                    fh.write(json.dumps(row) + "\n")
             except OSError as exc:
                 logger.warning("ReplayLedger: append failed for %s: %s", self._path, exc)
         return True
@@ -326,14 +354,15 @@ class WebhookReceiver:
             # lines via the parser-failure path.
             logger.debug(
                 "Parser raised for adapter=%s: %s",
-                sanitize_log(adapter),
+                for_log(adapter),
                 sanitize_log(str(exc)),
             )
             return ReceiveResult(status="bad_payload", delivery_id=delivery_id)
 
         # Record only after successful parse so a flaky parser does not
         # poison the ledger and silently swallow legitimate retries.
-        self._ledger.remember(delivery_id)
+        catalogue_hash = event.catalogue_content_hash if event is not None else None
+        self._ledger.remember(delivery_id, catalogue_content_hash=catalogue_hash)
 
         if event is None:
             return ReceiveResult(status="ignored", delivery_id=delivery_id)
@@ -349,6 +378,7 @@ class WebhookReceiver:
                 ticket=event.ticket,
                 delivery_id=delivery_id,
                 received_ts=event.received_ts,
+                catalogue_content_hash=event.catalogue_content_hash,
             )
         )
         return ReceiveResult(status="accepted", delivery_id=delivery_id, event=canonical_event)
@@ -465,7 +495,11 @@ def _github_delivery_id(headers: dict[str, str], body: bytes) -> str:
 
 def _github_parse(headers: dict[str, str], payload: dict[str, Any]) -> TrackerEvent | None:
     event_type = _header(headers, "x-github-event") or "unknown"
-    if event_type not in {"issues", "issue_comment", "pull_request"}:
+    runtime = get_event_catalogue_runtime()
+    entry = runtime.resolve("github", event_type)
+    if entry is None:
+        # Classify + count, but do not emit a queue-bound event (#5132).
+        runtime.record_unmapped("github", event_type)
         return None
     issue = payload.get("issue") or payload.get("pull_request") or {}
     if not issue:
@@ -497,9 +531,10 @@ def _github_parse(headers: dict[str, str], payload: dict[str, Any]) -> TrackerEv
     )
     return TrackerEvent(
         adapter="github",
-        action=str(payload.get("action") or event_type),
+        action=str(payload.get("action") or entry.canonical),
         ticket=ticket,
         delivery_id=_github_delivery_id(headers, b""),
+        catalogue_content_hash=runtime.content_hash,
     )
 
 
@@ -525,14 +560,18 @@ def _gitlab_delivery_id(headers: dict[str, str], body: bytes) -> str:
 
 def _gitlab_parse(headers: dict[str, str], payload: dict[str, Any]) -> TrackerEvent | None:
     kind = str(payload.get("object_kind") or "")
-    if kind not in {"issue", "note"}:
+    runtime = get_event_catalogue_runtime()
+    entry = runtime.resolve("gitlab", kind)
+    if entry is None:
+        # Classify + count, but do not emit a queue-bound event (#5132).
+        runtime.record_unmapped("gitlab", kind or "unknown")
         return None
     attrs = payload.get("object_attributes") or {}
-    if kind == "note":
+    if entry.shape == SHAPE_NOTE:
         issue_obj = payload.get("issue") or {}
         if not issue_obj:
             return None
-        attrs = {**issue_obj, **{"action": attrs.get("action", "commented")}}
+        attrs = {**issue_obj, "action": attrs.get("action", "commented")}
     iid = attrs.get("iid")
     project = payload.get("project") or {}
     project_path = str(project.get("path_with_namespace") or project.get("name") or "")
@@ -556,9 +595,10 @@ def _gitlab_parse(headers: dict[str, str], payload: dict[str, Any]) -> TrackerEv
     )
     return TrackerEvent(
         adapter="gitlab",
-        action=str(attrs.get("action") or kind),
+        action=str(attrs.get("action") or entry.canonical),
         ticket=ticket,
         delivery_id=_gitlab_delivery_id(headers, b""),
+        catalogue_content_hash=runtime.content_hash,
     )
 
 
@@ -676,7 +716,12 @@ def register_builtin_handlers() -> None:
     Idempotent - safe to call multiple times.  Adapter implementations
     that ship outside the core package can register additional handlers
     via :func:`register_handler` from their own ``__init__`` hooks.
+
+    Loads the event-type catalogue at registration time so a malformed
+    packaged catalogue fails at start rather than on the first delivery.
     """
+
+    get_event_catalogue_runtime()
 
     register_handler(
         WebhookHandler(
@@ -730,43 +775,339 @@ register_builtin_handlers()
 # ---------------------------------------------------------------------------
 
 
+def _ticket_updated_ts(ticket: Any) -> float | None:
+    """Return the ``updated_at`` claim on ``ticket`` as a float, if any."""
+
+    raw: dict[str, Any] = getattr(ticket, "raw", None) or {}
+    value: Any = raw.get("updated_at")
+    if value is None:
+        value = raw.get("updatedAt")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _backoff_delay(
+    attempt: int,
+    *,
+    retry_after: float | None,
+    base_s: float,
+    cap_s: float,
+    jitter: Callable[[], float],
+) -> float:
+    """Return the equal-jitter wait for ``attempt`` (1-based), capped at ``cap_s``.
+
+    The tracker's own ``retry_after`` hint wins over the exponential
+    schedule when it supplies one, but is still clamped by ``cap_s`` so a
+    hostile or mistaken hint cannot park the poll for an hour.  Half the
+    budget is fixed and half is jittered, which keeps the wait strictly
+    positive while spreading retries from several sources apart.
+    """
+
+    hinted = retry_after is not None and retry_after > 0
+    target = float(retry_after or 0.0) if hinted else base_s * (2 ** (attempt - 1))
+    target = min(target, cap_s)
+    half = target / 2.0
+    return half + jitter() * half
+
+
+class PollWatermarks:
+    """Persisted per-source poll cursors.
+
+    Mirrors :class:`ReplayLedger`: an in-memory dict backed by an
+    append-only JSONL file that is read on construction, so a restart
+    resumes from where the last poll stopped instead of replaying the
+    same "recent" window.  The newest entry for a source wins on load.
+    Cursors only ever move forward, so an out-of-order write cannot
+    rewind a source and re-deliver records already handled.
+
+    Writes are best-effort in the same sense as the replay ledger: a
+    disk failure logs a warning and leaves the in-memory cursor in place
+    rather than aborting the poll.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._lock = threading.Lock()
+        self._marks: dict[str, float] = {}
+        self._path = path
+        self._load_from_disk()
+
+    def _load_from_disk(self) -> None:
+        if self._path is None or not self._path.exists():
+            return
+        try:
+            with self._path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    source = entry.get("source")
+                    ts = entry.get("ts")
+                    if not isinstance(source, str) or not isinstance(ts, (int, float)):
+                        continue
+                    self._marks[source] = float(ts)
+        except OSError as exc:
+            logger.warning("PollWatermarks: failed to load %s: %s", self._path, exc)
+
+    def get(self, source: str) -> float:
+        """Return the cursor for ``source``; ``0.0`` when nothing is recorded."""
+
+        with self._lock:
+            return self._marks.get(source, 0.0)
+
+    def advance(self, source: str, ts: float) -> bool:
+        """Move ``source``'s cursor to ``ts``.  Return ``True`` if it moved.
+
+        A ``ts`` at or below the recorded cursor is ignored so the cursor
+        is monotonic even when a poll observes records out of order.
+        """
+
+        ts_value = float(ts)
+        with self._lock:
+            if ts_value <= self._marks.get(source, 0.0):
+                return False
+            self._marks[source] = ts_value
+        if self._path is not None:
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                with self._path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"source": source, "ts": ts_value}) + "\n")
+            except OSError as exc:
+                logger.warning("PollWatermarks: append failed for %s: %s", self._path, exc)
+        return True
+
+
+class TicketUpsertSink:
+    """Sink that upserts tickets on their stable tracker id.
+
+    A poll that is retried after a rate limit, or that overlaps a
+    webhook delivery, hands the same ticket id over more than once.
+    Keying on :attr:`Ticket.id` makes the far side idempotent: the later
+    record replaces the earlier one instead of appending a duplicate.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_id: dict[str, Ticket] = {}
+
+    def __call__(self, ticket: Ticket) -> None:
+        with self._lock:
+            self._by_id[ticket.id] = ticket
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._by_id)
+
+    @property
+    def tickets(self) -> list[Ticket]:
+        """Return the current record per stable id, in first-seen order."""
+
+        with self._lock:
+            return list(self._by_id.values())
+
+
+@dataclass(frozen=True)
+class PollSweepResult:
+    """Outcome of a poll sweep across several sources.
+
+    Attributes:
+        delivered: Ticket count handed to the sink, per source.
+        errors: ``"<ExceptionType>: <message>"`` per source that raised.
+            A source that fails is recorded here and the sweep carries on
+            with the remaining sources.
+        timed_out: Sources the wall-clock bound stopped, either before
+            their poll started or partway through it.
+    """
+
+    delivered: dict[str, int]
+    errors: dict[str, str]
+    timed_out: tuple[str, ...]
+
+
 def replay_recent_via_poll(
     adapter: Any,
     *,
-    last_processed_ts: float,
     sink: Callable[[Ticket], None],
+    last_processed_ts: float | None = None,
+    watermarks: PollWatermarks | None = None,
+    source: str | None = None,
+    newest_first: bool = False,
+    deadline: float | None = None,
+    max_attempts: int = 3,
+    backoff_base_s: float = 1.0,
+    backoff_cap_s: float = 60.0,
     now: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    jitter: Callable[[], float] | None = None,
 ) -> int:
-    """Poll once and feed any ticket newer than ``last_processed_ts`` to ``sink``.
+    """Poll once and feed any ticket newer than the watermark to ``sink``.
 
     Used at process start to catch events that the tracker tried to
-    deliver while bernstein was down.  The tracker adapter's
-    ``pull_open_tickets`` already paginates the upstream API, so we just
-    iterate and filter by an ``updated_at`` claim on the raw payload -
-    adapters that do not populate that field simply replay all open
-    tickets, which is the safe default.
+    deliver while bernstein was down.
+
+    The watermark comes from ``watermarks`` (keyed by ``source``, or the
+    adapter's ``name``) and is written back after a poll that ran to
+    completion, so a restart resumes where the last poll stopped.  An
+    explicit ``last_processed_ts`` overrides the stored cursor for
+    callers that manage their own; passing neither replays every open
+    ticket, which stays the safe default.
+
+    Set ``newest_first`` when the adapter yields newest records first:
+    the scan then stops at the first record at or below the watermark
+    instead of paginating the whole open-ticket set.  Left ``False`` the
+    function filters every record in Python, which is correct for any
+    ordering but costs a full scan.
+
+    ``deadline`` is an absolute timestamp on the ``now`` clock.  A poll
+    the deadline cuts short does not advance the watermark, because the
+    records it never reached would otherwise be skipped forever.
+
+    :class:`~bernstein.core.trackers.contract.RateLimited` is retried up
+    to ``max_attempts`` times with jittered, capped backoff; the attempt
+    restarts the poll from the top, which is safe when ``sink`` upserts
+    on the ticket id (see :class:`TicketUpsertSink`).  The exception
+    propagates once the attempts are spent.
 
     Returns the number of tickets handed to ``sink``.
     """
 
-    del now  # reserved for clock injection in tests; currently unused
-    count = 0
     pull = getattr(adapter, "pull_open_tickets", None)
     if pull is None:
         return 0
-    for ticket in pull():
-        raw = getattr(ticket, "raw", None) or {}
-        ts_field = raw.get("updated_at") or raw.get("updatedAt")
-        if isinstance(ts_field, (int, float)) and ts_field <= last_processed_ts:
+
+    clock = now if now is not None else time.time
+    sleeper = sleep if sleep is not None else time.sleep
+    jitter_fn = jitter if jitter is not None else random.random
+    key = source or getattr(adapter, "name", None) or "default"
+
+    if last_processed_ts is not None:
+        floor = float(last_processed_ts)
+    elif watermarks is not None:
+        floor = watermarks.get(key)
+    else:
+        floor = 0.0
+
+    attempt = 0
+    while True:
+        count = 0
+        highest = floor
+        complete = True
+        try:
+            for ticket in pull():
+                if deadline is not None and clock() >= deadline:
+                    complete = False
+                    break
+                ts_field = _ticket_updated_ts(ticket)
+                if ts_field is not None and ts_field <= floor:
+                    if newest_first:
+                        break
+                    continue
+                sink(ticket)
+                count += 1
+                if ts_field is not None and ts_field > highest:
+                    highest = ts_field
+        except RateLimited as exc:
+            attempt += 1
+            if attempt >= max_attempts:
+                logger.warning(
+                    "poll recovery: %s rate limited after %d attempts",
+                    sanitize_log(key),
+                    attempt,
+                )
+                raise
+            sleeper(
+                _backoff_delay(
+                    attempt,
+                    retry_after=exc.retry_after,
+                    base_s=backoff_base_s,
+                    cap_s=backoff_cap_s,
+                    jitter=jitter_fn,
+                )
+            )
             continue
-        sink(ticket)
-        count += 1
+        break
+
+    if complete and watermarks is not None:
+        watermarks.advance(key, highest)
     return count
 
 
+def replay_recent_via_poll_all(
+    adapters: Mapping[str, Any],
+    *,
+    sink: Callable[[Ticket], None],
+    watermarks: PollWatermarks | None = None,
+    deadline_s: float | None = None,
+    newest_first: bool = False,
+    max_attempts: int = 3,
+    backoff_base_s: float = 1.0,
+    backoff_cap_s: float = 60.0,
+    now: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    jitter: Callable[[], float] | None = None,
+) -> PollSweepResult:
+    """Poll every source in ``adapters``, isolating failures and slow sources.
+
+    Each source polls inside its own ``try``/``except`` so one broken or
+    unreachable resource type cannot abort the rest of the sweep; the
+    failure is recorded in :attr:`PollSweepResult.errors`.  ``deadline_s``
+    bounds the whole sweep rather than each source, so a single hung
+    source cannot starve the ones behind it - sources the bound stops are
+    listed in :attr:`PollSweepResult.timed_out` and keep their watermark.
+    """
+
+    clock = now if now is not None else time.time
+    deadline = clock() + deadline_s if deadline_s is not None else None
+
+    delivered: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    timed_out: list[str] = []
+
+    for name, adapter in adapters.items():
+        if deadline is not None and clock() >= deadline:
+            delivered[name] = 0
+            timed_out.append(name)
+            continue
+        try:
+            delivered[name] = replay_recent_via_poll(
+                adapter,
+                sink=sink,
+                watermarks=watermarks,
+                source=name,
+                newest_first=newest_first,
+                deadline=deadline,
+                max_attempts=max_attempts,
+                backoff_base_s=backoff_base_s,
+                backoff_cap_s=backoff_cap_s,
+                now=clock,
+                sleep=sleep,
+                jitter=jitter,
+            )
+        except Exception as exc:  # one source must not sink the whole sweep
+            delivered[name] = 0
+            errors[name] = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "poll recovery: source %s failed: %s",
+                sanitize_log(name),
+                sanitize_log(str(exc)),
+            )
+            continue
+        if deadline is not None and clock() >= deadline:
+            timed_out.append(name)
+
+    return PollSweepResult(delivered=delivered, errors=errors, timed_out=tuple(timed_out))
+
+
 __all__ = [
+    "PollSweepResult",
+    "PollWatermarks",
     "ReceiveResult",
     "ReplayLedger",
+    "TicketUpsertSink",
     "TrackerEvent",
     "WebhookConfig",
     "WebhookHandler",
@@ -776,4 +1117,5 @@ __all__ = [
     "register_builtin_handlers",
     "register_handler",
     "replay_recent_via_poll",
+    "replay_recent_via_poll_all",
 ]

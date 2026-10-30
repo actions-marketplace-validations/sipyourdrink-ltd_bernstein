@@ -70,7 +70,7 @@ if TYPE_CHECKING:
 # ``bernstein.core.cost.budget_countdown``) to keep this adapter free of
 # scheduler-internal transitive dependencies - see ``.importlinter``
 # contract ``adapters-no-scheduler``. Source of truth for both constants
-# is :mod:`bernstein.core.cost.budget_countdown` / :mod:`bernstein.core.security.agent_identity`.
+# is :mod:`bernstein.core.cost.budget_countdown` / :mod:`bernstein.core.identity.agent_card`.
 _TASK_BUDGETS_OPT_IN_ENV: str = "BERNSTEIN_ANTHROPIC_TASK_BUDGETS"
 _TASK_BUDGETS_BETA_VALUE: str = "task-budgets-2026-03-13"
 
@@ -277,6 +277,7 @@ class ClaudeCodeAdapter(CLIAdapter):
     # ``_infer_adapter_name_for_provider`` (via the registry's
     # provider-alias table). Unchanged from the old substring branch.
     provides = ("claude", "anthropic")
+    model_vendor = "anthropic"
 
     external_endpoints = (("api.anthropic.com", 443),)
     # Surface the upstream provider on the ``bernstein status``
@@ -524,7 +525,18 @@ class ClaudeCodeAdapter(CLIAdapter):
         cmd.extend(["--json-schema", _RESULT_SCHEMA])
 
         if mcp_config:
-            cmd.extend(["--mcp-config", json.dumps(mcp_config)])
+            # `--strict-mcp-config` beside it, always: "only use MCP servers from
+            # --mcp-config, ignoring all other MCP configurations". Without it Claude
+            # Code merges its OWN discovered servers on top of this payload -- ones
+            # registered with `claude mcp add` at user or local scope, a repo's
+            # `.mcp.json`, plugin-provided servers and account connectors -- so a
+            # spawned agent started servers bernstein never chose (#5965).
+            #
+            # This payload is still whatever the caller built, which includes
+            # `~/.claude/mcp.json`: bernstein's own loader reads that file (the claude
+            # CLI does not), so its servers still reach the agent, as do the task's
+            # `mcp_servers` and the bernstein bridge.
+            cmd.extend(["--mcp-config", json.dumps(mcp_config), "--strict-mcp-config"])
 
         if system_addendum:
             cmd.extend(["--append-system-prompt", system_addendum])
@@ -757,7 +769,7 @@ class ClaudeCodeAdapter(CLIAdapter):
     def _inject_hooks_config(
         workdir: Path,
         session_id: str,
-        server_url: str = "http://127.0.0.1:8052",
+        server_url: str | None = None,
     ) -> None:
         """Write Claude Code hooks config to ``.claude/settings.local.json``.
 
@@ -775,8 +787,17 @@ class ClaudeCodeAdapter(CLIAdapter):
         Args:
             workdir: Project working directory (worktree root).
             session_id: Agent session identifier, embedded in the hook URL.
-            server_url: Task server base URL (default localhost:8052).
+            server_url: Task server base URL. When None (the caller never passes
+                it), resolve BERNSTEIN_SERVER_URL, which the orchestrator sets to
+                its own ``--port``. The hard-coded 8052 default used to win
+                unconditionally, so on any non-default port every hook POSTed to
+                whatever else held 8052 and got 401 (measured 2026-09-02: 9 such
+                401s from one judge session).
         """
+        if server_url is None:
+            server_url = os.environ.get("BERNSTEIN_SERVER_URL", "http://127.0.0.1:8052")
+        server_url = server_url.rstrip("/")
+
         settings_dir = workdir / ".claude"
         settings_dir.mkdir(parents=True, exist_ok=True)
         settings_path = settings_dir / "settings.local.json"

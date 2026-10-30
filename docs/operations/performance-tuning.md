@@ -22,7 +22,7 @@ The right `max_agents` value depends on your provider's rate limits, not just yo
 
 ### Claude (Anthropic)
 
-Rate limits vary by plan and change over time; consult your provider console (for Anthropic, the usage and limits pages) for your actual quota rather than any published table. As a rule of thumb: start at `max_agents: 1` on trial or entry-level tiers, 4-6 on a standard paid API tier, and 8+ only on enterprise or Bedrock-style deployments where the cap is hardware and cost budget.
+Rate limits vary by plan and change over time; consult your provider console (for Anthropic, the usage and limits pages) for your actual quota rather than any published table. As a rule of thumb: start at `max_agents: 1` on trial or entry-level tiers, 4-6 on a standard paid API tier, and 8+ only on enterprise or other high-quota hosted deployments where the cap is hardware and cost budget.
 
 > **Tip:** `bernstein status` shows a provider/quota table once the orchestrator has recorded provider snapshots. Bernstein reads `X-RateLimit-*` headers and backs off automatically, but it cannot predict limits - set `max_agents` below your burst ceiling.
 
@@ -218,6 +218,15 @@ worktree_setup:
     - .env
   setup_command: null   # e.g., "npm install" or "uv sync"
 ```
+
+`copy_files` entries are copied into each new worktree, and each one is also
+excluded from git **in that worktree only**, so an agent's `git add -A` cannot
+commit its copy and break the merge back. The exclusion lives in the
+worktree's own git dir (a per-worktree `core.excludesFile`), never in the
+shared `.git/info/exclude`, so your own checkout and other worktrees still see
+the file. Entries are anchored to the repository root, so `secrets.env` does
+not hide a tracked `config/secrets.env`. List files, not directories: a
+directory entry is not copied and not excluded.
 
 **Disk estimate:** `worktree_size ≈ repo_size × (1 - symlink_ratio)`. For a 500 MB repo with `.venv` and `node_modules` symlinked, expect 50–100 MB per worktree.
 

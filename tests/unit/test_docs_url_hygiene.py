@@ -1,6 +1,6 @@
 """Guard: shipped source points at the canonical docs host only.
 
-The documentation site moved to ``bernstein.readthedocs.io``. The old
+The documentation site is ``docs.bernstein.run`` (Read the Docs). The old
 GitHub Pages host (``chernistry.github.io/bernstein``) no longer serves
 docs, so any user-facing link that still points there is a dead link in
 the wheel. This test scans the shipped source tree so a regression that
@@ -11,6 +11,13 @@ deprecation guard pins v1 writer construction sites.
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
+
+#: Scans the source tree rather than importing it, so no diff produces an
+#: import edge to this file. The marker puts it in every pull request's
+#: affected slice instead of only the merge group (#5428).
+pytestmark = pytest.mark.whole_tree_guard
 
 _SRC = Path(__file__).resolve().parents[2] / "src" / "bernstein"
 
@@ -34,5 +41,5 @@ def test_no_dead_docs_host_in_src() -> None:
     sites = _dead_link_sites()
     assert sites == [], (
         f"shipped source must not link to the retired docs host "
-        f"'{_DEAD_DOCS_HOST}'; use https://bernstein.readthedocs.io/ instead:\n" + "\n".join(sites)
+        f"'{_DEAD_DOCS_HOST}'; use https://docs.bernstein.run/ instead:\n" + "\n".join(sites)
     )

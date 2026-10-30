@@ -164,6 +164,21 @@ def _public_key_pem_from_raw(public_raw: bytes) -> bytes:
     )
 
 
+def _rfc7638_thumbprint_for_raw(public_raw: bytes) -> str:
+    from bernstein.core.security.agent_card_signer import _b64url
+
+    x = _b64url(public_raw)
+    canonical = json.dumps(
+        {"crv": "Ed25519", "kty": "OKP", "x": x},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return _b64url(hashlib.sha256(canonical).digest())
+
+
+_TEST_KEYPAIR_KID: str = _rfc7638_thumbprint_for_raw(_test_keypair()[1])
+
+
 def _emitter_with_known_key(
     *,
     install_rev: str = "aaaaaaaaaaaaaaaa",
@@ -486,6 +501,52 @@ class TestRuntimeClaim:
 
 
 # ---------------------------------------------------------------------------
+# cnf.jwk: further RFC 7517 members ride inside the signed pre-image
+# ---------------------------------------------------------------------------
+
+
+class TestCnfJwkMembers:
+    def test_default_writes_exactly_the_four_key_members(self, tmp_path: Path) -> None:
+        emitter = _emitter_with_known_key()
+        journal = _create_journal(tmp_path, [{"type": "run_completed", "ts": 1.0}])
+        parsed = json.loads(emitter.emit_trust_record(journal, "run-1", "exec-1"))
+
+        assert set(parsed["cnf"]["jwk"]) == {"kty", "crv", "x", "kid"}
+
+    def test_further_members_are_carried_beside_the_key_material_and_signed(self, tmp_path: Path) -> None:
+        emitter = _emitter_with_known_key()
+        journal = _create_journal(tmp_path, [{"type": "run_completed", "ts": 1.0}])
+        parsed = json.loads(
+            emitter.emit_trust_record(
+                journal, "run-1", "exec-1", cnf_jwk_members={"alg": "EdDSA", "\U0001f600": "supplementary-plane"}
+            )
+        )
+        jwk = parsed["cnf"]["jwk"]
+
+        assert jwk["alg"] == "EdDSA"
+        assert jwk["\U0001f600"] == "supplementary-plane"
+        assert jwk["kty"] == "OKP" and jwk["crv"] == "Ed25519" and jwk["kid"] == _TEST_KEYPAIR_KID
+        assert _offline_verify(parsed, _public_key_pem_from_raw(_test_keypair()[1])) is True
+        # The members are inside the pre-image: dropping one breaks the signature.
+        del parsed["cnf"]["jwk"]["alg"]
+        assert _offline_verify(parsed, _public_key_pem_from_raw(_test_keypair()[1])) is False
+
+    @pytest.mark.parametrize("member", ["kty", "crv", "x", "kid"])
+    def test_the_key_material_cannot_be_overridden(self, tmp_path: Path, member: str) -> None:
+        emitter = _emitter_with_known_key()
+        journal = _create_journal(tmp_path, [{"type": "run_completed", "ts": 1.0}])
+        with pytest.raises(ValueError, match="may not override the key material"):
+            emitter.emit_trust_record(journal, "run-1", "exec-1", cnf_jwk_members={member: "x"})
+
+    @pytest.mark.parametrize("member", ["d", "p", "q", "dp", "dq", "qi", "k"])
+    def test_private_key_parameters_are_refused_before_signing(self, tmp_path: Path, member: str) -> None:
+        emitter = _emitter_with_known_key()
+        journal = _create_journal(tmp_path, [{"type": "run_completed", "ts": 1.0}])
+        with pytest.raises(ValueError, match="private-key parameters"):
+            emitter.emit_trust_record(journal, "run-1", "exec-1", cnf_jwk_members={member: "x"})
+
+
+# ---------------------------------------------------------------------------
 # tool_transcript: always present, digest over tool_call entries only
 # ---------------------------------------------------------------------------
 
@@ -780,11 +841,11 @@ class TestCnfJwk:
         """The key id lives on the JWK (a property of the key), not in a
         signature-adjacent object -- see the module docstring's note on the
         schema's signature envelope."""
-        emitter = _emitter_with_known_key(install_rev="deadbeefdeadbeef")
+        emitter = _emitter_with_known_key()
         journal = _create_journal(tmp_path, [{"type": "run_completed", "ts": 1.0}])
         parsed = json.loads(emitter.emit_trust_record(journal, "run-1", "exec-1"))
 
-        assert parsed["cnf"]["jwk"]["kid"] == "install-deadbeefdeadbeef"
+        assert parsed["cnf"]["jwk"]["kid"] == _TEST_KEYPAIR_KID
 
 
 # ---------------------------------------------------------------------------
@@ -1517,7 +1578,7 @@ class TestEmitTrustRecord:
         assert parsed["subject"] == "spiffe://bernstein.run/run/integration-run/exec/integration-exec"
         assert parsed["iat"] == 1690000002
         assert parsed["tool_transcript"]["call_count"] == 1
-        assert parsed["cnf"]["jwk"]["kid"] == "install-aaaaaaaaaaaaaaaa"
+        assert parsed["cnf"]["jwk"]["kid"] == _TEST_KEYPAIR_KID
         assert len(parsed["signature"]) > 0
         assert _offline_verify(parsed, _public_key_pem_from_raw(public_raw)) is True
 

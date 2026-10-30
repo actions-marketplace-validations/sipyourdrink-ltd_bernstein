@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from bernstein.core.agents import project_context as _project_context
 from bernstein.core.agents.heartbeat import HeartbeatMonitor
 from bernstein.core.agents.project_context import resolve_project_context
+from bernstein.core.agents.prompt_segments import segment_prompt, segments_digest
 from bernstein.core.context_recommendations import RecommendationEngine
 from bernstein.core.defaults import SPAWN
 from bernstein.core.lessons import gather_lessons_for_context
@@ -767,7 +768,23 @@ def _get_lesson_context(role: str, tasks: list[Task], workdir: Path) -> str:
     return lesson_context
 
 
-def _legacy_completion_instructions(tasks: list[Task]) -> str:
+def _task_server_url(workdir: Path | None = None) -> str:
+    """The base URL the curl examples in this prompt must point at.
+
+    Delegates to the spawner's resolver rather than restating its rules --
+    ``BERNSTEIN_SERVER_URL``, then the run's own ``.sdd/runtime/server.port``,
+    then 8052. Writing the default into the prompt instead is what #5964
+    reports: a run on a dynamically allocated port handed the agent curl
+    commands aimed at 8052, which is either nothing or *another run's* server.
+
+    Imported inside the function because ``spawner_core`` imports this module.
+    """
+    from bernstein.core.agents.spawner_core import _resolve_task_server_url
+
+    return _resolve_task_server_url(workdir)
+
+
+def _legacy_completion_instructions(tasks: list[Task], server_url: str) -> str:
     """Fallback completion instructions when the contract include is absent.
 
     Mirrors the pre-contract prose: concrete curl commands with
@@ -776,7 +793,7 @@ def _legacy_completion_instructions(tasks: list[Task]) -> str:
     """
     completion_cmds = "\n".join(
         f"curl -s -w '\\n%{{http_code}}' --retry 3 --retry-delay 2 --retry-connrefused "
-        f"-X POST http://127.0.0.1:8052/tasks/{t.id}/complete "
+        f"-X POST {server_url}/tasks/{t.id}/complete "
         f'-H "Content-Type: application/json" '
         f'-d \'{{"result_summary": "Completed: {t.title}"}}\''
         for t in tasks
@@ -791,7 +808,7 @@ def _legacy_completion_instructions(tasks: list[Task]) -> str:
     )
 
 
-def _render_completion_instructions(tasks: list[Task]) -> str:
+def _render_completion_instructions(tasks: list[Task], server_url: str) -> str:
     """Build the terminal-outcome instruction block for the worker prompt.
 
     Renders the shared ``templates/roles/_includes/completion_contract.md``
@@ -807,8 +824,12 @@ def _render_completion_instructions(tasks: list[Task]) -> str:
         template = include_path.read_text(encoding="utf-8")
     except OSError:
         logger.warning("Completion contract include missing at %s; using legacy instructions", include_path)
-        return _legacy_completion_instructions(tasks)
+        return _legacy_completion_instructions(tasks, server_url)
 
+    # The include names the server as ``{{SERVER_URL}}``, not a literal. It is
+    # the completion POST, the one curl that decides whether a task is marked
+    # done, so it has to name the same server as every other curl in the prompt.
+    template = template.replace("{{SERVER_URL}}", server_url)
     ids = [t.id for t in tasks]
     if len(ids) == 1:
         header = "Complete this task. When done, report a terminal outcome for it:\n\n"
@@ -946,9 +967,13 @@ def _render_prompt(
     # Project context from .sdd/project.md if it exists
     project_context = resolve_project_context(tasks, workdir)
 
+    # Resolved once: every curl example in this prompt must name the same
+    # server, and the agent's worktree cannot resolve it for itself (#5964).
+    server_url = _task_server_url(workdir)
+
     # Completion-contract instructions shared with templates/roles via the
     # single _includes/completion_contract.md partial (#2244).
-    instructions = _render_completion_instructions(tasks)
+    instructions = _render_completion_instructions(tasks, server_url)
 
     # Available roles from templates directory
     available_roles = ""
@@ -985,6 +1010,8 @@ def _render_prompt(
         "AVAILABLE_ROLES": available_roles,
         "INSTRUCTIONS": instructions,
         "SPECIALISTS": specialist_block,
+        # Same server the curls below name; the manager's system prompt uses it (#5964).
+        "SERVER_URL": server_url,
     }
 
     role_prompt = _resolve_role_prompt(
@@ -1098,7 +1125,7 @@ def _render_prompt(
                     "\n## Team coordination\n"
                     "When you create a new file, define an API, or discover something other agents should know:\n"
                     "```bash\n"
-                    "curl -s -X POST http://127.0.0.1:8052/bulletin "
+                    "curl -s -X POST " + server_url + "/bulletin "
                     '-H "Content-Type: application/json" \\\n'
                     '  -d \'{"agent_id": "' + agent_id + '", "type": "finding", '
                     '"content": "<describe what you created or discovered>"}\'\n'
@@ -1110,7 +1137,7 @@ def _render_prompt(
                     "\n### Direct channel (agent-to-agent queries)\n"
                     "To ask another agent a question (e.g. about a schema or interface they own):\n"
                     "```bash\n"
-                    "curl -s -X POST http://127.0.0.1:8052/channel/query "
+                    "curl -s -X POST " + server_url + "/channel/query "
                     '-H "Content-Type: application/json" \\\n'
                     '  -d \'{"sender_agent": "' + agent_id + '", '
                     '"topic": "<short-topic>", '
@@ -1119,11 +1146,11 @@ def _render_prompt(
                     "```\n"
                     "Check for questions addressed to you:\n"
                     "```bash\n"
-                    "curl -s http://127.0.0.1:8052/channel/queries?agent_id=" + agent_id + "\n"
+                    "curl -s " + server_url + "/channel/queries?agent_id=" + agent_id + "\n"
                     "```\n"
                     "Respond to a query:\n"
                     "```bash\n"
-                    "curl -s -X POST http://127.0.0.1:8052/channel/<query_id>/respond "
+                    "curl -s -X POST " + server_url + "/channel/<query_id>/respond "
                     '-H "Content-Type: application/json" \\\n'
                     '  -d \'{"responder_agent": "' + agent_id + '", '
                     '"content": "<your answer>"}\'\n'
@@ -1224,6 +1251,25 @@ def _render_prompt(
             session_id,
             max_turns,
         )
+
+    # Prompt segmentation (#3455 step 1): digest the four blocks the
+    # orchestrator authors so a future divergence can name which one
+    # changed. Computed for the return value only -- this does not persist
+    # the segments or the list digest anywhere (no journal, no chain, no
+    # ContextCapsule field). This render path has no resume-state text of
+    # its own (crash recovery prepends resume_header outside this function,
+    # see spawner_core.spawn_for_resume), so resume_block is empty here.
+    _prompt_segments = segment_prompt(
+        role_block=role_prompt,
+        task_block=task_block,
+        mailbox_block=mailbox_section,
+        resume_block="",
+    )
+    logger.debug(
+        "Prompt segments digested (not yet anchored): %d segments, list digest=%s",
+        len(_prompt_segments),
+        segments_digest(_prompt_segments),
+    )
 
     # Strip empty/whitespace-only sections before compression
     named_sections = [(name, content) for name, content in named_sections if content and content.strip()]

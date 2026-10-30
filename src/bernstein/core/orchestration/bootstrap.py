@@ -39,6 +39,7 @@ from bernstein.core.log_redact import install_pii_filter
 from bernstein.core.orchestration.preflight import (
     _claude_has_oauth_session,
     _codex_has_auth,
+    check_adapter_configured,
     gemini_has_auth,
     preflight_checks,
 )
@@ -580,17 +581,24 @@ def _describe_cost_estimate(backlog_count: int, model: str | None) -> str:
     Returns:
         Plain-text fragment for the startup cost line.
     """
-    from bernstein.core.cost import estimate_run_cost
+    from bernstein.core.cost import estimate_run_cost, model_cost_is_known
+
+    count_note = f"{backlog_count} task(s)" if backlog_count > 0 else "task count pending planning"
+
+    if not model:
+        return f"unknown (no model configured, {count_note})"
+
+    # A model with no pricing-table entry (a gateway alias / self-hosted
+    # route) meters at $0 but is not free - say "unpriced" rather than quote
+    # "$0.00" as if the run cost nothing (issue #5337).
+    if not model_cost_is_known(model):
+        return f"unpriced ({model} not in pricing table, {count_note})"
 
     if backlog_count > 0:
-        if model:
-            low, high = estimate_run_cost(backlog_count, model)
-            return f"~${low:.2f}-${high:.2f} ({backlog_count} task(s), {model})"
-        return f"unknown (no model configured, {backlog_count} task(s))"
-    if model:
-        low, high = estimate_run_cost(1, model)
-        return f"~${low:.2f}-${high:.2f} per task ({model}, task count pending planning)"
-    return "unknown (no model configured, task count pending planning)"
+        low, high = estimate_run_cost(backlog_count, model)
+        return f"~${low:.2f}-${high:.2f} ({backlog_count} task(s), {model})"
+    low, high = estimate_run_cost(1, model)
+    return f"~${low:.2f}-${high:.2f} per task ({model}, task count pending planning)"
 
 
 def _record_team_manifest_lineage(seed: SeedConfig, workdir: Path) -> None:
@@ -736,6 +744,7 @@ def bootstrap_from_seed(
         cluster_enabled=cluster_enabled,
         auth_token=auth_token,
         evolve_mode=evolve_mode,
+        seed_path=_resolved_seed_path,
     )
     if not _wait_for_server(port, server_url=server_url):
         from bernstein.cli.errors import BernsteinError
@@ -951,6 +960,7 @@ def _watchdog_check_process(
     restart_fn: Any,
     post_restart_fn: Any | None = None,
     liveness: Liveness | None = None,
+    workdir: Path | None = None,
 ) -> tuple[float | None, int, bool]:
     """Check a single watchdog-monitored process and restart if it is not up.
 
@@ -997,6 +1007,17 @@ def _watchdog_check_process(
         return alive_since, restarts, give_up_logged
 
     # Not positively alive: dead, or a pid we cannot attribute to our pidfile.
+    # Check for deliberate-stop marker (issue #6089 slice 1).
+    if workdir is not None and name == "Orchestrator":
+        marker_path = workdir / ".sdd" / "runtime" / "spawner-deliberate-stop"
+        if marker_path.exists():
+            logger.info(
+                "%s stopped deliberately (marker present: %s) - not restarting",
+                name,
+                marker_path.read_text().strip()[:50],
+            )
+            return None, restarts, give_up_logged
+
     if restarts >= max_restarts:
         if not give_up_logged:
             logger.error(
@@ -1049,7 +1070,7 @@ def _supervisor_should_stand_down(workdir: Path) -> str | None:
       ordinary restart default is untouched. Reading the journal directly
       (rather than the audit-chain closure marker ``_restart_spawner``
       reconciles as bookkeeping) keeps this cheap enough to call every poll --
-      the marker it looks for is written once, at the very end of one run's
+      the marker it looks for is written once, near the end of one run's
       own small journal, not re-derived by re-verifying the whole project's
       audit history.
 
@@ -1077,7 +1098,9 @@ def _supervisor_should_stand_down(workdir: Path) -> str | None:
     if owner is not None:
         journal_path = contained_run_journal(sdd_dir / "runs", owner.run_id)
         events = load_events(journal_path).events if journal_path is not None else []
-        if events and events[-1].get("event") == "run_completed":
+        # ``run_completed`` is not the last row: the shutdown sequence appends
+        # ``run_quiescence`` after it, so look for it rather than at the tail.
+        if any(event.get("event") == "run_completed" for event in events):
             return f"run {owner.run_id} already self-stopped cleanly (run_completed journaled)"
     return None
 
@@ -1120,8 +1143,8 @@ def run_watchdog(
         adapter: Resolved CLI adapter override to preserve across
             watchdog-triggered spawner restarts (see ``_restart_spawner``).
         model: ``--model`` override to preserve across spawner restarts.
-        seed_path: Resolved bernstein.yaml path to preserve across spawner
-            restarts.
+        seed_path: Resolved bernstein.yaml path to preserve across server
+            and spawner restarts.
     """
     server_pid_path = workdir / ".sdd" / "runtime" / "server.pid"
     spawner_pid_path = workdir / ".sdd" / "runtime" / "spawner.pid"
@@ -1154,7 +1177,7 @@ def run_watchdog(
             max_restarts=max_restarts,
             reset_after_s=restart_reset_after_s,
             now=now,
-            restart_fn=lambda: _start_server(workdir, port),
+            restart_fn=lambda: _start_server(workdir, port, seed_path=seed_path),
             post_restart_fn=lambda: _wait_for_server(port),
             liveness=server_liveness,
         )
@@ -1193,6 +1216,7 @@ def run_watchdog(
             now=now,
             restart_fn=_restart_spawner,
             liveness=spawner_liveness,
+            workdir=workdir,
         )
 
 
@@ -1407,7 +1431,31 @@ def _bootstrap_from_goal_impl(
     # 0. Pre-startup git hygiene - clean stale worktrees/branches/skip-worktree files from prior runs (#4394)
     _run_git_hygiene(workdir)
 
-    seed = SeedConfig(goal=goal, cli=cli, model=model)  # type: ignore[arg-type]
+    # Issue #6081: inline goals should resolve quality_gates from bernstein.yaml
+    # if present, so run_started journals the same gate_config whether the goal
+    # came from the seed file or from -g. Read the existing config and extract
+    # gate-related fields to merge into the minimal seed.
+    from bernstein.core.config.seed import resolve_seed_path
+    from bernstein.core.config.seed_parser import parse_seed
+
+    _existing_gates = None
+    _existing_formal_verification = None
+    _seed_path = resolve_seed_path(workdir)
+    if _seed_path.exists():
+        try:
+            _existing = parse_seed(_seed_path)
+            _existing_gates = _existing.quality_gates
+            _existing_formal_verification = _existing.formal_verification
+        except Exception as exc:
+            logger.debug("Could not read quality_gates from %s: %s", _seed_path, exc)
+
+    seed = SeedConfig(
+        goal=goal,
+        cli=cli,
+        model=model,
+        quality_gates=_existing_gates,
+        formal_verification=_existing_formal_verification,
+    )  # type: ignore[call-arg]
 
     # Detect first run: no .sdd/ and no bernstein.yaml yet
     first_run = not (workdir / ".sdd").exists() and not (workdir / "bernstein.yaml").exists()
@@ -1460,6 +1508,12 @@ def _bootstrap_from_goal_impl(
         console.print(f"[green]{_icons.arrow_right}[/green] Created .sdd/ workspace")
     else:
         console.print(f"[green]{_icons.arrow_right}[/green] Workspace ready")
+
+    # An inline goal carries no seed, so the orchestrator subprocess can only learn
+    # its adapter from a concrete ``cli`` or BERNSTEIN_ADAPTER. Checked after the
+    # workspace step so a first-run ``bernstein.yaml`` is already in place, and
+    # before the server and watchdog exist to be left running behind a dead run (#6126).
+    check_adapter_configured(cli, workdir)
 
     with Status("[bold]Loading agent catalog...[/bold]", console=console):
         _discover_catalog(workdir)

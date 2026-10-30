@@ -379,6 +379,58 @@ before and after the upgrade are **not comparable** - re-seal once
 after upgrading, and keep any pinned pre-upgrade root labelled as the
 old scheme. this is a scheme upgrade, not a tamper alert.
 
+### Incremental verification and the published read layout
+
+the writer appends to the live `*.jsonl` segments under the chain lock.
+a seal publishes, beside them, what a reader verifies against:
+
+| path (under `.sdd/audit/`) | written | reader trusts it because |
+|---|---|---|
+| `checkpoints/latest.json` | replaced on every accepted seal (temp file, fsync, rename, directory fsync) | HMAC-signed with the audit key |
+| `checkpoints/checkpoints.jsonl` | appended, never rewritten | each line HMAC-signed and chained to its predecessor |
+| `tiles/<segment>.tile` | by `audit seal` when that segment's sealed prefix changed, same publish path as the pointer | it doesn't: a tile is checked, never trusted |
+
+`AuditLog.verify_incremental()` reads the newest checkpoint (the pointer,
+falling back to the ledger), and for each segment trusts the prefix the
+checkpoint pins only when those bytes still hash to the signed leaf and
+the prefix's first record links to the head the walk has reached. only
+the records appended after the pin are parsed and HMAC-checked, so after
+a seal, appending N records costs a walk of N records. a segment the
+checkpoint does not pin, or whose pinned prefix no longer reproduces, is
+walked in full, and every finding names the same `segment:line` a full
+`verify()` names. a log sealed before checkpoints existed has no pin and
+is walked in full.
+
+the pins are evidence about length as well as content. a segment cut back
+to a record boundary, or deleted outright, leaves a chain that still walks
+clean, so `verify()` alone passes it. the incremental verifier reports a
+pinned segment that is gone, shorter than its pin, or whose pinned prefix
+changed under a chain that still verifies, naming the segment, with the
+same wording the checkpoint pillar of `bernstein audit verify` uses. an
+`ack-tear` acknowledgement for that checkpoint clears it, exactly as it
+does for the checkpoint pillar. records appended after the newest seal
+are pinned by nothing, so removing them is not detectable from this
+directory alone; that is what external anchors and witness co-signatures
+(below) are for.
+
+a tile is unsigned, so editing a segment and rewriting its tile to match
+buys nothing: the edit fails the signed leaf and the segment is walked.
+each tile is compared byte for byte with the tile the seal would publish
+for the bytes this run authenticated, so a flipped byte in a tile is
+reported as `tiles/<segment>.tile: ...` rather than passing unnoticed.
+tiles are rendered with LF line endings on every platform, so identical
+directories publish identical tile bytes; tiles written by earlier
+releases with CRLF on Windows still verify.
+
+the run takes no lock and needs no write access: it works against a
+read-only copy while a writer appends to the live directory. its one write,
+the tile-read counter behind `last_tile_read_count()`, is best-effort and
+never part of the verdict.
+
+not yet covered: `bernstein audit verify` still walks every segment, the
+unchanged prefixes are still read once to be hashed, and a seal over a
+segment that grew since the last seal replaces that segment's tile.
+
 ### Tears: crash damage at the chain tail
 
 a crashed append is not a clean truncation. file size can be
@@ -413,10 +465,140 @@ scope, stated honestly: the checkpoint gate makes a shrink
 non-launderable by the seal job and detectable by every verify run
 against the local directory. an actor with write access to **both**
 the chain segments and the checkpoints file can still rewind both to
-a mutually consistent earlier state; catching that requires retention
-outside the writer's filesystem (an independent co-signer over
-checkpoints), which is planned as a follow-up and tracked on the
-issue tracker.
+a mutually consistent earlier state; catching that needs retention
+outside the writer's filesystem, which is what external anchors are.
+
+### External anchors: retention outside this machine
+
+everything the checkpoint gate compares against is material we hold.
+an actor who controls the audit directory holds all of it, so they
+can roll all of it back together and every local check passes. an
+**anchor** is the part they cannot reproduce: an RFC 3161 timestamp
+token, issued by a TSA, over `sha256(canonical checkpoint payload)`.
+the checkpoint payload already pins the origin, the record count and
+the per-segment leaves, so timestamping it timestamps the claim about
+how long the history was - and a TSA will not issue a token dated
+earlier.
+
+anchoring is optional, off by default, and bernstein never contacts a
+TSA. the operator makes the request and hands back the response:
+
+```bash
+# 1. what to timestamp
+bernstein audit anchor --print-request
+
+# 2. ask your TSA (any RFC 3161 endpoint)
+openssl ts -query -digest <digest> -sha256 -cert -no_nonce -out req.tsq
+curl -sS -H 'Content-Type: application/timestamp-query' \
+     --data-binary @req.tsq <tsa-url> -o resp.tsr
+
+# 3. record it beside the checkpoint
+bernstein audit anchor --rfc3161-token resp.tsr --rfc3161-tsa-url <tsa-url>
+```
+
+anchors live in `.sdd/audit/checkpoints/anchors.jsonl`, append-only
+and fsynced, beside `checkpoints.jsonl` and never inside it: a
+checkpoint payload carries no timestamps by design, and folding a
+token into it would break the byte-determinism of the checkpoints
+file. the record copies the anchored `origin`, `entry_count` and
+`checkpoint_root` out of the checkpoint, so deleting the checkpoints
+file does not delete the number the anchor was pinning.
+
+`bernstein audit verify` then runs an **external anchors** pillar:
+
+- the token must parse and its `messageImprint` must cover the
+  checkpoint payload the anchor names. this needs nothing from the
+  operator, so it always runs.
+- pass `--rfc3161-trusted-tsa-bundle <roots.pem>` to also authenticate
+  the issuing TSA. without it the token is bound to the checkpoint but
+  the signer is not identified - verify says so in its output.
+- a local history shorter than the newest anchored record count, a
+  different chain origin, or an anchored checkpoint that is no longer
+  on record are all **contradictions**, and each exits non-zero naming
+  the anchor.
+
+an anchor contradiction is **not** clearable with `audit ack-tear`.
+an acknowledgement records that an operator looked at local damage;
+it cannot withdraw a signature a third party made. restore the
+missing history, or treat the anchored range as unaccounted for.
+
+keep a copy of `anchors.jsonl` off the machine that writes it. an
+anchor deleted together with the history it contradicts protects
+nothing - which is why `bernstein doctor` reports the anchoring state
+(`never anchored` / `anchored at N entries, last at T`) rather than
+letting an unanchored install look as strong as an anchored one.
+
+still open, and deliberately not shipped here: operator-supplied
+external sinks (object lock, append-only bucket) for checkpoint
+retention.
+
+### Witness co-signatures: a second party that remembers
+
+an anchor says a history of a given size existed at a point in time.
+a **witness** says something the local host cannot say about itself:
+that it already accepted a tree this one has to extend. a witness is
+a minimal second party - another host, a separate unix user, or an
+operator laptop - holding per-origin monotonic state (the newest
+checkpoint it accepted for a chain origin) and an ed25519 key.
+
+the witness co-signs only when the submitted checkpoint is a
+consistent extension of its pin. it refuses otherwise, and the cause
+is named:
+
+| cause | what it means |
+| --- | --- |
+| `size_regression` | the submitted tree holds fewer records than the pinned one |
+| `state_mismatch` | a second tree at the size the witness already pinned, or a different origin |
+| `inconsistent_extension` | a pinned segment is gone, shrank, or changed under a length it was pinned at; or the submitted leaves do not rebuild the submitted root |
+
+three commands, one per host:
+
+```bash
+# on the log host: the checkpoint payload, no secrets in it
+bernstein audit witness export --out cp.json
+
+# on the witness: check against its own state, then co-sign
+bernstein audit witness cosign --checkpoint cp.json --key witness.key \
+    --state-dir ~/.bernstein-witness --out cosig.json
+
+# on the log host: store it, checked under the key you pin
+bernstein audit witness record --cosignature cosig.json --witness-key witness.pub
+```
+
+co-signatures live in `.sdd/audit/checkpoints/cosignatures.jsonl`,
+append-only and fsynced, beside `checkpoints.jsonl` and never inside
+it - same reason as anchors. witness state lives in the witness's own
+directory, one file per chain origin, written temp-file + rename +
+fsync so a crash leaves the old pin rather than a truncated one.
+
+`bernstein audit verify` then runs a **witness co-signatures** pillar:
+
+- pass `--witness-key <witness.pub>` to authenticate the recorded
+  co-signatures. without it they are reported as present but
+  unauthenticated and drive no verdict: a witness key taken from the
+  record itself is a witness vouching for itself.
+- pass `--witness-state <dir>` as well to read the witness's own pins
+  directly. that is the copy an actor who rewinds the local history
+  cannot delete.
+- a local history shorter than the newest witnessed record count, a
+  different chain origin, or a witnessed checkpoint that is no longer
+  on record are all **contradictions**, and each exits non-zero naming
+  the witnessed checkpoint.
+
+what the witness does *not* check: it never sees the audit key or the
+chain segments, so it cannot re-hash a segment prefix. a pinned
+segment that grew is accepted on the strength of the local gate, which
+does hold the bytes. what the witness adds is the memory.
+
+a witness holding no state for a chain co-signs and says so - a first
+acceptance, or one taken after the state was lost, proves nothing
+about history before it. that is the local-only guarantee again, and
+`witness cosign` prints it rather than passing silently. keep the
+state directory backed up for the same reason you keep
+`anchors.jsonl` off the writing machine.
+
+a witness contradiction is **not** clearable with `audit ack-tear`,
+for the same reason an anchor contradiction is not.
 
 ## Replaying a log
 
@@ -545,6 +727,8 @@ webhook payload, one batch:
     "outcome": "success",
     "details": {"from_status": "open", "to_status": "claimed"},
     "hmac": "d4e5f6…",
+    "prev_hmac": "a1b2c3…",
+    "sequence": 4271,
     "source": "bernstein-audit"
   }
 ]
@@ -552,9 +736,62 @@ webhook payload, one batch:
 
 retry behaviour: failed batches retry with exponential backoff
 (`max_retries`, `retry_backoff_s`) before being counted in
-`total_failed`. the chain on disk is the source of truth - SIEM is
-a mirror, not the master copy. if the SIEM drops a batch, replay
-from `.sdd/audit/` with `bernstein audit query`.
+`total_failed`. a batch that still fails writes an
+`audit.export.failed` event to the chain itself (when the exporter was
+constructed with a `failure_log`), so a silent forwarding outage shows
+up in `bernstein audit query` rather than being indistinguishable from
+quiet. the chain on disk is the source of truth - SIEM is a mirror,
+not the master copy. if the SIEM drops a batch, replay from
+`.sdd/audit/` with `bernstein audit query`.
+
+### Verifying an export without the source database
+
+Before issue #5034, `hmac` was the only field on an exported record, and
+it proves nothing to a receiver who never held the signing key: a
+deleted, reordered, or gapped record was invisible in the SIEM copy. Every
+`AuditEntry` now also carries `prev_hmac` and `sequence`, so the chain
+linkage survives the export.
+
+When the exporter is constructed with a `kms_adapter`
+(`bernstein.core.security.key_custody.KMSAdapter` -- the same Ed25519
+signer the lineage subsystem uses), each flushed batch is closed with a
+signed `SegmentReceipt`: first/last sequence, entry count, and the
+batch's chain-head hmac. `FileExporter` writes it as a trailing
+`{"segment_receipt": {...}}` line in the JSONL output.
+
+`bernstein audit verify-export <file>` reads that file back and reports
+whether it is contiguous, has a gap, was reordered, or was tampered with
+-- using only the file and, optionally, the signer's public key. An
+export produced before #5034 has no `sequence` field on its records, which
+reads as `sequence 0` on every record and is reported as `REORDERED` --
+that label means "this export predates the feature", not "records were
+reordered"; re-export with the current build to check it properly.
+
+```bash
+bernstein audit verify-export .sdd/exports/audit.jsonl
+bernstein audit verify-export .sdd/exports/audit.jsonl --public-key signer-public.jwk.json
+```
+
+Without `--public-key`, each receipt's embedded key is trusted on first
+use -- the command's `PASSED` panel says so explicitly (`Trust: signer
+trusted on first use -- authenticity NOT verified, re-run with
+--public-key`), because an attacker who rewrites the export and re-signs
+every receipt with their own key passes an unpinned check. Pin the signer
+with `--public-key` to actually verify authenticity: a receipt signed by
+any other key is then reported as `TAMPERED`. An export with no segment
+receipts at all reports `Trust: no segment receipts -- sequence continuity
+only` -- there is no signature evidence to check in that case.
+
+What the command proves either way is that the export is **contiguous, in
+order, and chain-linked**: each record's `prev_hmac` matches the previous
+record's stored `hmac`. It does not recompute any record's `hmac` from its
+content, so it cannot detect a record whose `details` were edited while
+its stored `hmac` was left alone -- that is a content-integrity question,
+answered only by `bernstein audit verify` against the source database and
+the HMAC signing key. This is the property that makes the SIEM copy a
+portable, offline-verifiable segment of the chain rather than just a log:
+a SOC analyst or auditor can check completeness and order for themselves,
+without holding the key.
 
 ### Sample dashboards
 

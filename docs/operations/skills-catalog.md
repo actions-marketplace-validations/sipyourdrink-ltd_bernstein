@@ -85,6 +85,35 @@ The signed payload is the canonical JSON of the entry, deliberately
 excluding the `signature` and `verified` fields so the signature is
 neither self-referential nor sensitive to operator-side flags.
 
+## Trust gate on install
+
+A skill body is prompt-space code: whatever it says steers the agent that
+loads it. Catalog content is third-party, so the install path promotes a
+fetched entry only after `lint_skill()` clears it. Promotion runs under
+strict lint, so any ERROR finding refuses the install:
+
+| Finding code         | What it catches                                                                 |
+|----------------------|---------------------------------------------------------------------------------|
+| `prompt-space-risk`  | Exfiltration-shaped instructions, credential-file asks, approval-bypass phrasing |
+| `invalid-manifest`   | Frontmatter that does not validate against the skill manifest schema             |
+| `unsafe-reference-path` / `missing-reference` | Declared bucket paths that escape the skill root or do not exist |
+| `sensitive-pattern`  | Invisible Unicode codepoints (a likely prompt-injection payload)                 |
+
+The gate runs against the staging copy, before the atomic swap into
+`.bernstein/skills/<name>/`. A refused entry therefore leaves nothing on
+disk: no skill directory, no `skills.lock` row, no install receipt. An
+already-installed clean version of the same skill is untouched.
+
+Each refusal appends a `skill.verification_refusal` event to the audit
+chain with `stage="install"`, the skill id and version, the offending
+lint findings in `detail`, and a `reason_code` of `prompt_space_risk`
+when a `prompt-space-risk` finding is present or `lint_error` otherwise.
+"Why was this skill refused?" is answerable offline from the chain.
+
+Local installs (`bernstein skills install <path>`) keep their existing
+posture: lint is advisory unless the operator passes `--strict`. The
+strictness is tied to the content being third-party, not to the command.
+
 ## Audit chain integration
 
 Every install / upgrade / uninstall appends an HMAC-chained event under
@@ -160,12 +189,24 @@ if not result.ok:
 
 ## Cache and TTL
 
-The fetcher caches the upstream catalog under
-`.sdd/skills_catalog/catalog.json` (project-local). The cache TTL
-defaults to 6 hours; operators override it via
-`BERNSTEIN_SKILLS_CATALOG_TTL` (seconds). The cache and the audit log
-share a single source of truth: a stale fetch on a 5xx upstream serves
-the last validated copy instead of failing.
+The fetcher caches the upstream catalog in one user-level file,
+`$XDG_CACHE_HOME/bernstein/skills-catalog.json` (or
+`~/.cache/bernstein/skills-catalog.json` when `XDG_CACHE_HOME` is unset).
+Every worker and worktree reads the same file, so parallel agents resolve
+the same digests and the same signed revocations. Set
+`BERNSTEIN_SKILLS_CATALOG_CACHE_PATH` to put the cache somewhere else.
+
+The cache TTL defaults to 6 hours; operators override it via
+`BERNSTEIN_SKILLS_CATALOG_TTL` (seconds). Inside the TTL a fetch makes no
+request. After it, the request carries `If-None-Match` and a `304` reuses
+the cached copy. A body that fails validation is remembered by its `ETag`,
+so it is not downloaded again until it changes. A stale fetch on a 5xx
+upstream serves the last validated copy instead of failing.
+
+Releases before this one cached the catalog per project under
+`.sdd/skills_catalog/catalog.json`. Spawn-time revocation enforcement
+still reads that file until the shared cache holds a valid catalog, so
+revocations cached there keep applying across the upgrade.
 
 ## Drift detection
 

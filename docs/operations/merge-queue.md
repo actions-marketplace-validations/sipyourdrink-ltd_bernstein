@@ -95,6 +95,28 @@ required-context coverage by
 | `typecheck (packages/vscode)` | `typecheck-ts.yml` :: `typecheck` | Yes - `merge_group: {}` | **No - see below** |
 | `typecheck (web)` | `typecheck-ts.yml` :: `typecheck` | Yes - `merge_group: {}` | **No - see below** |
 | `typecheck (templates/cloudflare-mcp-server)` | `typecheck-ts.yml` :: `typecheck` | Yes - `merge_group: {}` | **No - see below** |
+| `quorum` | `quorum.yml` :: `quorum` | Yes - `merge_group: {}` | **Yes - required by name through an organization ruleset** |
+
+`quorum` is required through an organization ruleset rather than the
+repository one, but by context name like every other row. It was pinned as a
+required *workflow* until 2026-09-17, and that form could only be satisfied
+by a run of the file itself: part of the verdict turns on elapsed time - the
+72-hour objection window in the charter - so a pull request whose window had
+closed kept the red check it was given hours earlier, and the only way to
+move it was a fresh pull-request event (close and reopen, in practice). A
+required context can be answered again whenever the answer changes, by a
+re-run or by re-publishing the context with
+`scripts/publish_required_check.py` from a workflow that holds
+`checks: write`.
+
+What the name buys back has to be replaced deliberately. A branch that can
+run workflows in this repository can publish a context by name, which a
+pinned workflow path could not; fork pull requests cannot, because their
+`GITHUB_TOKEN` is read-only. The replacement is a privileged re-evaluation
+that recomputes the verdict from the default branch and republishes it, so a
+published `quorum` that disagrees with the rules is overwritten rather than
+merged on. What the check decides, and why a branch rule cannot decide it
+instead, is written at the top of `scripts/quorum_check.py`.
 
 `typecheck-ts` occupies four rows because it publishes four contexts: its
 job is `typecheck (${{ matrix.package }})` and branch protection matches a
@@ -223,16 +245,25 @@ docs-only.
 
 ## macOS coverage under the queue
 
-The macOS matrix (`test-macos`, `adapter-integration-macos`) is **gated**:
-it runs on `push` to `main`, on macOS-sensitive diffs, and on the
-`macos-needed` label. On a queued group the label and `push` branches cannot
-fire, so `macos_sensitive` - computed from the group's combined diff - is what
-decides: a group touching a macOS-sensitive path runs the macOS cells in the
-queue, and a group that does not skips them. The `CI gate` roll-up tolerates
-exactly that skip (see `MACOS_SKIP_EVENTS` in `ci.yml`). Coverage is preserved
-because the **post-merge `push` to `main`** runs the full macOS suite
-un-gated, and `ci-macos-nightly.yml` is the daily safety net. The queue
-validates the integrated combination; the merged commit validates macOS.
+The macOS matrix (`test-macos`, `adapter-integration-macos`) **never runs in
+the queue**. Both jobs carry `github.event_name != 'merge_group'`.
+
+The reason is that a queue build cannot observe anything new on that surface.
+The group's merge commit is the tree that lands on `main`, and the
+**post-merge `push` to `main`** re-runs the same platform checks against it
+minutes later. Running them inside the group buys a duplicate of a result the
+push produces anyway, while the group sits at the head of the queue and every
+entry behind it waits.
+
+The `CI gate` roll-up tolerates the skip unconditionally on this event -- see
+`MACOS_UNCONDITIONAL_SKIP_EVENTS` in `ci.yml`, a subset of `MACOS_SKIP_EVENTS`
+-- so a queued group is never wedged waiting on a job that cannot start.
+
+Coverage on what actually lands: the post-merge push runs
+`adapter-integration-macos` on every commit and the `test-macos` shards
+whenever the diff touches a macOS-sensitive path, and `ci-macos-nightly.yml`
+re-runs the whole macOS suite at 06:00 UTC daily. The queue validates the
+integrated combination; the merged commit validates macOS.
 
 ## Auto-release through the queue
 
@@ -243,10 +274,17 @@ that commit changed `version = ` in `pyproject.toml`. Two questions had to
 be answered before the queue can be enabled.
 
 **Q1: do merge-queue CI runs dispatch the release listener?**
-No, and that is the desired behaviour. A `merge_group` run reports
-`head_branch = gh-readonly-queue/main/pr-<n>-<base_sha>`, which the
-dispatcher's `branches: [main]` filter excludes. Nothing is ever tagged
-from a queue ref that has not merged.
+No - and the dispatcher still has to route them anyway. A `merge_group`
+run reports `head_branch = gh-readonly-queue/main/pr-<n>-<base_sha>`, which
+the dispatcher's `branches: [main]` trigger filter excludes, so no listener
+run boots from the queue ref itself. But that merge_group run is the only
+CI the version-bump commit ever gets: the queue fast-forwards `main` onto
+the SHA it already built, so no `push` CI run follows. The dispatcher's
+`auto-release` job therefore also admits
+`startsWith(head_branch, 'gh-readonly-queue/main/')` and routes that single
+queue run to the release gate. Nothing is tagged from a queue ref that has
+not merged - the gate still inspects the triggering commit and the commit
+is on `main` by the time it runs.
 
 **Q2: does the post-queue merge still fire the release listener?**
 Yes. When a merge group goes green, GitHub advances the base branch and
@@ -354,9 +392,24 @@ and the Step 1 payload from becoming three different answers.
 | `grouping_strategy` | `ALLGREEN` | `ALLGREEN` | A group merges only if every entry is green |
 | `max_entries_to_build` | 1 | **5** | Build concurrency: the number of `merge_group` webhooks in flight. At `1` the queue tests one entry at a time, so a burst of N PRs costs N sequential full CI cycles - strictly worse latency than today with no load benefit the per-SHA policy does not already provide. `5` caps concurrent queue CI at 5 instead of the unbounded N a burst produces today. |
 | `min_entries_to_merge` | 1 | **1** | Never wait for a second entry before merging |
-| `max_entries_to_merge` | 1 | **1** | One PR lands per push to `main`. The auto-release gate keys on the push head SHA, so merging N entries in a single push silently skips a version bump that is not last in the batch - green CI, no tag, no publish, no error. Lifting this requires the release gate to stop keying on the push head SHA; tracked as a follow-up. The second former blocker is closed: `determine-changes` now classifies a queued group against `github.event.merge_group.base_sha`, so a multi-entry group is planned from its combined diff instead of its last commit. |
+| `max_entries_to_merge` | 1 | **1** | One PR lands per push to `main`. The auto-release gate keys on the push head SHA, so merging N entries in a single push silently skips a version bump that is not last in the batch - green CI, no tag, no publish, no error. Lifting this requires the release gate to stop keying on the push head SHA; tracked as a follow-up. The second former blocker is closed: `determine-changes` now classifies a queued group against the batch root, the merge-base of the queue head with the target branch, so a multi-entry group is planned from its combined diff instead of its last commit. It does not use `github.event.merge_group.base_sha`, which for a stacked entry is the previous entry's head (#5901). |
 | `min_entries_to_merge_wait_minutes` | 0 | **0** | With `max_entries_to_merge = 1` there is no batch to fill, so any wait is pure added latency |
 | `check_response_timeout_minutes` | 30 | **240** | Re-measured 2026-07-27 over the last 30 successful `CI` runs on `main` (`run_started_at` -> `updated_at`): p50 **49** min, p90 **214** min, max **243** min, and **30 of 30 exceeded 30 minutes**. The earlier figures in this row (p50 38 / p90 58 / max 105) are stale. At the shipped `30`, *every* entry is ejected as timed out. At `120`, 9 of those 30 runs would still have been ejected. `240` covers all but the single 243-minute outlier. Re-measure in Step 0 before flipping - this value tracks runner-pool contention, not the test suite. |
+
+### Grouping strategy: ALLGREEN vs HEADGREEN tradeoff
+
+The merge queue is configured with `grouping_strategy: ALLGREEN`.
+
+**The Tradeoff Stated Plainly:**
+- `ALLGREEN` is the strictest setting: every entry in a batch is tested together, and the batch merges only if the entire batch passes. This ensures the exact tree tested is the exact tree that lands on `main`. However, under cumulative batching, an entry at position 1 or 2 that fails only in the combined tree will fail every group containing it, stalling all queued PRs behind it.
+- `HEADGREEN` merges the longest passing prefix (`e1..eN-1`), which prevents a poison entry from blocking PRs queued behind it, but at the cost of merging a prefix whose combination was not the exact tested tree.
+
+**Measured Cost of ALLGREEN:**
+- On 2026-09-04 between 19:58Z and 22:19Z (2h21m), the queue held 7 PRs with CI green on each PR's branch, but produced zero merges because 2 entries failed in the combined tree. Six consecutive merge-group builds produced no merge. Once the failing entries were dequeued by hand, 9 merges landed in 4 minutes.
+- A second episode occurred overnight with #5234 (ejected and re-queued 5 times, each cycle a full group build, costing ~3 hours of queue capacity).
+
+**Decision:**
+The strategy remains `ALLGREEN`. A slow queue is preferable to an untested merge on `main`. Whole-tree guards on PRs (#5428) and baseline snapshot freshness (#5503) address the supply of poison pills directly. Until then, operators resolve stalls using the bisection runbook below.
 
 ## Blockers to the flip
 
@@ -572,6 +625,22 @@ checks. Any PRs sitting in the queue are released back to normal merge.
 | Entries ejected as timed out | `check_response_timeout_minutes` below the real CI wall time | Raise it; see the measured distribution in Tunables |
 | Merges land but no release is tagged | The post-merge `push` CI run did not reach the dispatcher | Confirm a `push` run on `main` exists at the merged SHA, then that `post-ci-dispatcher.yml` ran off it; check `pyproject.toml` is still absent from `ci.yml`'s `push.paths-ignore` |
 | Queue throughput too low | Build concurrency, not batching | Raise `max_entries_to_build`. Do **not** raise `max_entries_to_merge` - see Tunables |
+| Queue produces no merge for >1h with queued PRs | A single entry fails alone in the merged tree, failing all stacked groups (`ALLGREEN`) | Follow the bisection runbook below: identify the failing entry from the single-member batch and dequeue it |
+
+### Stalled queue bisection (handling poison entries)
+
+When the merge queue has entries queued but produces no merge for an hour:
+
+1. **Inspect the single-member batch:** The queue always builds position 1 alone as a single-member batch. Check `gh run list --event merge_group --limit 10`:
+   - If the single-member batch for PR #N is failing, PR #N is failing alone on top of `main`.
+   - If position 1 passes alone but stacked groups fail, the conflict is between two specific entries in the stack.
+2. **Identify the culprit:**
+   - Look at the failed `CI gate` check on the `merge_group` run.
+   - Trace the first group in the stack that transitioned from green to red.
+3. **Dequeue the poison entry:**
+   - Disable auto-merge on the culprit PR: `gh pr merge <number> --disable-auto`.
+   - The queue will automatically eject that entry and immediately re-form the remaining queue into new groups without having to drain or pause the ruleset.
+
 
 The `merge_group` path is guarded by regression tests in
 `tests/unit/test_required_check_canary_workflow_yaml.py` (required-context

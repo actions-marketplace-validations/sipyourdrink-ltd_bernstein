@@ -234,3 +234,48 @@ def test_conformance_replays_two_identical_gitleaks_runs(tmp_path: Path) -> None
     assert result.adapter_name == "gitleaks"
     assert result.determinism_tier is DeterminismTier.DETERMINISTIC
     assert sum(call.args[0][1] == "dir" for call in run.call_args_list) == 2
+
+
+def test_scan_result_carries_the_invocation_digest(tmp_path: Path) -> None:
+    """The digest on the returned object is the one the adapter recorded (#5151)."""
+    target = tmp_path / "target"
+    target.mkdir()
+    adapter = GitleaksAdapter(config_path=_CONFIG)
+
+    with (
+        patch("bernstein.adapters.gitleaks.shutil.which", return_value="/usr/local/bin/gitleaks"),
+        patch("bernstein.adapters.gitleaks.subprocess.run", side_effect=_fake_gitleaks_run),
+    ):
+        result = adapter.scan(target, ScanScope(roots=(target,)), tmp_path / "work")
+
+    assert adapter.last_invocation is not None
+    assert result.invocation_digest == adapter.last_invocation.argv_hash
+    assert result.invocation_digest != ""
+
+
+@pytest.mark.parametrize(
+    "module_name,func_name",
+    [
+        ("bernstein.adapters.scanner", "normalize_finding_path"),
+        ("bernstein.adapters.trivy", "_normalize_path"),
+    ],
+)
+def test_windows_drive_letter_path_is_relativized_correctly(module_name: str, func_name: str) -> None:
+    """Reproduce the Windows path bug without needing a Windows machine.
+
+    PurePosixPath doesn't consider 'C:/...' absolute, so we must gate
+    on the root being anchored, not the candidate (Issue #5787).
+    Trivy was the adapter that regressed, so all three are pinned here
+    via the shared helper in scanner.py and trivy's URI wrapper.
+    """
+    import importlib
+
+    module = importlib.import_module(module_name)
+    normalize_func = getattr(module, func_name)
+
+    # Simulate a Windows drive-letter path
+    assert normalize_func("C:/checkout/project/app.env", Path("C:/checkout/project")) == "app.env"
+    assert normalize_func("C:\\checkout\\project\\app.env", Path("C:/checkout/project")) == "app.env"
+
+    # Ensure relative roots don't truncate relative candidates (the latent edge)
+    assert normalize_func("src/app.py", Path("src")) == "src/app.py"

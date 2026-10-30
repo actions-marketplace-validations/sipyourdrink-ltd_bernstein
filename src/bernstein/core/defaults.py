@@ -160,10 +160,12 @@ class OrchestratorDefaults:
     # logic and its relationship to ``AGENT.idle_log_age_threshold_s``.
     stalled_manager_threshold_s: float = 170.0
 
-    # Starting wall-clock kill deadline for a spawned agent (OrchestratorConfig.
-    # max_agent_runtime_s). Self-extends +600s/tick up to a 5400s hard cap while
-    # the agent is heartbeating (see core/agents/agent_lifecycle.py); this is
-    # only the initial value before any extension. Tunable via
+    # Upward-only floor for spawned-agent scope/XL wall-clock buckets. Values
+    # above the shipped 1800s default raise shorter starting deadlines; values
+    # at or below the default never shorten the 900/1800/3600/7200s buckets.
+    # Heartbeat self-extension remains +600s/tick up to its 5400s ceiling (see
+    # core/agents/agent_lifecycle.py); that extension ceiling does not clamp a
+    # longer initial scope/XL deadline. Tunable via
     # ``tuning.orchestrator.max_agent_runtime_s``.
     max_agent_runtime_s: int = 1800  # 30 min
 
@@ -173,6 +175,26 @@ class OrchestratorDefaults:
     priority_age_threshold_s: float = 300.0  # 5 minutes
     priority_boost_step: int = 1  # priority step boosted per threshold period
     max_priority_age_boost: int = 2  # maximum cumulative boost allowed from aging
+
+    # Artefact-progress primitives (#5439); lifecycle wiring is not active yet.
+    # Stall declared when a task makes no artefact progress for this duration.
+    artefact_stall_threshold_s: float = 600.0  # 10 minutes
+    # Repeated failing command count that triggers a stall.
+    repeated_command_threshold: int = 3  # >= 3 identical command + exit code
+    # Maximum concurrent tasks driven by a coordinator.
+    fan_out_ceiling: int = 8
+    # When >= K tasks are in no-progress state, the fan-out ceiling halves.
+    fan_out_degrade_threshold: int = 2
+
+    def __post_init__(self) -> None:
+        if self.artefact_stall_threshold_s <= 0:
+            raise ValueError("artefact_stall_threshold_s must be positive")
+        if self.repeated_command_threshold < 2:
+            raise ValueError("repeated_command_threshold must be at least 2")
+        if self.fan_out_ceiling <= 0:
+            raise ValueError("fan_out_ceiling must be positive")
+        if self.fan_out_degrade_threshold <= 0:
+            raise ValueError("fan_out_degrade_threshold must be positive")
 
 
 # ---------------------------------------------------------------------------

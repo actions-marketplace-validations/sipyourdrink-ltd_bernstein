@@ -42,8 +42,8 @@ disposable. Anything under `.sdd/backlog/`, `.sdd/runtime/wal/`,
 `.sdd/metrics/`, `.sdd/cas/` or `.sdd/audit/` is needed to reconstruct
 state.
 
-The repo's `.gitignore` excludes the volatile pieces; the durable pieces
-can be checked in or shipped to remote storage.
+The repo's `.gitignore` excludes the whole `.sdd/` directory (it must never
+be committed); back the durable pieces up with `bernstein dr backup`.
 
 ---
 
@@ -78,10 +78,11 @@ Source: `src/bernstein/core/persistence/wal.py`.
 Three invariants make the WAL load-bearing for recovery:
 
 1. **Append-only.** `WALWriter.append()` only ever calls `f.write(...)
-   + f.flush() + os.fsync(...)` (`wal.py`). No mutation, no
-   truncation. A torn write that leaves a partial trailing line is
-   tolerated by the reader (`wal.py`) and by the tail-reader
-   (`wal.py`).
+   + f.flush() + os.fsync(...)` (`wal.py`). Existing entries are never
+   rewritten; the only truncation is a rollback of a partially written
+   entry when an append fails. A torn write that leaves a partial
+   trailing line is tolerated by the reader (`wal.py`) and by the
+   tail-reader (`wal.py`).
 2. **fsync per entry.** Every successful `append()` returns only after
    the line is on stable storage (`wal.py`). A process crash
    immediately after `append()` returns cannot lose the entry.
@@ -107,10 +108,33 @@ If the process crashes between the intent and the confirm, the intent
 remains in the file with `committed=False` and the sidecar index points
 to it. Recovery picks up there.
 
-The sidecar index (`UncommittedIndex`) is a performance cache only - if
-it is missing, truncated, or stale, recovery falls back to a full WAL
-scan and rebuilds it (`wal.py`). Loss of the index never costs
-correctness, only one slow boot.
+The sidecar index (`UncommittedIndex`) is what lets recovery decide which
+WALs to open at all. A run it does not name holds no uncommitted entry,
+so that run's file is never read: 200 runs of 500 entries stop being
+100 000 JSON parses per boot.
+
+Recovery therefore has to be able to trust it, and the rule is that the
+index is either **absent** or **right**. Three paths keep that true
+(`wal.py`):
+
+- **Absent or unparseable.** Recovery walks every WAL and rebuilds the
+  index from what it found. One slow boot, never a wrong answer.
+- **Present and parseable, including empty.** Taken as authoritative.
+  Empty means "nothing is uncommitted", not "I do not know".
+- **A row that could not be written.** `WALWriter.append` records an
+  uncommitted entry in the index after the WAL line is durable. If that
+  write fails, the append still succeeds - the entry is on disk - but the
+  index is now well-formed and short, which is the one state a reader
+  must never trust. The writer deletes it, turning the case back into
+  "absent". If the file cannot be deleted either, that is logged at
+  `error`, because recovery may then skip the run until the index is
+  removed by hand.
+
+The index is created by seeding it from one scan, not by writing an empty
+file, so a project whose WALs predate the index does not get told there is
+nothing to recover.
+
+Loss of the index still never costs correctness, only one slow boot.
 
 ---
 
@@ -120,26 +144,30 @@ When `bernstein run` starts in a workdir that already contains `.sdd/`,
 the recovery sequence is:
 
 ```text
-1. Load durable backlog
-   read .sdd/backlog/{open,claimed,closed}/*.yaml
-   reconstruct in-memory task store
+1. Task server lifespan (not the orchestrator)
+   store.replay_jsonl()
+     rebuild the in-memory task store from .sdd/runtime/tasks.jsonl
+   store.recover_stale_claimed_tasks()
+     reset every CLAIMED and IN_PROGRESS task to OPEN
+   (core/server/server_app.py, core/tasks/task_store_core.py)
+   Backlog YAML is not replayed; the orchestrator ingests new files
+   from .sdd/backlog/open/ and issues/ during its ticks.
 
-2. WALReplayEngine.scan_and_replay()
+2. WALReplayEngine.scan_and_replay()  (orchestrator _recover_from_wal())
    a. WALRecovery.scan_all_uncommitted(sdd_dir, exclude_run_id=current)
       → list[(run_id, WALEntry)] where committed=False
    b. For each entry:
         if entry.decision_type in _SKIP_DECISION_TYPES → mark informational
         if (now - entry.timestamp) > MAX_REPLAY_AGE_S (1 h) → mark stale
-        if IdempotencyStore.was_executed(key) → skip
-        else                                     → replay_handler(entry)
+        if IdempotencyStore.is_executed(entry) → skip
+        else                                   → replay_handler(entry)
+      The handler fails only task_claimed orphans the server still
+      reports as claimed (reason "claimed but never spawned").
    c. Append "wal_replay_completed" entry to current run's WAL
+   _recover_from_wal() then force-claims remaining orphaned claims
+   back to open and preserves prior worktrees with uncommitted work.
 
-3. recover_stale_claimed_tasks()
-   any task left in CLAIMED state by the dead orchestrator is reset to
-   OPEN so a new agent can pick it up
-   (core/tasks/task_store_core.py)
-
-4. Begin tick loop
+3. Begin tick loop
 ```
 
 Source files: `src/bernstein/core/persistence/wal_replay.py`,
@@ -189,7 +217,8 @@ hit an existing blob (`dedup_saves`).
 ### Merkle seals over audit logs
 
 `merkle.py` builds a binary Merkle tree over daily HMAC-chained audit
-log files. Each file's last-line HMAC becomes a leaf; the root hash is
+log files. Each file's full content is hashed into a domain-separated
+leaf (seal scheme v2); the root hash is
 written to `.sdd/audit/merkle/seal-<ISO-timestamp>.json` and proves no
 file was deleted, inserted, reordered, or tampered with between seals
 (`src/bernstein/core/persistence/merkle.py`).
@@ -219,8 +248,8 @@ Ephemeral (regenerated by the next run):
 - `.sdd/worktrees/` per-agent git worktrees
 - `.sdd/runtime/wal/uncommitted.idx.json` (sidecar - rebuildable)
 
-Never commit `.sdd/runtime/` or `.sdd/worktrees/`. The shipped
-`.gitignore` excludes both.
+Never commit `.sdd/`. The shipped `.gitignore` excludes the whole
+directory.
 
 ---
 
@@ -244,8 +273,8 @@ Never commit `.sdd/runtime/` or `.sdd/worktrees/`. The shipped
 Run-time helpers:
 
 ```bash
-# verify WAL integrity
-bernstein doctor
+# verify WAL integrity for one run
+bernstein verify --wal-integrity <run-id>
 
 # back up the durable parts (used by `bernstein dr`)
 bernstein dr backup --to ./backup.tar.gz
@@ -259,6 +288,6 @@ jq -r 'select(.decision_type=="wal_replay_completed") | .inputs' \
 
 - `architecture/LIFECYCLE.md` - task and agent state machines that drive
   the WAL entries.
-- `architecture/storage.md` - how `.sdd/` writes can be redirected to
-  S3/GCS/R2 instead of the local filesystem.
+- `architecture/storage.md` - the artifact-sink library for S3/GCS/R2
+  (not yet wired into `.sdd/` writes).
 - `operations/disaster-recovery.md` - the `bernstein dr` CLI.

@@ -118,15 +118,34 @@ def _build_registry_from_config(config: Any) -> tuple[FormatterConfig, ...]:
 
 
 class GateRunnerCommandsMixin:
-    """Mixin providing all individual gate implementations for GateRunner.
+    """Named as a mixin for :class:`~bernstein.core.gate_pipeline.GateRunner`,
+    but not currently composed into it (#5682).
 
-    This mixin is combined with :class:`~bernstein.core.gate_pipeline.GateRunner`
-    at runtime.  Methods here reference ``self._config``, ``self._workdir``,
-    ``self._base_ref``, ``self._changed_files_resolved``, and helper methods
-    from the cache mixin via the GateRunner instance.
+    ``GateRunner.__mro__`` is ``(GateRunner, object)`` -- nothing inherits
+    this class or injects it dynamically, despite the name and the methods
+    here being written as instance methods that assume ``self._config``,
+    ``self._workdir``, ``self._base_ref``, ``self._changed_files_resolved``,
+    and cache-mixin helpers are available on ``self`` the way they are on a
+    real ``GateRunner`` instance. Calling most of these methods directly
+    (``GateRunnerCommandsMixin().some_gate(...)``) raises ``AttributeError``,
+    the same failure #5572 hit for ``_build_dead_code_result`` before that
+    fix qualified the one call actually needed
+    (``GateRunnerCommandsMixin._build_dead_code_result(...)``, a
+    ``@staticmethod`` with no dependency on ``self``) instead of assuming
+    composition that does not exist.
+
+    Twenty-three method names are independently defined in both this file
+    and ``gate_runner.py`` (``_run_tests_gate``, ``_run_complexity_gate_sync``,
+    and 21 more) -- resolving whether that duplication should become real
+    composition, a shared base, or is simply dead code is a separate,
+    larger question this docstring does not answer; see the issue for the
+    open investigation.
     """
 
-    # -- mixin initialiser (called from GateRunner.__init__) -----------------
+    # -- mixin initialiser: defined, but never called from anywhere --------
+    # No call site exists in src/ (checked: `grep -rn "__init_commands__"`
+    # finds only this definition), and GateRunner.__init__ does not
+    # reference it either.
 
     @staticmethod
     def __init_commands__(instance: object) -> None:
@@ -142,7 +161,7 @@ class GateRunnerCommandsMixin:
         changed_files: list[str],
     ) -> GateResult:
         """Run the tests gate, optionally recording flaky-test telemetry."""
-        from bernstein.core import quality_gates as qg
+        from bernstein.core.quality import quality_gates as qg
         from bernstein.core.quality.flaky_detector import FlakyDetector, parse_pytest_output
 
         command = self._tests_command(step, run_dir, changed_files)
@@ -272,8 +291,8 @@ class GateRunnerCommandsMixin:
         augments with AST-based cross-codebase caller analysis via
         :mod:`bernstein.core.dead_code_detector`.
         """
-        from bernstein.core import dead_code_detector
-        from bernstein.core import quality_gates as qg
+        from bernstein.core import dead_code_detector  # type: ignore[attr-defined]  # meta-path redirect
+        from bernstein.core.quality import quality_gates as qg
 
         python_files = self._python_files(changed_files)
         if not python_files:
@@ -310,7 +329,7 @@ class GateRunnerCommandsMixin:
 
     def _run_dead_code_ast_analysis(self: Any, _dead_code_detector: Any, python_files: list[str], run_dir: Path) -> Any:
         """Run AST-based dead code analysis, returning the report."""
-        from bernstein.core import dead_code_detector as dcd
+        from bernstein.core import dead_code_detector as dcd  # type: ignore[attr-defined]  # meta-path redirect
 
         try:
             return dcd.analyse(
@@ -388,7 +407,7 @@ class GateRunnerCommandsMixin:
         Checks docstring accuracy, completeness, redundancy, and style via
         :mod:`bernstein.core.comment_quality`.
         """
-        from bernstein.core import comment_quality
+        from bernstein.core import comment_quality  # type: ignore[attr-defined]  # meta-path redirect
 
         python_files = self._python_files(changed_files)
         if not python_files:
@@ -962,58 +981,6 @@ class GateRunnerCommandsMixin:
             duration_ms=0,
             details="No merge conflicts predicted.",
             metadata={"branch": branch, "base_ref": self._base_ref},
-        )
-
-    # -- test expansion gate -------------------------------------------------
-
-    def _run_test_expansion_gate_sync(
-        self: Any,
-        step: GatePipelineStep,
-        _task: Any,
-        run_dir: Path,
-        changed_files: list[str],
-    ) -> GateResult:
-        """Check whether agent-modified source files have corresponding test coverage.
-
-        Identifies source files without matching test files and reports them
-        as uncovered. This is a non-blocking advisory gate.
-        """
-        source_files = [f for f in changed_files if not self._is_test_path(f) and f.endswith(".py")]
-        uncovered: list[str] = []
-        for src in source_files:
-            # Derive expected test path: src/foo/bar.py -> tests/unit/test_bar.py
-            src_path = Path(src)
-            expected_test = Path("tests") / "unit" / f"test_{src_path.stem}.py"
-            if not (run_dir / expected_test).exists() and expected_test.as_posix() not in changed_files:
-                uncovered.append(src)
-
-        if not source_files:
-            return self._skipped(step, "No Python source files changed.")
-
-        # Always pass - this is an advisory gate. Record uncovered files in metadata
-        # and write needs_coverage.json for downstream consumers.
-        if uncovered:
-            import json as _json
-
-            coverage_file = run_dir / ".sdd" / "runtime" / "needs_coverage.json"
-            coverage_file.parent.mkdir(parents=True, exist_ok=True)
-            entries = [{"source_file": f, "expected_test": f"tests/unit/test_{Path(f).stem}.py"} for f in uncovered]
-            coverage_file.write_text(_json.dumps(entries, indent=2), encoding="utf-8")
-
-        details = (
-            f"{len(uncovered)} source file(s) without test coverage: {', '.join(uncovered[:5])}"
-            if uncovered
-            else f"All {len(source_files)} source file(s) have corresponding tests."
-        )
-        return GateResult(
-            name=step.name,
-            status="pass",
-            required=step.required,
-            blocked=False,
-            cached=False,
-            duration_ms=0,
-            details=details,
-            metadata={"uncovered_files": uncovered} if uncovered else {},
         )
 
     # -- helper: complexity command ------------------------------------------

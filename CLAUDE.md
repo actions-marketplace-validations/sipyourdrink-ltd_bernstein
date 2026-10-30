@@ -3,7 +3,7 @@
 
 ## Overview
 
-Bernstein is the open-source governance layer for AI agents. A deterministic scheduler - no model in the coordination loop - runs agents in parallel, gates what they produce, and records every step, so a run can be verified after the fact, offline, from the artifacts alone. CLI coding agents work out of the box (Claude Code, Codex, Gemini CLI, and 40+ more), and the same layer governs any agent workload: the deliverable can be a diff, a research report, a dataset, or an audit evidence pack. Air-gap install profile included. Apache-2.0.
+Bernstein is the open-source governance layer for AI agents. It runs on policy as code: you write the policy - who may do what, what needs approval, what must be recorded - and Bernstein enforces it and produces the verifiable record. A deterministic scheduler - no model in the coordination loop - runs agents in parallel, gates what they produce, and records every step, so a run can be verified after the fact, offline, from the artifacts alone. CLI coding agents work out of the box (Claude Code, Codex, Gemini CLI, and 50+ more), and the same layer governs any agent workload: the deliverable can be a diff, a research report, a dataset, or an audit evidence pack. Air-gap install profile included. Apache-2.0.
 
 ## Module map
 
@@ -57,11 +57,12 @@ uv run mypy src                     # type-check
 
 Top-level entry points exposed by the package:
 
-| Command            | Purpose |
-|--------------------|---------|
-| `bernstein`        | bernstein.cli.main:cli |
-| `bernstein-worker` | bernstein.core.worker:main |
-| `bernstein-bench`  | bernstein.eval.bench.bench_cli:bench_group |
+| Command                | Purpose |
+|------------------------|---------|
+| `bernstein`            | bernstein.cli.main:cli |
+| `bernstein-worker`     | bernstein.core.worker:main |
+| `bernstein-bench`      | bernstein.eval.bench.bench_cli:bench_group |
+| `verify-audit-receipt` | bernstein.core.verifier.audit_receipt_verifier:main |
 
 **Back-compat aliases.** Legacy import paths (e.g. `bernstein.core.orchestrator`) are served by a `sys.meta_path` finder, not by physical shim files. The mechanism lives in `src/bernstein/core/__init__.py` as `_CoreRedirectFinder` driven by the `_REDIRECT_MAP` dict - add new aliases there rather than creating shim modules at the old path.
 

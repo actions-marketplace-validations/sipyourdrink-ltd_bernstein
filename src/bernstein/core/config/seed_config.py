@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from bernstein.core.quality_gates import QualityGatesConfig
     from bernstein.core.sandbox import DockerSandbox
     from bernstein.core.secrets import SecretsConfig
+    from bernstein.core.security.executor_admission import AdmissionPolicy
     from bernstein.core.tenanting import TenantConfig
     from bernstein.core.workspace import Workspace
     from bernstein.core.worktree import WorktreeSetupConfig
@@ -428,8 +429,14 @@ class SeedConfig:
     secrets: SecretsConfig | None = None
     key_rotation: KeyRotationConfig | None = None
     model_policy: dict[str, Any] | None = None
-    role_model_policy: dict[str, dict[str, str]] | None = None
+    role_model_policy: dict[str, dict[str, Any]] | None = None
     compliance: ComplianceConfig | None = None
+    # Issue #4907: parsed ``admission:`` block - the declarative
+    # allow/deny policy over adapters, models, endpoints and sandbox
+    # tiers. Validated here so a typo fails the run at config load
+    # rather than as a refused spawn mid-run; enforcement itself reads
+    # the same file at spawn time.
+    admission: AdmissionPolicy | None = None
     visual: VisualConfig | None = None
     sandbox: DockerSandbox | None = None
     bridges: BridgeConfigSet | None = None
@@ -470,6 +477,9 @@ class SeedConfig:
     # fallback chains + conformance floors + probe TTL). Validated at parse
     # time; consumed by the spawner's availability failover path.
     provider_availability: dict[str, Any] | None = None
+    # Issue #6554: maps DispatchTier values (edge/search/research/sandbox) to
+    # adapter (cli) names.  Consumed by the spawner's tier-aware routing path.
+    tier_adapters: dict[str, str] = field(default_factory=dict)
     cost_tags: dict[str, str] = field(default_factory=dict)
     cost_autopilot: bool = False
     # Per-quota-envelope budgets (issue #1405). Parsed from the
@@ -487,6 +497,7 @@ class SeedConfig:
     # blocking; ``"strict"`` raises and the manager skips the affected
     # server; ``"off"`` disables verification entirely.
     mcp_signing_mode: Literal["warn", "strict", "off"] = "warn"
+    data_class: Literal["restricted", "internal", "confidential", "public"] | None = None
 
     def __post_init__(self) -> None:
         """Emit preflight warnings for provider/env mismatches (once/process)."""

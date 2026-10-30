@@ -49,7 +49,7 @@ attribution), `regulatory_class` (operator-supplied filter, below),
 and `customer_signature` (detached Ed25519 signature a regulator can
 verify without Bernstein).
 
-Source: `src/bernstein/core/persistence/lineage.py:96`.
+Source: `LineageRecord` in `src/bernstein/core/persistence/lineage.py`.
 
 ---
 
@@ -66,7 +66,7 @@ order:
    `tuning.lineage.regulatory_class_default` for the whole run; the
    `LineageWriter` falls back to this when a record has no explicit
    class
-   (`src/bernstein/core/persistence/lineage.py:374`).
+   (`LineageWriter` in `src/bernstein/core/persistence/lineage.py`).
 3. **Unset (`null`)** - the record is still written; the export shows
    `-` (HTML) or an empty cell (CSV).
 
@@ -111,7 +111,7 @@ Full configuration (key kinds, HSM / TPM / KMS integration via the
 ## Producing the export
 
 ```bash
-bernstein lineage export <run_id> --format <csv|jsonld|html> \
+bernstein lineage export <run_id> --format <csv|jsonld|html|openlineage> \
                          --output <path> [--workdir .]
 ```
 
@@ -121,11 +121,12 @@ The exporter walks every lineage record for the run from
 `.sdd/runtime/wal/`, flattens each record into a row, and renders the
 chosen format. The output file is overwritten if it exists.
 
-| Format   | When to use                                                                            |
-| -------- | -------------------------------------------------------------------------------------- |
-| `csv`    | Analyst spreadsheets, GRC vendors that ingest CSV, ad-hoc filtering in Excel / Sheets. |
-| `jsonld` | Evidence packs for graph-walking auditors; shaped against schema.org `Action`.         |
-| `html`   | Human auditor review; single self-contained file (no JS / fonts / external assets).    |
+| Format        | When to use                                                                            |
+| ------------- | -------------------------------------------------------------------------------------- |
+| `csv`         | Analyst spreadsheets, GRC vendors that ingest CSV, ad-hoc filtering in Excel / Sheets. |
+| `jsonld`      | Evidence packs for graph-walking auditors; shaped against schema.org `Action`.         |
+| `html`        | Human auditor review; single self-contained file (no JS / fonts / external assets).    |
+| `openlineage` | Existing lineage/catalog stacks that speak OpenLineage (issue #4914). JSONL RunEvents. |
 
 Exit codes:
 
@@ -150,7 +151,22 @@ bernstein lineage export r-2026-05-05 --format csv \
 # JSON-LD for a graph-walking verifier.
 bernstein lineage export r-2026-05-05 --format jsonld \
   --output /tmp/r-2026-05-05.jsonld
+
+# OpenLineage JSONL for an existing lineage collector / catalog.
+bernstein lineage export r-2026-05-05 --format openlineage \
+  --output /tmp/r-2026-05-05.openlineage.jsonl
 ```
+
+### OpenLineage projection (#4914)
+
+`--format openlineage` is a **post-hoc projection** of the WAL lineage
+chain (and optional audit task outcomes), not a second source of truth.
+Two exports of the same finished run are byte-identical. Each event
+carries a custom `bernstein_chain` run facet with the WAL
+`chain_head_hash`, lineage record id, and a detached projection
+signature so a consumer that has the chain can verify the event was not
+edited in transit. HTTP collector transport is out of scope for this
+slice — file output only. Schema: `schemas/openlineage/1-0-5/`.
 
 The HTML form is suitable for direct inclusion in an evidence package
 (open in any browser, print to PDF, attach to the audit ticket).
@@ -166,17 +182,21 @@ bernstein lineage verify <run_id> [--workdir .] \
                          [--public-key /path/to/customer-pub.pem]
 ```
 
-Source: `src/bernstein/cli/commands/lineage_verify_cmd.py`. Walks
-every record for the run, re-checks the WAL hash chain, and (when
-`--public-key` is supplied) re-verifies every `customer_signature`.
+Source: `src/bernstein/cli/commands/lineage_verify_cmd.py`. Walks the
+run's lineage spine (`.sdd/lineage/<run_id>/spine.jsonl`), recomputing the
+Merkle hash chain and every HMAC tag. When no spine exists for the run it
+falls back to the legacy WAL chain, where it re-checks the WAL hash chain
+and (when `--public-key` is supplied) re-verifies every
+`customer_signature`. `--key-path` names the audit HMAC key file.
 
 Exit codes:
 
-| Code | Meaning                                                                |
-| ---- | ---------------------------------------------------------------------- |
-| `0`  | Chain intact and (if `--public-key`) every signature validated.        |
-| `1`  | `.sdd/` not found at the given workdir, or supplied public key is bad. |
-| `2`  | Tamper detected: WAL chain broken, or one or more signatures invalid.  |
+| Code | Meaning                                                                            |
+| ---- | ---------------------------------------------------------------------------------- |
+| `0`  | Chain intact (and, on the legacy chain with `--public-key`, every signature valid). |
+| `1`  | No entries, seal-only spine, `.sdd/` not found, or supplied public key is bad.      |
+| `2`  | Tamper detected: chain broken, or one or more signatures invalid.                   |
+| `3`  | Cannot verify: audit key missing.                                                   |
 
 The command prints a per-error list capped at 50 entries; the rest are
 summarised. Pipe to a file for the full set on a noisy chain.
@@ -209,14 +229,75 @@ for rec in reader.iter_records(run_id="r-2026-05-05"):
 ### Tamper-loud detection in the janitor
 
 The janitor's compaction step runs the same `verify_run_chain()` on
-every cycle. On verification failure it (a) emits an `audit.jsonl`
+every cycle. On verification failure it (a) emits an audit-chain
 entry of type `lineage_tamper_detected`, (b) increments the
 `bernstein_lineage_tamper_total{run_id=...}` Prometheus counter, and
 (c) POSTs to the configured SIEM webhook with exponential back-off on
 5xx. The janitor never blocks on a bad webhook - it records the event
 and lets the operator decide response policy. Source:
-`src/bernstein/core/quality/janitor.py:187`. Webhook configuration:
+`verify_lineage_chains` in `src/bernstein/core/quality/janitor.py`. Webhook configuration:
 [Regulator-class lineage § SIEM webhook](regulatory-lineage.md#configuring-the-siem-webhook).
+
+---
+
+## Reporting effective data sensitivity
+
+Trust propagates *inward* over a lineage closure: the effective trust of
+an artefact is the minimum `trust_class` over everything it derives
+from. Data sensitivity propagates the other way. The effective
+sensitivity of an artefact is the **maximum** class over the same
+closure, so a summary of a confidential document reports as
+confidential, and re-saving or transforming it does not shed the class -
+the new entry names the old one as a parent, and the closure still
+reaches the classified source.
+
+```bash
+bernstein lineage sensitivity <artefact-path|sha256:entry-hash> \
+                              [--log .sdd/lineage/log.jsonl] \
+                              [--cards .sdd/agents] [--json]
+```
+
+Source: `src/bernstein/cli/commands/lineage_cmd.py`. The report names
+the effective class, the closure member that raised it, and the walk
+through the graph that reaches it - not "this is confidential", which
+invites an argument, but "this is confidential because it derives,
+through these hops, from that entry", which is checkable offline from
+`log.jsonl` alone.
+
+Exit codes:
+
+| Code | Meaning                                                                |
+| ---- | ---------------------------------------------------------------------- |
+| `0`  | A verdict was produced (including the fail-closed one).                |
+| `1`  | The lineage gate failed; no class is printed.                          |
+
+The gate runs first because a class projected from an unverified log is
+not evidence of anything. An artefact the log does not know, and a log
+that does not exist, both report the fail-closed class `restricted`:
+absence of a classification is not a claim that something is harmless.
+
+### The source-to-sensitivity map
+
+Classifications enter the graph from a table the operator controls, the
+mirror of `trust_sources.yaml` on the opposite axis:
+
+```
+templates/provenance/sensitivity_sources.yaml
+```
+
+Each row maps a source name (`operator.attachment`, `web.fetch`, ...) to
+one of `public < internal < confidential < restricted`. A project-local
+copy at `<workdir>/templates/provenance/sensitivity_sources.yaml`
+replaces the bundled table rather than merging into it, so the table in
+force is exactly what the operator wrote. A source that is not listed
+reads as the highest class, and a class token that is not one of the
+four is dropped rather than coerced - guessing a class for a row the
+operator got wrong picks the least sensitive one exactly when that is
+the most damaging answer.
+
+Sensitivity is operator-set. Content inspection - the DLP scanner in
+`src/bernstein/core/security/dlp_scanner_v2.py` - answers a different
+question and its guesses are never written into this field.
 
 ---
 
@@ -227,9 +308,9 @@ janitor's retention policy:
 
 | Knob                         | Default | Source                                                       |
 | ---------------------------- | ------: | ------------------------------------------------------------ |
-| `disk.run_retention_count`   |     20  | `core/defaults.py:419`. Last 20 runs kept; older are pruned. |
-| `disk.wal_retention_count`   |     50  | `core/defaults.py:421`. Last 50 WAL files per run kept.      |
-| `lineage.compaction.enabled` |  `true` | Janitor gzips rotated WAL files in place.                    |
+| `tuning.janitor.run_retention_count` |     20  | `JanitorDefaults` in `core/defaults.py`. Last 20 runs kept; older are pruned. |
+| `tuning.janitor.wal_retention_count` |     50  | `JanitorDefaults` in `core/defaults.py`. Last 50 WAL files per run kept.      |
+| (no knob)                     | not scheduled | `compact_lineage_logs` gzips rotated `<run_id>.wal.jsonl.<N>` segments when invoked; the janitor cycle does not call it yet. |
 
 Two operational rules:
 
@@ -237,8 +318,8 @@ Two operational rules:
    while writes are still happening - a live verifier never races the
    compactor.
 2. Rotated `<run_id>.wal.jsonl.<N>` segments are gzipped to `<...>.gz`
-   on the next janitor cycle. The reader handles both forms
-   transparently.
+   when `compact_lineage_logs` is invoked (the janitor cycle does not
+   call it yet). The reader handles both forms transparently.
 
 For an auditor handover, snapshot `.sdd/runtime/wal/` for the run
 *before* the next janitor cycle and ship the snapshot alongside the
@@ -297,7 +378,7 @@ bernstein lineage export r-2026-05-05 --format html \
   --output /pack/r-2026-05-05.html
 ```
 
-Pair the export with `security/AUDIT.md` (HMAC-chained audit log) for
+Pair the export with `docs/security/AUDIT.md` (HMAC-chained audit log) for
 change-management integrity. SOC 2 evidence is generally satisfied by
 the audit log alone; lineage adds per-artefact provenance when an
 auditor asks "which prompt produced this rule?"

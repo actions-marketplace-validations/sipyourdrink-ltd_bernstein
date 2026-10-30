@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 # lists are alias-resolved at write time, so a change to alias discovery makes
 # every existing entry potentially short of edges even though its file hashes
 # still match.
-_ANALYZER_CACHE_VERSION = "4"
-_COMPAT_CACHE_VERSION = "5"
+_ANALYZER_CACHE_VERSION = "5"
+_COMPAT_CACHE_VERSION = "7"
 _WORKFLOW_PATH_PREFIX = ".github/workflows/"
 
 # Upper bound on a harvested path literal. Long strings in a test are prose,
@@ -141,8 +141,55 @@ def _normalize_mapping_list(raw: object) -> dict[str, list[str]]:
     return normalized
 
 
-def _collect_imports_from_node(node: ast.AST, package_prefixes: set[str]) -> set[str]:
-    """Collect project-scoped import names from a single AST node."""
+def _resolve_relative_import(
+    *,
+    current_module: str,
+    is_package_init: bool,
+    level: int,
+    module: str | None,
+) -> str | None:
+    """Resolve a relative ``from`` import to its absolute dotted module name.
+
+    Mirrors Python's own resolution: a package's ``__init__.py`` counts as the
+    package itself for ``__package__`` purposes, so ``level=1`` there refers to
+    the package's own directory rather than its parent. Returns ``None`` when
+    the import climbs to or above the project root (as many ``.``s as, or more
+    than, the current module has parent segments) -- undecidable, so the
+    caller drops the edge exactly as it already does for a module it cannot
+    resolve at all. This also covers a bare top-level module (``package_parts``
+    empty even before stripping): Python has no package for it to import
+    relative to, so *every* relative import there is invalid, not only ones
+    that climb further.
+    """
+    package_parts = current_module.split(".") if current_module else []
+    if not is_package_init:
+        package_parts = package_parts[:-1]
+    strip = level - 1
+    if strip >= len(package_parts):
+        return None
+    if strip:
+        package_parts = package_parts[: len(package_parts) - strip]
+    if module:
+        return ".".join([*package_parts, module]) if package_parts else module
+    return ".".join(package_parts) if package_parts else None
+
+
+def _collect_imports_from_node(
+    node: ast.AST,
+    package_prefixes: set[str],
+    *,
+    current_module: str | None = None,
+    is_package_init: bool = False,
+    importable_modules: set[str] | None = None,
+) -> set[str]:
+    """Collect project-scoped import names from a single AST node.
+
+    ``current_module`` (the dotted name of the file being parsed) resolves a
+    relative ``from .sibling import x`` / ``from ..pkg import x`` to the
+    absolute module it names. Without it, a relative import's edge is
+    silently dropped: ``node.module`` on a relative import never carries the
+    package prefix, so the plain prefix check below cannot see it either way.
+    """
     imports: set[str] = set()
     if isinstance(node, ast.Import):
         for alias in node.names:
@@ -151,23 +198,59 @@ def _collect_imports_from_node(node: ast.AST, package_prefixes: set[str]) -> set
                 imports.add(alias.name)
     elif isinstance(node, ast.ImportFrom):
         module = node.module or ""
-        if module:
-            top = module.split(".", 1)[0]
-            if top in package_prefixes:
-                imports.add(module)
+        resolved: str | None = None
+        if node.level and current_module:
+            resolved = _resolve_relative_import(
+                current_module=current_module,
+                is_package_init=is_package_init,
+                level=node.level,
+                module=module or None,
+            )
+        elif module:
+            resolved = module
+        if resolved and resolved.split(".", 1)[0] in package_prefixes:
+            imports.add(resolved)
+            if importable_modules:
+                # from pkg import child can load a real pkg.child module.
+                imports.update(
+                    child for alias in node.names if (child := f"{resolved}.{alias.name}") in importable_modules
+                )
     return imports
 
 
-def extract_project_imports(path: Path, package_prefixes: set[str]) -> set[str]:
-    """Extract imported project module names from a Python file."""
+def extract_project_imports(
+    path: Path,
+    package_prefixes: set[str],
+    *,
+    current_module: str | None = None,
+    importable_modules: set[str] | None = None,
+) -> set[str]:
+    """Extract imported project module names from a Python file.
+
+    ``current_module`` is the dotted module name ``path`` corresponds to
+    (e.g. from :func:`_path_to_module`); passing it lets a relative import be
+    resolved to the absolute module it names. Omitting it (the default)
+    preserves the prior behaviour of dropping relative-import edges, for
+    callers -- test files, the legacy CLI wrapper -- that have no module name
+    to resolve against.
+    """
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, SyntaxError, UnicodeDecodeError):
         return set()
 
+    is_package_init = path.name == "__init__.py"
     imports: set[str] = set()
     for node in ast.walk(tree):
-        imports.update(_collect_imports_from_node(node, package_prefixes))
+        imports.update(
+            _collect_imports_from_node(
+                node,
+                package_prefixes,
+                current_module=current_module,
+                is_package_init=is_package_init,
+                importable_modules=importable_modules,
+            )
+        )
     return imports
 
 
@@ -193,6 +276,30 @@ def _is_path_literal(value: str) -> bool:
     if "\\" in value:
         return False
     return "." in value.rsplit("/", 1)[-1]
+
+
+def _static_path_segments(node: ast.expr) -> list[str] | None:
+    """Return literal path segments from a ``Path``-style division chain.
+
+    A structural guard commonly anchors a scanned directory at ``REPO_ROOT``
+    and appends literal segments. The root is runtime-specific, but the
+    repository-relative directory is not.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Div):
+        return None
+
+    right = _static_path_segments(node.right)
+    if right is None:
+        return None
+    left = _static_path_segments(node.left)
+    return right if left is None else [*left, *right]
+
+
+def _is_directory_literal(value: str) -> bool:
+    """Return whether a static literal names a specific repository directory."""
+    return value.count("/") >= 2 and not value.startswith(".") and "." not in value.rsplit("/", 1)[-1]
 
 
 def extract_path_literals(path: Path) -> set[str]:
@@ -225,13 +332,23 @@ def extract_path_literals(path: Path) -> set[str]:
     except (OSError, SyntaxError, UnicodeDecodeError):
         return set()
 
-    return {
+    literals = {
         stripped
         for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
         for stripped in [node.value.strip().strip("/")]
         if _is_path_literal(stripped)
     }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BinOp):
+            continue
+        segments = _static_path_segments(node)
+        if segments is None:
+            continue
+        literal = "/".join(segment.strip("/") for segment in segments if segment.strip("/"))
+        if _is_directory_literal(literal):
+            literals.add(literal)
+    return literals
 
 
 def _string_dict_literal(node: ast.expr) -> dict[str, str]:
@@ -286,21 +403,25 @@ def _real_module_names(src_root: Path) -> set[str]:
     return names
 
 
-def discover_module_aliases(src_root: Path) -> dict[str, str]:
+def discover_module_aliases(src_root: Path, *, source_files: list[Path] | None = None) -> dict[str, str]:
     """Return legacy dotted module names mapped to the module they resolve to.
 
     The tables are read from the package ``__init__`` files that declare them
     rather than imported, so discovery has no import side effects and works on
     any source tree. An alias whose legacy name is also a real module on disk
     is dropped: the redirect finders are appended to ``sys.meta_path``, so the
-    real module wins the import and no rewrite is warranted.
+    real module wins the import and no rewrite is warranted. ``source_files``
+    lets scoped callers supply the exact project files without scanning vendor trees.
     """
     if not src_root.exists():
         return {}
 
-    real_modules = _real_module_names(src_root)
+    files = source_files if source_files is not None else sorted(src_root.rglob("*.py"))
+    real_modules = (
+        _real_module_names(src_root) if source_files is None else {_path_to_module(path, src_root) for path in files}
+    )
     aliases: dict[str, str] = {}
-    for init_file in sorted(src_root.rglob("__init__.py")):
+    for init_file in (path for path in files if path.name == "__init__.py"):
         package = _path_to_module(init_file, src_root)
         if not package:
             continue
@@ -338,13 +459,21 @@ def build_compat_dep_map(
     src_root: Path,
     test_dirs: list[Path],
     package_prefixes: set[str] | None = None,
+    extra_source_files: list[Path] | None = None,
+    *,
+    source_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
-    """Build the legacy dependency-map shape used by ``scripts/test_impact.py``."""
+    """Build the legacy map, optionally from an already scoped source list."""
     prefixes = package_prefixes or _iter_project_packages(src_root)
     # A test that imports a module under a legacy alias records the alias, not
     # the file that actually backs it. Resolving the alias here is what puts
     # the edge from the real source file into the map at all.
-    aliases = discover_module_aliases(src_root)
+    paths = source_paths if source_paths is not None else sorted(src_root.rglob("*.py"))
+    aliases = discover_module_aliases(src_root, source_files=paths)
+    source_files = [(path, src_root) for path in paths]
+    source_files.extend((path, root) for path in (extra_source_files or []) if path.is_file())
+    importable_modules = {_path_to_module(path, module_root) for path, module_root in source_files}
+    importable_modules.update(aliases)
     test_deps: dict[str, dict[str, Any]] = {}
     for test_dir in test_dirs:
         if not test_dir.exists():
@@ -353,21 +482,31 @@ def build_compat_dep_map(
             rel = test_file.relative_to(root).as_posix()
             test_deps[rel] = {
                 "hash": _file_hash(test_file),
-                "imports": sorted(resolve_module_aliases(extract_project_imports(test_file, prefixes), aliases)),
+                "imports": sorted(
+                    resolve_module_aliases(
+                        extract_project_imports(test_file, prefixes, importable_modules=importable_modules), aliases
+                    )
+                ),
                 "paths": sorted(extract_path_literals(test_file)),
             }
 
     source_imports: dict[str, dict[str, Any]] = {}
-    if src_root.exists():
-        for src_file in sorted(src_root.rglob("*.py")):
-            module = _path_to_module(src_file, src_root)
-            if not module:
-                continue
-            source_imports[module] = {
-                "hash": _file_hash(src_file),
-                "imports": sorted(resolve_module_aliases(extract_project_imports(src_file, prefixes), aliases)),
-                "paths": sorted(extract_path_literals(src_file)),
-            }
+    for src_file, module_root in source_files:
+        module = _path_to_module(src_file, module_root)
+        if not module:
+            continue
+        source_imports[module] = {
+            "hash": _file_hash(src_file),
+            "imports": sorted(
+                resolve_module_aliases(
+                    extract_project_imports(
+                        src_file, prefixes, current_module=module, importable_modules=importable_modules
+                    ),
+                    aliases,
+                )
+            ),
+            "paths": sorted(extract_path_literals(src_file)),
+        }
 
     return {
         "version": _COMPAT_CACHE_VERSION,
@@ -497,10 +636,13 @@ def _path_match_keys(rel_path: str) -> set[str]:
     ``src/bernstein/core/security/AGENTS.md`` yields the whole path, then
     ``core/security/AGENTS.md`` down to ``AGENTS.md``. A guard that globs for a
     bare file name matches on the last key; one that pins a single file matches
-    only on the longer key it wrote, so pinning stays specific.
+    only on the longer key it wrote, so pinning stays specific. Static
+    directory declarations also match their descendants.
     """
     parts = Path(rel_path).as_posix().split("/")
-    return {"/".join(parts[index:]) for index in range(len(parts))}
+    suffixes = {"/".join(parts[index:]) for index in range(len(parts))}
+    ancestors = {"/".join(parts[:index]) for index in range(1, len(parts))}
+    return suffixes | ancestors
 
 
 def _tests_reading_changed_paths(
@@ -950,19 +1092,44 @@ class TestImpactAnalyzer:
             tests.extend(sorted(path for path in test_dir.rglob("test_*.py") if path.is_file()))
         return tests
 
-    def _resolved_imports(self, path: Path) -> set[str]:
+    def _resolved_imports(self, path: Path, *, current_module: str | None = None) -> set[str]:
         """Parse project imports from ``path`` with legacy aliases resolved."""
         if self._aliases is None:
             self._aliases = discover_module_aliases(self._src_root)
-        return resolve_module_aliases(extract_project_imports(path, self._package_prefixes), self._aliases)
+        imports = extract_project_imports(path, self._package_prefixes, current_module=current_module)
+        return resolve_module_aliases(imports, self._aliases)
 
     def _parse_test_imports(self, test_file: Path) -> set[str]:
-        """Parse source dependencies imported by a test file."""
+        """Parse source dependencies imported by a test file.
+
+        Deliberately does not pass ``current_module`` -- a choice, not an
+        impossibility. Test directories are configured separately from
+        ``self._src_root`` (see ``self._test_dirs``) and are not usually
+        importable packages rooted the same way, so a test file has no
+        settled dotted module name to resolve a relative import against the
+        way :meth:`_parse_source_imports` does for source files. A test
+        helper imported relatively (``from .helpers import make_store``)
+        therefore still contributes no edge; that gap is real, but widening
+        this fix to cover it is out of scope here -- the source side is
+        where a relatively-imported facade silently drops selection edges
+        with nothing failing, which is the damage this fix addresses. If a
+        test tree ever gains a dotted root of its own (an ``__init__.py``
+        chain up to a known base), the same ``_path_to_module`` +
+        ``current_module`` technique would apply unchanged.
+        """
         return self._resolved_imports(test_file)
 
     def _parse_source_imports(self, source_file: Path) -> set[str]:
-        """Parse project imports used by a source file."""
-        return self._resolved_imports(source_file)
+        """Parse project imports used by a source file.
+
+        Passes the file's own dotted module name so a relative
+        ``from .sibling import x`` resolves to the absolute module it names --
+        without it, a re-export written with a relative import has no edge to
+        its real definition, and a change there silently misses the tests that
+        import only the re-exporting module.
+        """
+        module = _path_to_module(source_file, self._src_root)
+        return self._resolved_imports(source_file, current_module=module or None)
 
     def _name_based_mapping(self, source_rel: str) -> list[str]:
         """Map a source file to likely test files by naming convention."""

@@ -184,6 +184,42 @@ graph LR
    - Version control integration (git commit per change)
    - Notification to running agents
 
+   **Rollback semantics.** A rollback is driven by the proposal it is given and
+   by a record written to disk at apply time, never by state held in the
+   applying process. `FileUpgradeExecutor` copies each file aside under
+   `upgrades/backups/<storage key>/`, where the storage key is the proposal id
+   plus a digest of its identity fields (so two runs' `UPG-0001` never share a
+   directory), and writes a `manifest.json` beside it. `rollback_upgrade(proposal)`
+   therefore works in a process that did not perform the apply — after a
+   restart, or from a different command — given the same proposal object, since
+   the key is derived from it rather than from the id alone.
+
+   It has exactly three outcomes, and the distinction between the first two
+   matters:
+
+   | Situation | Result |
+   |---|---|
+   | `history.jsonl` records no applied change for this proposal | `True` — there is nothing to undo |
+   | The manifest exists and every file in it was restored | `True` |
+   | Applied with no manifest, or a restore failed | `RollbackError` |
+
+   The third case used to be the first: an empty in-process backup map iterated
+   zero times and returned `True`, so a rollback that restored nothing reported
+   success. A rollback that cannot be performed now fails loudly, and the
+   evolution loop re-raises rather than continuing to apply proposals on top of
+   a tree in an undeclared state.
+
+   Every rollback writes a receipt to `upgrades/rollbacks/<proposal id>.json`
+   (a repeat rollback or a reused id writes `<proposal id>.<n>.json` rather than
+   overwriting) carrying the files restored and a sha256 over the receipt body's
+   canonical JSON — the same shape the change-contract verdict receipt uses. The
+   checksum is keyless: it catches accidental corruption, not deliberate edits,
+   since anyone who changes the body can recompute it.
+
+   No category has a sink that writes backups today, so in a shipped build the
+   manifest branch is not reached and every rollback is the "nothing was
+   applied" row above.
+
 3. **Verification**
    - Immediate metric check (did things improve?)
    - A/B comparison with baseline
@@ -193,6 +229,51 @@ graph LR
    - Watch key metrics for 24h post-change
    - Alert on unexpected side effects
    - Log all changes for audit trail
+
+### Change Contract
+
+A proposal may carry an optional typed `ChangeContract` (see
+`src/bernstein/evolution/types.py`) that pins down *what* the change targets,
+*what* it predicts, *what* it promises to leave alone, *how* to falsify the
+prediction, and *how* to reverse it. The contract is the unit an author is
+expected to fill in; admission and evaluation gates consume it to decide
+whether the proposal is admissible, comparable against history, and safe to
+apply.
+
+**Fields:**
+
+- `component` (`str`) — logical name of the subsystem the change targets
+  (e.g. `"evolution.admission"`, `"routing.provider"`). The author uses this
+  to scope the change so the falsifier can match the right history window.
+- `target_fingerprint` (`str`) — opaque identity of the code/config the
+  proposal applies on top of. Used to reject stale proposals whose target
+  has moved.
+- `predicted_effect` (`PredictedEffect`) — the metric name (`metric: str`)
+  and the direction the change is expected to move it
+  (`direction: EffectDirection`, one of `increasing` | `decreasing`). The
+  admission gate checks this is well-formed; the evaluator compares the
+  recorded post-apply metric against this prediction.
+- `invariants` (`list[str]`) — predicates the change promises to preserve
+  (e.g. `"backward-compatible"`, `"no_new_dependency"`,
+  `"tests_in:tests/unit/test_X.py"`). The author lists each as a check the
+  evaluator can mechanically run.
+- `falsifier` (`ChangeFalsifier`) — describes how to disprove the
+  prediction: `history_ref` (which recorded window to compare against) and
+  `expected_verdicts` (the set of verdicts the falsifier expects, e.g.
+  `["pass", "regression"]`). If the recorded verdicts do not intersect
+  `expected_verdicts`, the prediction is treated as falsified.
+- `rollback` (`ChangeRollback`) — the inverse change: `files_to_restore`
+  (paths to revert) and `change_description` (human-readable summary of
+  what the rollback does). Required for every contract-bearing proposal
+  so apply-time rollback is always deterministic.
+
+**Authoring contract.** Every `ChangeContract` field is required when a
+proposal opts in (the `UpgradeProposal.contract` field is `None` for
+proposals that pre-date the contract). The contract is the contract:
+admission rejects a proposal whose `ChangeContract` is malformed, and the
+evaluator refuses to score one whose falsifier names a history window that
+is not yet sealed. Authors fill all six fields; readers (admission,
+evaluation, rollback) consume the typed projection, not the raw dict.
 
 ---
 

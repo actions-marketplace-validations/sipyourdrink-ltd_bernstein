@@ -18,6 +18,7 @@ anyone's word for either.
 
 from __future__ import annotations
 
+from bernstein.core.volunteer.adapter_selection import select_adapter_for_volunteer
 from bernstein.core.volunteer.budget import (
     DEFAULT_BUDGET_CONFIG_PATH,
     DEFAULT_BUDGET_DIR,
@@ -164,6 +165,17 @@ from bernstein.core.volunteer.sandbox_profile import (
     profile_matches,
     sandbox_env,
 )
+from bernstein.core.volunteer.task_board import (
+    DEFAULT_TASK_BOARD_PATH,
+    HUB_TASK_ID_PREFIX,
+    TASK_BOARD_SCHEMA_VERSION,
+    HubTask,
+    TaskBoard,
+    TaskBoardError,
+    TaskPublishError,
+    hub_task_id,
+    is_hub_native,
+)
 from bernstein.core.volunteer.task_finish import (
     REFUSAL_REASONS,
     SignedResultBundle,
@@ -193,9 +205,11 @@ __all__ = [
     "DEFAULT_CLEAN_ROOM_RECEIPT_PATH",
     "DEFAULT_CONSENT_PATH",
     "DEFAULT_LEDGER_PATH",
+    "DEFAULT_TASK_BOARD_PATH",
     "DEFAULT_WORKER_KEY_PATH",
     "GENESIS_ANCHOR",
     "HOST_GIT_ENV_PASSTHROUGH",
+    "HUB_TASK_ID_PREFIX",
     "ISSUE_TEXT_FENCE_LABEL",
     "LEASE_STORE_SCHEMA_VERSION",
     "LEDGER_SCHEMA_VERSION",
@@ -208,6 +222,7 @@ __all__ = [
     "REFUSAL_REASONS",
     "SANDBOX_ENV_ALLOWLIST",
     "SUPPORTED_SCHEMA_VERSIONS",
+    "TASK_BOARD_SCHEMA_VERSION",
     "TERM_GRACE_SECONDS",
     "VOLUNTEER_MANIFEST_PATH",
     "VOLUNTEER_PROFILE_NAME",
@@ -237,6 +252,7 @@ __all__ = [
     "GateDivergence",
     "HTTPResponse",
     "HTTPTransport",
+    "HubTask",
     "IndexEntry",
     "IssueClaimState",
     "IssueTextSanitizer",
@@ -252,9 +268,12 @@ __all__ = [
     "SkipDecision",
     "SkipReason",
     "Submission",
+    "TaskBoard",
+    "TaskBoardError",
     "TaskDiff",
     "TaskOutcome",
     "TaskProvenance",
+    "TaskPublishError",
     "TaskRefusal",
     "UnenforcedManifestFieldWarning",
     "VolunteerBudget",
@@ -281,6 +300,8 @@ __all__ = [
     "find_own_claim",
     "finish_volunteer_task",
     "host_git_env",
+    "hub_task_id",
+    "is_hub_native",
     "load_budget_config",
     "load_clean_room_receipt",
     "load_consent",
@@ -306,6 +327,7 @@ __all__ = [
     "sanitize_issue_text",
     "save_budget_config",
     "save_ledger",
+    "select_adapter_for_volunteer",
     "should_skip",
     "strip_html_comments",
     "verify_clean_room_receipt",

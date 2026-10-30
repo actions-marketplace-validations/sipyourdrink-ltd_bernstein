@@ -27,6 +27,12 @@ A successful terminal payload:
   "contract": "worker-completion/v1",
   "summary": "Added JWT refresh-token rotation and tests.",
   "files_changed": ["src/auth/jwt.py", "tests/test_jwt.py"],
+  "exports": [
+    {
+      "path": "src/auth/jwt.py",
+      "content_hash": "sha256:51ca74681851d3c8928452b5a3509a1da8d1586b857c4d6caade044c28c89f98"
+    }
+  ],
   "verification": {"command": "pytest tests/test_jwt.py", "exit_code": 0},
   "receipt_ref": "lineage:task-9f3a"
 }
@@ -36,8 +42,20 @@ A successful terminal payload:
 |-------|----------|-------|
 | `summary` | yes | Non-empty string, capped at 2000 characters. |
 | `files_changed` | no | List of non-empty path strings. |
-| `verification` | no | `{command, exit_code}` - a step the worker ran before completing. |
-| `receipt_ref` | no | Optional lineage/receipt reference. |
+| `exports` | no | Content-addressed outputs as `{path, content_hash}` objects. Hashes use canonical `sha256:<64 lowercase hex>` form. |
+| `verification` | no | `{command, exit_code}` - a step the worker ran before completing. Requires `receipt_ref`. |
+| `receipt_ref` | no | Lineage/receipt reference. **Required whenever `verification` is present.** |
+
+The last two are validated together. A completion may carry neither - not
+every task runs a verification - and it may carry `receipt_ref` alone. What it
+may not do is claim a verification ran without naming where the outcome was
+recorded: a payload with `verification` and no `receipt_ref` is rejected with
+`path == "$.receipt_ref"`.
+
+The reason is what a later reader can do with the record. A claim backed by a
+receipt and one the worker simply asserted used to serialize identically, so
+the orchestrator deciding whether a dependent task may start, and an operator
+reading the ledger, had no way to tell them apart (#5001).
 
 ### Refusal
 
@@ -67,6 +85,7 @@ At the completion API boundary the payload is validated against the closed
 schema:
 
 - Unknown top-level fields are rejected.
+- Unknown export fields and malformed export content hashes are rejected.
 - Unknown refusal kinds are rejected.
 - Missing required fields (per shape and per refusal kind) are rejected.
 - Malformed JSON is rejected.

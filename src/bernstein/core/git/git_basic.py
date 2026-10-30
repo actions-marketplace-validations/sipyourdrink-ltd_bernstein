@@ -8,6 +8,10 @@ import subprocess
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +86,7 @@ def run_git(
     timeout: int = 30,
     input_data: str | None = None,
     check: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> GitResult:
     """Execute a git command and return structured output.
 
@@ -91,6 +96,11 @@ def run_git(
         timeout: Seconds before the command is killed.
         input_data: Optional stdin content.
         check: If True, raise on non-zero exit code.
+        env: Complete environment for the child. ``None`` inherits this
+            process's. Callers needing one extra variable pass
+            ``os.environ | {...}`` - the parameter exists so wanting a custom
+            environment is not a reason to drop out of this wrapper and lose
+            the timeout with it.
 
     Returns:
         GitResult with returncode, stdout, stderr.
@@ -99,6 +109,12 @@ def run_git(
         subprocess.CalledProcessError: When *check* is True and the command fails.
         subprocess.TimeoutExpired: When the command exceeds *timeout*.
     """
+    # ``env`` is passed only when a caller supplied one, so the subprocess
+    # call for the other ~200 call sites is byte-identical to before.
+    # tests/unit/test_git_ops.py:75 and :103 assert the exact kwargs of this
+    # call with no ``env`` key present; an unconditional ``env=None`` would
+    # change both for no behavioural reason.
+    extra: dict[str, Any] = {"env": dict(env)} if env is not None else {}
     result = subprocess.run(
         ["git", *args],
         cwd=cwd,
@@ -108,6 +124,7 @@ def run_git(
         errors="replace",
         timeout=timeout,
         input=input_data,
+        **extra,
     )
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(
@@ -325,7 +342,7 @@ def conventional_commit(
     footer_parts: list[str] = []
     if task_id:
         footer_parts.append(f"Refs: #{task_id}")
-    footer_parts.append("Co-Authored-By: bernstein[bot] <noreply@bernstein.dev>")
+    footer_parts.append("Co-Authored-By: bernstein[bot] <noreply@bernstein.run>")
 
     # Assemble
     parts = [subject]
@@ -534,12 +551,17 @@ def resolve_default_branch(cwd: Path, remote: str = "origin") -> str:
     """Resolve the repository's default branch (the protected trunk).
 
     Resolution order: ``<remote>/HEAD`` first (the authoritative signal), then
-    ``init.defaultBranch`` from git config, then the ``<remote>/master``
-    remote-tracking ref, then the conventional ``main``/``master`` local probe,
-    and finally ``"main"`` as a last resort. Consulting ``init.defaultBranch``
-    and ``<remote>/master`` BEFORE the hard-coded ``main``-first local probe
-    means a repo whose real trunk is ``master`` is not mis-resolved to a stray
-    local ``main`` when ``<remote>/HEAD`` is unavailable. Never raises.
+    the ``<remote>/main`` / ``<remote>/master`` remote-tracking refs when
+    exactly one of them exists, then ``init.defaultBranch`` from git config,
+    then the conventional ``main``/``master`` local probe, and finally
+    ``"main"`` as a last resort. The remote-tracking refs are evidence from
+    the repository in hand, so they are consulted BEFORE ``init.defaultBranch``,
+    which is a machine-wide preference that says nothing about this clone: a
+    repo whose real trunk is ``master`` must not resolve to a stray local
+    ``main`` just because the machine's git config sets
+    ``init.defaultBranch=main``. When both remote-tracking refs exist the
+    trunk is genuinely ambiguous and resolution falls through to the config
+    and local probes as before. Never raises.
 
     Args:
         cwd: Repository root.
@@ -552,15 +574,19 @@ def resolve_default_branch(cwd: Path, remote: str = "origin") -> str:
     if from_head is not None:
         return from_head
 
+    tracked = [
+        candidate
+        for candidate in ("main", "master")
+        if _run_git_quiet(["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{candidate}"], cwd).ok
+    ]
+    if len(tracked) == 1:
+        return tracked[0]
+
     cfg = _run_git_quiet(["config", "--get", "init.defaultBranch"], cwd)
     if cfg.ok and cfg.stdout.strip():
         configured = cfg.stdout.strip()
         if _branch_exists(cwd, configured):
             return configured
-
-    master_tracking = _run_git_quiet(["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/master"], cwd)
-    if master_tracking.ok:
-        return "master"
 
     for candidate in ("main", "master"):
         if _branch_exists(cwd, candidate):

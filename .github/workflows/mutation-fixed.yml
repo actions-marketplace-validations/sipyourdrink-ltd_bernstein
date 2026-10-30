@@ -25,7 +25,7 @@
 # module uploads its JSON as an artifact for offline reading.
 #
 # `continue-on-error` is per-module (matrix `include` below), not a
-# blanket flag. Six of the seven modules hold their threshold with real
+# blanket flag. Six of the eleven modules hold their threshold with real
 # margin and gate for real: a kill-rate drop fails the workflow on the
 # weekly audit. `audit_log` is the one pinned exception - see its `include` entry and
 # tests/unit/test_mutation_fixed_workflow_yaml.py:ADVISORY_MODULES for
@@ -55,7 +55,7 @@ concurrency:
 jobs:
   mutate:
     name: ${{ matrix.module }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, vps]
     # Hard total cap; per-module budgets enforced inside the harness.
     timeout-minutes: 30
     # Per-module, driven by matrix.advisory below - not a blanket flag.
@@ -75,6 +75,11 @@ jobs:
           - lineage_tips
           - lineage_merge
           - config_seed_parser
+          - journal_verify
+          - sandbox_eval
+          - policy_engine
+          - compliance_policies
+          - audit_pack
         # Per-module advisory flag: `true` opts the module out of the run
         # conclusion. Keep this closed and reviewed - a module doesn't
         # get to stay advisory by default (mirrors the
@@ -101,9 +106,19 @@ jobs:
             advisory: false
           - module: config_seed_parser
             advisory: false
+          - module: journal_verify
+            advisory: false
+          - module: sandbox_eval
+            advisory: true
+          - module: policy_engine
+            advisory: true
+          - module: compliance_policies
+            advisory: true
+          - module: audit_pack
+            advisory: true
     steps:
       - name: Harden runner (audit mode)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: audit
       - name: Checkout
@@ -154,7 +169,7 @@ jobs:
         # for real, and the artifact - the survivor list a human needs to
         # act on it - must still be uploaded from the failing run.
         if: always() && steps.filter.outputs.skip != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mutation-${{ matrix.module }}
           path: mutation-results/${{ matrix.module }}.json

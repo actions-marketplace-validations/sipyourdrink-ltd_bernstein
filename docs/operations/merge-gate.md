@@ -58,18 +58,22 @@ gh api -X PATCH "repos/sipyourdrink-ltd/bernstein/branches/main/protection" \
   -f required_pull_request_reviews.required_approving_review_count=1 \
   -f required_pull_request_reviews.require_code_owner_reviews=true \
   -F allow_merge_queue=true
-
-# 2b. Configure the merge-queue policy (sets max group size and timeouts).
-gh api -X PUT "repos/sipyourdrink-ltd/bernstein/branches/main/merge_queue" \
-  -H "Accept: application/vnd.github+json" \
-  -f merge_method=squash \
-  -F max_entries_to_build=5 \
-  -F max_entries_to_merge=5 \
-  -F min_entries_to_merge=1 \
-  -F merge_queue_grouping_strategy=ALLGREEN \
-  -F min_entries_to_merge_wait_minutes=5 \
-  -F max_entries_to_merge_wait_minutes=60
 ```
+
+**2b. Configure the merge-queue policy** using the ruleset payload in
+[merge-queue.md :: Enable](merge-queue.md), which is the declared source of
+truth for these parameters: the shipped ruleset is reconciled *to* that
+document, and `tests/unit/test_merge_queue_runbook_docs.py` holds it to its own
+Tunables table. This page deliberately does not restate the values.
+
+Two of them are load-bearing rather than tuning, and are the reason a second
+copy is not kept here:
+
+- `max_entries_to_merge` must stay `1`. The auto-release gate keys on the push
+  head SHA, so merging N entries in one push skips a version bump anywhere but
+  last - green CI, no tag, no publish, and no error anywhere to notice.
+- `min_entries_to_merge_wait_minutes` is `0`. With one entry merging per push
+  there is no batch to fill, so any wait is pure added latency.
 
 After enabling, `gh pr merge --auto` will route the PR into the merge queue instead of merging immediately. CI then runs against the combined branch GitHub computes for the queued merge group, and the `merge_group:` trigger added to `.github/workflows/ci.yml` makes the existing CI suite respond to that event.
 
@@ -97,6 +101,50 @@ Notes:
 2. Cause `ci.yml` on main to fail (e.g. force-push a known-bad commit to a sandbox branch, then merge with admin override). Open a fresh PR. Confirm the main-red-guard step in `PR policy` emits a warning and job summary pointing at the failing SHA.
 3. Trigger the nightly sweep manually via `gh workflow run nightly-drift-sweep.yml`. Confirm it either no-ops (no drift) or opens a sweep PR labelled `automated`.
 4. Queue two PRs via auto-merge. Confirm each one gets its own merge-group CI run via the `merge_group:` trigger, and that `main` advances to the exact SHA the queue tested. The queue is configured with `max_entries_to_merge: 1` so one PR lands per push; see [merge-queue.md](merge-queue.md) for why.
+
+## Cross-task collusion gate (admission-time, content-level)
+
+The four layers above protect the merge *process*. The cross-task collusion
+gate protects merge *content* at the level of the candidate set: per-change
+gates evaluate one task at a time, so two tasks can jointly achieve what
+each alone is blocked for — one weakens a test the other's change needed to
+pass, a forbidden removal is split so each half leaves the guard
+half-standing, or one task writes a config value the other reads to widen
+its scope.
+
+`bernstein.core.quality.collusion_gate` evaluates three invariants over
+dependent task pairs (pairwise dependency from
+`bernstein.core.lineage.dependency`: path read-of-write, overlapping
+writes, symbol definition-vs-reference removal, config write under reader,
+weakened-test target touched):
+
+| Invariant | Fires when |
+|---|---|
+| `weakened-test-covers-changed-code` | one candidate weakens a test whose target module another candidate modifies |
+| `guarded-symbol-split-removal` | one candidate removes a guarded symbol's definition while another removes its reference |
+| `guarded-config-flip-under-reader` | one candidate writes a guarded config key to an unsafe value while another reads it |
+
+Status follows the same honesty rules as the per-task gates
+(`GateStatus` / `INCONCLUSIVE_REASONS`): any flag is `fail` and blocks; a
+candidate set containing any task with no recorded effect footprints — or
+an empty candidate set — is `inconclusive` / `evidence-missing` and blocks
+(a required gate never fabricates a pass over incomplete evidence);
+otherwise `pass`, with a `VerificationScope` whose confidence
+(`high`/`partial`/`none`) matches what was actually examined.
+
+Every admission decision — clean or not — is recorded in the merge
+admission receipt under the signed `collusion` binding field (receipt
+schema v3, versioned exactly like the v2 coverage fields so v1/v2 rows
+still load): the flags, each naming the invariant and both task ids; the
+candidate/coupled pair counts; the void task ids; and the gate status and
+reason.
+
+Wiring status: the gate's production consumer today is the eval bundle
+receipt path (`bernstein.eval.bench.collusion_bundle`), whose per-case
+receipts come from the same `CrossTaskAdmission.receipt_section()` the
+admission path consumes. Calling it from the live admission flow
+(`emit_merge_receipt` with `decision=` / `scopes=` / `collusion=`) is the
+next slice of #5463.
 
 ## Windows-lane promotion (self-promoting gate)
 

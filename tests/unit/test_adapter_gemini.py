@@ -1,11 +1,10 @@
 """Unit tests for GeminiAdapter spawn/kill/is_alive.
 
-Every spawn test is parametrised over both supported binary names
-(``antigravity`` and ``gemini``) so the suite proves the adapter's
-discovery cascade works against either binary. A dedicated
-``TestBinaryDiscoveryCascade`` block exercises the cascade itself:
-both binaries present, only legacy, neither (raises
-:class:`BinaryNotInstalledError`), and the operator override.
+Spawn tests are parametrised over the supported binary names (only
+``gemini``). A dedicated ``TestBinaryDiscoveryCascade`` block exercises
+the cascade itself: binary present, an ``antigravity`` binary never
+picked, missing (raises :class:`BinaryNotInstalledError`), and the
+operator override.
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ import pytest
 from bernstein.core.models import ApiTier, ModelConfig, ProviderType
 
 from bernstein.adapters.gemini import (
-    ANTIGRAVITY_BINARY,
     BINARY_ENV_VAR,
     LEGACY_GEMINI_BINARY,
     BinaryNotInstalledError,
@@ -37,9 +35,8 @@ if TYPE_CHECKING:
 # other adapter test modules (rovo, auggie, clm, ralphex).
 pytestmark = pytest.mark.usefixtures("no_watchdog_threads")  # suite-wide guard, see module docstring
 
-# Parametrisation surface: both supported binary names. Every spawn-side
-# test runs against both so a regression in either path is caught.
-ALL_BINARIES = (ANTIGRAVITY_BINARY, LEGACY_GEMINI_BINARY)
+# Parametrisation surface: every supported binary name.
+ALL_BINARIES = (LEGACY_GEMINI_BINARY,)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +222,64 @@ class TestGeminiAdapterSpawn:
         kwargs = popen.call_args.kwargs
         assert kwargs.get("start_new_session") is True
 
+    def test_gemini_prompt_carries_the_completion_protocol(self, tmp_path: Path, binary: str) -> None:
+        """Neither Gemini binary has a system-prompt flag; a non-empty
+        addendum must still reach the agent by riding on the ``-p`` prompt
+        argument (issue #5325), or the completion / heartbeat / signal-check
+        protocol never reaches a ``--cli gemini`` run.
+        """
+        adapter = GeminiAdapter()
+        proc_mock = _make_popen_mock(pid=109)
+        with (
+            patch("bernstein.adapters.gemini.shutil.which", side_effect=_which_only(binary)),
+            patch("bernstein.adapters.gemini.subprocess.Popen", return_value=proc_mock) as popen,
+        ):
+            adapter.spawn(
+                prompt="fix the bug",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gemini-3.1-pro", effort="high"),
+                session_id="gemini-s9",
+                system_addendum="When done, POST /complete. Heartbeat every 30s.",
+            )
+        inner = _inner_cmd(popen.call_args.args[0])
+        assert "When done, POST /complete. Heartbeat every 30s." in inner[inner.index("-p") + 1]
+
+    def test_gemini_addendum_appended_after_task_brief(self, tmp_path: Path, binary: str) -> None:
+        """A truncated prompt must lose the addendum, never the task brief."""
+        adapter = GeminiAdapter()
+        proc_mock = _make_popen_mock(pid=110)
+        with (
+            patch("bernstein.adapters.gemini.shutil.which", side_effect=_which_only(binary)),
+            patch("bernstein.adapters.gemini.subprocess.Popen", return_value=proc_mock) as popen,
+        ):
+            adapter.spawn(
+                prompt="primary task brief",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gemini-3.1-pro", effort="high"),
+                session_id="gemini-s10",
+                system_addendum="HEARTBEAT every 30s",
+            )
+        inner = _inner_cmd(popen.call_args.args[0])
+        full_prompt = inner[inner.index("-p") + 1]
+        assert full_prompt.index("primary task brief") < full_prompt.index("HEARTBEAT every 30s")
+
+    def test_gemini_empty_addendum_leaves_prompt_untouched(self, tmp_path: Path, binary: str) -> None:
+        adapter = GeminiAdapter()
+        proc_mock = _make_popen_mock(pid=111)
+        with (
+            patch("bernstein.adapters.gemini.shutil.which", side_effect=_which_only(binary)),
+            patch("bernstein.adapters.gemini.subprocess.Popen", return_value=proc_mock) as popen,
+        ):
+            adapter.spawn(
+                prompt="just the task",
+                workdir=tmp_path,
+                model_config=ModelConfig(model="gemini-3.1-pro", effort="high"),
+                session_id="gemini-s11",
+                system_addendum="",
+            )
+        inner = _inner_cmd(popen.call_args.args[0])
+        assert inner[inner.index("-p") + 1] == "just the task"
+
 
 # ---------------------------------------------------------------------------
 # spawn() - env isolation, parametrised on binary name
@@ -407,17 +462,26 @@ class TestGeminiWarnings:
 class TestBinaryDiscoveryCascade:
     """Cover the four discovery outcomes the adapter contract promises."""
 
-    def test_antigravity_wins_when_both_present(self) -> None:
-        """When both binaries resolve, ``antigravity`` is preferred."""
+    def test_antigravity_binary_is_never_a_candidate(self) -> None:
+        """An ``antigravity`` or ``agy`` binary on PATH is not picked.
 
-        def both_present(name: str) -> str | None:
-            return f"/usr/local/bin/{name}" if name in {ANTIGRAVITY_BINARY, LEGACY_GEMINI_BINARY} else None
+        The Antigravity CLI rejects the Gemini command line (``-m``,
+        ``--yolo``); it is served by the agy adapter.
+        """
+
+        def all_present(name: str) -> str | None:
+            return f"/usr/local/bin/{name}" if name in {"antigravity", "agy", LEGACY_GEMINI_BINARY} else None
+
+        def no_gemini(name: str) -> str | None:
+            return f"/usr/local/bin/{name}" if name in {"antigravity", "agy"} else None
 
         with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
-            assert resolve_google_cli_binary(which=both_present) == ANTIGRAVITY_BINARY
+            assert resolve_google_cli_binary(which=all_present) == LEGACY_GEMINI_BINARY
+            with pytest.raises(BinaryNotInstalledError, match="'agy' adapter"):
+                resolve_google_cli_binary(which=no_gemini, strict=True)
 
-    def test_legacy_wins_when_only_legacy_present(self) -> None:
-        """When only the legacy binary resolves, the cascade falls back."""
+    def test_gemini_resolves_when_present(self) -> None:
+        """When the ``gemini`` binary resolves, it is used."""
 
         def only_legacy(name: str) -> str | None:
             return "/usr/local/bin/gemini" if name == LEGACY_GEMINI_BINARY else None
@@ -432,7 +496,7 @@ class TestBinaryDiscoveryCascade:
         """
         with (
             patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
-            pytest.raises(BinaryNotInstalledError, match="antigravity"),
+            pytest.raises(BinaryNotInstalledError, match="gemini"),
         ):
             resolve_google_cli_binary(which=lambda _name: None, strict=True)
 
@@ -443,13 +507,13 @@ class TestBinaryDiscoveryCascade:
         aider adapter posture.
         """
         with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
-            assert resolve_google_cli_binary(which=lambda _name: None) == ANTIGRAVITY_BINARY
+            assert resolve_google_cli_binary(which=lambda _name: None) == LEGACY_GEMINI_BINARY
 
     def test_env_override_wins_over_cascade(self) -> None:
         """``BERNSTEIN_GEMINI_BINARY`` short-circuits the cascade."""
 
         def both_present(name: str) -> str | None:
-            return f"/usr/local/bin/{name}" if name in {"antigravity", "gemini", "vendor-cli"} else None
+            return f"/usr/local/bin/{name}" if name in {"gemini", "vendor-cli"} else None
 
         with patch.dict("os.environ", {"PATH": "/usr/bin", BINARY_ENV_VAR: "vendor-cli"}, clear=True):
             assert resolve_google_cli_binary(which=both_present) == "vendor-cli"
@@ -465,11 +529,11 @@ class TestBinaryDiscoveryCascade:
     def test_empty_env_override_falls_through_to_cascade(self) -> None:
         """A blank override behaves as if unset (no surprise pinning)."""
 
-        def only_antigravity(name: str) -> str | None:
-            return "/usr/local/bin/antigravity" if name == ANTIGRAVITY_BINARY else None
+        def only_gemini(name: str) -> str | None:
+            return "/usr/local/bin/gemini" if name == LEGACY_GEMINI_BINARY else None
 
         with patch.dict("os.environ", {"PATH": "/usr/bin", BINARY_ENV_VAR: "   "}, clear=True):
-            assert resolve_google_cli_binary(which=only_antigravity) == ANTIGRAVITY_BINARY
+            assert resolve_google_cli_binary(which=only_gemini) == LEGACY_GEMINI_BINARY
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Final
 from bernstein.core.git_ops import MergeResult, merge_with_conflict_detection
 from bernstein.core.models import AgentBackend, AgentSession
 from bernstein.core.prometheus import merge_duration
+from bernstein.core.security.sanitize import sanitize_log
 from bernstein.core.traces import AgentTrace, TraceStore, finalize_trace
 from bernstein.plugins.manager import get_plugin_manager
 
@@ -37,6 +38,23 @@ logger = logging.getLogger(__name__)
 #: project's standard truthy words.
 ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH = "BERNSTEIN_ALLOW_MERGE_TO_DEFAULT_BRANCH"
 
+#: Journal code for a merge refused because its target is the protected
+#: default branch -- the only refusal ``ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH``
+#: lifts. Every other code in ``refused_merges.jsonl`` names a merge gate
+#: (quality gates, file scope, blast radius) that the override does not touch.
+REFUSAL_TARGET_IS_DEFAULT_BRANCH: Final = "target-is-default-branch"
+
+#: Env var an operator sets to keep merge-backs local: the merge still happens,
+#: the push after it (and the pending-push retry queue) does not. ``safe_push``
+#: fetches, may rebase, and writes to ``origin``, so on a repository that has a
+#: remote a local-only or offline run published agent commits nobody had
+#: reviewed -- and there was no way to ask it not to short of removing the
+#: remote. Scope is the merge-back push only: the salvage push of
+#: ``salvage/<id>`` (``core/git/salvage.py``) and evolve mode's ``safe_push``
+#: to ``main`` (``orchestrator_evolve.py``) do not read this flag. Accepts the
+#: project's standard truthy words.
+ENV_LOCAL_ONLY = "BERNSTEIN_LOCAL_ONLY"
+
 _TRUTHY_ALLOW = frozenset({"1", "true", "yes", "on", "enable", "enabled"})
 
 
@@ -50,45 +68,56 @@ def _allow_merge_to_default_branch(env: dict[str, str] | None = None) -> bool:
     return raw is not None and raw.strip().lower() in _TRUTHY_ALLOW
 
 
+def _local_only(env: dict[str, str] | None = None) -> bool:
+    """Return ``True`` when this run must skip the merge-back push and the pending-push retry.
+
+    It does not stop every remote write: the salvage push and evolve mode's
+    push to ``main`` do not read it (see `ENV_LOCAL_ONLY`).
+
+    Read at the push site rather than passed down: the two merge entry points
+    and the queue path all reach the same `safe_push`, and threading a flag
+    through each of them is how one of them ends up missing it.
+    """
+    import os
+
+    source = os.environ if env is None else env
+    raw = source.get(ENV_LOCAL_ONLY)
+    return raw is not None and raw.strip().lower() in _TRUTHY_ALLOW
+
+
 def _record_merge_refusal(
     worktree_root: Path,
     session_id: str,
     branch: str,
-    reason: str = "target-is-default-branch",
+    reason: str = REFUSAL_TARGET_IS_DEFAULT_BRANCH,
+    detail: str = "",
 ) -> None:
     """Persist a visible record that a merge was refused.
 
     Written to ``.sdd/runtime/refused_merges.jsonl`` next to the pending-push
     journal so an operator (and any postmortem) can see exactly which session
-    was blocked, on which branch, why, and when.
+    was blocked, on which branch, why, and when. ``reason`` is the
+    machine-readable code; ``detail`` is the gate's own explanation (which
+    gates failed, which path fell outside the scope) and is written only
+    when the caller has one.
     """
     import json as _json
 
-    entry = {
-        "session_id": _sanitise_for_log(session_id),
-        "branch": _sanitise_for_log(branch),
-        "reason": _sanitise_for_log(reason),
+    entry: dict[str, object] = {
+        "session_id": sanitize_log(session_id),
+        "branch": sanitize_log(branch),
+        "reason": sanitize_log(reason),
         "ts": time.time(),
     }
+    if detail:
+        entry["detail"] = sanitize_log(detail)
     try:
         path = worktree_root / ".sdd" / "runtime" / "refused_merges.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(_json.dumps(entry) + "\n")
     except OSError as exc:  # recording is best-effort; never mask the refusal
-        logger.debug("Could not record merge refusal for %s: %s", _sanitise_for_log(session_id), exc)
-
-
-def _sanitise_for_log(value: str) -> str:
-    """Strip CR/LF from ``value`` so attacker-controlled input cannot
-    inject fake log lines.
-
-    Used at every log site that touches data read out of the pending
-    pushes file or subprocess stderr (CodeQL/Sonar py/log-injection
-    S5145). Keep this function cheap and side-effect-free -- it is
-    called inside the spawner hot path.
-    """
-    return value.replace("\r", "").replace("\n", "") if value else value
+        logger.debug("Could not record merge refusal for %s: %s", sanitize_log(session_id), exc)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +168,7 @@ def _incoming_files(worktree_root: Path, branch: str) -> list[str]:
         msg = f"could not be read: git diff --name-only {spec} did not complete ({exc})"
         raise IncomingChangeUnreadable(msg) from exc
     if names.returncode != 0:
-        detail = _sanitise_for_log(names.stderr.strip())
+        detail = sanitize_log(names.stderr.strip())
         msg = f"could not be read: git diff --name-only {spec} exited {names.returncode} ({detail})"
         raise IncomingChangeUnreadable(msg)
     return [line.strip() for line in names.stdout.splitlines() if line.strip()]
@@ -172,7 +201,7 @@ def _incoming_change(worktree_root: Path, branch: str) -> tuple[list[str], str]:
         msg = f"could not be read: git diff {spec} did not complete ({exc})"
         raise IncomingChangeUnreadable(msg) from exc
     if body.returncode != 0:
-        msg = f"could not be read: git diff {spec} exited {body.returncode} ({_sanitise_for_log(body.stderr.strip())})"
+        msg = f"could not be read: git diff {spec} exited {body.returncode} ({sanitize_log(body.stderr.strip())})"
         raise IncomingChangeUnreadable(msg)
     return files, body.stdout
 
@@ -263,12 +292,12 @@ def _signed_file_scope(worktree_root: Path, session_id: str) -> list[str] | _Unr
     if not auth_dir.exists():
         return None
 
-    from bernstein.core.agents.agent_identity import AgentIdentityStore
+    from bernstein.core.identity.agent_jwt import AgentIdentityStore
 
     try:
         identity = AgentIdentityStore(auth_dir).get(session_id)
     except OSError as exc:
-        logger.error("Could not read agent identities for %s: %s", _sanitise_for_log(session_id), exc)
+        logger.error("Could not read agent identities for %s: %s", sanitize_log(session_id), exc)
         return _UNREADABLE_SCOPE
     if identity is not None:
         return identity.allowed_files
@@ -283,7 +312,7 @@ def _signed_file_scope(worktree_root: Path, session_id: str) -> list[str] | _Unr
     try:
         present = any(entry.name == f"{session_id}.json" for entry in (auth_dir / "agent_identities").iterdir())
     except OSError as exc:
-        logger.error("Could not list agent identities for %s: %s", _sanitise_for_log(session_id), exc)
+        logger.error("Could not list agent identities for %s: %s", sanitize_log(session_id), exc)
         return _UNREADABLE_SCOPE
     return _UNREADABLE_SCOPE if present else None
 
@@ -303,11 +332,11 @@ def _refuse_merge(
     reconstructing either from ``refused_merges.jsonl`` should not find one
     of them better recorded than the other.
     """
-    _record_merge_refusal(worktree_root, session.id, branch, reason=code)
+    _record_merge_refusal(worktree_root, session.id, branch, reason=code, detail=reason)
     logger.error(
         "Refusing to merge agent work from %s: %s",
-        _sanitise_for_log(session.id),
-        _sanitise_for_log(reason),
+        sanitize_log(session.id),
+        sanitize_log(reason),
     )
     from bernstein.core.metric_collector import get_collector
 
@@ -488,7 +517,7 @@ def _record_landed_provenance(
     ``emit_production_event`` applies one level down.
     """
     if not run_id or not before_sha:
-        logger.debug("merge provenance: no run id or base for %s; nothing recorded", _sanitise_for_log(session_id))
+        logger.debug("merge provenance: no run id or base for %s; nothing recorded", sanitize_log(session_id))
         return
     try:
         from bernstein.core.git.git_basic import run_git
@@ -497,7 +526,7 @@ def _record_landed_provenance(
 
         head = run_git(["rev-parse", "HEAD"], worktree_root, timeout=10)
         if head.returncode != 0:
-            logger.warning("merge provenance: could not resolve HEAD after merge for %s", _sanitise_for_log(session_id))
+            logger.warning("merge provenance: could not resolve HEAD after merge for %s", sanitize_log(session_id))
             return
         after_sha = head.stdout.strip()
         if after_sha == before_sha:
@@ -515,14 +544,14 @@ def _record_landed_provenance(
             "merge provenance: recorded %d/%d landed path(s) for %s at %s",
             len(result.recorded),
             result.total_seen,
-            _sanitise_for_log(session_id),
+            sanitize_log(session_id),
             after_sha[:12],
         )
     except Exception as exc:
         logger.warning(
             "merge provenance: no rows recorded for %s: %s",
-            _sanitise_for_log(session_id),
-            _sanitise_for_log(str(exc)),
+            sanitize_log(session_id),
+            sanitize_log(str(exc)),
         )
 
 
@@ -562,8 +591,8 @@ def _run_merge_and_push(
             "Refusing to merge agent work from %s onto default branch %r: agent "
             "output must not reach a protected trunk without an explicit target. "
             "Check out a non-default branch, or set %s=1 to override.",
-            _sanitise_for_log(session.id),
-            _sanitise_for_log(target_branch),
+            sanitize_log(session.id),
+            sanitize_log(target_branch),
             ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH,
         )
         from bernstein.core.metric_collector import get_collector
@@ -651,17 +680,75 @@ def _run_merge_and_push(
 
     if merge_result and merge_result.success:
         _record_landed_provenance(session.id, worktree_root, before_sha, run_id)
+        _dispatch_post_merge(session, worktree_root, target_branch)
         # Push the branch we actually merged into (never a hard-coded "main").
         # ``target_branch`` is None only on detached HEAD; fall back to the
         # resolved default there.
         push_branch = target_branch or resolve_default_branch(worktree_root)
-        push_result = safe_push(worktree_root, push_branch)
-        if push_result.ok:
-            logger.info("Pushed merged work from %s to origin/%s", session.id, push_branch)
+        if _local_only():
+            # Skipped outright, not attempted-and-ignored: `safe_push` fetches
+            # and may rebase before it writes, so "try and swallow the error"
+            # still performs remote I/O, which is the thing an offline run
+            # cannot do and a local-only run does not want (#5961).
+            logger.info(
+                "%s set: keeping merged work from %s local, not pushing %s",
+                ENV_LOCAL_ONLY,
+                session.id,
+                push_branch,
+            )
         else:
-            logger.warning("Push failed after merge for %s: %s", session.id, push_result.stderr)
+            push_result = safe_push(worktree_root, push_branch)
+            if push_result.ok:
+                logger.info("Pushed merged work from %s to origin/%s", session.id, push_branch)
+            else:
+                logger.warning("Push failed after merge for %s: %s", session.id, push_result.stderr)
 
     return merge_result
+
+
+def _dispatch_post_merge(session: AgentSession, worktree_root: Path, merged_into: str | None) -> None:
+    """Fire ``LifecycleEvent.POST_MERGE`` for a merge that just landed (#5962).
+
+    Dispatched on the process-wide registry, the same lookup the
+    ``worker.escalated`` event uses: with none installed this is a no-op.
+    The payload names the merged branch, the branch it landed on, and the
+    commit ``HEAD`` points at after the merge.
+
+    The merge has already happened, so nothing a hook does here can undo
+    it: a failing or denying hook is logged and the merge path carries on.
+    """
+    from bernstein.core.lifecycle import hooks as lifecycle_hooks
+
+    registry = getattr(lifecycle_hooks, "GLOBAL_REGISTRY", None)
+    if registry is None:
+        return
+
+    from bernstein.core.git.git_basic import run_git as _run_git
+
+    try:
+        head = _run_git(["rev-parse", "HEAD"], worktree_root, timeout=10)
+        commit_sha = head.stdout.strip() if head.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("post_merge: HEAD unreadable at %s: %s", worktree_root, exc)
+        commit_sha = ""
+
+    task_ids = list(session.task_ids)
+    ctx = lifecycle_hooks.LifecycleContext(
+        event=lifecycle_hooks.LifecycleEvent.POST_MERGE,
+        task=task_ids[0] if task_ids else None,
+        session_id=session.id,
+        workdir=worktree_root,
+        data={
+            "branch": f"agent/{session.id}",
+            "merged_into": merged_into or "",
+            "commit_sha": commit_sha,
+            "task_ids": task_ids,
+        },
+    )
+    try:
+        registry.run(lifecycle_hooks.LifecycleEvent.POST_MERGE, ctx)
+    except Exception as exc:
+        logger.warning("post_merge hook failed for %s: %s", sanitize_log(session.id), exc)
 
 
 def _do_merge(
@@ -872,7 +959,7 @@ def validate_pending_push_entry(
     except ValueError:
         logger.warning(
             "Skipping pending push entry: repo_root %r escapes workspace",
-            _sanitise_for_log(raw_repo_root),
+            sanitize_log(raw_repo_root),
         )
         return None
 
@@ -902,6 +989,14 @@ def retry_pending_pushes(workdir: Path) -> int:
     if not path.exists():
         return 0
 
+    if _local_only():
+        # The queue is left intact: these are pushes a previous run recorded,
+        # and a local-only run declining to send them is not the same as
+        # deciding they are never wanted (#5961). Checked after the file so an
+        # empty queue does not log on every tick.
+        logger.info("%s set: not retrying pending pushes", ENV_LOCAL_ONLY)
+        return 0
+
     try:
         lines = path.read_text().splitlines()
     except OSError:
@@ -922,8 +1017,8 @@ def retry_pending_pushes(workdir: Path) -> int:
             continue
         repo_root, branch, session_id = validated
 
-        safe_session_id = _sanitise_for_log(session_id)
-        safe_repo_root = _sanitise_for_log(str(repo_root))
+        safe_session_id = sanitize_log(session_id)
+        safe_repo_root = sanitize_log(str(repo_root))
         push_result = safe_push(repo_root, branch)
         if push_result.ok:
             logger.info(
@@ -936,7 +1031,7 @@ def retry_pending_pushes(workdir: Path) -> int:
             logger.warning(
                 "Retry push still failing for %s: %s",
                 safe_session_id,
-                _sanitise_for_log(push_result.stderr),
+                sanitize_log(push_result.stderr),
             )
             remaining.append(line)
 

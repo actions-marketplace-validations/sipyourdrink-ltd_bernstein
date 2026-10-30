@@ -35,13 +35,54 @@ if TYPE_CHECKING:
     from bernstein.core.volunteer.clean_room import CleanRoomResult
 
 
-@click.group("volunteer")
-def volunteer_group() -> None:
+@click.group("volunteer", invoke_without_command=True)
+@click.pass_context
+def volunteer_group(ctx: click.Context) -> None:
     """Volunteer-worker surfaces: donate agent capacity to opt-in projects.
 
     A project declares its policy in `.bernstein/volunteer.json`; see
     `docs/reference/volunteer-manifest.md` for the schema.
     """
+    # Bare invocation (no subcommand) routes to onboarding entry point
+    if ctx.invoked_subcommand is None:
+        _run_onboarding()
+
+
+def _run_onboarding() -> None:
+    """Explain the volunteer flow, then stop before consent is asked for.
+
+    The entry point for ``bernstein volunteer`` with no subcommand (#3889).
+
+    A consent receipt is not a general "I agree to volunteer" record. It binds
+    the donor's key to the digest of one project's manifest and the digest of
+    the sandbox profile derived from it (:mod:`bernstein.core.volunteer.consent`),
+    so it can only be written once a project has been chosen. Nothing chooses one
+    yet: the autopilot loop has no task source, which is also why
+    ``bernstein volunteer autopilot`` refuses to run. Until it does, onboarding
+    explains what will happen and says what is missing, and records nothing --
+    a signed receipt over placeholder digests would read, to anything that
+    verifies only the signature, as consent to a policy the donor never saw.
+
+    Exits non-zero, so a script that runs onboarding cannot carry on as if a
+    donor had been onboarded.
+    """
+    click.echo("Bernstein volunteer onboarding")
+    click.echo()
+    click.echo(
+        "You are about to donate compute capacity to open-source projects. "
+        "A task is picked from a project that opted in, runs in a hardened sandbox "
+        "under that project's declared policy, and its result is submitted for review."
+    )
+    click.echo(
+        "Before any task runs you are asked for explicit consent, recorded as a receipt "
+        "signed by your key and bound to that project's manifest and sandbox profile."
+    )
+    click.echo()
+    click.echo("Usable today: `bernstein volunteer browse` to list projects, `budget` to set your limits.")
+    raise click.ClickException(
+        "onboarding cannot continue: no task source is implemented yet, so no project can be "
+        "chosen and there is nothing for a consent receipt to bind. No consent was recorded."
+    )
 
 
 @volunteer_group.command("verify")
@@ -501,12 +542,27 @@ def _print_clean_room_report(result: CleanRoomResult, *, receipt_digest: str, re
     default=None,
     help="Path to the JSONL lease store file.",
 )
-def hub_cmd(host: str, port: int, lease_store_path: str | None) -> None:
+@click.option(
+    "--allow-origin",
+    "allowed_origins",
+    multiple=True,
+    help=(
+        "Browser origin allowed to call this hub cross-origin, e.g. "
+        "https://volunteers.example. Repeat for several. Omitted installs no "
+        "CORS middleware, so only same-origin and non-browser clients reach "
+        "the API. There is no wildcard."
+    ),
+)
+def hub_cmd(host: str, port: int, lease_store_path: str | None, allowed_origins: tuple[str, ...]) -> None:
     """Serve the volunteer hub HTTP interface.
 
     The hub exposes endpoints for workers to enroll, claim, heartbeat,
-    submit, and release tasks.  See :func:`bernstein.core.volunteer.hub_app.build_hub_app`
-    for the API surface.
+    submit, and release tasks, plus its own task board for work that
+    originates here rather than mirroring a git-forge issue.  See
+    :func:`bernstein.core.volunteer.hub_app.build_hub_app` for the API surface.
+
+    The board's log is a sibling of the lease log, since the two are one hub's
+    state and are torn down together.
 
     .. note:: The lease store is single-process only. Do not run with
        ``uvicorn --workers N>1`` or multiple replicas.
@@ -532,6 +588,7 @@ def hub_cmd(host: str, port: int, lease_store_path: str | None) -> None:
     from bernstein.core.volunteer.budget import BudgetConfigError, load_budget_config
     from bernstein.core.volunteer.hub_app import build_hub_app
     from bernstein.core.volunteer.lease_store import LeaseStore
+    from bernstein.core.volunteer.task_board import TaskBoard
 
     if lease_store_path is None:
         lease_store_path = ".sdd/runtime/volunteer/leases.jsonl"
@@ -541,7 +598,36 @@ def hub_cmd(host: str, port: int, lease_store_path: str | None) -> None:
     except (BudgetConfigError, OSError) as error:
         raise click.ClickException(str(error)) from error
 
-    store = LeaseStore(Path(lease_store_path), budget=donor_budget)
-    app = build_hub_app(store)
+    lease_log = Path(lease_store_path)
+    store = LeaseStore(lease_log, budget=donor_budget)
+    board = TaskBoard(lease_log.parent / "tasks.jsonl")
+    app = build_hub_app(store, task_board=board, allowed_origins=allowed_origins)
     click.echo(f"Bernstein volunteer hub listening on http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
+@volunteer_group.command("autopilot")
+@click.option(
+    "--profile",
+    "profile_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=".bernstein/volunteer_profile.json",
+    help="Path to volunteer profile JSON (default: .bernstein/volunteer_profile.json).",
+)
+def autopilot_cmd(profile_path: Path) -> None:
+    """Run volunteer tasks automatically using the autopilot loop.
+
+    Claims tasks matching the donor's profile, runs them in the hardened
+    sandbox, submits results, and repeats until stopped.
+
+    Requires a TaskSource implementation (see AutopilotLoop documentation).
+    """
+    from bernstein.core.volunteer.autopilot_loop import AutopilotLoop
+    from bernstein.core.volunteer.volunteer_profile import VolunteerProfile, load_profile
+
+    click.echo(f"Loading profile from {profile_path}")
+    # Demonstrate usage of the modules
+    profile: VolunteerProfile = load_profile(profile_path.read_text())
+    click.echo(f"Profile loaded for autopilot loop: {len(profile.allowed_projects)} allowed projects")
+    click.echo(f"AutopilotLoop available for TaskSource implementation: {AutopilotLoop.__name__}")
+    raise click.ClickException("Autopilot requires a TaskSource implementation (not yet implemented)")

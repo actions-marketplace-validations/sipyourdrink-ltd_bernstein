@@ -13,9 +13,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from bernstein.cli.commands.bom_cmd import bom_group
+from bernstein.core.lineage.spine import LineageSpine
 
 
 def _sha(label: str) -> str:
@@ -348,3 +350,334 @@ class TestRoundTrip:
             assert result.exit_code == 0, result.output
             decoded = json.loads(out.read_text(encoding="utf-8"))
             assert key in decoded
+
+
+# ---------------------------------------------------------------------------
+# 4. ``bom emit --from-lineage`` -- project the snapshot off the run spine
+# ---------------------------------------------------------------------------
+
+
+_SPINE_KEY = b"k" * 32
+
+
+def _seed_spine(workdir: Path, run_id: str) -> LineageSpine:
+    spine = LineageSpine(workdir / ".sdd" / "lineage", run_id=run_id, hmac_key=_SPINE_KEY)
+    spine.record(
+        artifact_path="src/a.py",
+        content=b"a",
+        actor="agent:worker",
+        step_id="s1",
+        model="claude-sonnet",
+        timestamp=1767225600,
+    )
+    spine.record(
+        artifact_path="src/b.py",
+        content=b"b",
+        actor="agent:worker",
+        step_id="s2",
+        model="claude-sonnet",
+        timestamp=1767225660,
+    )
+    return spine
+
+
+def _install_audit_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    key_file = tmp_path / "audit.key"
+    key_file.write_bytes(_SPINE_KEY)
+    key_file.chmod(0o600)
+    monkeypatch.setenv("BERNSTEIN_AUDIT_KEY_PATH", str(key_file))
+
+
+class TestBOMEmitFromLineage:
+    def test_emit_from_lineage_projects_the_run_spine(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_audit_key(tmp_path, monkeypatch)
+        spine = _seed_spine(tmp_path, "20260101-run-a")
+
+        result = CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", "20260101-run-a", "--from-lineage", "--workdir", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0, result.output
+        doc = json.loads(result.stdout)
+        assert doc["run_id"] == "20260101-run-a"
+        assert doc["lineage_root_hash"] == spine.head_hash()
+        assert [(m["name"], m["invocation_count"]) for m in doc["models"]] == [("claude-sonnet", 2)]
+
+    def test_emit_from_lineage_needs_no_hand_written_snapshot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The whole point: ``.sdd/runs/<run>/bom_snapshot.json`` need not exist."""
+        _install_audit_key(tmp_path, monkeypatch)
+        _seed_spine(tmp_path, "20260101-run-b")
+        assert not (tmp_path / ".sdd" / "runs" / "20260101-run-b" / "bom_snapshot.json").exists()
+
+        result = CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", "20260101-run-b", "--from-lineage", "--workdir", str(tmp_path)],
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_emit_from_lineage_output_passes_structural_verify(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_audit_key(tmp_path, monkeypatch)
+        _seed_spine(tmp_path, "20260101-run-c")
+        out = tmp_path / "bom.json"
+
+        emit = CliRunner().invoke(
+            bom_group,
+            [
+                "emit",
+                "--run",
+                "20260101-run-c",
+                "--from-lineage",
+                "--workdir",
+                str(tmp_path),
+                "--out",
+                str(out),
+            ],
+        )
+        assert emit.exit_code == 0, emit.output
+
+        verify = CliRunner().invoke(bom_group, ["verify", str(out)])
+        assert verify.exit_code == 0, verify.output
+
+    def test_emit_from_lineage_rejects_a_run_with_an_empty_spine(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_audit_key(tmp_path, monkeypatch)
+        (tmp_path / ".sdd" / "lineage").mkdir(parents=True)
+
+        result = CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", "20260101-empty", "--from-lineage", "--workdir", str(tmp_path)],
+        )
+        assert result.exit_code == 1
+        assert "20260101-empty" in result.output
+
+    def test_emit_from_lineage_requires_run_and_excludes_snapshot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_audit_key(tmp_path, monkeypatch)
+        snap_path = tmp_path / "snap.json"
+        snap_path.write_text(json.dumps(_snapshot()), encoding="utf-8")
+
+        no_run = CliRunner().invoke(bom_group, ["emit", "--from-lineage", "--workdir", str(tmp_path)])
+        assert no_run.exit_code == 2
+
+        with_snapshot = CliRunner().invoke(
+            bom_group,
+            ["emit", "--from-lineage", "--snapshot", str(snap_path), "--workdir", str(tmp_path)],
+        )
+        assert with_snapshot.exit_code == 2
+
+    def test_emit_from_lineage_fails_closed_without_an_audit_key(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A read-only projection must never mint key material (issue #2639)."""
+        _seed_spine(tmp_path, "20260101-run-d")
+        key_file = tmp_path / "absent.key"
+        monkeypatch.setenv("BERNSTEIN_AUDIT_KEY_PATH", str(key_file))
+
+        result = CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", "20260101-run-d", "--from-lineage", "--workdir", str(tmp_path)],
+        )
+
+        assert result.exit_code != 0
+        assert not key_file.exists()
+
+    def test_emit_from_lineage_rejects_a_run_id_that_escapes_its_directory(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_audit_key(tmp_path, monkeypatch)
+
+        result = CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", "../elsewhere", "--from-lineage", "--workdir", str(tmp_path)],
+        )
+
+        assert result.exit_code == 1
+        assert "invalid run id" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 5. ``bom verify --from-lineage`` -- offline re-derivation
+# ---------------------------------------------------------------------------
+
+
+class TestBOMVerifyFromLineage:
+    def test_verify_from_lineage_fails_closed_when_component_hash_does_not_resolve(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_audit_key(tmp_path, monkeypatch)
+        _seed_spine(tmp_path, "20260101-run-v")
+        out = tmp_path / "bom.json"
+
+        emit = CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", "20260101-run-v", "--from-lineage", "--workdir", str(tmp_path), "--out", str(out)],
+        )
+        assert emit.exit_code == 0, emit.output
+
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        doc["models"][0]["sha256"] = _sha("unrelated-component")
+        out.write_text(json.dumps(doc), encoding="utf-8")
+
+        verify = CliRunner().invoke(
+            bom_group,
+            ["verify", str(out), "--from-lineage", "--run", "20260101-run-v", "--workdir", str(tmp_path)],
+        )
+        assert verify.exit_code == 1
+        assert "claude-sonnet" in verify.output
+
+    def test_verify_from_lineage_passes_for_faithful_projection(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_audit_key(tmp_path, monkeypatch)
+        _seed_spine(tmp_path, "20260101-run-w")
+        out = tmp_path / "bom.json"
+
+        emit = CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", "20260101-run-w", "--from-lineage", "--workdir", str(tmp_path), "--out", str(out)],
+        )
+        assert emit.exit_code == 0, emit.output
+
+        verify = CliRunner().invoke(
+            bom_group,
+            ["verify", str(out), "--from-lineage", "--run", "20260101-run-w", "--workdir", str(tmp_path)],
+        )
+        assert verify.exit_code == 0, verify.output
+        assert "PASS" in verify.output
+
+    def test_verify_from_lineage_requires_run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_audit_key(tmp_path, monkeypatch)
+        _seed_spine(tmp_path, "20260101-run-x")
+        out = tmp_path / "bom.json"
+        CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", "20260101-run-x", "--from-lineage", "--workdir", str(tmp_path), "--out", str(out)],
+        )
+
+        verify = CliRunner().invoke(
+            bom_group,
+            ["verify", str(out), "--from-lineage", "--workdir", str(tmp_path)],
+        )
+        assert verify.exit_code == 2
+
+
+class TestBOMVerifyForgeries:
+    """``bom verify --from-lineage`` fails every hand-edit of a faithful BOM."""
+
+    @staticmethod
+    def _emit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: str) -> tuple[Path, dict[str, Any]]:
+        _install_audit_key(tmp_path, monkeypatch)
+        spine = _seed_spine(tmp_path, run_id)
+        spine.record(
+            artifact_path="src/c.py",
+            content=b"c",
+            actor="agent:worker",
+            step_id="s3",
+            model="gpt-other",
+            timestamp=1767225720,
+        )
+        out = tmp_path / "bom.json"
+        emit = CliRunner().invoke(
+            bom_group,
+            ["emit", "--run", run_id, "--from-lineage", "--workdir", str(tmp_path), "--out", str(out)],
+        )
+        assert emit.exit_code == 0, emit.output
+        return out, json.loads(out.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _verify(tmp_path: Path, out: Path, doc: dict[str, Any], run_id: str) -> Any:
+        out.write_text(json.dumps(doc), encoding="utf-8")
+        return CliRunner().invoke(
+            bom_group,
+            ["verify", str(out), "--from-lineage", "--run", run_id, "--workdir", str(tmp_path)],
+        )
+
+    def test_omitted_model_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, doc = self._emit(tmp_path, monkeypatch, "20260101-run-f1")
+        doc["models"] = [m for m in doc["models"] if m["name"] != "gpt-other"]
+        result = self._verify(tmp_path, out, doc, "20260101-run-f1")
+        assert result.exit_code == 1
+        assert "gpt-other" in result.output
+
+    def test_emptied_model_list_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, doc = self._emit(tmp_path, monkeypatch, "20260101-run-f2")
+        doc["models"] = []
+        assert self._verify(tmp_path, out, doc, "20260101-run-f2").exit_code == 1
+
+    def test_renamed_model_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, doc = self._emit(tmp_path, monkeypatch, "20260101-run-f3")
+        doc["models"][0]["name"] = "gpt-7-secret"
+        result = self._verify(tmp_path, out, doc, "20260101-run-f3")
+        assert result.exit_code == 1
+
+    def test_inflated_count_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, doc = self._emit(tmp_path, monkeypatch, "20260101-run-f4")
+        doc["models"][0]["invocation_count"] = 999
+        result = self._verify(tmp_path, out, doc, "20260101-run-f4")
+        assert result.exit_code == 1
+        assert "invocation_count" in result.output
+
+    def test_swapped_sha256_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, doc = self._emit(tmp_path, monkeypatch, "20260101-run-f5")
+        doc["models"][0]["sha256"] = doc["models"][1]["sha256"]
+        result = self._verify(tmp_path, out, doc, "20260101-run-f5")
+        assert result.exit_code == 1
+        assert "sha256 mismatch" in result.output
+
+    def test_deleted_spine_row_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, doc = self._emit(tmp_path, monkeypatch, "20260101-run-f6")
+        spine_path = tmp_path / ".sdd" / "lineage" / "20260101-run-f6" / "spine.jsonl"
+        lines = spine_path.read_bytes().rstrip(b"\n").split(b"\n")
+        del lines[1]
+        spine_path.write_bytes(b"\n".join(lines) + b"\n")
+        result = self._verify(tmp_path, out, doc, "20260101-run-f6")
+        assert result.exit_code == 1
+        assert "does not verify" in result.output
+
+    def test_run_without_from_lineage_is_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, _ = self._emit(tmp_path, monkeypatch, "20260101-run-f7")
+        result = CliRunner().invoke(bom_group, ["verify", str(out), "--run", "20260101-run-f7"])
+        assert result.exit_code == 2
+        assert "--from-lineage" in result.output
+
+    def test_workdir_without_from_lineage_is_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, _ = self._emit(tmp_path, monkeypatch, "20260101-run-f8")
+        result = CliRunner().invoke(bom_group, ["verify", str(out), "--workdir", str(tmp_path)])
+        assert result.exit_code == 2
+
+    def test_structural_pass_states_its_scope(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, _ = self._emit(tmp_path, monkeypatch, "20260101-run-f9")
+        result = CliRunner().invoke(bom_group, ["verify", str(out)])
+        assert result.exit_code == 0
+        assert "structural only" in result.output

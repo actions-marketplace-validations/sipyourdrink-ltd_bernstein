@@ -35,6 +35,8 @@ import sys
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 # Imported for their side effect: each package __init__ appends its redirect
 # finder to sys.meta_path, which is what the reconciliation test interrogates.
 import bernstein.cli
@@ -45,6 +47,7 @@ import bernstein.core  # noqa: F401
 from bernstein.core.quality.test_impact import TestImpactAnalyzer as ImpactAnalyzer
 from bernstein.core.quality.test_impact import (
     _real_module_names,
+    _resolve_relative_import,
     build_compat_dep_map,
     compat_get_affected_tests,
     discover_module_aliases,
@@ -183,6 +186,7 @@ def test_analyzer_picks_the_alias_importing_test(tmp_path: Path) -> None:
     assert lifecycle in analysis.affected_tests
 
 
+@pytest.mark.timeout(300)
 def test_repo_worktree_change_selects_its_lifecycle_suite() -> None:
     """Regression pin on the reported case, against the real source tree.
 
@@ -277,3 +281,236 @@ def test_every_live_redirect_edge_is_discovered() -> None:
         f"selector, so a change to the module behind them would not select the suites that "
         f"import them under the legacy name: {missing[:10]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Re-exports (#5111 slice 4)
+# ---------------------------------------------------------------------------
+#
+# The alias tests above cover a name the import SYSTEM redirects. A re-export is
+# the ordinary-Python cousin: module A binds a name defined in module B, a test
+# imports only A, and a change confined to B still has to select that test.
+#
+# It does today -- the edge is carried by A's own import of B, so the transitive
+# walk reaches it. That is worth pinning rather than assuming: the shape is
+# indistinguishable from the alias case to a reader of the test file, the whole
+# selection is invisible when it is wrong (a green required lane that ran
+# nothing), and nothing else asserts it explicitly.
+
+
+def _reexport_fixture(tmp_path: Path, facade_body: str, test_body: str) -> tuple[Path, Path]:
+    """A project where the test imports a facade and never names the definition."""
+    src = tmp_path / "src"
+    tests = tmp_path / "tests" / "unit"
+    _write(src / "proj" / "__init__.py", "")
+    _write(src / "proj" / "engine.py", "def compute() -> int:\n    return 1\n")
+    _write(src / "proj" / "facade.py", facade_body)
+    _write(tests / "test_via_facade.py", test_body)
+    return src, tests
+
+
+def _selected_for(tmp_path: Path, src: Path, tests: Path, changed: str) -> set[str]:
+    dep_map = build_compat_dep_map(tmp_path, src, [tests], {"proj"})
+    return {
+        p.relative_to(tmp_path).as_posix()
+        for p in compat_get_affected_tests([changed], dep_map, root=tmp_path, src_root=src)
+    }
+
+
+def test_a_named_reexport_makes_its_importers_affected(tmp_path: Path) -> None:
+    src, tests = _reexport_fixture(
+        tmp_path,
+        facade_body="from proj.engine import compute\n\n__all__ = ['compute']\n",
+        test_body="from proj.facade import compute\n\n\ndef test_it() -> None:\n    assert compute() == 1\n",
+    )
+    selected = _selected_for(tmp_path, src, tests, "src/proj/engine.py")
+    assert "tests/unit/test_via_facade.py" in selected, (
+        "a change to the module that DEFINES a re-exported name must select the suite that "
+        "imports it through the facade; the test never names proj.engine"
+    )
+
+
+def test_a_star_reexport_makes_its_importers_affected(tmp_path: Path) -> None:
+    """``from x import *`` binds no name statically, so it is the shape most likely to be lost."""
+    src, tests = _reexport_fixture(
+        tmp_path,
+        facade_body="from proj.engine import *  # noqa: F403\n",
+        test_body="from proj.facade import compute\n\n\ndef test_it() -> None:\n    assert compute() == 1\n",
+    )
+    assert "tests/unit/test_via_facade.py" in _selected_for(tmp_path, src, tests, "src/proj/engine.py")
+
+
+def test_a_package_init_reexport_makes_its_importers_affected(tmp_path: Path) -> None:
+    """The commonest form in this codebase: ``from pkg import name``."""
+    src = tmp_path / "src"
+    tests = tmp_path / "tests" / "unit"
+    _write(src / "proj" / "__init__.py", "from proj.engine import compute\n")
+    _write(src / "proj" / "engine.py", "def compute() -> int:\n    return 1\n")
+    _write(
+        tests / "test_via_facade.py",
+        "from proj import compute\n\n\ndef test_it() -> None:\n    assert compute() == 1\n",
+    )
+    assert "tests/unit/test_via_facade.py" in _selected_for(tmp_path, src, tests, "src/proj/engine.py")
+
+
+def test_a_two_hop_reexport_chain_still_reaches_the_test(tmp_path: Path) -> None:
+    """Definition -> middle -> facade -> test. One missing hop selects nothing."""
+    src = tmp_path / "src"
+    tests = tmp_path / "tests" / "unit"
+    _write(src / "proj" / "__init__.py", "")
+    _write(src / "proj" / "engine.py", "def compute() -> int:\n    return 1\n")
+    _write(src / "proj" / "mid.py", "from proj.engine import compute\n")
+    _write(src / "proj" / "facade.py", "from proj.mid import compute\n")
+    _write(
+        tests / "test_via_facade.py",
+        "from proj.facade import compute\n\n\ndef test_it() -> None:\n    assert compute() == 1\n",
+    )
+    assert "tests/unit/test_via_facade.py" in _selected_for(tmp_path, src, tests, "src/proj/engine.py")
+
+
+def test_an_unrelated_module_does_not_select_the_facade_test(tmp_path: Path) -> None:
+    """The control. Without it every assertion above passes on a selector that returns everything."""
+    src, tests = _reexport_fixture(
+        tmp_path,
+        facade_body="from proj.engine import compute\n",
+        test_body="from proj.facade import compute\n\n\ndef test_it() -> None:\n    assert compute() == 1\n",
+    )
+    _write(src / "proj" / "unrelated.py", "VALUE = 2\n")
+    assert _selected_for(tmp_path, src, tests, "src/proj/unrelated.py") == set()
+
+
+# ---------------------------------------------------------------------------
+# Relative-import re-exports (#5111 slice 4, continued)
+# ---------------------------------------------------------------------------
+#
+# Every re-export fixture above writes the facade's import as an absolute
+# dotted path (``from proj.engine import compute``). That is not the form an
+# intra-package re-export is normally written in -- ``from .engine import
+# compute`` or, from a package's own ``__init__.py``, ``from .engine import
+# compute`` again with the package itself as the base -- and the analyser's
+# import extraction never resolved ``node.level``, so a relative import's
+# module name never carried the package prefix the selector matches on. The
+# edge from the defining module through a relatively-imported facade was
+# silently dropped: not routed to the full-suite fallback (a separate,
+# unrelated test already covers the facade module directly, so the "some
+# source changed maps to no test" fail-open path never triggers), just
+# missing from the precise selection with nothing failing.
+
+
+def test_a_relative_reexport_makes_its_importers_affected(tmp_path: Path) -> None:
+    """``from .engine import compute`` -- the ordinary sibling-module re-export."""
+    src, tests = _reexport_fixture(
+        tmp_path,
+        facade_body="from .engine import compute\n",
+        test_body="from proj.facade import compute\n\n\ndef test_it() -> None:\n    assert compute() == 1\n",
+    )
+    # A second, direct-import test so a change to engine.py is already mapped
+    # through it and the fail-open "unmapped source" fallback cannot mask the
+    # missing edge by selecting everything anyway.
+    _write(tests / "test_engine_direct.py", "from proj.engine import compute\n")
+    assert _selected_for(tmp_path, src, tests, "src/proj/engine.py") == {
+        "tests/unit/test_via_facade.py",
+        "tests/unit/test_engine_direct.py",
+    }
+
+
+def test_a_package_init_relative_reexport_makes_its_importers_affected(tmp_path: Path) -> None:
+    """``proj/__init__.py`` doing ``from .engine import compute``.
+
+    A package's own ``__init__.py`` is its own ``__package__`` for relative
+    resolution -- level 1 refers to ``proj`` itself, not ``proj``'s parent --
+    which is the distinction :func:`_resolve_relative_import` has to get
+    right for this, the commonest re-export shape in this codebase, to work.
+    """
+    src = tmp_path / "src"
+    tests = tmp_path / "tests" / "unit"
+    _write(src / "proj" / "__init__.py", "from .engine import compute\n")
+    _write(src / "proj" / "engine.py", "def compute() -> int:\n    return 1\n")
+    _write(
+        tests / "test_via_facade.py",
+        "from proj import compute\n\n\ndef test_it() -> None:\n    assert compute() == 1\n",
+    )
+    _write(tests / "test_engine_direct.py", "from proj.engine import compute\n")
+    assert _selected_for(tmp_path, src, tests, "src/proj/engine.py") == {
+        "tests/unit/test_via_facade.py",
+        "tests/unit/test_engine_direct.py",
+    }
+
+
+def test_a_two_level_relative_reexport_makes_its_importers_affected(tmp_path: Path) -> None:
+    """``from ..engine import compute`` -- climbing one level up from a subpackage."""
+    src = tmp_path / "src"
+    tests = tmp_path / "tests" / "unit"
+    _write(src / "proj" / "__init__.py", "")
+    _write(src / "proj" / "engine.py", "def compute() -> int:\n    return 1\n")
+    _write(src / "proj" / "sub" / "__init__.py", "")
+    _write(src / "proj" / "sub" / "facade.py", "from ..engine import compute\n")
+    _write(
+        tests / "test_via_facade.py",
+        "from proj.sub.facade import compute\n\n\ndef test_it() -> None:\n    assert compute() == 1\n",
+    )
+    _write(tests / "test_engine_direct.py", "from proj.engine import compute\n")
+    assert _selected_for(tmp_path, src, tests, "src/proj/engine.py") == {
+        "tests/unit/test_via_facade.py",
+        "tests/unit/test_engine_direct.py",
+    }
+
+
+# ---------------------------------------------------------------------------
+# _resolve_relative_import: direct unit coverage (review follow-up, #5111)
+# ---------------------------------------------------------------------------
+#
+# The fixtures above exercise this function only indirectly, through three
+# end-to-end selection tests that each build a tree, run the analyser, and
+# compare file sets -- the right *integration* coverage, but an expensive way
+# to pin pure arithmetic. A reviewer's manual trace caught a `>` that should
+# have been `>=`: when a relative import climbs exactly as many levels as the
+# current module has parent segments (not just past them), the old check let
+# it through and returned a fabricated top-level module name instead of
+# `None`. The same off-by-one made every relative import in a bare top-level
+# module (no enclosing package at all) resolve to a fabricated name too,
+# since an empty `package_parts` never satisfied the strict `>`.
+
+
+def test_level_one_resolves_against_the_full_package() -> None:
+    assert _resolve_relative_import(current_module="a.b.c", is_package_init=False, level=1, module="d") == "a.b.d"
+
+
+def test_level_two_climbs_one_parent() -> None:
+    assert _resolve_relative_import(current_module="a.b.c", is_package_init=False, level=2, module="e") == "a.e"
+
+
+def test_a_packages_own_init_is_its_own_package_for_level_one() -> None:
+    """``a/b/__init__.py``'s own package is ``a.b``, not ``a`` -- the case almost everyone gets wrong first time."""
+    assert _resolve_relative_import(current_module="a.b", is_package_init=True, level=1, module="c") == "a.b.c"
+
+
+def test_climbing_exactly_to_the_top_returns_none_not_a_fabricated_name() -> None:
+    """The off-by-one: ``strip == len(package_parts)`` must refuse, not silently succeed.
+
+    ``a/b/c.py``'s package is ``a.b`` (two segments). A level-3 import strips
+    two segments, landing exactly on nothing left to resolve against --
+    Python raises ``ImportError`` here, so this must not return a bare
+    ``"d"`` as if ``d`` were a real top-level module.
+    """
+    assert _resolve_relative_import(current_module="a.b.c", is_package_init=False, level=3, module="d") is None
+
+
+def test_climbing_past_the_top_returns_none() -> None:
+    assert _resolve_relative_import(current_module="a.b.c", is_package_init=False, level=4, module="d") is None
+
+
+def test_a_bare_top_level_module_has_no_package_to_resolve_against() -> None:
+    """``widget.py`` at the source root: even ``level=1`` has nothing to climb from.
+
+    Regression case for the same off-by-one: ``package_parts`` is already
+    empty here (a non-init file strips its own name, leaving nothing), so
+    the boundary check has to fire at ``strip == 0`` too, not only for a
+    deeper climb.
+    """
+    assert _resolve_relative_import(current_module="widget", is_package_init=False, level=1, module="sibling") is None
+
+
+def test_bare_from_dot_import_with_no_named_module() -> None:
+    """``from . import x`` -- ``module`` is ``None`` on the AST node, not empty string."""
+    assert _resolve_relative_import(current_module="a.b.c", is_package_init=False, level=1, module=None) == "a.b"

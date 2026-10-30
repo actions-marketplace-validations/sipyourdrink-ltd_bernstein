@@ -34,7 +34,7 @@ and the receipt stops verifying; it does not merely lose a log line.
 
 All three sign through the same Ed25519 KMS adapter that already signs lineage
 records and the multi-tenant `head_signature` (see
-[`lineage_kms.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/core/security/lineage_kms.py)) - no new
+[`key_custody.py`](https://github.com/sipyourdrink-ltd/bernstein/blob/main/src/bernstein/core/security/key_custody.py)) - no new
 key material or rotation cadence. The verifying key is embedded as an RFC 8037
 JWK (`signing.public_key_jwk`) so the receipt is self-contained; auditors may
 pin it out-of-band for additional trust.
@@ -78,9 +78,17 @@ The standalone verifier imports **no Bernstein code** - only `cryptography` and
 python tools/verify_audit_receipt.py --receipt audit-receipt-....json --verbose
 ```
 
+An installed package (pip, uv, pipx, conda) carries the same script and runs it
+as `verify-audit-receipt --receipt audit-receipt-....json --verbose`, with the
+same options and exit codes.
+
 It recomputes `head_sha256` from the embedded range, asserts every format binds
 that value, and validates each envelope with a stock verification path. Pin the
 key with `--jwk` or `--public-key`; scope with `--format cose|intoto|transparency|all`.
+Without a pin the receipt can only be checked against the key it carries
+(trust-on-first-use), so the `public_key` check fails and the overall result is
+`FAIL`; pass `--allow-unpinned-key` to accept that integrity-only result. The
+key-trust status is always printed on the `public_key` line.
 Exit code `0` means all checks passed, `1` a check failed, `2` bad arguments.
 
 The `bernstein audit receipt verify <path>` subcommand shells out to that

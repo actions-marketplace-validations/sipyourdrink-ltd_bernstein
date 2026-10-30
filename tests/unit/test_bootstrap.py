@@ -347,6 +347,16 @@ def test_bootstrap_from_seed_timeout_message_derives_from_ready_constant(
     assert "10.0s" not in printed[0], f"rendered message {printed[0]!r} still has the stale literal"
 
 
+def _autowrite_seed(workdir: Path) -> None:
+    """Stand-in for ``auto_write_bernstein_yaml`` that leaves the seed the real one writes.
+
+    The no-adapter pre-flight (#6126) runs right after that step and relies on the
+    seed being there, so a stub that writes nothing would exercise a state the real
+    function never produces.
+    """
+    (workdir / "bernstein.yaml").write_text("cli: auto\n")
+
+
 def test_bootstrap_from_goal_autowrites_seed_on_first_run(
     tmp_path: Path,
     invariants_module: types.ModuleType,
@@ -367,7 +377,9 @@ def test_bootstrap_from_goal_autowrites_seed_on_first_run(
         stack.enter_context(patch("bernstein.core.server_launch._detect_project_type", return_value="python"))
         stack.enter_context(patch("bernstein.core.orchestration.bootstrap.preflight_checks"))
         stack.enter_context(patch("bernstein.core.orchestration.bootstrap.ensure_sdd", return_value=True))
-        mock_autowrite = stack.enter_context(patch("bernstein.core.orchestration.bootstrap.auto_write_bernstein_yaml"))
+        mock_autowrite = stack.enter_context(
+            patch("bernstein.core.orchestration.bootstrap.auto_write_bernstein_yaml", side_effect=_autowrite_seed)
+        )
         stack.enter_context(patch("bernstein.core.orchestration.bootstrap._clean_stale_runtime"))
         stack.enter_context(patch("bernstein.core.orchestration.bootstrap._discover_catalog"))
         stack.enter_context(patch("bernstein.core.orchestration.bootstrap._build_codebase_index"))
@@ -483,7 +495,9 @@ def test_goal_readiness_error_reports_the_timeout_the_wait_actually_uses(
         stack.enter_context(patch("bernstein.core.orchestration.bootstrap._acquire_pid_lock"))
         stack.enter_context(patch("bernstein.core.agent_discovery.discover_agents_cached", return_value=discovery))
         stack.enter_context(patch("bernstein.core.server_launch._detect_project_type", return_value="python"))
-        stack.enter_context(patch("bernstein.core.orchestration.bootstrap.auto_write_bernstein_yaml"))
+        stack.enter_context(
+            patch("bernstein.core.orchestration.bootstrap.auto_write_bernstein_yaml", side_effect=_autowrite_seed)
+        )
         stack.enter_context(_patched_timeout(47.5))
         with pytest.raises(SystemExit):
             bootstrap_from_goal("Ship the parser", tmp_path, port=8123, cli="auto")
@@ -656,3 +670,81 @@ def test_start_watchdog_surfaces_a_dead_on_arrival_watchdog(tmp_path: Path) -> N
 
     assert mock_logger.error.called, "dead-on-arrival watchdog must log an operator-visible error"
     assert mock_console.print.called, "dead-on-arrival watchdog must be surfaced to the console"
+
+
+def test_watchdog_does_not_restart_after_quiescence_self_stop(tmp_path: Path) -> None:
+    """A deliberate quiescence self-stop is not a crash - watchdog does not restart.
+
+    Regression guard for issue #6089 slice 1: after the orchestrator exits on
+    "Quiescence confirmed ... self-stopping", the watchdog saw a dead spawner
+    pidfile and restarted it five times, creating five empty run directories.
+
+    A marker file next to spawner.pid signals deliberate shutdown. The watchdog
+    must read it and skip restart.
+    """
+    from bernstein.core.orchestration.bootstrap import _watchdog_check_process
+    from bernstein.core.orchestration.process_utils import LIVENESS_GONE
+
+    runtime_dir = tmp_path / ".sdd" / "runtime"
+    runtime_dir.mkdir(parents=True)
+
+    # Simulate orchestrator writing the deliberate-stop marker
+    marker_path = runtime_dir / "spawner-deliberate-stop"
+    marker_path.write_text("quiescence")
+
+    restart_fn = MagicMock(return_value=99999)
+
+    # Dead spawner, deliberate-stop marker present -> no restart
+    _alive_since, restarts, _give_up = _watchdog_check_process(
+        name="Orchestrator",
+        pid=None,
+        alive_since=None,
+        restarts=0,
+        give_up_logged=False,
+        max_restarts=5,
+        reset_after_s=120.0,
+        now=time.monotonic(),
+        restart_fn=restart_fn,
+        liveness=LIVENESS_GONE,
+        workdir=tmp_path,
+    )
+
+    restart_fn.assert_not_called()
+    assert restarts == 0
+
+
+def test_watchdog_still_restarts_a_crashed_spawner(tmp_path: Path) -> None:
+    """A spawner that dies without a deliberate-stop marker is still restarted.
+
+    Guard for issue #6089 slice 1: the deliberate-stop marker must not disable
+    restart for genuine crashes. No marker + dead pid -> restart as before.
+    """
+    from bernstein.core.orchestration.bootstrap import _watchdog_check_process
+    from bernstein.core.orchestration.process_utils import LIVENESS_GONE
+
+    runtime_dir = tmp_path / ".sdd" / "runtime"
+    runtime_dir.mkdir(parents=True)
+
+    # No marker present
+    marker_path = runtime_dir / "spawner-deliberate-stop"
+    assert not marker_path.exists()
+
+    restart_fn = MagicMock(return_value=99999)
+
+    # Dead spawner, no marker -> restart as usual
+    _alive_since, restarts, _give_up = _watchdog_check_process(
+        name="Orchestrator",
+        pid=None,
+        alive_since=None,
+        restarts=0,
+        give_up_logged=False,
+        max_restarts=5,
+        reset_after_s=120.0,
+        now=time.monotonic(),
+        restart_fn=restart_fn,
+        liveness=LIVENESS_GONE,
+        workdir=tmp_path,
+    )
+
+    restart_fn.assert_called_once()
+    assert restarts == 1

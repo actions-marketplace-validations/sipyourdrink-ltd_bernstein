@@ -33,6 +33,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from bernstein.core.registry_guard import DuplicateGuard, caller_module_name
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
@@ -46,6 +48,7 @@ __all__ = [
     "TrackerFactory",
     "TrackerRegistration",
     "TrackerRegistry",
+    "discover_plugin_ingest_adapters",
     "discover_plugin_trackers",
     "get_registry",
     "register_tracker",
@@ -104,6 +107,7 @@ class TrackerRegistry:
 
     def __init__(self) -> None:
         self._entries: dict[str, TrackerRegistration] = {}
+        self._guard = DuplicateGuard("tracker adapter")
 
     def register(
         self,
@@ -136,14 +140,15 @@ class TrackerRegistry:
             DuplicateTrackerError: When ``name`` is already registered
                 and ``overwrite`` is ``False``.
         """
-        if name in self._entries and not overwrite:
-            existing = self._entries[name]
-            msg = (
-                f"Tracker {name!r} is already registered "
-                f"(source={existing.source}, provenance={existing.provenance!r}). "
-                "Pass overwrite=True to replace it."
-            )
-            raise DuplicateTrackerError(msg)
+        if overwrite:
+            self._guard.forget(name)
+        module_name = provenance or caller_module_name()
+        if module_name == __name__:
+            module_name = caller_module_name(depth=2)
+        try:
+            self._guard.register(name, module_name, error_type=DuplicateTrackerError)
+        except DuplicateTrackerError as exc:
+            raise DuplicateTrackerError(f"{exc}. Pass overwrite=True to replace it.") from None
         entry = TrackerRegistration(
             name=name,
             factory=factory,
@@ -159,6 +164,7 @@ class TrackerRegistry:
     def unregister(self, name: str) -> None:
         """Remove ``name`` from the registry (no-op if absent)."""
         self._entries.pop(name, None)
+        self._guard.forget(name)
 
     def get(self, name: str) -> TrackerRegistration:
         """Return the registration for ``name``.
@@ -237,7 +243,7 @@ def _builtin_registrations() -> tuple[tuple[str, TrackerFactory, str, tuple[str,
     from bernstein.core.trackers.linear import LinearTracker
     from bernstein.core.trackers.servicenow import ServiceNowTracker
 
-    return (
+    return (  # type: ignore[return-value]  # structural tuple match
         (
             "linear",
             LinearTracker,
@@ -495,3 +501,113 @@ def _wrap_callable(callable_: Callable[..., AbstractTrackerAdapter]) -> TrackerF
         return callable_(**kwargs)
 
     return factory
+
+
+# ---------------------------------------------------------------------------
+# Ingest adapter declarations (plugin-provided)
+# ---------------------------------------------------------------------------
+
+# Module-level store of plugin-provided ingest adapter declarations,
+# keyed by adapter name. Built-in adapters (when any exist) are not yet
+# tracked here -- the contract is purely a plugin extension point.
+_ingest_declarations: dict[str, Any] = {}
+
+
+def _coerce_ingest_declaration(raw: Any) -> Any | None:
+    """Normalise a plugin-supplied ingest declaration.
+
+    Accepts:
+    * An :class:`IngestAdapterDeclaration` instance.
+    * A ``(name, version, declared_event_types)`` or
+      ``(name, version, declared_event_types, summary)`` tuple.
+
+    Returns:
+        The declaration, or ``None`` if *raw* is unrecognised.
+    """
+    from bernstein.core.observability.ingest_contract import IngestAdapterDeclaration
+
+    if isinstance(raw, IngestAdapterDeclaration):
+        return raw
+    if isinstance(raw, tuple) and len(raw) in (3, 4):
+        try:
+            name, version, event_types = raw[0], raw[1], raw[2]
+            summary = raw[3] if len(raw) == 4 else ""
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(name, str) or not isinstance(version, str):
+            return None
+        normalised = tuple(str(e) for e in event_types)
+        return IngestAdapterDeclaration(
+            name=name,
+            version=version,
+            declared_event_types=normalised,
+            summary=str(summary),
+        )
+    return None
+
+
+def discover_plugin_ingest_adapters(plugin_manager: Any | None = None) -> int:
+    """Populate the ingest declaration store with plugin-contributed entries.
+
+    Iterates over loaded pluggy plugins, calls
+    ``provide_ingest_adapter`` on each that implements it, and registers
+    every returned :class:`IngestAdapterDeclaration` (or
+    ``(name, version, declared_event_types[, summary])`` tuple) under
+    ``_ingest_declarations``.
+
+    Args:
+        plugin_manager: Optional explicit plugin manager. When ``None``
+            the orchestrator's default manager is fetched via
+            :func:`bernstein.plugins.manager.get_plugin_manager`.
+
+    Returns:
+        Number of plugin declarations newly registered.
+    """
+    pm = plugin_manager
+    if pm is None:
+        try:
+            from bernstein.plugins.manager import get_plugin_manager
+
+            pm = get_plugin_manager()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Could not obtain plugin manager: %s", exc)
+            return 0
+
+    registered_names = getattr(pm, "_registered_names", [])
+    inner_pm = getattr(pm, "_pm", None)
+    if inner_pm is None:
+        log.debug("Plugin manager has no inner pluggy manager; skipping ingest discovery.")
+        return 0
+
+    added = 0
+    for plugin_name in registered_names:
+        plugin = inner_pm.get_plugin(plugin_name)
+        if plugin is None or not hasattr(plugin, "provide_ingest_adapter"):
+            continue
+        try:
+            result = plugin.provide_ingest_adapter()
+        except Exception as exc:
+            log.warning("Plugin %r provide_ingest_adapter raised: %s", plugin_name, exc)
+            continue
+        if result is None:
+            continue
+        items = result if isinstance(result, list) else [result]
+        for raw in items:
+            declaration = _coerce_ingest_declaration(raw)
+            if declaration is None:
+                log.warning(
+                    "Plugin %r provide_ingest_adapter returned unrecognised value %r; ignoring.",
+                    plugin_name,
+                    raw,
+                )
+                continue
+            if declaration.name in _ingest_declarations:
+                log.warning(
+                    "Plugin %r tried to register duplicate ingest adapter %r; skipping.",
+                    plugin_name,
+                    declaration.name,
+                )
+                continue
+            _ingest_declarations[declaration.name] = declaration
+            added += 1
+    return added

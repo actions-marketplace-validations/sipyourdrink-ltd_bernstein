@@ -10,6 +10,9 @@ Commands:
   Read the run snapshot (or load a custom snapshot JSON via
   ``--snapshot``) and emit the encoded BOM. ``--format`` defaults to
   ``json`` and accepts ``json``, ``cyclonedx`` and ``spdx``.
+  ``--from-lineage`` derives the snapshot from the run's lineage spine
+  under ``.sdd/lineage/<run>/`` instead of requiring a hand-assembled
+  ``bom_snapshot.json`` (issue #2916).
 * ``bernstein bom verify <path>`` -- structural verification report.
 
 Both subcommands are pure projections / pure verifications: no network
@@ -54,6 +57,13 @@ def bom_group() -> None:
     help="Explicit snapshot JSON path. Mutually exclusive with --run.",
 )
 @click.option(
+    "--from-lineage",
+    "from_lineage",
+    is_flag=True,
+    default=False,
+    help="Project the snapshot from .sdd/lineage/<run>/ instead of reading bom_snapshot.json.",
+)
+@click.option(
     "--format",
     "fmt",
     default="json",
@@ -77,23 +87,36 @@ def bom_group() -> None:
 def emit_cmd(
     run_id: str | None,
     snapshot_path: str | None,
+    from_lineage: bool,
     fmt: str,
     out_path: str | None,
     workdir: str,
 ) -> None:
     """Emit an AI-BOM derived from an existing run snapshot."""
-    from bernstein.core.compliance.ai_bom import (
-        BOMError,
-        encode_bom,
-        generate_bom,
-    )
+    from bernstein.core.compliance.ai_bom import BOMError
 
     if run_id and snapshot_path:
         click.echo("error: --run and --snapshot are mutually exclusive", err=True)
         raise SystemExit(2)
+    if from_lineage and snapshot_path:
+        click.echo("error: --from-lineage and --snapshot are mutually exclusive", err=True)
+        raise SystemExit(2)
+    if from_lineage and not run_id:
+        click.echo("error: --from-lineage requires --run", err=True)
+        raise SystemExit(2)
     if not run_id and not snapshot_path:
         click.echo("error: one of --run or --snapshot is required", err=True)
         raise SystemExit(2)
+
+    if from_lineage:
+        assert run_id is not None
+        try:
+            snapshot = _snapshot_from_lineage(run_id, workdir)
+        except BOMError as exc:
+            click.echo(f"error: {exc}", err=True)
+            raise SystemExit(1) from None
+        _write_bom(snapshot, fmt=fmt, out_path=out_path)
+        return
 
     if run_id:
         snap_path = Path(workdir).resolve() / ".sdd" / "runs" / run_id / "bom_snapshot.json"
@@ -114,11 +137,45 @@ def emit_cmd(
         click.echo("error: snapshot must decode to a JSON object", err=True)
         raise SystemExit(1)
 
-    snapshot: dict[str, Any] = cast("dict[str, Any]", snapshot_raw)
+    snapshot: dict[str, Any] = cast("dict[str, Any]", snapshot_raw)  # type: ignore[no-redef]  # conditional import
+
+    _write_bom(snapshot, fmt=fmt, out_path=out_path)
+
+
+def _snapshot_from_lineage(run_id: str, workdir: str) -> dict[str, Any]:
+    """Derive the BOM snapshot from the run's lineage spine.
+
+    The spine constructor needs the HMAC key the chain was written under.
+    It is loaded read-only: a projection path must never mint key material,
+    because a freshly minted key cannot authenticate an existing chain
+    (issue #2639).
+    """
+    from bernstein.core.compliance.ai_bom import BOMError, snapshot_from_spine
+    from bernstein.core.lineage.spine import LineageSpine, SpineRunIdError
+    from bernstein.core.security.audit import (
+        AuditKeyMissingError,
+        AuditKeyPermissionError,
+        load_audit_key,
+    )
 
     try:
-        bom = generate_bom(snapshot)
-        payload = encode_bom(bom, fmt=fmt)
+        hmac_key = load_audit_key()
+    except (AuditKeyMissingError, AuditKeyPermissionError) as exc:
+        raise BOMError(f"cannot read the audit key the lineage chain was written under: {exc}") from None
+
+    try:
+        spine = LineageSpine(Path(workdir).resolve() / ".sdd" / "lineage", run_id=run_id, hmac_key=hmac_key)
+    except SpineRunIdError as exc:
+        raise BOMError(f"invalid run id: {exc}") from None
+    return snapshot_from_spine(spine)
+
+
+def _write_bom(snapshot: dict[str, Any], *, fmt: str, out_path: str | None) -> None:
+    """Encode ``snapshot`` and write it to ``out_path`` or stdout."""
+    from bernstein.core.compliance.ai_bom import BOMError, encode_bom, generate_bom
+
+    try:
+        payload = encode_bom(generate_bom(snapshot), fmt=fmt)
     except BOMError as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(1) from None
@@ -138,28 +195,97 @@ def emit_cmd(
     type=click.Path(dir_okay=False, exists=True, resolve_path=True),
 )
 @click.option(
+    "--from-lineage",
+    "from_lineage",
+    is_flag=True,
+    default=False,
+    help="Re-derive the BOM from .sdd/lineage/<run>/ and fail on any difference from the document.",
+)
+@click.option(
+    "--run",
+    "run_id",
+    default=None,
+    help="Run identifier used to resolve the lineage spine. Only valid with --from-lineage, where it is required.",
+)
+@click.option(
+    "--workdir",
+    default=None,
+    help="Project root used to resolve .sdd/lineage (default: the current directory). Only valid with --from-lineage.",
+)
+@click.option(
     "--quiet",
     is_flag=True,
     default=False,
     help="Only emit exit code; suppress the verification report.",
 )
-def verify_cmd(bom_path: str, quiet: bool) -> None:
-    """Verify a previously emitted AI-BOM."""
-    from bernstein.core.compliance.ai_bom import verify_bom
+def verify_cmd(bom_path: str, from_lineage: bool, run_id: str | None, workdir: str | None, quiet: bool) -> None:
+    """Verify a previously emitted AI-BOM.
+
+    Without ``--from-lineage`` the check is structural only: it does not look
+    at the run's lineage spine, so it cannot tell a faithful BOM from a
+    hand-edited one. With ``--from-lineage --run <id>`` the BOM is recomputed
+    from the run's lineage spine and compared field by field; any difference
+    (a missing, extra or renamed component, a different hash or count, a
+    different head anchor) or a chain that does not verify fails the check.
+    """
+    from bernstein.core.compliance.ai_bom import BOMError, verify_bom
 
     raw = Path(bom_path).read_bytes()
-    report = verify_bom(raw)
+
+    if not from_lineage and (run_id is not None or workdir is not None):
+        click.echo(
+            "error: --run and --workdir only apply with --from-lineage; "
+            "without it the check is structural and never reads the lineage spine",
+            err=True,
+        )
+        raise SystemExit(2)
+
+    if from_lineage:
+        if not run_id:
+            click.echo("error: --from-lineage requires --run", err=True)
+            raise SystemExit(2)
+        try:
+            report = _verify_against_spine(raw, run_id=run_id, workdir=workdir or ".")
+        except BOMError as exc:
+            click.echo(f"error: {exc}", err=True)
+            raise SystemExit(1) from None
+    else:
+        report = verify_bom(raw)
 
     if quiet:
         raise SystemExit(0 if report.ok else 1)
 
     if report.ok:
-        click.echo(f"PASS: checked {report.checked_count} element(s)")
+        scope = "" if from_lineage else " (structural only; not compared with the lineage spine)"
+        click.echo(f"PASS{scope}: checked {report.checked_count} element(s)")
     else:
         click.echo(f"FAIL: {len(report.errors)} error(s); checked {report.checked_count} element(s)")
         for err in report.errors:
             click.echo(f"  - {err}")
     raise SystemExit(0 if report.ok else 1)
+
+
+def _verify_against_spine(raw: bytes, *, run_id: str, workdir: str) -> Any:
+    """Resolve ``raw`` BOM bytes against the run's lineage spine."""
+    from bernstein.core.compliance.ai_bom import BOMError, verify_bom_against_spine
+    from bernstein.core.lineage.spine import LineageSpine, SpineRunIdError
+    from bernstein.core.security.audit import (
+        AuditKeyMissingError,
+        AuditKeyPermissionError,
+        load_audit_key,
+    )
+
+    try:
+        hmac_key = load_audit_key()
+    except (AuditKeyMissingError, AuditKeyPermissionError) as exc:
+        raise BOMError(f"cannot read the audit key the lineage chain was written under: {exc}") from None
+
+    try:
+        spine = LineageSpine(Path(workdir).resolve() / ".sdd" / "lineage", run_id=run_id, hmac_key=hmac_key)
+    except SpineRunIdError as exc:
+        raise BOMError(f"invalid run id: {exc}") from None
+
+    return verify_bom_against_spine(raw, spine=spine, hmac_key=hmac_key)
 
 
 # Optional helper for tests / other callers: serialise a snapshot dict into

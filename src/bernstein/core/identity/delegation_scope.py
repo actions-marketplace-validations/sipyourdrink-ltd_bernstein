@@ -71,6 +71,7 @@ from bernstein.core.security.agent_card_signer import canonicalize_jcs
 from bernstein.core.security.capability_tokens import (
     allowlist_narrows,
     bound_narrows,
+    glob_narrows,
     prefixes_narrow,
     uses_narrows,
 )
@@ -181,27 +182,46 @@ class DelegationScope:
 
     ``permissions`` and ``duties`` are plain sets: an empty set is the
     narrowest possible grant, never the widest.
+
+    ``allowed_files`` is a glob field, and a glob is not a path prefix:
+    ``path_prefixes`` narrows by ancestry, where ``src`` covers ``src/core``,
+    while ``src`` as a pattern admits the path ``src`` and nothing under it.
+    It is graded by :func:`~bernstein.core.security.capability_tokens.glob_narrows`,
+    which reasons over the pattern grammar in
+    :mod:`bernstein.core.path_scope` directly rather than by the ancestry
+    primitive the other path axis uses (#5351, resolved by #5418).
     """
 
     permissions: frozenset[str] = frozenset()
     duties: frozenset[str] = frozenset()
     task_ids: frozenset[str] | None = None
     path_prefixes: frozenset[str] | None = None
+    allowed_files: frozenset[str] | None = None
     not_after: float | None = None
     max_uses: int | None = None
     max_depth: int | None = None
 
     def to_body(self) -> dict[str, Any]:
-        """Return the JCS-ready dict (sets rendered as sorted lists)."""
-        return {
-            "duties": sorted(self.duties),
-            "max_depth": self.max_depth,
-            "max_uses": self.max_uses,
-            "not_after": self.not_after,
-            "path_prefixes": sorted(self.path_prefixes) if self.path_prefixes is not None else None,
-            "permissions": sorted(self.permissions),
-            "task_ids": sorted(self.task_ids) if self.task_ids is not None else None,
-        }
+        """Return the JCS-ready dict (sets rendered as sorted lists).
+
+        ``allowed_files`` is the one conditional key, emitted only when the
+        axis is used.  :meth:`scope_ref` digests these bytes, so emitting it
+        unconditionally as ``null`` would re-address every scope written before
+        the axis existed and stop sealed records from replaying byte-identically.
+        """
+        body: dict[str, Any] = {} if self.allowed_files is None else {"allowed_files": sorted(self.allowed_files)}
+        body.update(
+            {
+                "duties": sorted(self.duties),
+                "max_depth": self.max_depth,
+                "max_uses": self.max_uses,
+                "not_after": self.not_after,
+                "path_prefixes": sorted(self.path_prefixes) if self.path_prefixes is not None else None,
+                "permissions": sorted(self.permissions),
+                "task_ids": sorted(self.task_ids) if self.task_ids is not None else None,
+            }
+        )
+        return body
 
     @classmethod
     def from_body(cls, body: dict[str, Any]) -> DelegationScope:
@@ -211,6 +231,7 @@ class DelegationScope:
             duties=frozenset(body.get("duties") or ()),
             task_ids=_frozen(body.get("task_ids")),
             path_prefixes=_frozen(body.get("path_prefixes")),
+            allowed_files=_frozen(body.get("allowed_files")),
             not_after=None if body.get("not_after") is None else float(body["not_after"]),
             max_uses=None if body.get("max_uses") is None else int(body["max_uses"]),
             max_depth=None if body.get("max_depth") is None else int(body["max_depth"]),
@@ -240,6 +261,11 @@ def narrowing_violations(child: DelegationScope, parent: DelegationScope) -> tup
     An empty tuple means the child is a strict subset of the parent's grant.
     Axis names are stable identifiers so a verifier can report *which* axis was
     widened instead of a bare pass/fail.
+
+    ``allowed_files`` is graded by
+    :func:`~bernstein.core.security.capability_tokens.glob_narrows`, the glob
+    subsumption primitive (#5418) -- not by :func:`prefixes_narrow`, which
+    narrows by path ancestry and would misread a glob as a prefix.
     """
     axes: list[str] = []
     if not child.permissions <= parent.permissions:
@@ -250,6 +276,8 @@ def narrowing_violations(child: DelegationScope, parent: DelegationScope) -> tup
         axes.append("task_ids")
     if not prefixes_narrow(child.path_prefixes, parent.path_prefixes):
         axes.append("path_prefixes")
+    if not glob_narrows(child.allowed_files, parent.allowed_files):
+        axes.append("allowed_files")
     if not bound_narrows(child.not_after, parent.not_after):
         axes.append("not_after")
     if not uses_narrows(child.max_uses, parent.max_uses):
@@ -806,12 +834,19 @@ DIAGNOSTIC_SCOPE_REF_UNRESOLVED: str = "scope_ref_unresolved_inline_governs"
 DIAGNOSTIC_SCOPE_REF_ONLY_RESOLVED: str = "scope_ref_only_resolved"
 VERDICT_DIAGNOSTICS: frozenset[str] = frozenset({DIAGNOSTIC_SCOPE_REF_ONLY_RESOLVED, DIAGNOSTIC_SCOPE_REF_UNRESOLVED})
 
-#: Keys :meth:`DelegationScope.from_body` interprets. A body carrying anything
-#: else is not something the comparator can reason about: the unreadable key
-#: records ``comparison_axis_unsupported``. Readable axes are still compared,
-#: and a widening found on one of them fails the hop, fail dominating unproven.
+#: Keys the comparator can reason about. A body carrying anything else records
+#: ``comparison_axis_unsupported`` for that key. Readable axes are still
+#: compared, and a widening found on one of them fails the hop, fail dominating
+#: unproven.
+#:
+#: ``allowed_files`` joined this set in #5418: :func:`glob_narrows` (via
+#: :mod:`bernstein.core.path_scope`) now decides glob containment, so a hop
+#: recording that axis grades on it like every other axis instead of
+#: unproven. A key from a future version still lands outside this set and
+#: still grades unproven, unchanged.
 SCOPE_BODY_KEYS: frozenset[str] = frozenset(
     {
+        "allowed_files",
         "duties",
         "max_depth",
         "max_uses",
@@ -914,6 +949,7 @@ def grade_chain(
     scope_resolver: Callable[[str], DelegationScope | None] | None = None,
     genesis: str = "0" * 64,
     chain_ok: bool = True,
+    root_issuers: frozenset[str] = frozenset(),
 ) -> ChainVerdict:
     """Grade every hop pass / fail / unproven and compose one chain verdict.
 
@@ -954,6 +990,7 @@ def grade_chain(
             by_hmac,
             scope_resolver=scope_resolver,
             genesis=genesis,
+            root_issuers=root_issuers,
         )
         for index in range(len(receipts))
     )
@@ -972,6 +1009,7 @@ def _grade_hop(
     *,
     scope_resolver: Callable[[str], DelegationScope | None] | None,
     genesis: str,
+    root_issuers: frozenset[str] = frozenset(),
 ) -> HopVerdict:
     """Grade one hop without consulting any other hop's verdict."""
     receipt = receipts[index]
@@ -994,8 +1032,15 @@ def _grade_hop(
     # that claims otherwise mid-chain may be a second tree's root or may be
     # evading its ceiling, and the receipts cannot tell those apart, so it is
     # unproven.
-    is_root = resolved is None and index == 0
-    if resolved is None and index > 0:
+    # A declared root issuer is the one case where a hop may be a root without
+    # being first. The name comes from OUTSIDE the receipts -- the run manifest
+    # records which identity the run minted as its root (#5047) -- so a hop
+    # cannot promote itself by writing its own issuer field, which is exactly
+    # the evasion the positional rule exists to stop. Every run whose root is
+    # unknown keeps the positional rule unchanged.
+    declared_root = bool(root_issuers) and receipt.issuer in root_issuers
+    is_root = resolved is None and (index == 0 or declared_root)
+    if resolved is None and index > 0 and not declared_root:
         reasons.append(REASON_ROOT_CLAIMED_MID_CHAIN)
     parent_hop_index = None if parent is None else receipts[parent].hop_index
 

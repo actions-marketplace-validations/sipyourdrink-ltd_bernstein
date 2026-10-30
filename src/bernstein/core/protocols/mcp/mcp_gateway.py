@@ -24,12 +24,23 @@ WAL output:  {result, error, latency_ms}
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sys
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from bernstein.core.protocols.mcp_catalog import MCPServerCapabilities, ServerCapabilitiesStore
+    from bernstein.core.protocols.payments.x402 import X402SettlementCoordinator
+    from bernstein.core.replay.journal import EventJournal
+    from bernstein.core.security.audit_chain import AuditChainStore
+    from bernstein.core.security.toolcall_interlock import ToolCallAttestationInterlock
+    from bernstein.core.wal import WALEntry, WALWriter
 
 from bernstein.core.orchestration.worker_loop_detector import WorkerLoopDetector
 from bernstein.core.persistence.action_cache import open_cache
@@ -38,18 +49,14 @@ from bernstein.core.protocols.mcp.stateless_core import (
     anchor_stateless_call,
     request_span_id,
 )
+from bernstein.core.security.audit_chain import record_mcp_capability_drift
 from bernstein.core.security.claude_tool_result_injection import ToolResultInjector
 
 logger = logging.getLogger(__name__)
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    from bernstein.core.protocols.payments.x402 import X402SettlementCoordinator
-    from bernstein.core.replay.journal import EventJournal
-    from bernstein.core.security.audit_chain import AuditChainStore
-    from bernstein.core.security.toolcall_interlock import ToolCallAttestationInterlock
-    from bernstein.core.wal import WALEntry, WALWriter
+# Shared by ``_send_request`` and the timeout ``toolcall.effect`` duration so
+# a later change cannot lie in the chain.
+_CONNECTOR_REQUEST_TIMEOUT_S = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +185,7 @@ class MCPGateway:
         self,
         upstream_cmd: list[str],
         wal_writer: WALWriter,
+        capabilities_store: ServerCapabilitiesStore | None = None,
         replay: GatewayReplay | None = None,
         *,
         server_name: str = "unknown",
@@ -188,6 +196,7 @@ class MCPGateway:
     ) -> None:
         self._upstream_cmd = upstream_cmd
         self._wal_writer = wal_writer
+        self._capabilities_store = capabilities_store
         self._replay = replay
         self._server_name = server_name.strip() or "unknown"
         self._journal = journal
@@ -206,7 +215,83 @@ class MCPGateway:
         self._loop_detector = WorkerLoopDetector()
         self._proc: asyncio.subprocess.Process | None = None
         self._pending: dict[Any, asyncio.Future[dict[str, Any]]] = {}
+        # Stripped upstream line per answered request id, so ``toolcall.effect``
+        # digests the bytes as received (#6270). Callers of ``_send_request``
+        # take their entry on success; failures discard it. ``_read_upstream_loop``
+        # must stay the only reader of upstream stdout: a reader that skips this
+        # map silently downgrades effect digests to the compact-JSON fallback.
+        self._received_lines: dict[Any, bytes] = {}
         self._reader_task: asyncio.Task[None] | None = None
+
+    # ------------------------------------------------------------------
+    # Capability drift
+    # ------------------------------------------------------------------
+
+    def _compute_tool_digest(self, tool_names: tuple[str, ...]) -> str:
+        """Return ``sha256:<hex>`` of sorted canonical JSON of tool names."""
+        canonical = json.dumps(sorted(tool_names), separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _process_capability_drift(
+        self,
+        tool_names: tuple[str, ...],
+        old_caps: MCPServerCapabilities | None,
+    ) -> None:
+        """Process capability drift for given tool names.
+
+        Updates store and emits audit event if drift detected. No-op if
+        no capabilities store or audit chain is configured.
+        """
+        if self._capabilities_store is None or self._audit_chain is None:
+            return
+        digest = self._compute_tool_digest(tool_names)
+        prior = self._capabilities_store.get_capabilities(self._server_name)
+        if prior is not None and prior.capability_digest == digest:
+            return
+        # Get run_id from the wal_writer for the audit chain event
+        run_id = self._wal_writer._run_id
+        self._capabilities_store.set_capabilities(self._server_name, frozenset(tool_names), digest)
+        try:
+            record_mcp_capability_drift(
+                chain=self._audit_chain,
+                run_id=run_id,
+                server_name=self._server_name,
+                current_tools=tool_names,
+                previous_tools=tuple(sorted(prior.tool_names)) if prior is not None else None,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to record MCP capability drift for %s",
+                self._server_name,
+                exc_info=True,
+            )
+
+    async def _check_capability_drift(self) -> None:
+        """Check capability drift on first contact.
+
+        Called on gateway start. Gets current advertised tools via
+        tools/list, computes digest, and checks against stored state.
+        Emits a drift event if the server is new or capabilities changed.
+        """
+        if self._capabilities_store is None or self._audit_chain is None:
+            return
+        try:
+            response, _ = await self._send_request(
+                {"jsonrpc": "2.0", "method": "tools/list", "id": 0},
+                0,
+            )
+        except Exception:
+            logger.debug("Capability drift check: tools/list failed", exc_info=True)
+            return
+        self._received_lines.pop(0, None)
+        tools = (response or {}).get("result", {}).get("tools", [])
+        if not isinstance(tools, list):
+            return
+        tool_names = tuple(t["name"] for t in tools if isinstance(t, dict) and "name" in t)
+        if not tool_names:
+            return
+        old_caps = self._capabilities_store.get_capabilities(self._server_name)
+        self._process_capability_drift(tool_names, old_caps)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -218,6 +303,7 @@ class MCPGateway:
             return
         if not self._upstream_cmd:
             return
+        await self._check_capability_drift()
         self._proc = await asyncio.create_subprocess_exec(
             *self._upstream_cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -255,6 +341,7 @@ class MCPGateway:
                 if req_id is not None:
                     fut = self._pending.get(req_id)
                     if fut and not fut.done():
+                        self._received_lines[req_id] = line
                         fut.set_result(msg)
         except Exception:
             # Upstream died - fail all pending futures
@@ -345,8 +432,23 @@ class MCPGateway:
                 await self._send_upstream(message)
             return None
 
-        await self._prepare_tool_dispatch(message, method, params, req_id)
-        response, latency_ms = await self._send_request(message, req_id)
+        prepared = await self._prepare_tool_dispatch(message, method, params, req_id)
+        try:
+            response, latency_ms = await self._send_request(message, req_id)
+        except TimeoutError:
+            await self._record_tool_effect(prepared, None, _CONNECTOR_REQUEST_TIMEOUT_S * 1000.0, "timeout")
+            raise
+        received = self._received_lines.pop(req_id, None)
+        from bernstein.core.security.toolcall_interlock import toolcall_effect_outcome
+
+        await self._record_tool_effect(
+            prepared,
+            response,
+            latency_ms,
+            toolcall_effect_outcome(response),
+            received=received,
+        )
+
         self._record_wal_and_metrics(method, params, req_id, response, latency_ms)
         record = self._anchor_proxied_call(method, params)
 
@@ -388,10 +490,10 @@ class MCPGateway:
         method: str,
         params: dict[str, Any],
         req_id: Any,
-    ) -> None:
+    ) -> tuple[Any, Any] | None:
         """Cross the attestation interlock before live connector I/O."""
         if method != "tools/call" or self._attestation_interlock is None:
-            return
+            return None
         from bernstein.core.security.toolcall_interlock import ToolCallIntent
 
         intent = ToolCallIntent.from_request(
@@ -403,7 +505,30 @@ class MCPGateway:
             span_id=request_span_id(message),
             arguments=params.get("arguments", {}),
         )
-        await self._attestation_interlock.before_dispatch(intent)
+        evidence = await self._attestation_interlock.before_dispatch(intent)
+        return intent, evidence
+
+    async def _record_tool_effect(
+        self,
+        prepared: tuple[Any, Any] | None,
+        response: dict[str, Any] | None,
+        duration_ms: float,
+        outcome: str,
+        *,
+        received: bytes | None = None,
+    ) -> None:
+        """Write ``toolcall.effect`` after the connector returns (#6270)."""
+        if prepared is None or self._attestation_interlock is None:
+            return
+        intent, evidence = prepared
+        await self._attestation_interlock.after_dispatch(
+            intent,
+            evidence,
+            response=response,
+            duration_ms=duration_ms,
+            outcome=outcome,
+            received=received,
+        )
 
     async def _send_request(self, message: dict[str, Any], req_id: Any) -> tuple[dict[str, Any], float]:
         """Send one JSON-RPC request upstream and await its response.
@@ -417,7 +542,10 @@ class MCPGateway:
         t0 = time.monotonic()
         try:
             await self._send_upstream(message)
-            response: dict[str, Any] = await asyncio.wait_for(asyncio.shield(fut), timeout=30.0)
+            response: dict[str, Any] = await asyncio.wait_for(asyncio.shield(fut), timeout=_CONNECTOR_REQUEST_TIMEOUT_S)
+        except BaseException:
+            self._received_lines.pop(req_id, None)
+            raise
         finally:
             self._pending.pop(req_id, None)
         return response, (time.monotonic() - t0) * 1000.0
@@ -458,8 +586,22 @@ class MCPGateway:
         retried = build_retry_request(message, pre.payment_ref)
         retried_id = retried.get("id")
         retried_params: dict[str, Any] = retried.get("params") or {}
-        await self._prepare_tool_dispatch(retried, "tools/call", retried_params, retried_id)
-        settled, latency_ms = await self._send_request(retried, retried_id)
+        retried_prepared = await self._prepare_tool_dispatch(retried, "tools/call", retried_params, retried_id)
+        try:
+            settled, latency_ms = await self._send_request(retried, retried_id)
+        except TimeoutError:
+            await self._record_tool_effect(retried_prepared, None, _CONNECTOR_REQUEST_TIMEOUT_S * 1000.0, "timeout")
+            raise
+        retried_received = self._received_lines.pop(retried_id, None)
+        from bernstein.core.security.toolcall_interlock import toolcall_effect_outcome
+
+        await self._record_tool_effect(
+            retried_prepared,
+            settled,
+            latency_ms,
+            toolcall_effect_outcome(settled),
+            received=retried_received,
+        )
         wal_entry = self._record_wal_and_metrics("tools/call", retried_params, retried_id, settled, latency_ms)
         self._anchor_proxied_call("tools/call", retried_params)
 
@@ -481,7 +623,7 @@ class MCPGateway:
 
         return settled
 
-    def _anchor_proxied_call(self, method: str, params: dict[str, Any]) -> StatelessCallRecord | None:
+    def _anchor_proxied_call(self, method: str, params: dict[str, Any]) -> StatelessCallRecord | None:  # type: ignore[return]  # implicit None
         """Anchor a proxied call into the run journal and audit chain.
 
         Mirrors the WAL record with a chain-anchored continuity record
@@ -491,7 +633,7 @@ class MCPGateway:
         a missing anchor is visible to a verifier as a call-index gap.
         """
         if self._journal is None:
-            return
+            return  # type: ignore[return-value]  # implicit None
         try:
             return anchor_stateless_call(
                 journal=self._journal,

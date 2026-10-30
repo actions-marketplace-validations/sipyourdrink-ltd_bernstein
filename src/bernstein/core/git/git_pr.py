@@ -45,6 +45,15 @@ class MergeResult:
             this is the list of forbidden paths that were staged.  The
             merge is aborted and never produces a commit in this case
             (fix for defect 28, the decoy-commit secret-leak path).
+        merge_commit: The sha of the merge commit this merge produced on
+            the integration branch, when it produced one. Empty when the
+            merge failed, was refused, or found nothing to commit
+            (branches already identical) -- there is no commit to name in
+            any of those cases. Read right after the commit succeeds so a
+            caller (e.g. the ``task_merged`` journal row, issue #5271) can
+            tie the recorded merge decision back to the git object it
+            actually produced, rather than recording only that *a* merge
+            happened.
     """
 
     success: bool
@@ -52,6 +61,7 @@ class MergeResult:
     merge_diff: str = ""
     error: str = ""
     refused_forbidden_files: list[str] = field(default_factory=list)
+    merge_commit: str = ""
 
 
 @dataclass(frozen=True)
@@ -320,18 +330,15 @@ def merge_with_conflict_detection(
                 if audit_chain:
                     from pathlib import Path as _Path
 
-                    from bernstein.core.security.audit import AuditLog
-
                     sdd_dir = _Path(worktree_root).parent.parent
-                    audit_log = AuditLog.load_from_file(str(sdd_dir / "runtime" / "audit.log"))
-                    chain = AuditChainStore(audit_log)
+                    chain = AuditChainStore(sdd_dir / "runtime")
                     receipt = refuse_read_set(
                         chain=chain,
                         sdd_dir=sdd_dir,
                         task_id=task_id,
                         base_commit=base_commit,
                         target_branch=branch,
-                        changed_paths=changed_paths,
+                        changed_paths=changed_paths,  # type: ignore[arg-type]  # structural match between read_set_admission/read_set_receipt
                         private_key_pem="",
                         public_key_pem="",
                     )
@@ -425,10 +432,15 @@ def merge_with_conflict_detection(
         commit_r = run_git(["commit", "-m", msg], cwd, timeout=30)
         if commit_r.ok:
             diff = run_git(["diff", "HEAD~1", "--stat"], cwd, timeout=30).stdout
-            return MergeResult(success=True, conflicting_files=[], merge_diff=diff)
-        # Nothing to commit (branches already identical)
+            rev_r = run_git(["rev-parse", "HEAD"], cwd, timeout=10)
+            commit_sha = rev_r.stdout.strip() if rev_r.ok else ""
+            return MergeResult(success=True, conflicting_files=[], merge_diff=diff, merge_commit=commit_sha)
+        # Nothing to commit (branches already identical). No commit was
+        # produced, so `merge_commit` stays empty: reading HEAD here would
+        # name the integration branch's pre-merge tip, a commit that predates
+        # the reap and that this merge did not create (#5271 review, F1).
         run_git(["merge", "--abort"], cwd, timeout=10)
-        return MergeResult(success=True, conflicting_files=[])
+        return MergeResult(success=True, conflicting_files=[], merge_commit="")
 
     # 2. Check if the failure is due to merge conflicts
     conflicts = _parse_conflict_files(cwd)

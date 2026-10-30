@@ -53,8 +53,6 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import cbor2
-
 from bernstein.core.persistence.merkle import _combine_internal, _leaf_digest
 from bernstein.core.security.audit_dsse import (
     DSSE_PAYLOAD_TYPE,
@@ -70,6 +68,14 @@ from bernstein.core.security.audit_multitenant import (
     _events_jsonl_bytes,
     _read_audit_events,
     _rebuild_slice_chain,
+)
+from bernstein.core.security.cose import (
+    COSE_ALG_EDDSA,
+    COSE_LABEL_ALG,
+    COSE_LABEL_CONTENT_TYPE,
+    COSE_LABEL_KID,
+    COSE_SIGN1_TAG,
+    build_cose_sign1_bytes,
 )
 
 if TYPE_CHECKING:
@@ -90,16 +96,14 @@ RECEIPT_SCHEMA_VERSION: str = "1.0.0"
 #: Receipt predicate/type URL. Versioned so a future v2 can co-exist.
 RECEIPT_TYPE: str = "https://bernstein.run/attestations/audit-receipt/v1"
 
-#: COSE_Sign1 CBOR tag (RFC 9052 section 2).
-_COSE_SIGN1_TAG: int = 18
-
-#: COSE ``alg`` header value for EdDSA (RFC 9053 / IANA COSE Algorithms).
-_COSE_ALG_EDDSA: int = -8
-
-#: COSE header labels (RFC 9052 section 3.1).
-_COSE_LABEL_ALG: int = 1
-_COSE_LABEL_CONTENT_TYPE: int = 3
-_COSE_LABEL_KID: int = 4
+#: COSE wire constants. Defined in :mod:`bernstein.core.security.cose` and
+#: re-exported under the old private names so existing importers keep working;
+#: these are the standard's values, not ours, so there is one copy (#6207).
+_COSE_SIGN1_TAG: int = COSE_SIGN1_TAG
+_COSE_ALG_EDDSA: int = COSE_ALG_EDDSA
+_COSE_LABEL_ALG: int = COSE_LABEL_ALG
+_COSE_LABEL_CONTENT_TYPE: int = COSE_LABEL_CONTENT_TYPE
+_COSE_LABEL_KID: int = COSE_LABEL_KID
 
 #: Content type advertised in the COSE protected header.
 COSE_CONTENT_TYPE: str = "application/vnd.bernstein.audit-receipt+json"
@@ -170,6 +174,38 @@ def _canonical_json_bytes(obj: dict[str, Any]) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+#: Legacy profile: :func:`_canonical_json_bytes`, unchanged (``ensure_ascii``
+#: default True, no numeric normalisation).
+HASH_PROFILE_LEGACY: str = "py-json-v1"
+
+#: RFC 8785 (JCS) profile via
+#: :func:`bernstein.core.security.agent_card_signer.canonicalize_jcs`, already
+#: used by the TRACE projection and audit-chain digests.
+HASH_PROFILE_JCS_V2: str = "jcs-v2"
+
+
+def _canonical_bytes_for_profile(obj: dict[str, Any], hash_profile: str) -> bytes:
+    """Return canonical bytes for *obj* under a named hash profile.
+
+    A record with no ``hash_profile`` field is :data:`HASH_PROFILE_LEGACY` by
+    convention; callers resolve that default before calling this function.
+    Does not change :func:`_canonical_json_bytes` itself, so every receipt
+    that already relies on its bytes keeps them.
+
+    Raises:
+        ValueError: *hash_profile* is neither known profile. Callers on an
+            untrusted read path (a receipt someone else produced) must catch
+            this and fail closed rather than let it propagate.
+    """
+    if hash_profile == HASH_PROFILE_JCS_V2:
+        from bernstein.core.security.agent_card_signer import canonicalize_jcs
+
+        return canonicalize_jcs(obj)
+    if hash_profile == HASH_PROFILE_LEGACY:
+        return _canonical_json_bytes(obj)
+    raise ValueError(f"unknown hash_profile {hash_profile!r}")
+
+
 def _canonical_event_bytes(event: dict[str, Any]) -> bytes:
     """Return the canonical single-event bytes used as a Merkle leaf.
 
@@ -224,22 +260,17 @@ def _build_cose_sign1(
     existing head-signature convention
     (:func:`bernstein.core.security.audit_head_signature.build_head_signature`
     signs ``bytes.fromhex(head_sha256)``) and reusing ``KMSAdapter.sign``.
+
+    The envelope is encoded by
+    :func:`bernstein.core.security.cose.build_cose_sign1_bytes`, shared with
+    the run receipt since #6207. The bytes are unchanged by that move.
     """
-    protected_map: dict[int, Any] = {
-        _COSE_LABEL_ALG: _COSE_ALG_EDDSA,
-        _COSE_LABEL_CONTENT_TYPE: COSE_CONTENT_TYPE,
-        _COSE_LABEL_KID: key_id.encode("utf-8"),
-    }
-    protected_bstr = cbor2.dumps(protected_map, canonical=True)
-    # RFC 9052 section 4.4: Sig_structure for COSE_Sign1.
-    sig_structure = ["Signature1", protected_bstr, b"", subject_digest_bytes]
-    to_sign = cbor2.dumps(sig_structure, canonical=True)
-    signature = kms_adapter.sign(to_sign)
-    cose_obj = cbor2.CBORTag(
-        _COSE_SIGN1_TAG,
-        [protected_bstr, {}, subject_digest_bytes, signature],
+    cose_bytes = build_cose_sign1_bytes(
+        payload=subject_digest_bytes,
+        content_type=COSE_CONTENT_TYPE,
+        key_id=key_id,
+        kms_adapter=kms_adapter,
     )
-    cose_bytes = cbor2.dumps(cose_obj, canonical=True)
     return {
         "alg": "EdDSA",
         "key_id": key_id,
@@ -331,6 +362,22 @@ def _merkle_root_and_path(
         level = next_level
         idx //= 2
     return level[0], path
+
+
+def _root_from_inclusion(leaf_hash: str, audit_path: list[dict[str, Any]]) -> str:
+    """Fold an inclusion proof from leaf up to root.
+
+    ``audit_path`` is the on-disk shape written by
+    :func:`_build_transparency_receipt`: ``{"hash": sibling, "left": bool}``.
+    Hashing is :func:`_combine_internal` — the same domain-separated pair
+    as the tree builder. The standalone receipt verifier copies this walk;
+    callers must import it rather than write a third copy.
+    """
+    node = leaf_hash
+    for step in audit_path:
+        sibling = str(step.get("hash", ""))
+        node = _combine_internal(sibling, node) if step.get("left") else _combine_internal(node, sibling)
+    return node
 
 
 def _build_transparency_receipt(

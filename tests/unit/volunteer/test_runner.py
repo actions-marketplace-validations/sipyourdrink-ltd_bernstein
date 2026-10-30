@@ -113,6 +113,7 @@ def _task(repo: Path | str, **overrides: Any) -> ClaimedTask:
         "issue_number": 7,
         "issue_title": "off-by-one in the items endpoint",
         "issue_body": "ITEMS[n] should be ITEMS[n - 1]",
+        "role": "backend",
     }
     defaults.update(overrides)
     return ClaimedTask(**defaults)
@@ -474,6 +475,49 @@ def test_the_repo_url_allowlist_admits_transports_and_refuses_helpers(url: str, 
     assert (repo_url_problem(url) is not None) is rejected
 
 
+# URL shapes urlsplit refuses outright: a bracketed-IPv6 netloc carrying
+# userinfo, an unclosed bracket, and a stray one.
+_UNPARSEABLE_URLS = [
+    "http://[::1]@evil.com/project.git",
+    "https://[::1",
+    "http://a]b/project.git",
+]
+
+
+@pytest.mark.parametrize("url", _UNPARSEABLE_URLS)
+def test_a_url_the_parser_refuses_is_refused_not_raised(url: str) -> None:
+    """``repo_url`` arrives on a claimed task, so this input is not ours.
+
+    ``urlparse`` raises ``ValueError`` on these, and the call was unguarded,
+    so the gate that decides whether a URL may reach git left the caller
+    with a traceback instead of the refusal it is waiting to record.
+    """
+    problem = repo_url_problem(url)
+    assert problem is not None
+    assert "cannot be parsed" in problem
+
+
+@pytest.mark.parametrize("url", _UNPARSEABLE_URLS)
+def test_an_unparseable_url_becomes_a_refusal_from_run_claimed_task(url: str, tmp_path: Path) -> None:
+    """The headline claim: the caller gets a refusal, not a traceback.
+
+    ``repo_url_problem`` returning a string is only half of it. What the
+    volunteer protocol records is a ``TaskRefusal`` carrying the stage and
+    reason a verifier reads, and on ``main`` the ``ValueError`` escaped
+    ``run_claimed_task`` before one could be built.
+    """
+    outcome = _run(url, tmp_path, agent_argv=mock_agent_argv(fix="off-by-one"))
+
+    assert isinstance(outcome, TaskRefusal)
+    assert outcome.stage == RefusalStage.REPO_URL
+    assert outcome.reason == "unsupported_repo_url"
+
+
+def test_a_well_formed_url_is_still_admitted() -> None:
+    """Catching the parse error must not start refusing the ordinary case."""
+    assert repo_url_problem("https://github.com/owner/project.git") is None
+
+
 def test_private_github_repository_is_refused_in_volunteer_mode(
     fixture_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -745,3 +789,9 @@ def test_the_clone_never_carries_a_host_credential_variable(tmp_path: Path, monk
     home = next(line for line in observed.splitlines() if line.startswith("HOME="))
     assert home != f"HOME={Path.home()}", "the clone reads the donor's ~/.gitconfig and its credential helper"
     assert home.endswith("git-home"), home
+
+
+def test_claimed_task_keeps_ref_as_the_fifth_positional_argument() -> None:
+    task = ClaimedTask("https://example.com/r.git", 7, "title", "body", "release-1.2")
+    assert task.ref == "release-1.2"
+    assert task.role is None

@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import httpx
 
+from bernstein.adapters.base import AdapterCooldownError
+from bernstein.core import defaults as _defaults
 from bernstein.core.agent_log_aggregator import AgentLogAggregator
 from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 from bernstein.core.completion_budget import CompletionBudget
@@ -29,7 +31,7 @@ from bernstein.core.cross_model_verifier import (
     CrossModelVerifierConfig,
     run_cross_model_verification_sync,
 )
-from bernstein.core.defaults import TASK
+from bernstein.core.defaults import OrchestratorDefaults
 from bernstein.core.effectiveness import EffectivenessScorer
 from bernstein.core.evidence.completion_gate import seal_evidence_on_completion
 from bernstein.core.fast_path import (
@@ -54,12 +56,15 @@ from bernstein.core.replay.review_board import (
 )
 from bernstein.core.router import RouterError
 from bernstein.core.rule_enforcer import RulesConfig, load_rules_config, run_rule_enforcement
+from bernstein.core.security.quarantine import is_transient_host_failure
 from bernstein.core.spawn_analyzer import SpawnAnalyzer, SpawnFailureAnalysis
 from bernstein.core.tasks.artifact_completion import is_artifact_mode, verify_task_completion
 from bernstein.core.tasks.auto_spawn_guard import AutoSpawnGuard, meta_task_kind
 from bernstein.core.tasks.lifecycle import transition_agent
 from bernstein.core.tasks.models import (
     AgentSession,
+    Complexity,
+    ModelConfig,
     Task,
     TaskStatus,
 )
@@ -70,9 +75,11 @@ from bernstein.core.tick_pipeline import (
     close_task,
     complete_task,
     fail_task,
+    release_task,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
     from pathlib import Path
 
     from bernstein.core.git_ops import MergeResult
@@ -83,6 +90,7 @@ else:
 logger = logging.getLogger(__name__)
 
 _XL_ROLES = frozenset({"architect", "security", "manager"})
+_SHIPPED_MAX_AGENT_RUNTIME_S = OrchestratorDefaults().max_agent_runtime_s
 
 # Bug 1 (2026-07-02, fix/claim-conflict-churn): bounds for the claim-conflict
 # recovery loop in ``_claim_task_with_conflict_retry`` / ``claim_and_spawn_batches``.
@@ -189,7 +197,7 @@ def _get_active_agent_files(orch: Any) -> set[str]:
     """Return the set of files currently being edited by active agents.
 
     Inspects the git diff in each active agent's worktree to discover which
-    files have uncommitted changes.  Falls back to ``_file_ownership`` entries
+    files have uncommitted changes.  Falls back to ``FileLockManager`` entries
     for agents whose worktree cannot be inspected.
 
     Args:
@@ -200,6 +208,7 @@ def _get_active_agent_files(orch: Any) -> set[str]:
     """
     active_files: set[str] = set()
     spawner = getattr(orch, "_spawner", None)
+    lock_manager = getattr(orch, "_lock_manager", None)
 
     for agent_id, session in orch._agents.items():
         if session.status == "dead":
@@ -212,17 +221,17 @@ def _get_active_agent_files(orch: Any) -> set[str]:
         if worktree_path is not None:
             changed = _get_changed_files_in_worktree(worktree_path)
             active_files.update(changed)
-        # Also include statically declared owned_files from file_ownership
-        for fpath, owner in orch._file_ownership.items():
-            if owner == agent_id:
-                active_files.add(fpath)
+        # Also include statically declared owned_files from the lock manager
+        if lock_manager is not None:
+            for lock in lock_manager.locks_for_agent(agent_id):
+                active_files.add(lock.file_path)
 
     return active_files
 
 
 def check_file_overlap(
     batch: list[Task],
-    file_ownership: dict[str, str],
+    file_ownership: Mapping[str, str],
     agents: dict[str, AgentSession],
 ) -> bool:
     """Check if any file in the batch is owned by an active agent.
@@ -336,22 +345,35 @@ def _speculative_warm_pool_candidates(orch: Any, task_graph: Any, tasks: list[Ta
     return candidates
 
 
-def _batch_timeout_seconds(batch: list[Task]) -> int:
+def _batch_timeout_seconds(batch: list[Task], configured_max_agent_runtime_s: int | None = None) -> int:
     """Return the spawn timeout bucket for a task batch.
 
     The timeout contract is intentionally coarse-grained so operators can reason
-    about behavior without reconstructing adaptive multipliers:
-    small=15m, medium=30m, large=60m, xl=120m.
+    about behavior without reconstructing adaptive multipliers: small=15m,
+    medium=30m, large=60m, xl=120m. ``max_agent_runtime_s`` is an upward-only
+    floor when configured above its shipped default; lower values never shorten
+    a scope or XL bucket.
     """
-    bucket_seconds = max(TASK.scope_timeout_s.get(task.scope.value, 30 * 60) for task in batch)
+    # Read the tuning singleton THROUGH the module on every call. bernstein.yaml
+    # is parsed (``config/seed_parser._parse_tuning`` -> ``defaults.override``)
+    # long after this module is imported, and ``override`` rebinds the module
+    # attribute rather than mutating the frozen instance - so a name captured by
+    # ``from ... import TASK`` is a permanent snapshot of the shipped defaults,
+    # and ``tuning.task.scope_timeout_s`` / ``xl_timeout_s`` never reach the
+    # value the adapter watchdog is armed with.
+    task_defaults = _defaults.TASK
+    bucket_seconds = max(task_defaults.scope_timeout_s.get(task.scope.value, 30 * 60) for task in batch)
     xl_batch = any(task.role in _XL_ROLES for task in batch) or any(
         task.scope.value == "large" and task.complexity.value == "high" for task in batch
     )
-    # TASK.scope_timeout_s / xl_timeout_s are typed float (see defaults.py), but
+    # scope_timeout_s / xl_timeout_s are typed float (see defaults.py), but
     # every configured bucket is a whole second count and every downstream
     # consumer (AgentSession.timeout_s) is int - convert explicitly rather than
     # widen the return type and push the float onward.
-    return int(TASK.xl_timeout_s) if xl_batch else int(bucket_seconds)
+    resolved = int(task_defaults.xl_timeout_s) if xl_batch else int(bucket_seconds)
+    if configured_max_agent_runtime_s is not None and configured_max_agent_runtime_s > _SHIPPED_MAX_AGENT_RUNTIME_S:
+        return max(resolved, int(configured_max_agent_runtime_s))
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +542,99 @@ def _stamp_checkpoint_retry_metadata_safe(
         return retry_metadata
 
 
+def _write_retry_checkpoint(orch: Any, session: AgentSession, *, detector: str) -> None:
+    """Record a checkpointed-retry reference before an ordinary crash/timeout retry (#5844).
+
+    ``checkpoint_retry.record_task_checkpoint`` had exactly one production
+    caller (an operator's ``steer.pause``), so ``latest_checkpoint`` always
+    saw nothing and ``_stamp_checkpoint_retry_metadata_safe`` above always
+    stamped ``cold``/``no_checkpoint`` on the ordinary failure path. The
+    warm-resume machinery from #2359/#2403 never fired for the crash/timeout
+    cases it exists for. This writes the checkpoint that stamp reads back, at
+    the moment the dying session's adapter and worktree are still known,
+    mirroring ``heartbeat._write_stall_checkpoint``'s resume-checkpoint write
+    beside it (issue #3376), one journal write earlier in the same death path.
+
+    ``session.id`` (``f"{role}-{uuid.uuid4().hex[:8]}"``) is Bernstein's own
+    label for the session, not what ``CheckpointRef.session_id`` is
+    documented to hold: "the native session identifier the adapter handed
+    back". No adapter in this repo currently returns one: ``Adapter.resume``
+    (``adapters/base.py``) is unoverridden everywhere, so its default
+    ``return None`` (fall back to a fresh spawn) is the only behavior any
+    adapter has, so there is nothing native to record here yet. Recording
+    ``session.id`` under this field would stamp ``retry_mode: warm`` for a
+    resume no adapter can perform and seal that claim into the HMAC audit
+    chain with no way for a later reader to tell it was never resumable. This
+    writer therefore leaves ``session_id`` empty; ``decide_retry`` already
+    downgrades a checkpoint with no session id to cold (``no_session_id``),
+    the same as if no checkpoint existed, while the adapter name and
+    workspace hash still get recorded for whichever future adapter grows a
+    real ``resume()`` and can be threaded through here.
+
+    Fail-open by design, like the stall checkpoint beside it: a write
+    failure must never block the retry/DLQ decision that follows.
+
+    Ordering assumption: the two calls between this write and the actual
+    retry decision, ``_maybe_preserve_worktree`` (records a path in a
+    dict, touches no file) and the orphan-handling call that reaches
+    ``retry_or_fail_task``, run before ``_save_partial_work``'s WIP
+    commit/merge/cleanup ever touches this worktree, so the live
+    ``workspace_hash`` recompute that decides warm-vs-cold sees the same
+    tree this function just hashed. ``workspace_hash`` also excludes
+    ``.git``, so even a same-tree WIP commit taken later would not move it.
+    ``_save_partial_work``'s merge-and-cleanup step can and does remove the
+    worktree outright, but only after the decision above has already been
+    made and stamped onto the retry task's metadata, so a later destruction
+    cannot retroactively un-stamp it. If a future change moves the retry
+    decision to run after ``_save_partial_work``, this assumption breaks and
+    warm resume goes silently cold.
+    """
+    workdir = getattr(orch, "_workdir", None)
+    if not isinstance(workdir, Path):
+        return
+    task_ids = list(getattr(session, "task_ids", None) or [])
+    if not task_ids:
+        return
+    try:
+        from bernstein.adapters.registry import adapter_name_for_provider
+        from bernstein.core.tasks import checkpoint_retry
+
+        worktree_path = orch._spawner.get_worktree_path(session.id)
+        if worktree_path is None:
+            return
+        adapter_name = adapter_name_for_provider(session.provider, session.model_config.model) or getattr(
+            orch._spawner, "default_adapter_name", None
+        )
+        ws_hash = checkpoint_retry.workspace_hash(Path(worktree_path))
+        for task_id in task_ids:
+            # A pause checkpoint with a real session_id is resumable; the
+            # empty-session death row would shadow it as the latest row.
+            existing = checkpoint_retry.latest_checkpoint(workdir / ".sdd", task_id)
+            if existing is not None and existing.session_id:
+                continue
+            checkpoint_retry.record_task_checkpoint(
+                sdd_dir=workdir / ".sdd",
+                task_id=task_id,
+                adapter=adapter_name or "",
+                # Not session.id: see the docstring above. No adapter hands
+                # back a native session id yet, so there is nothing
+                # resumable to record; an empty session_id makes
+                # decide_retry downgrade this to cold (no_session_id)
+                # instead of claiming a warm resume nothing can perform.
+                session_id="",
+                workspace_hash=ws_hash,
+                worktree_path=str(worktree_path),
+            )
+    except Exception as exc:
+        logger.warning(
+            "Could not write retry checkpoint for session %s (%s): %s: %s",
+            session.id,
+            detector,
+            type(exc).__name__,
+            exc,
+        )
+
+
 def _extract_failure_context(
     task: Task,
     workdir: Path | None,
@@ -543,6 +658,25 @@ def _extract_failure_context(
             logger.debug("Failed to record retry failure category metric: %s", exc)
 
     return failure_context
+
+
+def note_queued_retries(tasks: Iterable[Task], retried_task_ids: set[str]) -> None:
+    """Mark every task that already has a retry on the board as handled.
+
+    ``retried_task_ids`` lives in one orchestrator process, but the retries it
+    guards against duplicating live on the task server. A restarted
+    orchestrator starts with an empty set and, without this, queues a second
+    retry for every failure an earlier process already retried. A retry's
+    ``metadata["retry_of"]`` names its source, so the board itself answers.
+
+    Args:
+        tasks: Every task on the board, in any status.
+        retried_task_ids: Set of handled task IDs (mutated in-place).
+    """
+    for task in tasks:
+        source = task.metadata.get("retry_of")
+        if source:
+            retried_task_ids.add(str(source))
 
 
 def maybe_retry_task(
@@ -617,12 +751,14 @@ def maybe_retry_task(
         # with an empty set, so the store is asked whether this title is
         # already at the quarantine threshold before it is incremented again.
         if not quarantine.is_quarantined(task.title):
-            quarantine.record_failure(task.title, "Max retries exhausted")
-            logger.warning(
-                "Task %r exhausted %d retries -- recorded cross-run failure in quarantine",
-                task.title,
-                effective_max,
-            )
+            failure_reason = task.result_summary or "Max retries exhausted"
+            recorded = quarantine.record_failure(task.title, failure_reason, task_id=task.id)
+            if recorded:
+                logger.warning(
+                    "Task %r exhausted %d retries -- recorded cross-run failure in quarantine",
+                    task.title,
+                    effective_max,
+                )
         return False
 
     next_retry = retry_count + 1
@@ -709,7 +845,12 @@ def maybe_retry_task(
         # Carry forward the explicit max_turns override (if any) so a retry
         # spawn doesn't silently fall back to complexity-based auto-computation.
         "max_turns": task.max_turns,
+        "depends_on": task.depends_on,
+        "owned_files": task.owned_files,
     }
+    # Preserve completion signals on retry (mirrors retry_or_fail_task below).
+    if task.completion_signals:
+        payload["completion_signals"] = [{"type": s.type, "value": s.value} for s in task.completion_signals]
     logger.info(
         "maybe_retry_task: carrying max_turns=%r forward from task %s to retry %d",
         task.max_turns,
@@ -1351,7 +1492,7 @@ def retry_or_fail_task(
         elif adapter_is_claude_compatible:
             retry_model = tier_model
         else:
-            retry_model = pinned_model or task.model
+            retry_model = pinned_model or task.model  # type: ignore[assignment]  # dynamic status
 
         logger.info(
             "Retry model decision for task %s (role=%s, retry_count=%s, scope=%s): "
@@ -1886,6 +2027,10 @@ def _pre_spawn_checks_pass(orch: Any, alive_count: int) -> bool:
         logger.debug("Skipping claim/spawn: orchestrator is shutting down")
         return False
 
+    if getattr(orch, "_stop_spawning", False):
+        logger.warning("Cost anomaly detector halted spawning; skipping all spawns this tick")
+        return False
+
     _adapter = getattr(getattr(orch, "_spawner", None), "_adapter", None)
     if _adapter is not None and _adapter.is_rate_limited():
         logger.warning("Provider rate-limited - skipping all spawns this tick")
@@ -2261,6 +2406,26 @@ def _spawn_respawn_budget(orch: Any) -> Any:
     )
 
 
+def _cost_anomaly_complexity(task: Task) -> str:
+    """Translate the task's three ordered levels into the detector's size tiers."""
+    return {Complexity.LOW: "small", Complexity.MEDIUM: "medium", Complexity.HIGH: "large"}.get(
+        task.complexity, "medium"
+    )
+
+
+def _check_spawn_cost_anomalies(orch: Any, batch: list[Task], model_config: ModelConfig) -> None:
+    """Dispatch current log-only checks using the spawner's resolved model."""
+    detector = getattr(orch, "_anomaly_detector", None)
+    if detector is None or len(batch) != 1:
+        return
+    task = batch[0]
+    try:
+        for signal in detector.check_spawn(task.id, _cost_anomaly_complexity(task), model_config.model):
+            orch._handle_anomaly_signal(signal)
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        logger.warning("Cost anomaly spawn check failed for task %s (%s)", task.id, type(exc).__name__)
+
+
 def claim_and_spawn_batches(
     orch: Any,  # Orchestrator instance (avoids circular import)
     batches: list[list[Task]],
@@ -2501,6 +2666,10 @@ def claim_and_spawn_batches(
             for task in quarantined_tasks:
                 entry = orch._quarantine.get_entry(task.title)
                 action = entry.action if entry else "skip"
+                reason = (
+                    f"Quarantined after {entry.fail_count if entry else 0} failures: "
+                    f"{entry.action if entry else 'skip'}"
+                )
                 logger.warning(
                     "Skipping quarantined task %s (title=%r, fail_count=%d, action=%s)",
                     task.id,
@@ -2516,6 +2685,14 @@ def claim_and_spawn_batches(
                         decomposed_task_ids=orch._decomposed_task_ids,
                         workdir=orch._workdir,
                     )
+                else:
+                    with contextlib.suppress(Exception):
+                        fail_task(
+                            orch._client,
+                            base,
+                            task.id,
+                            reason,
+                        )
             continue
 
         # Pre-flight: auto-decompose large tasks before claiming.
@@ -2784,7 +2961,7 @@ def claim_and_spawn_batches(
                         _route.refused_reason,
                     )
 
-        batch_timeout_s = _batch_timeout_seconds(batch)
+        batch_timeout_s = _batch_timeout_seconds(batch, orch._config.max_agent_runtime_s)
         _shadow_bandit_decision: Any | None = None
         _routing_bandit: Any = getattr(orch, "_bandit_router", None)
         _bandit_mode = str(getattr(orch, "_bandit_routing_mode", "static"))
@@ -2823,6 +3000,12 @@ def claim_and_spawn_batches(
                 "Bandit routing skipped for multi-task batch %s; static batch escalation keeps attribution clear",
                 [task.id for task in batch],
             )
+
+        # The spawner observes its authoritative model after role/default and
+        # provider resolution, including later failover and resume attempts.
+        orch._spawner._cost_anomaly_spawn_observer = lambda tasks, config: _check_spawn_cost_anomalies(
+            orch, tasks, config
+        )
 
         try:
             # Check if any task in this batch has a preserved worktree for resume
@@ -3028,6 +3211,18 @@ def claim_and_spawn_batches(
                 session.id,
                 session.agent_source,
             )
+        except AdapterCooldownError as exc:
+            # The adapter is backing off, the tasks did not fail. Failing them
+            # here spent their retry budget on every tick of the backoff until
+            # the lineage failed for good and its dependents were blocked.
+            # Hand the claims back untouched instead; the next tick after the
+            # backoff claims them again.
+            logger.info("Spawn deferred for batch %s: %s", [t.id for t in batch], exc)
+            for task in batch:
+                try:
+                    release_task(orch._client, base, task.id, f"spawn deferred: {exc}")
+                except Exception as rel_exc:
+                    logger.warning("Could not release task %s after adapter cooldown: %s", task.id, rel_exc)
         except (OSError, RuntimeError, ValueError, RouterError) as exc:
             logger.error("Spawn failed for batch %s: %s", [t.id for t in batch], exc)
             result.errors.append(f"spawn: {exc}")
@@ -3077,6 +3272,13 @@ def claim_and_spawn_batches(
                 )
             should_retry, _ = spawn_analyzer.should_retry(batch_history, max_retries=orch._MAX_SPAWN_FAILURES)
             if new_count >= orch._MAX_SPAWN_FAILURES or not should_retry:
+                # Classify the caught exception, not agent-writable task.result_summary.
+                if is_transient_host_failure(str(exc)):
+                    try:
+                        for task in batch:
+                            orch._quarantine.excuse_failure(task.id, f"host resource exhaustion during spawn: {exc}")
+                    except Exception:
+                        logger.warning("Could not excuse tasks after host resource exhaustion", exc_info=True)
                 # The analyzer can call it quits before the budget is
                 # spent. Park explicitly so the two ways of giving up
                 # leave the same operator-visible state.
@@ -3574,7 +3776,19 @@ def _evaluate_approval_gate(
             timeout_s=timeout_s,
         )
         if approval_result.rejected:
-            logger.warning("Approval gate: task %s rejected -- skipping merge for agent %s", task.id, session.id)
+            if approval_result.resolution == "timed_out":
+                logger.warning(
+                    "Approval gate: task %s rejected on timeout (no decision within the review window) "
+                    "-- skipping merge for agent %s",
+                    task.id,
+                    session.id,
+                )
+            else:
+                logger.warning(
+                    "Approval gate: task %s rejected -- skipping merge for agent %s",
+                    task.id,
+                    session.id,
+                )
             return True
         if not approval_result.approved:
             _create_approval_pr(orch, task, session, completion_data)
@@ -3684,8 +3898,9 @@ def _write_task_resume_checkpoint(
     session: AgentSession | None,
     worktree_path: Path | None,
     adapter_name: str | None = None,
+    stall_reason: str | None = None,
 ) -> None:
-    """Write a task resume checkpoint for a completed task.
+    """Write a task resume checkpoint for a completed or stall-killed task.
 
     This checkpoint captures the state after a successful step transition
     (agent spawn -> task completion) so the task can be resumed later if
@@ -3703,6 +3918,10 @@ def _write_task_resume_checkpoint(
         adapter_name: Adapter that ran the session. ``bernstein resume`` reads
             its resume strategy off this name (``resume_cmd.py``), so a
             checkpoint written without one is readable but not resumable.
+        stall_reason: When set, this checkpoint was written at an automatic
+            stall-kill boundary (issue #3376) rather than after a normal step
+            completion. Passed straight through onto the checkpoint's own
+            ``stall_reason`` field.
     """
     adapter = adapter_name or ""
     adapter_session_id = session.id if session is not None else ""
@@ -3735,6 +3954,7 @@ def _write_task_resume_checkpoint(
         worktree_path=str(worktree_path) if worktree_path is not None else None,
         scratchpad_path=scratchpad_path,
         scratchpad_sha256=scratchpad_sha,
+        stall_reason=stall_reason,
         meta=({"adapter_name": adapter} if adapter else {}),
     )
     save_checkpoint(workdir, checkpoint)
@@ -3795,7 +4015,15 @@ def _reap_and_cleanup_session(
         # issue #2365: chain the merge decision into the run journal so the
         # review board's merged column is a projection of the journal, not a
         # side inference. No-op when the orchestrator has no recorder.
-        record_task_merged(getattr(orch, "_recorder", None), task_id=task.id, agent_id=session.id)
+        # issue #5271: carry the merge commit sha so the row can be tied back
+        # to the git object it actually produced, not just to "a merge
+        # happened". None when the merge found nothing to commit.
+        record_task_merged(
+            getattr(orch, "_recorder", None),
+            task_id=task.id,
+            agent_id=session.id,
+            merge_commit=getattr(merge_result, "merge_commit", None),
+        )
 
     # issue #2559: reconcile what the task declared it would produce against what
     # this run's spine actually carries, and record an artifact-keyed attempt for
@@ -4110,7 +4338,7 @@ def _record_bandit_outcome(
     bandit.record_outcome(
         task=task,
         model=session.model_config.model if session.model_config else "sonnet",
-        effort=getattr(session, "effort", "") or "",
+        effort=session.model_config.effort if session.model_config else "",
         cost_usd=bm.cost_usd if bm is not None else 0.0,
         quality_score=1.0 if janitor_passed else 0.0,
         budget_ceiling=max(float(getattr(orch._config, "budget_usd", 0.0) or 0.0), 1.0),
@@ -4725,6 +4953,45 @@ class _JanitorFutureLike(Protocol):
     def done(self) -> bool: ...
 
 
+def _ingest_remote_completion(orch: Any, task: Task) -> str | None:
+    """Return the branch holding a remote completion's posted artifact, or None.
+
+    A ``code_diff`` task yields its posted ``diff`` applied onto HEAD; an
+    artifact-mode task yields its posted ``artifact`` written at the declared
+    output path. No verified artifact, or an artifact that does not apply,
+    yields None with an explicit log line, and verification proceeds on the run
+    checkout so the verdict stays an honest FAIL rather than a silent skip.
+    """
+    from bernstein.core.git.remote_diff_ingest import (
+        RemoteDiffApplyError,
+        ingest_remote_artifact,
+        ingest_remote_diff,
+    )
+    from bernstein.core.security.audit import load_or_create_audit_key
+
+    workdir = Path(getattr(orch, "_workdir", "") or "")
+    if not str(workdir):
+        return None
+    sdd_dir = workdir / ".sdd"
+    try:
+        hmac_key = load_or_create_audit_key()
+        if is_artifact_mode(task):
+            branch = ingest_remote_artifact(workdir, sdd_dir, task, hmac_key=hmac_key)
+        else:
+            branch = ingest_remote_diff(workdir, sdd_dir, task.id, hmac_key=hmac_key)
+    except RemoteDiffApplyError as exc:
+        logger.warning("janitor: remote artifact did not apply task=%s detail=%s", task.id, exc.detail[-300:])
+        return None
+    except Exception as exc:  # pragma: no cover - defensive: never lose a task on ingest
+        logger.warning("janitor: remote artifact ingest raised task=%s exc=%s", task.id, exc)
+        return None
+    if branch is None:
+        logger.info("janitor: remote completion without a posted artifact task=%s", task.id)
+        return None
+    logger.info("janitor: remote artifact ingested task=%s branch=%s", task.id, branch)
+    return branch
+
+
 def _enqueue_alive_exit_janitor_pass(
     orch: Any,
     task: Task,
@@ -4801,6 +5068,14 @@ def _enqueue_alive_exit_janitor_pass(
     judge_provider: str | None = getattr(_orch_config, "judge_provider", None)
     executor = getattr(orch, "_executor", None)
     preview_branch = _agent_preview_branch(orch, session_id)
+    if session_id is None and preview_branch is None:
+        # Issue #6611: a worker outside the host completed over HTTP and handed
+        # its output back as a posted artifact. Nothing in the run checkout
+        # carries it, so grading that tree fails every remote completion.
+        # Materialise the receipted bytes as a branch and grade the merged tree.
+        preview_branch = _ingest_remote_completion(orch, task)
+        if preview_branch is not None:
+            session_id = f"remote-{task.id}"
     preview_setup = _preview_setup(orch) if preview_branch is not None else None
     if executor is None:
         # Defensive: if the orchestrator has no executor we still want a
@@ -4898,6 +5173,12 @@ def process_completed_tasks(
         if task.id in orch._processed_done_tasks:
             continue
         orch._processed_done_tasks[task.id] = None
+        # A failed task (the quiescence pass hands those in too) is registered for
+        # the drain tracker only: it has no completion to verify or merge, and the
+        # retry machinery already decided it. Running the chain on it let a janitor
+        # FAIL reopen retried and permanently failed tasks.
+        if task.status != TaskStatus.DONE:
+            continue
         new_tasks.append(task)
 
     if not new_tasks:
@@ -5058,6 +5339,30 @@ def _process_single_completed_task(
             logger.warning("append_decision failed for task %s: %s", task.id, exc)
 
     _record_evolution_completion(orch, task, session, task_m, cost_usd, janitor_passed)
+
+    # Per-task anomaly checks: ceiling, token-ratio, retry-spiral, baseline update.
+    _anomaly_det = getattr(orch, "_anomaly_detector", None)
+    if _anomaly_det is not None:
+        _task_m = task_m
+        _cost = cost_usd
+        _tokens_in = _task_m.tokens_prompt if _task_m else 0
+        _tokens_out = _task_m.tokens_completion if _task_m else 0
+        _complexity = _cost_anomaly_complexity(task)
+        _orig_id = _lineage_id(task)
+        _is_retry = _orig_id != task.id or task.retry_count > 0 or task.title.startswith("[RETRY")
+        try:
+            for _sig in _anomaly_det.check_task_completion(
+                task.id,
+                _complexity,
+                _cost,
+                _tokens_in,
+                _tokens_out,
+                is_retry=_is_retry,
+                original_task_id=_orig_id if _is_retry else None,
+            ):
+                orch._handle_anomaly_signal(_sig)
+        except (AttributeError, OSError, TypeError, ValueError) as exc:
+            logger.warning("Cost anomaly completion check failed for task %s (%s)", task.id, type(exc).__name__)
 
     # issue #4463: a scheduled gate repair already reopened this unit of work
     # under a new task id on the preserved branch -- fail this task with a
@@ -5475,8 +5780,9 @@ def _get_git_diff_text_in_worktree(worktree_path: Path) -> str:
 def _claim_file_ownership(orch: Any, agent_id: str, tasks: list[Task]) -> None:
     """Register file ownership for files in the given tasks.
 
-    Uses :class:`~bernstein.core.file_locks.FileLockManager` when available,
-    falling back to the legacy ``_file_ownership`` dict for compatibility.
+    Uses :class:`~bernstein.core.file_locks.FileLockManager` as the single
+    source of truth.  The legacy ``_file_ownership`` attribute is a read-only
+    projection of it; there is no longer a fallback path.
 
     Also claims ownership for paths inferred from the task title/description
     (CRITICAL-007) so that subsequent ``check_file_overlap`` calls detect
@@ -5501,9 +5807,6 @@ def _claim_file_ownership(orch: Any, agent_id: str, tasks: list[Task]) -> None:
                 task_id=task.id,
                 task_title=task.title,
             )
-        # Keep legacy dict in sync so existing code that reads _file_ownership still works
-        for fpath in all_files:
-            orch._file_ownership[fpath] = agent_id
 
 
 # ---------------------------------------------------------------------------

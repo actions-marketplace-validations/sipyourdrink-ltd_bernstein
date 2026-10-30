@@ -109,17 +109,24 @@ def test_default_adapter_strategy_is_conservative() -> None:
 
 
 def test_only_the_computer_use_family_declares_artifact_output_mode() -> None:
-    """The coding path stays the default; the axis has exactly one consumer.
+    """The coding path stays the default; only non-coding units of work opt out.
 
     ``computer_use`` fronts an external agent whose unit of work is the
-    signed per-action record, not a commit (#3110), so it declares
-    ``artifact``. ``holmesgpt`` is a read-only investigation CLI whose unit
-    of work is the conclusion artifact, not a commit (#3123), so it also
-    declares ``artifact``. Every coding adapter keeps ``git-diff`` - growing
-    this set is a deliberate act, not a default drift.
+    signed per-action record, not a commit (#3110); ``garak`` runs a probe
+    suite whose unit of work is the scan report; ``holmesgpt`` is a read-only
+    investigation CLI whose unit of work is the conclusion artifact (#3123);
+    ``skyvern`` drives a browser-automation server whose unit of work is the
+    run result, not a commit. Every coding adapter keeps ``git-diff`` - growing
+    this set is a deliberate act, not a default drift, and each member needs a
+    comment at its declaration saying what its unit of work is instead.
     """
     non_git_diff = {name for name, s in STRATEGY_MATRIX.items() if s.output_mode is not OutputMode.GIT_DIFF}
-    assert non_git_diff == {"computer_use", "holmesgpt"}
+    assert non_git_diff == {
+        "computer_use",
+        "garak",
+        "holmesgpt",
+        "skyvern",
+    }
 
 
 def test_computer_use_declares_artifact_output_mode() -> None:
@@ -173,16 +180,22 @@ def test_stream_json_adapters_declared() -> None:
 
 
 def test_text_signal_default_for_plain_adapters() -> None:
-    for name in ("aider", "droid", "opencode"):
+    for name in ("aider", "droid"):
         assert strategy_for(name).event_channel is EventChannel.TEXT_SIGNALS
 
 
 def test_opencode_declares_native_resume_and_a_dangerous_mode_flag() -> None:
-    """Both axes are backed by flags the adapter passes; the event channel is not yet."""
+    """All three axes are backed by flags the adapter passes on every spawn.
+
+    ``event_channel`` names what the upstream CLI emits, not what Bernstein
+    currently parses (#3676): ``opencode.py`` passes ``--format json``, under
+    which the CLI emits NDJSON, so the declared channel is ``stream-json``
+    even though nothing consumes those events yet.
+    """
     strategy = strategy_for("opencode")
     assert strategy.resume is ResumeStrategy.FLAG
     assert strategy.dangerous_mode is DangerousModeStrategy.CLI_FLAG
-    assert strategy.event_channel is EventChannel.TEXT_SIGNALS
+    assert strategy.event_channel is EventChannel.STREAM_JSON
 
 
 def test_opencode_resume_declaration_drives_the_retry_surface() -> None:

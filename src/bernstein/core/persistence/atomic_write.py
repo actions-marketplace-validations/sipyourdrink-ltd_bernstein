@@ -76,7 +76,7 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
-def write_atomic_bytes(path: Path, data: bytes) -> None:
+def write_atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     """Atomically write *data* to *path* via temp-file + ``os.replace``.
 
     The sequence is:
@@ -92,6 +92,11 @@ def write_atomic_bytes(path: Path, data: bytes) -> None:
     Args:
         path: Final destination file.
         data: Byte payload to write.
+        mode: Permission bits for the created file. The ``0o600`` default is
+            right for ``.sdd/runtime/`` state, which may carry task metadata
+            or session tokens. A caller writing something that has to stay
+            readable by another account -- templates shipped inside an
+            installed package, say -- passes ``0o644`` and says why.
 
     Raises:
         OSError: Propagated from the underlying filesystem calls after
@@ -101,12 +106,12 @@ def write_atomic_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = _tmp_path_for(path)
     try:
-        # 0o600 - owner-only. Runtime state may carry task metadata, session
-        # tokens, or other material that should not be world-readable.
+        # Owner-only by default. Runtime state may carry task metadata,
+        # session tokens, or other material that should not be world-readable.
         fd = os.open(
             str(tmp),
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
+            mode,
         )
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
@@ -120,7 +125,7 @@ def write_atomic_bytes(path: Path, data: bytes) -> None:
     _fsync_dir(path.parent)
 
 
-def write_atomic_text(path: Path, data: str, *, encoding: str = "utf-8") -> None:
+def write_atomic_text(path: Path, data: str, *, encoding: str = "utf-8", mode: int = 0o600) -> None:
     """Atomically write *data* as text to *path*.
 
     Thin wrapper over :func:`write_atomic_bytes` that handles encoding.
@@ -129,8 +134,39 @@ def write_atomic_text(path: Path, data: str, *, encoding: str = "utf-8") -> None
         path: Final destination file.
         data: Text payload to write.
         encoding: Text encoding (default UTF-8).
+        mode: Permission bits for the created file; see
+            :func:`write_atomic_bytes`.
     """
-    write_atomic_bytes(path, data.encode(encoding))
+    write_atomic_bytes(path, data.encode(encoding), mode=mode)
+
+
+def promote_atomic(staged_path: Path, path: Path) -> None:
+    """Atomically move an already-written staged file onto *path*.
+
+    Companion to :func:`write_atomic_bytes` for producers that emit a
+    *set* of files which must become visible together: write every file
+    of the set into a scratch directory on the same filesystem with
+    :func:`write_atomic_text` / :func:`write_atomic_bytes`, and only once
+    the whole set is durable call this for each file. A failure at any
+    point before the first promote leaves the published location exactly
+    as it was, so a consumer reading it sees the previous complete set.
+
+    ``os.replace`` swaps the directory entry, so a reader holding *path*
+    sees either the previous file or the new one - never a truncated or
+    half-written mix.
+
+    Args:
+        staged_path: Fully written source file. Must live on the same
+            filesystem as *path*, otherwise ``os.replace`` raises.
+        path: Final destination. Parent directory is created if missing.
+
+    Raises:
+        OSError: Propagated from ``os.replace`` (e.g. a cross-device
+            staging path, or a destination that is a directory).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(str(staged_path), str(path))
+    _fsync_dir(path.parent)
 
 
 def write_atomic_json(
@@ -156,6 +192,7 @@ def write_atomic_json(
 
 
 __all__ = [
+    "promote_atomic",
     "write_atomic_bytes",
     "write_atomic_json",
     "write_atomic_text",

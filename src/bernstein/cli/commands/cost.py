@@ -304,7 +304,13 @@ def _aggregate_from_ledger_or_tasks(
     written by the LLM-adapter pre-call hook into ``.sdd/cost/ledger.jsonl``.
     When the ledger is unavailable we degrade to ``task_records`` so older
     runs still show a sensible breakdown.
+
+    Issue #4985: ``principal``, ``grant`` and ``authorizing_identity`` are
+    ledger-only columns. Without a ledger every row reports as
+    ``unattributed`` -- the task record cannot say by whose grant a call
+    was made, and inventing one would be worse than saying nothing.
     """
+    from bernstein.core.cost.principal_attribution import ATTRIBUTION_DIMENSIONS, UNATTRIBUTED
     from bernstein.core.cost.spend_ledger import SpendLedger, aggregate_entries
 
     if ledger_path.exists():
@@ -316,7 +322,12 @@ def _aggregate_from_ledger_or_tasks(
 
     rows: dict[str, dict[str, Any]] = defaultdict(lambda: {"tasks": 0, "cost_usd": 0.0})
     for rec in task_records:
-        if dimension == "role":
+        if dimension in ATTRIBUTION_DIMENSIONS:
+            # Attribution lives only on the ledger row (issue #4985). Without
+            # a ledger there is nothing to attribute, and guessing from the
+            # task record would fold unattributed spend onto a principal.
+            label = UNATTRIBUTED
+        elif dimension == "role":
             label = str(rec.get("role", "") or "unknown")
         elif dimension == "envelope":
             raw_tags_env: object = rec.get("cost_tags") or {}
@@ -672,9 +683,26 @@ DEFAULT_METRICS_DIR = ".sdd/metrics"
 @click.option(
     "--by",
     "group_by",
-    type=click.Choice(["agent", "model", "task", "day", "role", "feature_label", "envelope", "profile"]),
+    type=click.Choice(
+        [
+            "agent",
+            "model",
+            "task",
+            "day",
+            "role",
+            "feature_label",
+            "envelope",
+            "profile",
+            "principal",
+            "grant",
+            "authorizing_identity",
+        ]
+    ),
     default=None,
-    help=("Group breakdown by agent, model, task, day, role, feature_label, envelope, or profile (issue #2245)."),
+    help=(
+        "Group breakdown by agent, model, task, day, role, feature_label, envelope, profile (issue #2245), "
+        "principal, grant, or authorizing_identity (issue #4985)."
+    ),
 )
 @click.option(
     "--ledger",
@@ -825,7 +853,7 @@ def cost_cmd(
         grouped_data = _aggregate_by_task(task_records)
     elif group_by == "day":
         grouped_data = _aggregate_by_day(task_records)
-    elif group_by in ("role", "feature_label", "envelope"):
+    elif group_by in ("role", "feature_label", "envelope", "principal", "grant", "authorizing_identity"):
         # Issue #1320 + #1405: role / feature_label / envelope are tagged
         # dimensions that live in the rolling spend ledger. Fall back to
         # task_records when the ledger is missing so old runs still show
@@ -1766,6 +1794,93 @@ estimate_alias_cmd = click.Command(
 cost_cmd.add_command(cost_envelopes_group, "envelopes")
 
 
+@click.group("model-call")
+def model_call_group() -> None:
+    """Model call ledger operations: invoke with reuse, replay records."""
+
+
+@model_call_group.command("invoke", hidden=True)
+@click.option("--sdd-dir", "sdd_dir", type=str, required=True, help="Path to .sdd directory.")
+@click.option("--capability-id", type=str, required=True, help="Capability making the call.")
+@click.option("--adapter-id", type=str, required=True, help="Adapter the call goes to.")
+@click.option("--model", type=str, required=True, help="Model identifier.")
+@click.option("--model-version", type=str, default="", help="Provider version string for model.")
+@click.option("--parameters", type=str, default="{}", help="JSON object of resolved parameters.")
+@click.option("--parameter-schema-version", type=str, default="", help="Adapter parameter schema version.")
+@click.option("--input", "input_text", type=str, required=True, help="Input text being sent.")
+@click.option("--journal-entry-id", type=str, default="", help="Work ledger entry this call belongs to.")
+@click.option("--reuse-identical", is_flag=True, default=False, help="Short-circuit on matching content hash.")
+def model_call_invoke(
+    sdd_dir: str,
+    capability_id: str,
+    adapter_id: str,
+    model: str,
+    model_version: str,
+    parameters: str,
+    parameter_schema_version: str,
+    input_text: str,
+    journal_entry_id: str,
+    reuse_identical: bool,
+) -> None:
+    """Test scaffolding: invoke adapter and write ledger record.
+
+    This command is test scaffolding only. Real adapter invocation requires
+    a running agent session via the orchestrator. Use the ModelCallLedger
+    library API directly for testing with mock adapters.
+    """
+    # Fail closed: no real adapter session available in standalone CLI context
+    console.print(
+        "[red]Error: Real adapter invocation requires a running agent session.[/red]\n"
+        "[yellow]This command is test scaffolding only. Real adapter calls must go through[/yellow]\n"
+        "[yellow]the orchestrator, which manages adapter lifecycle and session state.[/yellow]\n\n"
+        "[blue]For testing with mock adapters, use the ModelCallLedger library API directly:[/blue]\n"
+        "  from bernstein.core.cost.model_call_ledger import ModelCallLedger\n"
+        "  ledger = ModelCallLedger(Path(sdd_dir))\n"
+        "  record = ledger.invoke(capability_id=..., call=lambda: 'mock output', ...)"
+    )
+    raise click.Abort
+
+
+@model_call_group.command("replay", hidden=True)
+@click.option("--sdd-dir", "sdd_dir", type=str, required=True, help="Path to .sdd directory.")
+@click.option("--record-id", type=str, required=True, help="ID of the record to replay.")
+def model_call_replay(sdd_dir: str, record_id: str) -> None:
+    """Test scaffolding: re-execute a stored call and write a new linked record.
+
+    This command is test scaffolding only. Real adapter invocation requires
+    a running agent session via the orchestrator. Use the ModelCallLedger
+    library API directly for testing with mock adapters.
+    """
+    # Fail closed: no real adapter session available in standalone CLI context
+    console.print(
+        "[red]Error: Real adapter invocation requires a running agent session.[/red]\n"
+        "[yellow]This command is test scaffolding only. Real adapter calls must go through[/yellow]\n"
+        "[yellow]the orchestrator, which manages adapter lifecycle and session state.[/yellow]\n\n"
+        "[blue]For testing with mock adapters, use the ModelCallLedger library API directly:[/blue]\n"
+        "  from bernstein.core.cost.model_call_ledger import ModelCallLedger\n"
+        "  ledger = ModelCallLedger(Path(sdd_dir))\n"
+        "  record = ledger.replay(record_id, call=lambda: 'mock output')"
+    )
+    raise click.Abort
+
+
+cost_cmd.add_command(model_call_group, "model-call")
+
+
+#: The alias reuses the canonical command's Parameter objects rather than
+#: re-declaring them, so `bernstein estimate` cannot come to parse, default or
+#: reject an invocation differently from `bernstein cost estimate`. Re-declared
+#: options drift silently: a changed Choice set or default reads as identical
+#: under a name-by-name comparison.
+estimate_alias_cmd = click.Command(
+    "estimate",
+    params=list(estimate_cmd.params),
+    callback=_estimate_alias_callback,
+    help="[Deprecated] Predict task cost before running (use 'bernstein cost estimate').",
+    short_help="[Deprecated] Predict task cost before running.",
+)
+
+
 @click.group("cost-envelopes")
 @click.pass_context
 def cost_envelopes_alias_cmd(ctx: click.Context) -> None:
@@ -1796,4 +1911,5 @@ __all__ = [
     "cost_profile_report_cmd",
     "estimate_alias_cmd",
     "estimate_cmd",
+    "model_call_group",
 ]

@@ -76,6 +76,12 @@ JOURNAL_FILENAME = "journal.jsonl"
 #: Unset or non-positive means keep everything.
 RETENTION_ENV_VAR = "BERNSTEIN_REPLAY_RETENTION"
 
+#: Legacy hash profile: Python json.dumps with ensure_ascii=True, default=str.
+HASH_PROFILE_LEGACY: str = "py-json-v1"
+
+#: RFC 8785 (JCS) hash profile: canonicalize_jcs, no default=str, floats per ES6 Number.toString.
+HASH_PROFILE_JCS_V2: str = "jcs-v2"
+
 #: Envelope fields that vary across runs even when execution is identical.
 #: Excluded from ``payload_hash`` so two byte-identical runs chain to the
 #: same head regardless of timing (mirrors the legacy recorder policy,
@@ -95,6 +101,13 @@ _NON_DETERMINISTIC_FIELDS = frozenset({"ts", "elapsed_s", "index", "prev_hash", 
 #: collects *every* matching field (every path a row names is a path the
 #: run touched).
 PATH_FIELDS = ("path", "file_path")
+
+#: Known nested payload carriers whose sub-dicts are also scanned for
+#: :data:`PATH_FIELDS`.  ``args`` is the standard tool-call argument map
+#: (e.g. ``{"type": "tool_call", "args": {"path": "README.md"}}``);
+#: ``frame`` wraps entire ACP events emitted by ``ACPEventJournalSink``.
+#: Extending this tuple makes new carriers visible to *all* consumers.
+PAYLOAD_CARRIERS: tuple[str, ...] = ("args", "frame")
 
 _GENESIS_HASH = ""
 
@@ -179,35 +192,70 @@ def contained_run_journal(runs_root: Path, entry_name: str, filename: str = JOUR
         return None
 
 
-def _payload_hash(event_type: str, payload: dict[str, Any]) -> str:
+def _payload_hash(event_type: str, payload: dict[str, Any], hash_profile: str = HASH_PROFILE_LEGACY) -> str:
     """Return the SHA-256 of the canonical, timing-excluded payload.
 
     The ``event`` type and the decision-relevant payload keys are hashed;
     the wall-clock envelope and the derived chain fields are dropped so a
     faithful replay - which differs only in timing - hashes identically.
+
+    Args:
+        event_type: The event type string.
+        payload: The event payload dict.
+        hash_profile: Canonicalization profile. ``"py-json-v1"`` (default)
+            uses ``json.dumps`` with ``ensure_ascii=True`` and ``default=str``.
+            ``"jcs-v2"`` uses RFC 8785 via ``canonicalize_jcs`` with no
+            ``default=str`` fallback.
     """
+    from bernstein.core.security.agent_card_signer import canonicalize_jcs
+
     projected = {k: v for k, v in payload.items() if k not in _NON_DETERMINISTIC_FIELDS}
     projected["event"] = event_type
-    canonical = json.dumps(projected, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    if hash_profile == HASH_PROFILE_JCS_V2:
+        canonical = canonicalize_jcs(projected)
+    else:
+        canonical = json.dumps(projected, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
-def compute_event_hash(*, prev_hash: str, event_type: str, payload_hash: str, index: int) -> str:
+def compute_event_hash(
+    *,
+    prev_hash: str,
+    event_type: str,
+    payload_hash: str,
+    index: int,
+    hash_profile: str = HASH_PROFILE_LEGACY,
+) -> str:
     """Return ``event_hash = H(prev_hash, event_type, payload_hash, index)``.
 
     The pre-image is canonical JSON of the ordered field tuple, so the
     digest is stable across processes and platforms.
+
+    Args:
+        prev_hash: Previous event hash.
+        event_type: Event type string.
+        payload_hash: Payload hash.
+        index: Monotonic index.
+        hash_profile: Canonicalization profile. ``"py-json-v1"`` (default)
+            uses ``json.dumps`` with ``sort_keys=True``. ``"jcs-v2"`` uses
+            RFC 8785 via ``canonicalize_jcs``.
     """
-    preimage = json.dumps(
-        {
-            "prev_hash": prev_hash,
-            "event_type": event_type,
-            "payload_hash": payload_hash,
-            "index": index,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    from bernstein.core.security.agent_card_signer import canonicalize_jcs
+
+    preimage_obj = {
+        "prev_hash": prev_hash,
+        "event_type": event_type,
+        "payload_hash": payload_hash,
+        "index": index,
+    }
+    if hash_profile == HASH_PROFILE_JCS_V2:
+        preimage = canonicalize_jcs(preimage_obj)
+    else:
+        preimage = json.dumps(
+            preimage_obj,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     return hashlib.sha256(preimage).hexdigest()
 
 
@@ -352,8 +400,18 @@ class EventJournal:
         sdd_dir: Path to the ``.sdd`` directory.
     """
 
-    def __init__(self, run_id: str, sdd_dir: Path) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        sdd_dir: Path,
+        *,
+        hash_profile: str = HASH_PROFILE_LEGACY,
+    ) -> None:
+        if hash_profile not in (HASH_PROFILE_LEGACY, HASH_PROFILE_JCS_V2):
+            raise ValueError(f"unknown hash_profile {hash_profile!r}")
+
         self._run_id = run_id
+        self._hash_profile = hash_profile
         self._runs_root = sdd_dir / "runs"
         # Path-injection barrier (py/path-injection). A run_id names one journal
         # directory and must be a single safe path segment. The writer shares
@@ -410,7 +468,14 @@ class EventJournal:
         Raises:
             ValueError: The existing chain fails verification.
         """
-        journal = cls(run_id, sdd_dir)
+        # Detect hash_profile from the first event, if present
+        loaded = load_events(run_journal_path(sdd_dir, run_id))
+        hash_profile = HASH_PROFILE_LEGACY
+        if loaded.events:
+            first_event = loaded.events[0]
+            if "hash_profile" in first_event:
+                hash_profile = str(first_event["hash_profile"])
+        journal = cls(run_id, sdd_dir, hash_profile=hash_profile)
         loaded = load_events(journal.path)
         events = loaded.events
         if loaded.discarded_line_indices:
@@ -513,12 +578,20 @@ class EventJournal:
                     prior = 0
             index = self._index
             prev_hash = self._head
-            p_hash = _payload_hash(event, data)
+            # The row carries ``hash_profile`` for non-legacy profiles, and the
+            # verifier hashes every non-envelope row key. Hash the same
+            # projection here so the profile is covered by the chain and the
+            # write and verify payloads are identical.
+            hashed_payload: dict[str, Any] = data
+            if self._hash_profile != HASH_PROFILE_LEGACY:
+                hashed_payload = {"hash_profile": self._hash_profile, **data}
+            p_hash = _payload_hash(event, hashed_payload, self._hash_profile)
             e_hash = compute_event_hash(
                 prev_hash=prev_hash,
                 event_type=event,
                 payload_hash=p_hash,
                 index=index,
+                hash_profile=self._hash_profile,
             )
             entry: dict[str, Any] = {
                 "ts": time.time(),
@@ -529,6 +602,8 @@ class EventJournal:
                 "payload_hash": p_hash,
                 "event_hash": e_hash,
             }
+            if self._hash_profile != HASH_PROFILE_LEGACY:
+                entry["hash_profile"] = self._hash_profile
             entry.update(data)
             line = json.dumps(entry, default=str)
             try:
@@ -737,6 +812,17 @@ class EventJournal:
         Retention is applied over past *runs*, never mid-run, so the
         active chain stays intact for ``verify``. Non-positive or unset
         retention keeps everything.
+
+        ``run_id`` is caller-supplied (an operator-pinned ``BERNSTEIN_RUN_ID``,
+        or a resumed older run - see ``orchestrator.py``/``multi_cell.py``)
+        and is not guaranteed to sort after every existing run directory. The
+        deletion count is therefore computed first (``len(run_dirs) -
+        retention``) and then satisfied by walking every directory oldest
+        first, skipping the active one wherever it falls: taking only the
+        first ``excess`` names and separately skipping the active run left
+        the deletion count short whenever the active run landed inside that
+        slice, so more than ``retention`` directories could survive (issue
+        #5881).
         """
         retention = _retention_limit()
         if retention <= 0 or not self._runs_root.exists():
@@ -745,12 +831,18 @@ class EventJournal:
             (d for d in self._runs_root.iterdir() if d.is_dir()),
             key=lambda d: d.name,
         )
-        excess = len(run_dirs) - retention
-        for stale in run_dirs[:excess]:
+        to_delete = len(run_dirs) - retention
+        if to_delete <= 0:
+            return
+        deleted = 0
+        for stale in run_dirs:
+            if deleted >= to_delete:
+                break
             if stale.name == self._run_id:
                 continue
             with contextlib.suppress(OSError):
                 _remove_tree(stale)
+            deleted += 1
 
 
 def _retention_limit() -> int:
@@ -1126,16 +1218,33 @@ def verify_events(events: list[dict[str, Any]]) -> JournalVerifyResult:
             unauthenticated_fields=tuple(sorted(_NON_DETERMINISTIC_FIELDS)),
         )
 
+    # Detect hash_profile from the first event
+    hash_profile = HASH_PROFILE_LEGACY
+    if events:
+        first_event = events[0]
+        if "hash_profile" in first_event:
+            hash_profile = str(first_event["hash_profile"])
+            if hash_profile not in (HASH_PROFILE_LEGACY, HASH_PROFILE_JCS_V2):
+                return JournalVerifyResult(
+                    chain_consistent=False,
+                    coverage=JournalCoverageStatus.COMPLETE,
+                    identity=JournalIdentityStatus.UNVERIFIABLE,
+                    count=len(events),
+                    errors=[f"unknown hash_profile {hash_profile!r}"],
+                    unauthenticated_fields=tuple(sorted(_NON_DETERMINISTIC_FIELDS)),
+                )
+
     prev_hash = _GENESIS_HASH
     for i, row in enumerate(events):
         event_type = str(row.get("event", ""))
         payload = {k: v for k, v in row.items() if k not in _NON_DETERMINISTIC_FIELDS}
-        expected_payload_hash = _payload_hash(event_type, payload)
+        expected_payload_hash = _payload_hash(event_type, payload, hash_profile)
         expected_hash = compute_event_hash(
             prev_hash=prev_hash,
             event_type=event_type,
             payload_hash=expected_payload_hash,
             index=i,
+            hash_profile=hash_profile,
         )
         stored_hash = str(row.get("event_hash", ""))
         stored_prev = str(row.get("prev_hash", ""))
@@ -1209,6 +1318,50 @@ def record_dispatch_knob_selection(
         resolved=resolved,
         reason=reason,
     )
+
+
+def read_sealed_journal_head(*, run_id: str, sdd_dir: Path | str) -> str | None:
+    """Look up the run's journal-head seal from the lineage spine, if any.
+
+    The read counterpart of :func:`seal_journal_into_spine`: a finalized run
+    carries its head in a spine entry's ``step_id``, and this recovers it.
+
+    Returns ``None`` - "no seal to check against", never an error - when the
+    run has no spine, when the spine's HMAC chain does not verify (so nothing
+    it carries can be trusted), or when the audit key needed to check that
+    chain is not configured. Callers distinguish that from a seal that
+    disagrees with the artifacts on disk, which is a loud mismatch.
+
+    Args:
+        run_id: The run whose seal to read.
+        sdd_dir: The ``.sdd`` directory holding ``lineage/<run_id>/``.
+
+    Returns:
+        The sealed head hash, or ``None`` when there is no trustworthy seal.
+    """
+    from pathlib import Path as _Path
+
+    from bernstein.core.lineage.spine import JOURNAL_SEAL_STEP_PREFIX, LineageSpine, SpineStatus
+    from bernstein.core.security.audit import AuditKeyMissingError, load_audit_key
+
+    lineage_root = _Path(sdd_dir) / "lineage"
+    spine_path = lineage_root / run_id / "spine.jsonl"
+    if not spine_path.exists():
+        return None
+    try:
+        hmac_key = load_audit_key()
+    except AuditKeyMissingError:
+        return None
+
+    spine = LineageSpine(lineage_root, run_id=run_id, hmac_key=hmac_key)
+    if spine.verify().status is SpineStatus.TAMPERED:
+        return None
+
+    head = ""
+    for entry in spine.iter_entries():
+        if entry.step_id.startswith(JOURNAL_SEAL_STEP_PREFIX):
+            head = entry.step_id.removeprefix(JOURNAL_SEAL_STEP_PREFIX)
+    return head or None
 
 
 def seal_journal_into_spine(
@@ -1286,17 +1439,25 @@ def rebuild_state(path: Path, *, from_step: int) -> dict[str, Any]:
     upper = max(0, min(from_step, len(events)))
     prefix = events[:upper]
 
+    # Detect hash_profile from the first event
+    hash_profile = HASH_PROFILE_LEGACY
+    if events:
+        first_event = events[0]
+        if "hash_profile" in first_event:
+            hash_profile = str(first_event["hash_profile"])
+
     prev_hash = _GENESIS_HASH
     events_seen: list[str] = []
     for i, row in enumerate(prefix):
         event_type = str(row.get("event", ""))
         payload = {k: v for k, v in row.items() if k not in _NON_DETERMINISTIC_FIELDS}
-        p_hash = _payload_hash(event_type, payload)
+        p_hash = _payload_hash(event_type, payload, hash_profile)
         prev_hash = compute_event_hash(
             prev_hash=prev_hash,
             event_type=event_type,
             payload_hash=p_hash,
             index=i,
+            hash_profile=hash_profile,
         )
         events_seen.append(event_type)
 
@@ -1322,6 +1483,7 @@ __all__ = [
     "compute_event_hash",
     "contained_run_journal",
     "load_events",
+    "read_sealed_journal_head",
     "rebuild_state",
     "record_dispatch_knob_selection",
     "seal_journal_into_spine",

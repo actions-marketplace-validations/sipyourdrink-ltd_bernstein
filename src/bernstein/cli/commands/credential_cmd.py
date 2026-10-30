@@ -4,7 +4,7 @@ Two subcommands project the lineage spine into a signed C2PA manifest
 and verify it back against the artifact and the install identity:
 
 * ``bernstein credential emit <artifact>`` -- project the artifact's
-  lineage-spine subtree into a C2PA 2.2 manifest, sign it with the
+  lineage-spine subtree into a C2PA 2.4 manifest, sign it with the
   install-identity Ed25519 key, and write it next to the artifact as
   ``<artifact>.c2pa.json``.
 * ``bernstein credential verify <artifact>`` -- re-read the manifest and
@@ -37,6 +37,7 @@ from bernstein.core.lineage.c2pa import (
     verify_manifest,
 )
 from bernstein.core.lineage.spine import LineageSpine
+from bernstein.core.security.audit import load_or_create_audit_key
 from bernstein.core.security.install_key import (
     InstallKeyError,
     load_or_create_install_key,
@@ -233,13 +234,7 @@ def _read_artifact(root: Path, artifact_path: str) -> bytes:
 
 def _load_spine(root: Path, run_id: str) -> LineageSpine:
     lineage_root = root / ".sdd" / "lineage"
-    return LineageSpine(lineage_root, run_id=run_id, hmac_key=_load_hmac_key())
-
-
-def _load_hmac_key() -> bytes:
-    from bernstein.core.security.audit import load_or_create_audit_key
-
-    return load_or_create_audit_key()
+    return LineageSpine(lineage_root, run_id=run_id, hmac_key=load_or_create_audit_key())
 
 
 def _signing_key_path(root: Path) -> Path:

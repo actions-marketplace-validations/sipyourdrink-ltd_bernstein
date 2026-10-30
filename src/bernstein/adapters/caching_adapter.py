@@ -237,6 +237,17 @@ class CachingAdapter(CLIAdapter):
         """Return inner adapter's name."""
         return self._inner.name()
 
+    @property
+    def model_vendor(self) -> str:
+        """Forward the wrapped adapter's declared model vendor, if any.
+
+        ``CLIAdapter`` declares ``model_vendor`` as a class attribute, so
+        normal lookup finds the base default ("") and :meth:`__getattr__`
+        never fires. A caching-wrapped spawn would otherwise lose the
+        vendor declaration and journal no ``model_provider``.
+        """
+        return getattr(self._inner, "model_vendor", "") or ""
+
     def plugin_info(self) -> AdapterPluginInfo:
         """Delegate plugin metadata to the wrapped adapter.
 
@@ -258,10 +269,10 @@ class CachingAdapter(CLIAdapter):
             return False
         return self._inner.is_alive(pid)
 
-    def kill(self, pid: int) -> ProcessReapReceipt | None:
-        """Delegate to inner adapter (no receipt for cached PID 0)."""
+    def kill(self, pid: int) -> ProcessReapReceipt:
+        """Delegate to the inner adapter or record a cached no-op reap."""
         if pid == 0:
-            return None
+            return super().kill(pid)
         return self._inner.kill(pid)
 
     def detect_tier(self) -> Any:

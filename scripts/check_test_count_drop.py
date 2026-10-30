@@ -11,7 +11,10 @@ keeps the collected count stable and stays green without an override.
 
 Base and head are collected under the **same** isolated temp environment
 (``git show`` bytes into sibling files, one pytest invocation style) so the
-delta measures the diff, not the ambient tree.
+delta measures the diff, not the ambient tree. ``PYTHONPATH`` is pointed at
+the real repo checkout so a module that imports a sibling ``tests/`` helper
+by its repo-relative dotted path still resolves; the tempdir itself stays a
+single-file island so ambient conftest / fixture drift cannot leak in.
 
 Outcome words (never collapse these)::
 
@@ -22,13 +25,30 @@ Outcome words (never collapse these)::
 A module that fails to import collects zero; the message names
 ``import_error`` so it is not read as a silent false-positive count drop.
 
-Override (PR body, reviewable)::
+Override (reviewable)::
 
     test-count-drop: tests/unit/foo/test_bar.py -3
 
 Allow that path's collected count to fall by **at most** 3. Overrides that
 name a module with no drop are stale and fail the check. There is no
 path-less global budget.
+
+The guard reads overrides from the PR body (``--pr-body`` / ``PR_BODY``) and
+from the commit messages of the compared range. Which text reaches the
+``merge_group`` build (which has no ``pull_request`` payload, so no
+``PR_BODY``) depends on how the merge queue lands entries:
+
+* squash, as this repository does (commit title = PR title, message = PR
+  body): the queue build compares one squash commit whose message *is* the
+  PR body. **Put the override in the PR body.** A trailer in a branch commit
+  message is discarded by the squash and never reaches the queue build.
+* merge commit: branch commits survive into the queue build, so a trailer
+  in a commit message is read there too.
+
+To keep both lanes in agreement, the ``pull_request`` lane runs with
+``--no-commit-messages`` and reads only the PR body, the same text the
+squash queue will read. It does not re-run on a body edit; push or re-run
+the job after adding the override.
 
 A deleted test module whose matching subject under ``src/`` was also deleted
 in the same diff is carved out.
@@ -40,6 +60,7 @@ Usage::
 
     python scripts/check_test_count_drop.py --base origin/main
     python scripts/check_test_count_drop.py --base "$BASE" --pr-body "$PR_BODY"
+    python scripts/check_test_count_drop.py --base "$BASE" --pr-body "$PR_BODY" --no-commit-messages
 """
 
 from __future__ import annotations
@@ -151,6 +172,20 @@ def changed_paths(repo: Path, base: str, head: str = "HEAD") -> tuple[set[str], 
     return modified, deleted, added
 
 
+def commit_message_text(repo: Path, base: str, head: str = "HEAD") -> str:
+    """Return the concatenated commit messages of ``base..head``.
+
+    The ``merge_group`` build's only override channel: it has no
+    ``pull_request`` payload, so ``PR_BODY`` is empty there. Under a squash
+    queue this range is one commit whose message is the PR title plus body;
+    under a merge-commit queue it holds the branch commits themselves.
+    """
+    try:
+        return _git(repo, "log", "--format=%B", f"{base}..{head}")
+    except subprocess.CalledProcessError:
+        return ""
+
+
 def subject_stem(test_path: str) -> str | None:
     """Return the production-module stem implied by a test path, if any."""
     match = _TEST_NAME_RE.match(Path(test_path).stem)
@@ -198,8 +233,19 @@ def _parse_collect_output(result: subprocess.CompletedProcess[str]) -> CollectRe
     return CollectResult(status="ok", count=len(lines))
 
 
-def pytest_collect_file(path: Path, *, python: str, cwd: Path) -> CollectResult:
-    """Run collect-only on *path* with cwd=*cwd* (shared isolation root)."""
+def pytest_collect_file(path: Path, *, python: str, cwd: Path, import_root: Path) -> CollectResult:
+    """Run collect-only on *path* with cwd=*cwd* (shared isolation root).
+
+    ``import_root`` (the real repo checkout) goes on ``PYTHONPATH`` so a module
+    that imports a sibling test helper by its repo-relative dotted path (e.g.
+    ``from tests.unit._adapter_test_helpers import ...``, ~20 files do this
+    today) still resolves. The isolation tempdir holds only this one
+    materialised file with no ``tests`` package around it, so without this the
+    import fails and a stable module reads as every case having disappeared.
+    """
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(import_root), existing]))
     result = subprocess.run(
         [
             python,
@@ -212,6 +258,7 @@ def pytest_collect_file(path: Path, *, python: str, cwd: Path) -> CollectResult:
             "--no-cov",
         ],
         cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
@@ -255,12 +302,12 @@ def collect_pair(
             base_result = CollectResult(status="missing")
         else:
             base_path.write_bytes(base_bytes)
-            base_result = pytest_collect_file(base_path, python=python, cwd=root)
+            base_result = pytest_collect_file(base_path, python=python, cwd=root, import_root=repo)
         if head_bytes is None:
             head_result = CollectResult(status="missing")
         else:
             head_path.write_bytes(head_bytes)
-            head_result = pytest_collect_file(head_path, python=python, cwd=root)
+            head_result = pytest_collect_file(head_path, python=python, cwd=root, import_root=repo)
         return base_result, head_result
 
 
@@ -270,15 +317,22 @@ def build_report(
     base: str | None,
     head: str = "HEAD",
     pr_body: str = "",
+    read_commit_messages: bool = True,
     python: str = sys.executable,
 ) -> DropReport:
-    """Compare collected counts for test modules touched between *base* and *head*."""
+    """Compare collected counts for test modules touched between *base* and *head*.
+
+    ``read_commit_messages=False`` is the ``pull_request`` lane of a squash
+    queue: branch commit messages do not survive the squash, so only the PR
+    body counts, matching what the ``merge_group`` build will read.
+    """
     report = DropReport()
     if not base:
         report.not_run = "no merge base (--base); guard did not compare"
         return report
 
-    overrides = parse_overrides(pr_body)
+    commits = commit_message_text(repo, base, head) if read_commit_messages else ""
+    overrides = parse_overrides(f"{pr_body}\n{commits}")
     modified, deleted, added = changed_paths(repo, base, head)
     touched = {p for p in (modified | deleted | added) if is_test_module(p)}
     report.checked = len(touched)
@@ -343,8 +397,12 @@ def format_report(report: DropReport) -> str:
                 lines.append(f"  {rel}: {base_n} -> {head_n} (drop {base_n - head_n}; cause=count_drop)")
         lines.append(
             "Restore the cases, consolidate via parametrize (collected count must stay "
-            "stable), carve out a deleted subject, or add a PR-body override: "
-            "`test-count-drop: <path> -<N>`."
+            "stable), carve out a deleted subject, or declare an override: "
+            "`test-count-drop: <path> -<N>`. Put it in the PR body: the merge queue "
+            "squashes, and the squash commit message (PR title + body) is the only text "
+            "the merge-queue build reads. A trailer in a branch commit message is dropped "
+            "by the squash; it counts only under a merge-commit queue. After editing the "
+            "body, push or re-run this job."
         )
     if report.stale_overrides:
         lines.append("FAIL: stale test-count-drop overrides (no drop for that path):")
@@ -372,11 +430,24 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("PR_BODY", ""),
         help="PR body text (or set PR_BODY); used for test-count-drop overrides",
     )
+    parser.add_argument(
+        "--commit-messages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also read overrides from base..head commit messages (default). The pull_request "
+        "lane of a squash queue passes --no-commit-messages: branch messages do not survive the squash",
+    )
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help="Repository root")
     args = parser.parse_args(argv)
 
     base = args.base.strip() or None
-    report = build_report(args.root, base=base, head=args.head, pr_body=args.pr_body)
+    report = build_report(
+        args.root,
+        base=base,
+        head=args.head,
+        pr_body=args.pr_body,
+        read_commit_messages=args.commit_messages,
+    )
     print(format_report(report))
     if report.not_run is not None:
         return 0

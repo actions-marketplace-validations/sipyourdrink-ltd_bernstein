@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, Literal
@@ -183,6 +183,19 @@ class QualityGatesConfig:
         comment_quality_docstyle: Expected docstring style for the comment-quality
             gate. One of ``"google"``, ``"numpy"``, ``"rest"``, or ``"auto"``
             (auto-detect per docstring).
+        behavior_probe: Execute the callables the diff changed against boundary
+            inputs derived from their own signatures. Crash-level only: it
+            reports undocumented exceptions, return values contradicting the
+            return annotation, and calls that do not return inside the budget.
+            It never asserts what a callable should have computed. Off by
+            default - it starts one interpreter per probe.
+        behavior_probe_python_command: Command that starts the interpreter a
+            probe runs in. Empty means the interpreter running the gate.
+        behavior_probe_per_callable_timeout_s: Wall-clock budget for one probe.
+        behavior_probe_gate_timeout_s: Wall-clock budget for the whole gate.
+        behavior_probe_max_callables: Cap on probed callables per run; the rest
+            are recorded ``cap-exceeded`` in the receipt.
+        behavior_probe_max_probes_per_callable: Cap on probes per callable.
     """
 
     enabled: bool = True
@@ -272,6 +285,21 @@ class QualityGatesConfig:
     agent_test_mutation: bool = False
     agent_test_mutation_threshold: float = 0.70
     agent_test_mutation_timeout_s: int = 300
+    behavior_probe: bool = False
+    behavior_probe_python_command: str = ""
+    behavior_probe_per_callable_timeout_s: int = 15
+    behavior_probe_gate_timeout_s: int = 300
+    behavior_probe_max_callables: int = 12
+    behavior_probe_max_probes_per_callable: int = 6
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return this configuration as a plain JSON-able dict.
+
+        Nested dataclasses (``pipeline`` steps, ``intent_verification``,
+        ``benchmark``) are converted recursively by :func:`dataclasses.asdict`
+        so the result survives ``json.dumps``.
+        """
+        return asdict(self)
 
 
 @dataclass
@@ -864,8 +892,8 @@ def _run_pii_gate(
             files are scanned.
 
     Returns:
-        QualityGateCheckResult with ``blocked=True`` if any high-severity
-        finding is detected.
+        QualityGateCheckResult with ``blocked=True`` if any finding has
+        ``block_merge`` set: a high-severity secret, or regulated PII.
     """
     from bernstein.core.pii_output_gate import format_findings, scan_text
 
@@ -897,7 +925,9 @@ def _run_pii_gate(
             detail="No secrets or PII detected in agent output.",
         )
 
-    has_high = any(f.severity == "high" for _, f in all_findings)
+    # The finding says whether it blocks. Asking the severity string instead let
+    # an SSN or a card number through while a private key blocked (#6191).
+    blocks = any(f.block_merge for _, f in all_findings)
     finding_objs = [f for _, f in all_findings]
     detail = format_findings(finding_objs)
 
@@ -908,8 +938,8 @@ def _run_pii_gate(
 
     return QualityGateCheckResult(
         gate="pii_scan",
-        passed=not has_high,
-        blocked=has_high,
+        passed=not blocks,
+        blocked=blocks,
         detail=detail,
     )
 

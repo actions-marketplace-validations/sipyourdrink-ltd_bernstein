@@ -13,12 +13,21 @@ import json
 import logging
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    create_model,
+    field_validator,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +220,63 @@ class LocalEndpointProfileSchema(BaseModel):
     timeout: float = Field(default=120.0, gt=0)
 
 
+class AdmissionRuleSchema(BaseModel):
+    """One ordered rule of the ``admission`` block (issue #4907).
+
+    Every axis is a list of shell globs; an axis left unset does not
+    constrain the rule. Deny rules are evaluated before allow rules, and
+    a spawn matching no allow rule is refused, so the block is fail
+    closed by construction.
+
+    The authoritative parser is
+    :meth:`bernstein.core.security.executor_admission.AdmissionPolicy.from_mapping`;
+    this schema mirrors it so ``bernstein.yaml`` validates the same way
+    through ``load_and_validate`` as it parses through ``parse_seed``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, description="Rule identifier, unique within the block.")
+    effect: Literal["allow", "deny"]
+    roles: list[str] | None = None
+    adapters: list[str] | None = None
+    models: list[str] | None = None
+    endpoints: list[str] | None = None
+    sandboxes: list[str] | None = None
+    task_types: list[str] | None = None
+
+
+class AdmissionSchema(BaseModel):
+    """The ``admission`` block: which executors this repository may use.
+
+    ``mode`` mirrors the capability matrix's enforcement vocabulary:
+    ``enforce`` refuses a spawn the policy does not admit, ``warn``
+    admits it but records the refusing rule, ``off`` records the
+    evaluation only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["enforce", "warn", "off"] = "enforce"
+    rules: list[AdmissionRuleSchema] = Field(default_factory=list)
+
+
+class EscalationLadderStep(BaseModel):
+    """One step of ``role_model_policy.<role>.ladder`` (issue #4855).
+
+    ``model`` is adapter-neutral: it is stored and later passed through to
+    the selected adapter unmodified. ``adapter`` is optional; when set it
+    must name an installed selectable adapter at config-read time (hard
+    failure — unrunnable steps are never skipped).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    adapter: str | None = None
+    max_attempts: int = Field(default=1, ge=1)
+
+
 class RoleModelPolicyEntry(BaseModel):
     """Per-role model/provider policy.
 
@@ -235,6 +301,11 @@ class RoleModelPolicyEntry(BaseModel):
     setting these fields for a role pinned to an adapter that does not
     declare sampling support raises ``SamplingParamsRefusal`` rather than
     silently dropping the override.
+
+    ``ladder`` (issue #4855) is an ordered escalation ladder. When unset,
+    behaviour is byte-identical to prior releases. ``fallback_model`` is
+    deprecated sugar for a two-step ladder ``[model, fallback_model]`` and
+    is mutually exclusive with an explicit ``ladder``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -270,6 +341,23 @@ class RoleModelPolicyEntry(BaseModel):
     # instead of a single model; ``model``/``base_url``/``api_key_env`` above
     # are then ignored in favor of the council's own per-candidate endpoints.
     council: CouncilConfig | None = None
+    # Ordered escalation ladder (issue #4855). Unset preserves the cascade
+    # one-hop on compaction retries. When set, the retry patch reads
+    # decide_ladder_advance and does not stamp a model without evidence.
+    ladder: list[EscalationLadderStep] | None = None
+    # Deprecated sugar for a two-step ladder; mutually exclusive with
+    # ``ladder``. Prefer an explicit ``ladder`` in new configs.
+    fallback_model: str | None = Field(
+        default=None,
+        description=(
+            "Deprecated: sugar for a two-step escalation ladder [model, fallback_model]. "
+            "Prefer role_model_policy.<role>.ladder. Mutually exclusive with ladder."
+        ),
+    )
+    # Per-task escalation spend cap consulted before a hop. ``None`` means
+    # no ladder budget guard (generous default until an operator opts in).
+    escalation_budget_usd: float | None = Field(default=None, ge=0)
+
     # Opt-in map of task-tier → model id (#4854). When unset, dispatch is
     # byte-identical to a single ``model`` pin. Keys must be members of the
     # closed tier set (``light``|``standard``|``heavy``|``critical``); the
@@ -294,6 +382,22 @@ class RoleModelPolicyEntry(BaseModel):
                 raise ValueError(f"tier_models[{tier!r}] must be a non-empty model id")
             cleaned[tier] = model.strip()
         return cleaned
+
+    @model_validator(mode="after")
+    def _validate_escalation_ladder_fields(self) -> RoleModelPolicyEntry:
+        if self.ladder is not None and self.fallback_model is not None:
+            raise ValueError(
+                "ladder and fallback_model are mutually exclusive; "
+                "fallback_model is deprecated sugar for a two-step ladder"
+            )
+        if self.ladder is not None and len(self.ladder) == 0:
+            raise ValueError("ladder must be non-empty when set")
+        if self.fallback_model is not None:
+            if not self.fallback_model.strip():
+                raise ValueError("fallback_model must be a non-empty string when set")
+            if self.model is None or not self.model.strip():
+                raise ValueError("fallback_model requires model to be set (two-step sugar)")
+        return self
 
 
 class RoleConfigEntry(BaseModel):
@@ -807,6 +911,27 @@ class ArchConformanceSchema(BaseModel):
     )
 
 
+#: Effort levels the routing layer and adapters understand (``max`` > ``high``
+#: > ``medium``/``normal`` > ``low``); mirrors the claude adapter's effort map.
+EffortLevel = Literal["max", "high", "medium", "normal", "low"]
+
+
+def _validate_cli_selection(value: str) -> str:
+    """Accept any selectable adapter registry name or the ``auto`` sentinel.
+
+    Delegates to :func:`bernstein.core.config.seed_parser.valid_cli_selections`
+    (the live adapter registry) so the schema, the seed parser and ``--cli``
+    share one source of truth. Imported lazily to keep this module free of an
+    import cycle with the seed parser and the adapters package.
+    """
+    from bernstein.core.config.seed_parser import valid_cli_selections
+
+    valid = valid_cli_selections()
+    if value not in valid:
+        raise ValueError(f"cli must be one of {sorted(valid)}, got: {value!r}")
+    return value
+
+
 class BernsteinConfig(BaseModel):
     """Top-level Pydantic model for bernstein.yaml.
 
@@ -826,14 +951,22 @@ class BernsteinConfig(BaseModel):
     goal: str = Field(..., min_length=1, description="High-level project objective.")
 
     # --- Core settings ---
-    cli: Literal["claude", "codex", "gemini", "qwen", "auto"] = Field(
+    cli: Annotated[str, AfterValidator(_validate_cli_selection)] = Field(
         default="auto",
-        description="CLI agent backend.",
+        description="CLI agent backend: a selectable adapter registry name or 'auto'.",
     )
     max_agents: int = Field(default=6, ge=1, description="Maximum concurrent agents.")
+    effort: EffortLevel | None = Field(
+        default=None,
+        description="Default effort level for reasoning models.",
+    )
     model: str | None = Field(default=None, description="Model override.")
     team: Literal["auto"] | list[str] = Field(default="auto", description="Role team selection.")
     budget: str | int | float | None = Field(default=None, description='Spending cap ("$20", 20, or 20.0).')
+    data_class: Literal["restricted", "internal", "confidential", "public"] | None = Field(
+        default=None,
+        description="Operator-declared data sensitivity for trust records. Defaults to confidential when undeclared.",
+    )
 
     # --- Behavioral flags ---
     evolution_enabled: bool = Field(default=True, description="Enable self-evolution loop.")
@@ -882,6 +1015,13 @@ class BernsteinConfig(BaseModel):
         description=(
             "Named OpenAI-compatible endpoint profiles for local runtimes. "
             "Referenced from role_model_policy.<role>.endpoint."
+        ),
+    )
+    admission: AdmissionSchema | None = Field(
+        default=None,
+        description=(
+            "Declarative allow/deny policy over the adapters, models, endpoints "
+            "and sandbox tiers this repository may spawn on."
         ),
     )
     role_model_policy: dict[str, RoleModelPolicyEntry] | None = None
@@ -1000,10 +1140,41 @@ class BernsteinConfig(BaseModel):
         # base_url/model/api_key_env so downstream consumers see one shape.
         self._resolve_local_endpoint_references(errors)
 
+        # Escalation ladder adapters (issue #4855): a step naming an
+        # adapter that is not installed hard-fails at config read.
+        self._validate_escalation_ladder_adapters(errors)
+
         if errors:
             raise ValueError("Configuration has conflicting settings:\n" + "\n".join(f"  - {e}" for e in errors))
 
         return self
+
+    def _validate_escalation_ladder_adapters(self, errors: list[str]) -> None:
+        """Hard-fail ladder steps that name a missing selectable adapter."""
+        if not self.role_model_policy:
+            return
+        from bernstein.adapters.registry import selectable_adapter_names
+        from bernstein.core.routing.escalation_ladder import LadderStep, validate_ladder_adapters
+
+        known = selectable_adapter_names()
+        for role, entry in self.role_model_policy.items():
+            steps: list[LadderStep] = []
+            if entry.ladder:
+                steps = [
+                    LadderStep(model=step.model, adapter=step.adapter, max_attempts=step.max_attempts)
+                    for step in entry.ladder
+                ]
+            elif entry.fallback_model and entry.model:
+                steps = [
+                    LadderStep(model=entry.model, max_attempts=1),
+                    LadderStep(model=entry.fallback_model, max_attempts=1),
+                ]
+            if not steps:
+                continue
+            try:
+                validate_ladder_adapters(steps, role=role, known_adapters=known)
+            except ValueError as exc:
+                errors.append(str(exc))
 
     def _resolve_local_endpoint_references(self, errors: list[str]) -> None:
         """Materialize ``endpoint`` profile references onto role entries.
@@ -1320,3 +1491,111 @@ def export_json_schema(*, indent: int = 2) -> str:
         JSON string of the schema.
     """
     return json.dumps(BernsteinConfig.json_schema(), indent=indent)
+
+
+# ---------------------------------------------------------------------------
+# Section schemas & pre-merge partial layer validation (issue #5110)
+# ---------------------------------------------------------------------------
+
+SECTION_SCHEMAS: dict[str, type[BaseModel]] = {
+    "notify": NotifyConfigSchema,
+    "quality_gates": QualityGatesSchema,
+    "admission": AdmissionSchema,
+    "model_policy": ModelPolicySchema,
+    "worktree_setup": WorktreeSetupSchema,
+    "storage": StorageSchema,
+    "sovereign": SovereignProfileSchema,
+    "session": SessionSchema,
+    "github": GithubSchema,
+    "orchestration": OrchestrationSchema,
+    "cluster": ClusterSchema,
+    "remote": RemoteSchema,
+    "agency": AgencySchema,
+    "formal_verification": FormalVerificationSchema,
+    "batch": BatchSchema,
+    "cost_policy": CostPolicySchema,
+    "test_agent": TestAgentSchema,
+    "smtp": SmtpSchema,
+    "model_fallback": ModelFallbackSchema,
+    "provider_availability": ProviderAvailabilitySchema,
+    "arch_conformance": ArchConformanceSchema,
+}
+
+
+class LayerValidationError(ValueError):
+    """Raised when a configuration layer fails schema validation before merge (#5110)."""
+
+    def __init__(self, layer_name: str, path: str | None, errors: list[str]) -> None:
+        self.layer_name = layer_name
+        self.path = path
+        self.errors = errors
+        source = path or layer_name
+        super().__init__(
+            f"Config layer '{layer_name}' (source: {source}) failed validation with {len(errors)} error(s):\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+
+
+_FIELD_VALIDATOR_MODELS: dict[str, type[BaseModel]] = {}
+
+
+def _get_field_validator_model(key: str) -> type[BaseModel]:
+    """Return a single-field Pydantic model for validating *key* with its Field constraints."""
+    if key not in _FIELD_VALIDATOR_MODELS:
+        field_info = BernsteinConfig.model_fields[key]
+        field_def: Any = (field_info.annotation, field_info)
+        _FIELD_VALIDATOR_MODELS[key] = create_model(
+            f"FieldValidator_{key}",
+            **{key: field_def},
+        )
+    return _FIELD_VALIDATOR_MODELS[key]
+
+
+def validate_layer_partial(
+    data: Mapping[str, Any],
+    *,
+    layer_name: str,
+    path: str | Path | None = None,
+) -> None:
+    """Validate a partial configuration layer before it is merged into the effective config.
+
+    Validates any sections present against their dedicated Pydantic schemas,
+    and any recognized top-level fields against BernsteinConfig field types and constraints.
+
+    Args:
+        data: Partial dictionary from the configuration layer.
+        layer_name: Human-readable layer name (e.g. 'run-overlay', 'inline-override').
+        path: File path or source identifier if available.
+
+    Raises:
+        LayerValidationError: If any fields present in *data* fail schema validation.
+    """
+    errors: list[str] = []
+    str_path = str(path) if path is not None else None
+
+    for key, value in data.items():
+        if key in SECTION_SCHEMAS:
+            if isinstance(value, dict):
+                schema_cls = SECTION_SCHEMAS[key]
+                try:
+                    schema_cls.model_validate(value)
+                except ValidationError as exc:
+                    for issue in exc.errors():
+                        if issue["type"] == "missing":
+                            continue
+                        loc = ".".join(str(p) for p in issue["loc"])
+                        errors.append(f"{key}.{loc}: {issue['msg']}")
+            elif value is not None:
+                errors.append(f"{key}: expected a mapping/dictionary, got {type(value).__name__}")
+        elif key in BernsteinConfig.model_fields:
+            validator_model = _get_field_validator_model(key)
+            try:
+                validator_model.model_validate({key: value})
+            except ValidationError as exc:
+                for issue in exc.errors():
+                    loc = ".".join(str(p) for p in issue["loc"])
+                    field_desc = loc if loc else key
+                    errors.append(f"{field_desc}: {issue['msg']}")
+
+    if errors:
+        raise LayerValidationError(layer_name=layer_name, path=str_path, errors=errors)

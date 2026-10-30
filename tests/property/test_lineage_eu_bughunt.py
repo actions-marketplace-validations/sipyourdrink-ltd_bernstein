@@ -680,22 +680,51 @@ class TestKmsContractDrift:
     schedule it for a follow-up.
     """
 
-    @pytest.mark.xfail(
-        reason=(
-            "KMS-adapter contract drift: Ed25519FileKeySigner exposes "
-            "public_key_bytes() but auditors using JWK-based attestation "
-            "flows want public_key_jwk(). Tracked as a follow-up - see "
-            "the PR body for the proposed JWK shape."
-        ),
-        strict=True,
-    )
     def test_signer_exposes_public_key_jwk(self, tmp_path: Path) -> None:
+        """FIXED: the Phase-1 signer advertises its key the way adapters do.
+
+        This was an ``xfail(strict=True)``. Every ``KMSAdapter`` has
+        ``public_key_jwk()``; ``Ed25519FileKeySigner`` had only
+        ``public_key_bytes()``. Since ``signer_from_config`` returns either
+        one depending on which config shape the operator wrote, the same key
+        on the same disk exposed a different surface through ``key_path=``
+        than through ``kms_adapter='file'``.
+        """
         signer, _ = _make_signer(tmp_path)
-        # If/when public_key_jwk lands, it should return a dict with kty/crv/x.
-        jwk = signer.public_key_jwk()  # type: ignore[attr-defined]
+        jwk = signer.public_key_jwk()
         assert jwk["kty"] == "OKP"
         assert jwk["crv"] == "Ed25519"
         assert "x" in jwk
+
+    def test_the_jwk_encodes_the_same_key_the_raw_export_does(self, tmp_path: Path) -> None:
+        """Both exports must describe one key, or an auditor verifies nothing.
+
+        Asserted against ``public_key_bytes`` rather than against a
+        recomputed constant, so the two cannot pass by making the same
+        mistake.
+        """
+        import base64
+
+        signer, _ = _make_signer(tmp_path)
+        jwk = signer.public_key_jwk()
+
+        decoded = base64.urlsafe_b64decode(jwk["x"] + "=" * (-len(jwk["x"]) % 4))
+        assert decoded == signer.public_key_bytes()
+
+    def test_the_file_signer_and_the_file_adapter_agree_on_the_jwk(self, tmp_path: Path) -> None:
+        """The drift this closes, stated as the equality it was missing.
+
+        ``key_path=`` and ``kms_adapter='file'`` over the same key file must
+        advertise the same JWK apart from the ``kid`` label.
+        """
+        from bernstein.core.security.key_custody import FileBasedKMSAdapter
+
+        signer, _verifier = _make_signer(tmp_path)
+        adapter = FileBasedKMSAdapter(signer.key_path)
+
+        signer_jwk = {k: v for k, v in signer.public_key_jwk().items() if k != "kid"}
+        adapter_jwk = {k: v for k, v in adapter.public_key_jwk().items() if k != "kid"}
+        assert signer_jwk == adapter_jwk
 
     def test_signer_exposes_raw_public_bytes_today(self, tmp_path: Path) -> None:
         """Documented baseline: 32-byte raw public key is the only export today."""
@@ -729,23 +758,42 @@ class TestHsmStubMissing:
         with pytest.raises(LineageSignerError, match="key_kind"):
             signer_from_config(enabled=True, key_path="/tmp/doesnt-matter", key_kind="hsm")
 
-    @pytest.mark.xfail(
-        reason=(
-            "HSM stub gap: signer_from_config(key_kind='hsm') should hand back "
-            "a concrete stub raising NotImplementedError with an integration-ticket "
-            "pointer in the docstring, instead of a generic config error. "
-            "Tracked as a follow-up."
-        ),
-        strict=True,
-    )
     def test_hsm_stub_raises_not_implemented_with_docstring(self) -> None:
-        from bernstein.core.persistence.lineage_signer import HSMSigner  # type: ignore[attr-defined]
+        """FIXED: there is a named stub, and its docstring says where to go."""
+        from bernstein.core.persistence.lineage_signer import HSMSigner
 
         stub = HSMSigner()
-        # Docstring should point at the integration ticket.
         assert stub.__class__.__doc__ and "HSM" in stub.__class__.__doc__
         with pytest.raises(NotImplementedError):
             stub.sign(b"payload")
+
+    def test_the_hsm_key_kind_error_is_distinct_from_a_typo(self) -> None:
+        """ "Not implemented yet" and "not a thing" need different next steps.
+
+        Both used to produce the same generic "unsupported key_kind" message,
+        which is what the finding was actually about.
+        """
+        with pytest.raises(LineageSignerError, match="not implemented"):
+            signer_from_config(enabled=True, key_path="/tmp/doesnt-matter", key_kind="hsm")
+
+        with pytest.raises(LineageSignerError, match="unsupported") as typo:
+            signer_from_config(enabled=True, key_path="/tmp/doesnt-matter", key_kind="ed25519-ish")
+        assert "not implemented" not in str(typo.value)
+
+    def test_the_hsm_stub_is_not_mistaken_for_a_customer_integration(self) -> None:
+        """``HSMSigner`` must not be a subclass of ``HSMKMSAdapter``.
+
+        ``_resolve_hsm_subclass`` discovers a real integration through
+        ``HSMKMSAdapter.__subclasses__()``, which returns *direct* subclasses
+        only. If this stub were one, a customer who subclassed it - the
+        natural reading of its name - would be invisible to that lookup and
+        would silently fall back to the stub they were trying to replace.
+        """
+        from bernstein.core.persistence.lineage_signer import HSMSigner
+        from bernstein.core.security.key_custody import HSMKMSAdapter
+
+        assert not issubclass(HSMSigner, HSMKMSAdapter)
+        assert HSMSigner not in HSMKMSAdapter.__subclasses__()
 
 
 # ---------------------------------------------------------------------------
@@ -873,19 +921,67 @@ class TestMixedEndpointHandling:
         # destination. Asserting False here pins the right semantics.
         assert adapter._is_self_hosted_endpoint(url) is False, url
 
-    @pytest.mark.xfail(
-        reason=(
-            "Operational bug: Python 3.12+ urllib.parse.urlsplit raises "
-            "ValueError on a bracketed-IPv6 netloc with userinfo "
-            "(e.g. 'http://[::1]@evil.com:8000'). The residency guard "
-            "doesn't catch the parse error, so a malformed URL crashes "
-            "spawn instead of cleanly returning False. Fix: wrap urlparse "
-            "in try/except ValueError and fail closed. Tracked as a "
-            "follow-up."
-        ),
-        strict=True,
-    )
     def test_ipv6_userinfo_does_not_mask_real_host(self) -> None:
+        """A bracketed-IPv6 netloc with userinfo fails closed (FIXED).
+
+        This was an ``xfail(strict=True)``: ``urllib.parse.urlsplit``
+        raises ``ValueError`` on this shape, and the guard did not catch
+        it, so a malformed URL left ``spawn()`` with a traceback instead
+        of a residency verdict.
+        """
         url = "http://[::1]@evil.com:8000"
         adapter = OllamaAdapter()
         assert adapter._is_self_hosted_endpoint(url) is False, url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://[::1]@evil.com:8000",
+            "http://[::1",
+            "http://a]b",
+            "http://[",
+            "http://]",
+        ],
+    )
+    def test_an_unparseable_url_is_a_verdict_not_an_exception(self, url: str) -> None:
+        """Every URL urlsplit refuses lands on False, the fail-closed answer.
+
+        The guard runs inside ``spawn()`` under the residency profile. A
+        raise there reads as a crash rather than as the refusal it should
+        be, and hides which endpoint was rejected and why.
+        """
+        adapter = OllamaAdapter()
+        assert adapter._is_self_hosted_endpoint(url) is False, url
+
+    @pytest.mark.parametrize("url", ["http://[::1]:11434", "http://[fe80::1]", "http://[fc00::1]:8080"])
+    def test_a_well_formed_bracketed_ipv6_literal_still_resolves(self, url: str) -> None:
+        """Catching the parse error must not swallow the addresses that work."""
+        adapter = OllamaAdapter()
+        assert adapter._is_self_hosted_endpoint(url) is True, url
+
+
+def test_the_hsm_error_reaches_the_config_an_operator_actually_writes() -> None:
+    """``key_kind: hsm`` with no ``key_path`` is the whole point.
+
+    Choosing an HSM means *not* pointing at a private key file on disk, so
+    that operator sets no ``key_path``. With the guards ordered the other way
+    they were told "requires key_path" - the one instruction that sends them
+    to build the file key they were avoiding - and the HSM message only
+    reached someone who supplied both, a config nobody writes on purpose.
+    """
+    with pytest.raises(LineageSignerError, match="not implemented"):
+        signer_from_config(enabled=True, key_kind="hsm")
+
+
+def test_the_hsm_check_normalises_key_kind_the_same_way_the_typo_check_does() -> None:
+    """The two comparisons used to differ, so ``HSM`` took the typo branch."""
+    with pytest.raises(LineageSignerError, match="not implemented"):
+        signer_from_config(enabled=True, key_kind="HSM")
+    with pytest.raises(LineageSignerError, match="not implemented"):
+        signer_from_config(enabled=True, key_kind="  hsm  ")
+
+
+def test_a_missing_key_path_still_reports_itself_for_the_file_route() -> None:
+    """Reordering must not lose the guard it moved past."""
+    with pytest.raises(LineageSignerError, match="requires key_path"):
+        signer_from_config(enabled=True, key_kind="ed25519")

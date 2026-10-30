@@ -21,6 +21,7 @@ import yaml
 
 from bernstein.agents.catalog import CatalogRegistry
 from bernstein.core.compliance import ComplianceConfig, CompliancePreset
+from bernstein.core.config.config_schema import LayerValidationError
 from bernstein.core.config.run_overlay import (
     RunOverlayError,
     resolve_effective_mapping,
@@ -65,6 +66,8 @@ from bernstein.core.worktree import WorktreeSetupConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from bernstein.core.security.executor_admission import AdmissionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -795,7 +798,7 @@ def _parse_role_model_policy(
     raw: object,
     *,
     local_endpoints: dict[str, dict[str, str]] | None = None,
-) -> dict[str, dict[str, str | int | dict[str, object]]] | None:
+) -> dict[str, dict[str, _RolePolicyValue]] | None:
     """Parse optional role-specific provider/model overrides.
 
     ``local_endpoints`` is the parsed ``local_endpoints`` section (profile
@@ -808,7 +811,7 @@ def _parse_role_model_policy(
     if not isinstance(raw, dict):
         raise SeedError("role_model_policy must be a mapping of role -> settings")
 
-    parsed: dict[str, dict[str, str | int | dict[str, object]]] = {}
+    parsed: dict[str, dict[str, _RolePolicyValue]] = {}
     for role, settings in raw.items():
         if not isinstance(role, str) or not role:
             raise SeedError("role_model_policy keys must be non-empty role strings")
@@ -859,8 +862,20 @@ _ROLE_POLICY_COUNCIL_KEY = "council"
 # even though the schema path (``load_and_validate``) accepted the same file.
 _ROLE_POLICY_ENDPOINT_KEY = "endpoint"
 
+# Escalation ladder keys (issue #4855). Parsed separately from scalar string
+# keys: ``ladder`` is a list of step mappings; ``fallback_model`` is deprecated
+# sugar for a two-step ladder; ``escalation_budget_usd`` is an optional float.
+_ROLE_POLICY_LADDER_KEY = "ladder"
+_ROLE_POLICY_FALLBACK_MODEL_KEY = "fallback_model"
+_ROLE_POLICY_ESCALATION_BUDGET_KEY = "escalation_budget_usd"
+
 # Opt-in task-tier → model map (#4854). Nested mapping, validated separately.
 _ROLE_POLICY_TIER_MODELS_KEY = "tier_models"
+
+# One parsed ``role_model_policy.<role>`` setting. ``tier_models`` is spelled
+# out separately from ``dict[str, object]``: dict is invariant in its value
+# type, so the narrower parse result is not assignable to the wider member.
+_RolePolicyValue = str | int | float | list[dict[str, str | int]] | dict[str, str] | dict[str, object]
 
 # Endpoint fields that the ``endpoint`` profile reference pins; setting any of
 # them inline alongside ``endpoint`` is a conflict (the profile is the single
@@ -889,6 +904,51 @@ def _parse_tier_models(role: str, raw: object) -> dict[str, str]:
 
 
 _COUNCIL_CANDIDATE_KEYS: tuple[str, ...] = ("model", "base_url", "api_key_env")
+
+_LADDER_STEP_KEYS: frozenset[str] = frozenset({"model", "adapter", "max_attempts"})
+
+
+def _parse_ladder_step(role: str, index: int, raw: object) -> dict[str, str | int]:
+    """Parse one ``ladder[]`` step for ``role_model_policy.<role>``."""
+    if not isinstance(raw, dict):
+        raise SeedError(f"role_model_policy[{role!r}].ladder[{index}] must be a mapping")
+    model = raw.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise SeedError(f"role_model_policy[{role!r}].ladder[{index}].model must be a non-empty string")
+    parsed: dict[str, str | int] = {"model": model.strip()}
+
+    adapter = raw.get("adapter")
+    if adapter is not None:
+        if not isinstance(adapter, str) or not adapter.strip():
+            raise SeedError(f"role_model_policy[{role!r}].ladder[{index}].adapter must be a non-empty string when set")
+        from bernstein.adapters.registry import selectable_adapter_names
+
+        known = selectable_adapter_names()
+        if adapter.strip() not in known:
+            known_list = ", ".join(sorted(known)) or "(none)"
+            raise SeedError(
+                f"role_model_policy[{role!r}].ladder[{index}].adapter={adapter!r} is not an "
+                f"installed selectable adapter. Known: {known_list}. Unrunnable ladder steps "
+                "are a hard configuration failure (not skipped)."
+            )
+        parsed["adapter"] = adapter.strip()
+
+    max_attempts = raw.get("max_attempts", 1)
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+        raise SeedError(f"role_model_policy[{role!r}].ladder[{index}].max_attempts must be a positive integer")
+    parsed["max_attempts"] = max_attempts
+
+    unknown_keys = sorted(set(raw) - _LADDER_STEP_KEYS)
+    if unknown_keys:
+        raise SeedError(f"role_model_policy[{role!r}].ladder[{index}] has unknown keys: {', '.join(unknown_keys)}")
+    return parsed
+
+
+def _parse_ladder(role: str, raw: object) -> list[dict[str, str | int]]:
+    """Parse ``role_model_policy.<role>.ladder`` (issue #4855)."""
+    if not isinstance(raw, list) or not raw:
+        raise SeedError(f"role_model_policy[{role!r}].ladder must be a non-empty list")
+    return [_parse_ladder_step(role, i, entry) for i, entry in enumerate(raw)]
 
 
 def _parse_council_candidate(role: str, member: str, raw: object) -> dict[str, str]:
@@ -981,7 +1041,7 @@ def _parse_single_role_policy(
     settings: object,
     *,
     local_endpoints: dict[str, dict[str, str]] | None = None,
-) -> dict[str, str | int | dict[str, object]]:
+) -> dict[str, _RolePolicyValue]:
     """Parse and validate a single role's model policy settings.
 
     ``endpoint`` names a ``local_endpoints`` profile (see
@@ -1024,11 +1084,17 @@ def _parse_single_role_policy(
     worktree, relative to ``.bernstein/``. The runner
     (``openai_agents_runner._load_council_config``) is what actually
     resolves and loads it, at spawn/run time, not here.
+
+    ``ladder`` / ``fallback_model`` / ``escalation_budget_usd`` (issue #4855)
+    declare an evidence-gated escalation ladder. Unset preserves today's
+    behaviour. ``fallback_model`` is deprecated sugar for a two-step ladder
+    and is mutually exclusive with ``ladder``. A step ``adapter`` that is
+    not installed hard-fails at parse time.
     """
     if not isinstance(settings, dict):
         raise SeedError(f"role_model_policy[{role!r}] must be a mapping")
 
-    normalized: dict[str, str | int | dict[str, object]] = {}
+    normalized: dict[str, _RolePolicyValue] = {}
     for key in _ROLE_POLICY_KEYS:
         value = settings.get(key)
         if value is None:
@@ -1101,9 +1167,44 @@ def _parse_single_role_policy(
         for key, value in profile.items():
             normalized[key] = value
 
+    raw_ladder = settings.get(_ROLE_POLICY_LADDER_KEY)
+    raw_fallback = settings.get(_ROLE_POLICY_FALLBACK_MODEL_KEY)
+    if raw_ladder is not None and raw_fallback is not None:
+        raise SeedError(
+            f"role_model_policy[{role!r}]: ladder and fallback_model are mutually exclusive; "
+            "fallback_model is deprecated sugar for a two-step ladder"
+        )
+    if raw_ladder is not None:
+        normalized[_ROLE_POLICY_LADDER_KEY] = _parse_ladder(role, raw_ladder)
+    if raw_fallback is not None:
+        if not isinstance(raw_fallback, str) or not raw_fallback.strip():
+            raise SeedError(
+                f"role_model_policy[{role!r}][{_ROLE_POLICY_FALLBACK_MODEL_KEY!r}] must be a non-empty string"
+            )
+        if "model" not in normalized:
+            raise SeedError(f"role_model_policy[{role!r}]: fallback_model requires model to be set (two-step sugar)")
+        normalized[_ROLE_POLICY_FALLBACK_MODEL_KEY] = raw_fallback.strip()
+
+    raw_budget = settings.get(_ROLE_POLICY_ESCALATION_BUDGET_KEY)
+    if raw_budget is not None:
+        if isinstance(raw_budget, bool) or not isinstance(raw_budget, (int, float)) or float(raw_budget) < 0:
+            raise SeedError(
+                f"role_model_policy[{role!r}][{_ROLE_POLICY_ESCALATION_BUDGET_KEY!r}] must be a non-negative number"
+            )
+        normalized[_ROLE_POLICY_ESCALATION_BUDGET_KEY] = float(raw_budget)
     raw_tier_models = settings.get(_ROLE_POLICY_TIER_MODELS_KEY)
     if raw_tier_models is not None:
         normalized[_ROLE_POLICY_TIER_MODELS_KEY] = _parse_tier_models(role, raw_tier_models)
+    # ``tier_models`` and ``ladder`` both choose a model, so an entry that
+    # declares both leaves unstated which one a hop follows. Refuse the pair,
+    # the way ``ladder`` and ``fallback_model`` already refuse each other. This
+    # can be relaxed later into "tiers pick the entry point, the ladder
+    # escalates from there"; an unstated interaction cannot be taken back.
+    if normalized.get(_ROLE_POLICY_LADDER_KEY) is not None and normalized.get(_ROLE_POLICY_TIER_MODELS_KEY):
+        raise SeedError(
+            f"role_model_policy[{role!r}]: ladder and tier_models are mutually exclusive; "
+            "both select a model and their interaction is undefined"
+        )
 
     allowed_keys = (
         set(_ROLE_POLICY_KEYS)
@@ -1112,6 +1213,9 @@ def _parse_single_role_policy(
             _ROLE_POLICY_COUNCIL_KEY,
             _ROLE_POLICY_STYLE_KEY,
             _ROLE_POLICY_ENDPOINT_KEY,
+            _ROLE_POLICY_LADDER_KEY,
+            _ROLE_POLICY_FALLBACK_MODEL_KEY,
+            _ROLE_POLICY_ESCALATION_BUDGET_KEY,
             _ROLE_POLICY_TIER_MODELS_KEY,
         }
     )
@@ -1662,6 +1766,28 @@ def _parse_key_rotation(raw: object) -> KeyRotationConfig | None:
     )
 
 
+def _parse_admission(raw: object) -> AdmissionPolicy | None:
+    """Parse the optional ``admission`` block (issue #4907).
+
+    Declarative allow/deny rules over the executor identity of a spawn.
+    Validating here means a typo in the block fails the run at config
+    load with the offending key named, instead of surfacing later as a
+    refused spawn; the spawn-time gate re-reads the same file, so the two
+    can never disagree about what the operator declared.
+    """
+    if raw is None:
+        return None
+    from bernstein.core.security.executor_admission import (
+        AdmissionPolicy,
+        AdmissionPolicyError,
+    )
+
+    try:
+        return AdmissionPolicy.from_mapping(raw)
+    except AdmissionPolicyError as exc:
+        raise SeedError(str(exc)) from exc
+
+
 def _parse_compliance(raw: object) -> ComplianceConfig | None:
     """Parse the optional ``compliance`` section."""
     if raw is None:
@@ -1775,6 +1901,23 @@ def _parse_quality_gates(raw: object) -> QualityGatesConfig | None:
             "pii_allowlist_prefixes",
             ["FAKE", "TEST", "EXAMPLE", "DUMMY", "PLACEHOLDER", "LOCALHOST"],
         ),
+        # DLP keys: documented beside pii_scan in docs/architecture/quality-pipeline.md
+        # and read nowhere until #6615 -- a ``dlp_scan: false`` was accepted by the
+        # schema (extra="allow") and then dropped, so the gate could not be
+        # configured or disabled from a seed. Defaults mirror QualityGatesConfig.
+        dlp_scan=_qg_bool("dlp_scan", True),
+        dlp_check_license_violations=_qg_bool("dlp_check_license_violations", True),
+        dlp_check_regulated_data=_qg_bool("dlp_check_regulated_data", True),
+        dlp_check_proprietary_data=_qg_bool("dlp_check_proprietary_data", True),
+        dlp_block_license_violations=_qg_bool("dlp_block_license_violations", True),
+        dlp_block_regulated_data=_qg_bool("dlp_block_regulated_data", True),
+        dlp_block_proprietary_data=_qg_bool("dlp_block_proprietary_data", False),
+        dlp_internal_url_patterns=_qg_str_list("dlp_internal_url_patterns", []),
+        dlp_ignore_paths=_qg_str_list("dlp_ignore_paths", []),
+        dlp_allowlist_prefixes=_qg_str_list(
+            "dlp_allowlist_prefixes",
+            ["FAKE", "TEST", "EXAMPLE", "DUMMY", "PLACEHOLDER", "MOCK", "SAMPLE"],
+        ),
         run_config=_qg_bool("run_config", True),
         security_scan=_qg_bool("security_scan", False),
         security_scan_command=_qg_optional_str("security_scan_command"),
@@ -1801,6 +1944,12 @@ def _parse_quality_gates(raw: object) -> QualityGatesConfig | None:
         auto_format_python_command=_qg_str("auto_format_python_command", "ruff format"),
         auto_format_js_command=_qg_str("auto_format_js_command", "prettier --write"),
         auto_format_rust_command=_qg_str("auto_format_rust_command", "rustfmt"),
+        behavior_probe=_qg_bool("behavior_probe", False),
+        behavior_probe_python_command=_qg_str("behavior_probe_python_command", ""),
+        behavior_probe_per_callable_timeout_s=_qg_int("behavior_probe_per_callable_timeout_s", 15),
+        behavior_probe_gate_timeout_s=_qg_int("behavior_probe_gate_timeout_s", 300),
+        behavior_probe_max_callables=_qg_int("behavior_probe_max_callables", 12),
+        behavior_probe_max_probes_per_callable=_qg_int("behavior_probe_max_probes_per_callable", 6),
         benchmark=benchmark_cfg,
     )
 
@@ -2128,6 +2277,25 @@ def _parse_mcp_signing_mode(data: dict[str, object]) -> Literal["warn", "strict"
     return cast("Literal['warn', 'strict', 'off']", candidate)
 
 
+def _parse_data_class(raw: object) -> Literal["restricted", "internal", "confidential", "public"] | None:
+    """Parse the optional ``data_class`` field.
+
+    Allowed values: restricted, internal, confidential, public.
+    When absent, defaults to None (the emitter uses "confidential").
+
+    Raises:
+        SeedError: When the value is not one of the four permitted literals.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise SeedError(f"data_class must be a string, got: {type(raw).__name__}")
+    allowed = {"restricted", "internal", "confidential", "public"}
+    if raw not in allowed:
+        raise SeedError(f"data_class must be one of {sorted(allowed)}, got: {raw!r}")
+    return cast("Literal['restricted', 'internal', 'confidential', 'public']", raw)
+
+
 # Every top-level key ``parse_seed`` consumes, directly or via a helper
 # that receives the whole mapping. Any new ``data.get(...)`` read must be
 # added here; keys outside the known set trigger the unknown-key warning
@@ -2148,6 +2316,7 @@ _PARSED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "context_files",
         "cors",
         "cost",
+        "data_class",
         "cost_autopilot",
         "cost_tags",
         "dashboard_auth",
@@ -2186,6 +2355,7 @@ _PARSED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "smtp",
         "storage",
         "team",
+        "tier_adapters",
         "team_manifest",
         "tenants",
         "test_agent",
@@ -2284,6 +2454,11 @@ def parse_seed(path: Path) -> SeedConfig:
     Raises:
         SeedError: If the file is missing, unreadable, or has invalid content.
     """
+    return _parse_seed(path, apply_tuning=True)
+
+
+def _parse_seed(path: Path, *, apply_tuning: bool) -> SeedConfig:
+    """Share parsing with launch validation without rebinding parent tuning."""
     if not path.exists():
         raise SeedError(f"Seed file not found: {path}")
 
@@ -2309,7 +2484,7 @@ def parse_seed(path: Path) -> SeedConfig:
     # a setup that edits the committed file directly behaves as it always did.
     try:
         data: dict[str, object] = cast("_StrObjDict", resolve_effective_mapping(committed, config_path=path))
-    except RunOverlayError as exc:
+    except (RunOverlayError, LayerValidationError) as exc:
         raise SeedError(str(exc)) from exc
 
     _warn_unknown_top_level_keys(data)
@@ -2402,6 +2577,7 @@ def parse_seed(path: Path) -> SeedConfig:
     secrets = _parse_secrets(data.get("secrets"))
     key_rotation = _parse_key_rotation(data.get("key_rotation"))
     compliance = _parse_compliance(data.get("compliance"))
+    admission = _parse_admission(data.get("admission"))
     visual = _parse_visual(data.get("visual"))
     sandbox = _parse_sandbox(data.get("sandbox"))
     bridges = _parse_bridge_settings(data.get("bridges"))
@@ -2419,6 +2595,12 @@ def parse_seed(path: Path) -> SeedConfig:
     judge_provider_raw = _parse_optional_str_field(data, "judge_provider")
     model_fallback = _parse_model_fallback(data.get("model_fallback"))
     provider_availability = _parse_provider_availability(data.get("provider_availability"))
+    _raw_tier_adapters = data.get("tier_adapters")
+    tier_adapters: dict[str, str] = {}
+    if _raw_tier_adapters is not None:
+        if not isinstance(_raw_tier_adapters, dict):
+            raise SeedError(f"tier_adapters must be a mapping, got: {type(_raw_tier_adapters).__name__}")
+        tier_adapters = {str(k): str(v) for k, v in _raw_tier_adapters.items()}
     cost_tags = _parse_cost_tags(data.get("cost_tags", {}))
     cost_autopilot_raw = _validate_optional_bool(data, "cost_autopilot", False)
     cost_envelopes = _parse_cost_envelopes(data)
@@ -2431,7 +2613,9 @@ def parse_seed(path: Path) -> SeedConfig:
 
     metrics = _parse_metrics(data.get("metrics"))
     mcp_signing_mode = _parse_mcp_signing_mode(data)
-    _parse_tuning(data)
+    data_class = _parse_data_class(data.get("data_class"))
+    if apply_tuning:
+        _parse_tuning(data)
 
     return SeedConfig(
         goal=goal,
@@ -2466,6 +2650,7 @@ def parse_seed(path: Path) -> SeedConfig:
         model_policy=model_policy,
         role_model_policy=cast(Any, role_model_policy),
         compliance=compliance,
+        admission=admission,
         visual=visual,
         sandbox=sandbox,
         bridges=bridges,
@@ -2485,6 +2670,7 @@ def parse_seed(path: Path) -> SeedConfig:
         judge_provider=cast("str | None", judge_provider_raw),
         model_fallback=model_fallback,
         provider_availability=provider_availability,
+        tier_adapters=tier_adapters,
         cost_tags=cost_tags,
         cost_autopilot=cost_autopilot_raw,
         cost_envelopes=cost_envelopes,
@@ -2492,4 +2678,5 @@ def parse_seed(path: Path) -> SeedConfig:
         org_policies=org_policies,
         metrics=metrics,
         mcp_signing_mode=mcp_signing_mode,
+        data_class=data_class,
     )

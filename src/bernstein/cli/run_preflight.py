@@ -22,10 +22,11 @@ from bernstein.cli.helpers import (
 from bernstein.cli.run import render_run_summary_from_dict
 from bernstein.cli.ui import make_console
 from bernstein.core.cost import estimate_run_cost
-from bernstein.core.cost.model_prices import is_free_route
+from bernstein.core.cost.model_prices import is_free_route, model_cost_is_known
 from bernstein.core.cost.preflight import CostBand, compute_band, format_band
 from bernstein.core.plan_loader import load_plan_from_yaml
 from bernstein.core.runtime_state import directory_size_bytes
+from bernstein.core.tasks.lifecycle import SUCCESSFUL_TASK_STATUSES, UNSUCCESSFUL_TERMINAL_STATUSES
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
     from bernstein.core.config.seed import SeedConfig
 
 logger = logging.getLogger(__name__)
+
+_TERMINAL_TASK_STATES = frozenset(status.value for status in SUCCESSFUL_TASK_STATUSES | UNSUCCESSFUL_TERMINAL_STATUSES)
 
 
 def validate_seed_or_exit(seed_file: str | None) -> SeedConfig | None:
@@ -132,10 +135,16 @@ def _surface_merge_refusals(workdir: Path, *, since_ts: float, console: Console)
     """Print a loud warning for agent merges the merge guard refused this run.
 
     The spawner merge guard refuses to land agent work on the repository's
-    protected default branch and records each refusal to
-    ``.sdd/runtime/refused_merges.jsonl``. Without this warning the refusal
-    is only visible in the spawner log, so the run ends looking clean while
-    the work was discarded (gh-2756).
+    protected default branch, and the merge gates (quality gates, file
+    scope, blast radius) refuse work that fails them; each refusal is
+    recorded to ``.sdd/runtime/refused_merges.jsonl``. Without this warning
+    the refusal is only visible in the spawner log, so the run ends looking
+    clean while the work was discarded (gh-2756).
+
+    The two kinds get separate warnings because they have different fixes:
+    only a default-branch refusal is lifted by checking out a working branch
+    or by the override env var, so that remedy must not be offered for a
+    failed gate.
 
     Args:
         workdir: Repository root of the run.
@@ -143,22 +152,44 @@ def _surface_merge_refusals(workdir: Path, *, since_ts: float, console: Console)
             shown, filtering out journal entries from previous runs.
         console: Console to print the warning to.
     """
-    from bernstein.core.agents.spawner_merge import ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH
+    from bernstein.core.agents.spawner_merge import (
+        ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH,
+        REFUSAL_TARGET_IS_DEFAULT_BRANCH,
+    )
     from bernstein.core.quality.retrospective import read_merge_refusals
 
     refusals = read_merge_refusals(workdir / ".sdd" / "runtime", since_ts=since_ts)
     if not refusals:
         return
-    branches = sorted({r.branch for r in refusals if r.branch})
-    branch_note = f" onto default branch {', '.join(repr(b) for b in branches)}" if branches else ""
-    console.print(
-        f"[bold red]Merge refused:[/bold red] agent work from {len(refusals)} session(s) was NOT "
-        f"merged{branch_note} and was discarded (details: .sdd/runtime/refused_merges.jsonl)."
-    )
-    console.print(
-        "Check out a working branch first (git checkout -b <branch>), or set "
-        f"{ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH}=1 and re-run."
-    )
+    # Journal lines without a reason predate the gate codes; the guard only
+    # ever wrote default-branch refusals then.
+    trunk = [r for r in refusals if r.reason in ("", REFUSAL_TARGET_IS_DEFAULT_BRANCH)]
+    gated = [r for r in refusals if r.reason not in ("", REFUSAL_TARGET_IS_DEFAULT_BRANCH)]
+    if trunk:
+        branches = sorted({r.branch for r in trunk if r.branch})
+        branch_note = f" onto default branch {', '.join(repr(b) for b in branches)}" if branches else ""
+        console.print(
+            f"[bold red]Merge refused:[/bold red] agent work from {len(trunk)} session(s) was NOT "
+            f"merged{branch_note} and was discarded (details: .sdd/runtime/refused_merges.jsonl)."
+        )
+        console.print(
+            "Check out a working branch first (git checkout -b <branch>), or set "
+            f"{ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH}=1 and re-run."
+        )
+    if gated:
+        console.print(
+            f"[bold red]Merge refused:[/bold red] merge gates kept agent work from {len(gated)} "
+            "session(s) off the target branch (details: .sdd/runtime/refused_merges.jsonl):"
+        )
+        for refusal in gated:
+            line = f"  {refusal.branch or refusal.session_id}: {refusal.reason}"
+            if refusal.detail:
+                line += f" - {refusal.detail}"
+            console.print(line, markup=False, highlight=False)
+        console.print(
+            "Fix what the gate reports and re-run the task; "
+            f"{ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH} does not lift a gate refusal."
+        )
 
 
 def _show_run_summary() -> None:
@@ -271,10 +302,12 @@ class RunCostEstimate:
         high_usd: Legacy single-point high estimate (kept for back-compat).
         band: Optional calibrated p50/p90 band. Populated for new callers;
             legacy callers can leave it unset.
-        free_route: True when the resolved model is a zero-cost route (a
-            ``:free`` id or a model the run's own metering prices at $0). The
-            estimate is then a hard $0 rather than a phantom fixed rate
-            (issue #3013).
+        free_route: True when the resolved model is a genuinely zero-cost
+            route (a ``:free`` id or a $0 local adapter). The estimate is
+            then a hard $0 rather than a phantom fixed rate (issue #3013).
+        unpriced: True when the resolved model has no pricing-table entry -
+            it meters at $0 but that is a missing price, not a free run. The
+            banner then reads ``unpriced`` instead of ``$0.00`` (issue #5337).
     """
 
     task_count: int | None
@@ -283,6 +316,7 @@ class RunCostEstimate:
     high_usd: float
     band: CostBand | None = None
     free_route: bool = False
+    unpriced: bool = False
 
 
 def _estimate_task_count(workdir: Path, plan_file: Path | None, goal: str | None) -> int | None:
@@ -434,8 +468,14 @@ def _estimate_run_preview(
     # resolved model, not a fixed Anthropic rate, keeps the pre-run banner
     # and the final ``total_cost`` drawn from the same pricing source, so a
     # free route is never quoted a phantom estimate (issue #3013).
-    free_route = est_cli in _FREE_ADAPTERS or is_free_route(est_model)
-    if free_route:
+    # A run is free when a $0 local adapter or a ``:free`` id resolves; it is
+    # merely *unpriced* when the model has no pricing-table entry - the same
+    # $0 estimate, but the banner must say "unpriced" rather than quote
+    # "$0.00" as if the run cost nothing (issue #5337).
+    zero_cost = est_cli in _FREE_ADAPTERS or is_free_route(est_model)
+    unpriced = zero_cost and est_cli not in _FREE_ADAPTERS and not model_cost_is_known(est_model)
+    free_route = zero_cost and not unpriced
+    if zero_cost:
         low_usd, high_usd = 0.0, 0.0
         band = CostBand(
             p50=0.0,
@@ -463,6 +503,7 @@ def _estimate_run_preview(
         high_usd=high_usd,
         band=band,
         free_route=free_route,
+        unpriced=unpriced,
     )
 
 
@@ -505,15 +546,28 @@ def _emit_preflight_runtime_warnings(
         else:
             basis = f"per task at {estimate.model} pricing, task count not yet planned"
         if estimate.free_route:
-            # A zero-cost route (:free / unpriced) must not be quoted a
-            # phantom rate: the real run meters it at $0 (issue #3013).
+            # A genuinely zero-cost route (:free id / $0 local adapter) must
+            # not be quoted a phantom rate: the real run meters it at $0
+            # (issue #3013).
             if estimate.task_count is not None:
                 basis = f"free route - no cost ({estimate.model}), based on {estimate.task_count} task(s)"
             else:
                 basis = f"free route - no cost ({estimate.model}), task count not yet planned"
+        elif estimate.unpriced:
+            # No pricing-table entry: meters at $0, but that is a missing
+            # price, not a free run - say so instead of quoting $0.00
+            # (issue #5337).
+            not_priced = f"unpriced - {estimate.model} is not in the pricing table"
+            if estimate.task_count is not None:
+                basis = f"{not_priced}, based on {estimate.task_count} task(s)"
+            else:
+                basis = f"{not_priced}, task count not yet planned"
         if band is not None:
-            console.print(f"[bold yellow]{format_band(band)}[/bold yellow]")
-            if estimate.free_route:
+            if estimate.unpriced:
+                console.print("[bold yellow]Estimated cost:[/bold yellow] unpriced")
+            else:
+                console.print(f"[bold yellow]{format_band(band)}[/bold yellow]")
+            if estimate.free_route or estimate.unpriced:
                 console.print(f"[dim]{basis}[/dim]")
             else:
                 samples_note = (
@@ -522,6 +576,8 @@ def _emit_preflight_runtime_warnings(
                     else "no history yet - using heuristic"
                 )
                 console.print(f"[dim]{basis}, {samples_note}[/dim]")
+        elif estimate.unpriced:
+            console.print(f"[bold yellow]Estimated cost:[/bold yellow] unpriced {basis}")
         else:
             console.print(
                 f"[bold yellow]Estimated cost:[/bold yellow] ${estimate.low_usd:.2f}-${estimate.high_usd:.2f} {basis}"
@@ -646,7 +702,104 @@ def _raise_if_no_plan_after_spawn(*, narrate_wait: bool = True) -> None:
         )
 
 
-def _finalize_run_output(*, quiet: bool, wait: float | None = None) -> None:
+def _extract_tasks_from_payload(payload: Any) -> list[dict[str, Any]]:
+    """Extract list of task dicts from /tasks or /status response payload."""
+    if isinstance(payload, list):
+        return [t for t in payload if isinstance(t, dict)]
+    if isinstance(payload, dict):
+        if "tasks" in payload:
+            val = payload["tasks"]
+            if isinstance(val, list):
+                return [t for t in val if isinstance(t, dict)]
+            if isinstance(val, dict) and "items" in val and isinstance(val["items"], list):
+                return [t for t in val["items"] if isinstance(t, dict)]
+        if "items" in payload and isinstance(payload["items"], list):
+            return [t for t in payload["items"] if isinstance(t, dict)]
+    return []
+
+
+class TaskStateProgressTracker:
+    """Tracks and emits task state transitions in non-interactive runs.
+
+    Emits one line per state transition:
+    task <id> <state> adapter=<name> model=<route> title="<first 60 chars>"
+    plus a 'planned' line when the task is first observed.
+
+    Task rows carry an adapter or model only when one was routed to that task
+    specifically; every other task runs on the run's own adapter and model,
+    which ``default_adapter`` / ``default_model`` name. ``unknown`` is left for
+    a run whose adapter is auto-detected inside the orchestrator.
+    """
+
+    def __init__(
+        self,
+        console: Console | None = None,
+        *,
+        default_adapter: str | None = None,
+        default_model: str | None = None,
+    ) -> None:
+        self.console = console or make_console()
+        self.seen_states: dict[str, str] = {}
+        self.default_adapter = default_adapter or "unknown"
+        self.default_model = default_model or "unknown"
+
+    @staticmethod
+    def format_line(task_id: str, state: str, adapter: str, model: str, title: str) -> str:
+        clean_title = " ".join(title.replace('"', "'").split())[:60]
+        return f'task {task_id} {state} adapter={adapter} model={model} title="{clean_title}"'
+
+    def update_tasks(self, tasks: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for task in tasks:
+            task_id = str(task.get("id") or "")
+            if not task_id:
+                continue
+            current_state = str(task.get("status") or "open")
+            adapter = str(task.get("adapter") or task.get("cli") or self.default_adapter)
+            model = str(task.get("model") or self.default_model)
+            title = str(task.get("title") or "")
+
+            if task_id not in self.seen_states:
+                if current_state not in _TERMINAL_TASK_STATES:
+                    self.seen_states[task_id] = "planned"
+                    planned_line = self.format_line(task_id, "planned", adapter, model, title)
+                    lines.append(planned_line)
+                    self.console.print(planned_line, markup=False, highlight=False, soft_wrap=True)
+                else:
+                    self.seen_states[task_id] = current_state
+
+            if current_state != self.seen_states[task_id]:
+                state_line = self.format_line(task_id, current_state, adapter, model, title)
+                lines.append(state_line)
+                self.console.print(state_line, markup=False, highlight=False, soft_wrap=True)
+                self.seen_states[task_id] = current_state
+
+        return lines
+
+    def poll(self) -> list[str]:
+        from bernstein.cli.helpers import server_get
+
+        try:
+            tasks_data = server_get("/tasks")
+            tasks = _extract_tasks_from_payload(tasks_data)
+            if not tasks:
+                status_data = server_get("/status")
+                tasks = _extract_tasks_from_payload(status_data)
+            return self.update_tasks(tasks)
+        except Exception as exc:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.warning("Failed to poll task progress: %s", exc, exc_info=True)
+            else:
+                logger.debug("Failed to poll task progress: %s", exc, exc_info=True)
+            return []
+
+
+def _finalize_run_output(
+    *,
+    quiet: bool,
+    wait: float | None = None,
+    seed: SeedConfig | None = None,
+) -> None:
     """Render either the interactive dashboard or the final summary.
 
     Uses terminal capability detection (TUI-003) to choose between the
@@ -693,6 +846,8 @@ def _finalize_run_output(*, quiet: bool, wait: float | None = None) -> None:
         quiet: When True, wait for quiescence and print only the terminal summary.
         wait: Seconds to wait for quiescence, keeping the progress output;
             None detaches as before.
+        seed: The run's resolved seed. Its adapter and model label the
+            non-interactive progress lines of tasks routed to neither.
     """
     from bernstein.cli.run_bootstrap import (
         _RUN_WAIT_DEFAULT_S,
@@ -752,7 +907,15 @@ def _finalize_run_output(*, quiet: bool, wait: float | None = None) -> None:
             # outcome and surface a refusal as a non-zero exit.
             from bernstein.cli.run_bootstrap import _await_first_spawn_outcome
 
-            outcome, reason = _await_first_spawn_outcome()
+            run_adapter = seed.cli if seed is not None and seed.cli != "auto" else None
+            tracker = TaskStateProgressTracker(
+                console=console,
+                default_adapter=run_adapter,
+                default_model=seed.model if seed is not None else None,
+            )
+            tracker.poll()
+            outcome, reason = _await_first_spawn_outcome(on_poll=tracker.poll)
+            tracker.poll()
             _show_run_summary()
             if outcome == "refused":
                 console.print(f"[red]Run failed before any work started:[/red] {reason}")

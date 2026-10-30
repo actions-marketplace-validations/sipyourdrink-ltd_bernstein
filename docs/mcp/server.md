@@ -14,6 +14,12 @@ client at the server. For the per-tier tool catalogue see
 | SSE | `bernstein mcp --transport http` | Remote/web integration. |
 | Streamable HTTP | served on `/mcp` | Stateless remote integration with cancellation. |
 
+A hosted, read-only instance of the streamable transport is served at
+`https://mcp.bernstein.run/mcp`; it verifies run receipts and lists the
+shipped presets and adapters without installing anything. Connect with
+`claude mcp add --transport http bernstein https://mcp.bernstein.run/mcp`;
+nothing is stored and no secret is needed. The same verifier is also served as a form at `https://mcp.bernstein.run/verify`.
+
 The streamable HTTP transport binds to loopback by default. Binding to a
 public interface requires a bearer token (see Auth) and is otherwise refused
 at startup.
@@ -680,3 +686,9 @@ the completion route rather than a second client-side check.
 
    The original call returns `cancelled: true` with its preserved `partial`
    output.
+
+### Wait for a role task
+
+`bernstein_subscribe(role, timeout_seconds=30)` is a standard-tier, bounded SSE wait for the first future task creation. It returns task ID/title, closes on completion, timeout or cancellation, and does not install a dormant-chat wake mechanism. See [delivery, auth and lifecycle semantics](../operations/notifications.md#role-task-subscriptions-sse).
+
+The tool advertises an output schema for notification, empty timeout and error payloads and returns matching `structuredContent`. With cost metering enabled, both schema and payload include the standard meter envelope on local and remote transports.

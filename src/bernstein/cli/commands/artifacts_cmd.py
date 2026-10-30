@@ -22,12 +22,64 @@ from pathlib import Path
 import click
 
 from bernstein.cli.helpers import console
+from bernstein.core.security.audit import load_or_create_audit_key
 
 
-def _load_hmac_key() -> bytes:
-    from bernstein.core.security.audit import load_or_create_audit_key
+def _render_report_provenance(payload: dict[str, object], sdd: Path) -> None:
+    """Render per-claim finding-reference provenance for a report artifact."""
+    from bernstein.core.evidence.run_artifacts import ARTIFACT_TYPE_FINDING, read_artifact_rows
 
-    return load_or_create_audit_key()
+    finding_refs = payload.get("finding_references", [])
+    if not isinstance(finding_refs, list):
+        console.print("\n[dim]Finding references: invalid format[/dim]")
+        return
+
+    if not finding_refs:
+        console.print("\n[dim]Finding references: none[/dim]")
+        return
+
+    console.print("\n[bold]Finding References[/bold]")
+    for i, ref in enumerate(finding_refs):
+        if not isinstance(ref, dict):
+            console.print(f"  [{i + 1}] invalid reference")
+            continue
+        task_id = ref.get("task_id")
+        key = ref.get("key")
+        version = ref.get("version")
+        if not isinstance(task_id, str):
+            console.print(f"  [{i + 1}] missing task_id")
+            continue
+        if not isinstance(key, str):
+            console.print(f"  [{i + 1}] missing key")
+            continue
+
+        rows = read_artifact_rows(sdd, task_id, verify=False)
+        matching = [r for r in rows if r.key == key and r.artifact_type == ARTIFACT_TYPE_FINDING]
+
+        if not matching:
+            console.print(f"  [{i + 1}] {task_id}:{key} NOT FOUND")
+            continue
+
+        if version is not None:
+            if not isinstance(version, int) or version < 1:
+                console.print(f"  [{i + 1}] {task_id}:{key} INVALID_VERSION")
+                continue
+            selected = [r for r in matching if r.version == version]
+            if not selected:
+                console.print(f"  [{i + 1}] {task_id}:{key} v{version} NOT FOUND")
+                continue
+            finding_hash = selected[0].content_hash
+            if (sdd / "audit").exists():
+                console.print(f"  [{i + 1}] {task_id}:{key} v{version} -> {finding_hash[:40]}...")
+            else:
+                console.print(f"  [{i + 1}] {task_id}:{key} v{version} (hash: {finding_hash[:40]}...)")
+        else:
+            latest = matching[-1] if matching else None
+            if latest:
+                finding_hash = latest.content_hash
+                console.print(f"  [{i + 1}] {task_id}:{key} -> {finding_hash[:40]}...")
+            else:
+                console.print(f"  [{i + 1}] {task_id}:{key} no versions")
 
 
 @click.group("artifacts")
@@ -77,7 +129,7 @@ def artifacts_list_cmd(task: str, workdir: str, output_json: bool) -> None:
     # Read WITHOUT the fail-closed filter so a tampered journal renders as
     # tampered, not as "no artifacts". Verdicts drive the displayed state.
     records = read_artifact_rows(sdd, task, verify=False)
-    verdict_list = verify_run_artifacts(sdd, task, hmac_key=_load_hmac_key())
+    verdict_list = verify_run_artifacts(sdd, task, hmac_key=load_or_create_audit_key())
     verdicts = {(r.key, r.version): r for r in verdict_list}
 
     def _emit_json(rows: list[dict[str, object]], *, verified: bool, reason: str | None) -> None:
@@ -159,7 +211,13 @@ def artifacts_list_cmd(task: str, workdir: str, output_json: bool) -> None:
     show_default=True,
     help="Project root containing .sdd/.",
 )
-def artifacts_show_cmd(task: str, key: str, workdir: str) -> None:
+@click.option(
+    "--provenance",
+    "-p",
+    is_flag=True,
+    help="Render per-claim finding-reference provenance for report artifacts.",
+)
+def artifacts_show_cmd(task: str, key: str, workdir: str, provenance: bool) -> None:
     """Render KEY's latest version for TASK, plus its version history.
 
     A version whose stored blob fails its hash check renders as *tampered*, not
@@ -172,7 +230,7 @@ def artifacts_show_cmd(task: str, key: str, workdir: str) -> None:
     sdd = Path(workdir).resolve() / ".sdd"
     # Unverified read so a broken journal reaches the tampered (exit 2) path
     # instead of masquerading as a missing artifact.
-    verdict_list = verify_run_artifacts(sdd, task, hmac_key=_load_hmac_key())
+    verdict_list = verify_run_artifacts(sdd, task, hmac_key=load_or_create_audit_key())
     verdicts = {(r.key, r.version): r for r in verdict_list}
     records = [r for r in read_artifact_rows(sdd, task, verify=False) if r.key == key]
     if not records:
@@ -203,8 +261,18 @@ def artifacts_show_cmd(task: str, key: str, workdir: str) -> None:
 
     blob = EvidenceStore(sdd / "evidence").get(latest.content_hash)
     console.print("\n[bold]Content[/bold]")
+    decoded: dict[str, object] | None = None
     if blob is not None and content_hash_of(blob) == latest.content_hash:
-        console.print(json.loads(blob.decode("utf-8")))
+        try:
+            payload_obj = json.loads(blob.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload_obj = None
+        if isinstance(payload_obj, dict):
+            decoded = payload_obj
+            console.print(decoded)
+
+    if provenance and latest.artifact_type == "report" and decoded is not None:
+        _render_report_provenance(decoded, sdd)
 
     if len(records) > 1:
         console.print("\n[bold]Version history[/bold]")

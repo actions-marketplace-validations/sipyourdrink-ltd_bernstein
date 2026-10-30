@@ -54,8 +54,52 @@ ARTEFACT_KINDS: frozenset[str] = frozenset(
 #: :mod:`bernstein.core.lineage.provenance`.
 TRUST_CLASSES: frozenset[str] = frozenset({"operator", "workspace", "first_party", "third_party", "public"})
 
+#: Data-sensitivity classes recordable on an entry (issue #5042). The mirror of
+#: :data:`TRUST_CLASSES` on the opposite axis: ``trust_class`` says how much we
+#: trust an input, ``sensitivity`` says how sensitive it is. ``None`` on an
+#: entry means "no classification recorded" and is dropped from the canonical
+#: form so pre-feature entries keep byte-identical wire bytes. The sensitivity
+#: projection treats absence as the *highest* class (fail closed high) -- see
+#: :mod:`bernstein.core.lineage.sensitivity`.
+SENSITIVITY_CLASSES: frozenset[str] = frozenset({"public", "internal", "confidential", "restricted"})
+
 #: Shape of a bare hex SHA-256, used to validate recorded attachment digests.
 _HEX64: re.Pattern[str] = re.compile(r"\A[0-9a-f]{64}\Z")
+
+#: Closed set of valid ``activity_source`` values (issue #4962). ``None`` means
+#: pre-existing entry not yet migrated and is dropped from canonical bytes so
+#: every historical signature and HMAC stays valid.
+ACTIVITY_SOURCES: frozenset[str] = frozenset({"scheduler", "adapter"})
+
+#: Closed set of valid ``provider`` values for :class:`ModelRef` (issue #5037).
+MODEL_REF_PROVIDERS: frozenset[str] = frozenset({"openai", "anthropic", "google", "azure", "ollama", "local"})
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRef:
+    """Model reference capturing the request/response gap (issue #5037).
+
+    ``None`` fields are dropped from the canonical bytes so every historical
+    entry keeps its exact wire form, signature and HMAC.
+    """
+
+    provider: str
+    model_requested: str
+    model_reported: str | None = None
+    version: str | None = None
+    routing_decision_hash: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.provider:
+            raise ValueError("provider must be a non-empty string")
+        if not self.model_requested:
+            raise ValueError("model_requested must be a non-empty string")
+        if self.model_reported is not None and not self.model_reported:
+            raise ValueError("model_reported must be a non-empty string when not None")
+        if self.version is not None and not self.version:
+            raise ValueError("version must be a non-empty string when not None")
+        if self.routing_decision_hash and not self.routing_decision_hash.startswith("sha256:"):
+            raise ValueError(f"routing_decision_hash must start with 'sha256:', got {self.routing_decision_hash!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +125,10 @@ class LineageEntry:
     # bytes so every historical entry keeps its exact wire form, signature and
     # HMAC. A tool-result provenance record sets this to one of TRUST_CLASSES.
     trust_class: str | None = None
+    # Additive, optional (issue #4962). ``None`` is dropped from the canonical
+    # bytes so every historical entry keeps its exact wire form, signature and
+    # HMAC. When not None must be one of LINEAGE_ENTRY.ACTIVITY_SOURCES.
+    activity_source: str | None = None
     # Additive, optional (issue #1797), dropped when ``None`` on the same rule
     # as ``trust_class``. Hex SHA-256 digests of the operator attachments the
     # producing turn was handed, so the receipt names every input the model
@@ -93,6 +141,22 @@ class LineageEntry:
     # both mis-type the relation and make every attached linear write look
     # like a merge in the tip projection.
     attachment_digests: list[str] | None = None
+    # Additive, optional (issue #5037). ``None`` is dropped from the canonical
+    # bytes so every historical entry keeps its exact wire form, signature and
+    # HMAC. When not None must be a valid ModelRef instance.
+    model_ref: ModelRef | None = None
+    # Additive, optional (issue #5042), dropped when ``None`` on the same rule
+    # as ``trust_class``. The operator's data classification of this artefact.
+    # Deliberately a second field beside ``trust_class`` rather than a widening
+    # of it: trust and sensitivity are opposite axes and propagate in opposite
+    # directions (minimum over the closure vs maximum over it). When not None
+    # must be one of SENSITIVITY_CLASSES.
+    sensitivity: str | None = None
+    # Additive, optional (issue #5937). ``None`` is dropped from the canonical
+    # bytes so every historical entry keeps its exact wire form, signature and
+    # HMAC. Carries a foreign attestation with issuer metadata and opaque
+    # envelope. Not part of the HMAC audit chain.
+    external_attestation: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.v != LINEAGE_ENTRY_VERSION:
@@ -106,12 +170,42 @@ class LineageEntry:
                 raise ValueError(f"parent_hash must start with 'sha256:', got {p!r}")
         if self.trust_class is not None and self.trust_class not in TRUST_CLASSES:
             raise ValueError(f"unknown trust_class: {self.trust_class!r}")
+        if self.activity_source is not None and self.activity_source not in ACTIVITY_SOURCES:
+            raise ValueError(f"unknown activity_source: {self.activity_source!r}")
         if self.attachment_digests is not None:
             if not self.attachment_digests:
                 raise ValueError("attachment_digests must be omitted rather than empty")
             for d in self.attachment_digests:
                 if len(d) != 64 or not _HEX64.match(d):
                     raise ValueError(f"attachment digest must be 64 lower-case hex chars, got {d!r}")
+        if self.model_ref is not None and not isinstance(self.model_ref, ModelRef):
+            raise ValueError(f"model_ref must be a ModelRef instance, got {type(self.model_ref).__name__}")
+        if self.sensitivity is not None and self.sensitivity not in SENSITIVITY_CLASSES:
+            raise ValueError(f"unknown sensitivity: {self.sensitivity!r}")
+        if self.external_attestation is not None:
+            # Validate the external attestation structure
+            from .foreign_attestation import _REQUIRED_KEYS, _SHA256_DIGEST, _non_empty_string
+
+            if frozenset(self.external_attestation) != _REQUIRED_KEYS:
+                raise ValueError("external_attestation has unsupported or missing fields")
+
+            for field in ("issuer", "issuer_key_id", "claimed_subject"):
+                if not _non_empty_string(self.external_attestation[field]):
+                    raise ValueError(f"external_attestation requires a non-empty {field}")
+
+            content_hash = self.external_attestation["content_hash"]
+            if not isinstance(content_hash, str) or _SHA256_DIGEST.fullmatch(content_hash) is None:
+                raise ValueError("external_attestation requires a sha256 content_hash")
+
+            # Trust class validation is done by the foreign attestation verifier
+            envelope = self.external_attestation["envelope"]
+            if not isinstance(envelope, dict):
+                raise ValueError("external_attestation requires an envelope")
+            if not _non_empty_string(envelope.get("format")):
+                raise ValueError("external_attestation envelope requires a format")
+            payload_hash = envelope.get("payload_hash")
+            if not isinstance(payload_hash, str) or _SHA256_DIGEST.fullmatch(payload_hash) is None:
+                raise ValueError("external_attestation envelope requires a sha256 payload_hash")
 
 
 def _canonical_body(entry: LineageEntry) -> dict[str, object]:
@@ -128,8 +222,16 @@ def _canonical_body(entry: LineageEntry) -> dict[str, object]:
     body = asdict(entry)
     if body.get("trust_class") is None:
         body.pop("trust_class", None)
+    if body.get("activity_source") is None:
+        body.pop("activity_source", None)
     if body.get("attachment_digests") is None:
         body.pop("attachment_digests", None)
+    if body.get("model_ref") is None:
+        body.pop("model_ref", None)
+    if body.get("sensitivity") is None:
+        body.pop("sensitivity", None)
+    if body.get("external_attestation") is None:
+        body.pop("external_attestation", None)
     return body
 
 

@@ -5,6 +5,8 @@ Subcommands:
 * ``sandbox web-test`` - drive a Playwright self-test against a dev
   server URL using scenarios declared in a YAML file. Artefacts land
   under ``.sdd/sandbox/<task-id>/``.
+* ``sandbox leaks`` - list sandbox sessions that were never destroyed and
+  whose owning task is recorded terminal. Read-only.
 
 The CLI is intentionally thin: it loads scenarios, invokes
 :class:`bernstein.core.sandbox.playwright_runner.PlaywrightRunner`, and
@@ -15,11 +17,12 @@ intended to be fed back into the agent's next prompt.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 
@@ -351,6 +354,118 @@ def microvm_launcher_cmd(output: Path | None, library: str | None) -> None:
         console.print("[green]host is ready to boot a libkrun microVM.[/green]")
 
 
+@sandbox_group.command("attest")
+@click.option(
+    "--host-facts",
+    "host_facts_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=(
+        "JSON file of host facts to attest over. Without it only the two facts "
+        "readable without probing the host (os, arch) are recorded."
+    ),
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Print the canonical signed attestation JSON instead of a summary.",
+)
+def attest_cmd(host_facts_path: Path | None, as_json: bool) -> None:
+    """Mint an Ed25519-signed isolation attestation for this host.
+
+    The attestation records, per registered backend, which of its declared
+    capabilities this host was observed to deliver. Nothing is measured yet:
+    every declared capability is recorded as ``unverifiable`` with the reason
+    code ``probe_runner_not_implemented``, because an unmeasured capability
+    reported as observed would be a false statement. The probe runner that
+    turns those entries into real verdicts lands separately.
+
+    The signed body carries no wall-clock, run id or chain position, so
+    minting twice over an unchanged host under the same install identity
+    produces byte-identical output.
+    """
+    from bernstein.core.sandbox.attestation import (
+        BackendAttestation,
+        IsolationAttestationError,
+        ProbeOutcome,
+        ProbeResult,
+        build_isolation_attestation,
+    )
+    from bernstein.core.sandbox.registry import list_backends
+    from bernstein.core.security.agent_card_keystore import AgentCardKeystore
+
+    host_facts = _read_host_facts(host_facts_path)
+
+    entries: list[BackendAttestation] = []
+    for backend in list_backends():
+        declared = tuple(backend.capabilities)
+        entries.append(
+            BackendAttestation(
+                name=backend.name,
+                declared=declared,
+                unverifiable=declared,
+                probes=tuple(
+                    ProbeResult(
+                        capability=cap,
+                        outcome=ProbeOutcome.UNVERIFIABLE,
+                        reason_code="probe_runner_not_implemented",
+                    )
+                    for cap in declared
+                ),
+            ),
+        )
+
+    try:
+        attestation = build_isolation_attestation(
+            keystore=AgentCardKeystore(),
+            host_facts=host_facts,
+            backends=entries,
+        )
+    except IsolationAttestationError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if as_json:
+        click.echo(attestation.to_canonical_json())
+        return
+
+    console.print(f"[green]attestation:[/green] {attestation.attestation_digest()}")
+    console.print(f"[dim]host facts:[/dim] {attestation.host_facts_digest}")
+    console.print(f"[dim]signer:[/dim] {attestation.keyid}")
+    for entry in attestation.backends:
+        console.print(
+            f"  {entry.name}: {len(entry.observed)} observed, "
+            f"{len(entry.refuted)} refuted, {len(entry.unverifiable)} unverifiable",
+        )
+    console.print(
+        "[yellow]nothing measured yet[/yellow] - every capability is recorded as "
+        "unverifiable until the probe runner lands.",
+    )
+
+
+def _read_host_facts(path: Path | None) -> dict[str, object]:
+    """Load host facts from *path*, or fall back to the two facts readable here.
+
+    Returning a partial-but-honest set is deliberate: the collector that reads
+    kernel, runtime versions and cgroup mode is a separate piece of work, and
+    inventing values for the fields it will own would put a fabricated input
+    into the digest the selector later caches on.
+    """
+    import json as _json
+    import platform
+
+    if path is None:
+        return {"os": platform.system().lower(), "arch": platform.machine()}
+    try:
+        raw = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"could not read host facts from {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise click.ClickException(f"host facts file {path} must contain a JSON object")
+    return {str(k): v for k, v in cast("dict[Any, Any]", raw).items()}
+
+
 @sandbox_group.group("receipt")
 def receipt_group() -> None:
     """Inspect and verify fork-race selection receipts."""
@@ -531,8 +646,97 @@ def receipt_verify_cmd(receipt_path: Path, cas_dir: Path, expected_keyid: str | 
         raise click.exceptions.Exit(code=result.exit_code)
 
 
+# ---------------------------------------------------------------------------
+# leaked sandbox sessions (#5112)
+# ---------------------------------------------------------------------------
+
+
+@sandbox_group.command("leaks")
+@click.option(
+    "--workdir",
+    "workdir",
+    default=".",
+    show_default=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Project root holding .sdd/.",
+)
+@click.option(
+    "--all",
+    "show_all",
+    is_flag=True,
+    default=False,
+    help="Also list sessions left out, with the reason (task still running, no task record, ...).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit machine-readable JSON.")
+def leaks_cmd(workdir: Path, show_all: bool, as_json: bool) -> None:
+    """List sandbox sessions whose task finished but which were never destroyed.
+
+    Pairs the ``sandbox.session_create`` / ``sandbox.session_destroy`` records
+    in the audit log, then reads each open session's owning task from the task
+    log. A session is listed as leaked only when every task it was provisioned
+    for is recorded done, failed, closed, cancelled, abandoned, or refused; a
+    session whose task is still running, or has no record, is never listed as
+    leaked. A task log with a torn line, or an unreadable audit segment, stops
+    the command with an error rather than listing from a partial record.
+
+    Read-only: nothing is destroyed or written. Remove a leaked session with
+    the backend's own tooling (for example ``docker rm``) once you have checked
+    it holds nothing you need.
+    """
+    from bernstein.cli.commands.worktrees_cmd import format_age
+    from bernstein.core.sandbox.leak_sweep import SandboxSweepUnavailableError, sweep_leaked_sandboxes
+
+    try:
+        candidates = sweep_leaked_sandboxes(workdir)
+    except SandboxSweepUnavailableError as exc:
+        raise click.ClickException(f"cannot list leaked sandbox sessions: {exc}") from exc
+
+    leaked = [c for c in candidates if c.is_leaked]
+    shown = candidates if show_all else leaked
+
+    if as_json:
+        rows = [
+            {
+                "sandbox_session_id": c.session.sandbox_session_id,
+                "backend": c.session.backend,
+                "agent_session_id": c.session.agent_session_id,
+                "task_ids": list(c.session.task_ids),
+                "task_statuses": dict(c.task_statuses),
+                "created_at": c.session.created_at,
+                "age_seconds": c.age_seconds,
+                "verdict": c.verdict.value,
+                "reason": c.reason,
+            }
+            for c in shown
+        ]
+        click.echo(json.dumps(rows, indent=2))
+        return
+
+    if shown:
+        from rich.table import Table
+
+        table = Table(title="Open sandbox sessions", header_style="bold cyan")
+        table.add_column("Sandbox", overflow="fold")
+        table.add_column("Backend")
+        table.add_column("Age", justify="right")
+        table.add_column("Verdict")
+        table.add_column("Tasks", overflow="fold")
+        for c in shown:
+            age = "?" if c.age_seconds is None else format_age(c.age_seconds)
+            verdict = "[red]leaked[/red]" if c.is_leaked else "[dim]excluded[/dim]"
+            table.add_row(c.session.sandbox_session_id, c.session.backend, age, verdict, c.reason)
+        console.print(table)
+
+    excluded = len(candidates) - len(leaked)
+    console.print(f"{len(leaked)} leaked, {excluded} excluded (nothing was destroyed).")
+    if excluded and not show_all:
+        console.print("[dim]Re-run with --all to see why sessions were excluded.[/dim]")
+
+
 __all__ = [
+    "attest_cmd",
     "fork_race_cmd",
+    "leaks_cmd",
     "microvm_launcher_cmd",
     "receipt_group",
     "receipt_verify_cmd",

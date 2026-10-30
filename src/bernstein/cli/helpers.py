@@ -18,6 +18,10 @@ from bernstein.cli.ui import make_console
 from bernstein.core.defaults import SDD_SERVER_PORT
 from bernstein.core.platform_compat import kill_process, kill_process_group
 from bernstein.core.process_utils import is_process_alive as _shared_is_process_alive
+from bernstein.core.run_auth_token import ACCESS_CLIENT_ID_ENV as ACCESS_CLIENT_ID_ENV
+from bernstein.core.run_auth_token import ACCESS_CLIENT_SECRET_ENV as ACCESS_CLIENT_SECRET_ENV
+from bernstein.core.run_auth_token import access_proxy_headers as access_proxy_headers
+from bernstein.core.run_auth_token import auth_headers
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -119,34 +123,6 @@ def print_startup_banner() -> None:
         except Exception:
             pass
     print_banner()
-
-
-def auth_headers(workdir: Path | None = None) -> dict[str, str]:
-    """Return the Authorization header dict for talking to the local server.
-
-    Resolution order (issue #2794):
-
-    1. The ``BERNSTEIN_AUTH_TOKEN`` env var, when the caller inherited it.
-    2. The persisted run token file under ``.sdd/runtime`` (written by the
-       launcher when it auto-generates a token), so a monitor invoked from a
-       shell that never inherited the launcher env still authenticates.
-
-    Args:
-        workdir: Workspace to resolve the token file against. Defaults to the
-            current working directory - the workspace the monitor runs in.
-
-    Returns:
-        ``{"Authorization": "Bearer <token>"}`` when a token is found, else an
-        empty dict.
-    """
-    token = os.environ.get("BERNSTEIN_AUTH_TOKEN")
-    if not token:
-        from bernstein.core.run_auth_token import read_run_auth_token
-
-        token = read_run_auth_token(workdir or Path.cwd())
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
 
 
 def resolve_server_url(workdir: Path | None = None) -> str:
@@ -619,3 +595,45 @@ def print_warning(message: str) -> None:
 def print_info(message: str) -> None:
     """Print an informational message in cyan with an → prefix."""
     console.print(f"[cyan]→[/cyan] {message}")
+
+
+# ---------------------------------------------------------------------------
+# Audit key loading for read-only commands (issue #5095)
+# ---------------------------------------------------------------------------
+
+
+def load_verify_only_key(key_path: Path | None = None) -> bytes:
+    """Load the audit HMAC key read-only, for a command that only verifies.
+
+    The named alternative to importing
+    :func:`bernstein.core.security.audit.load_or_create_audit_key` directly,
+    which every writing command does. A ``verify`` pass only reads the chain,
+    so it must never mint key material: ``load_or_create_audit_key`` would
+    generate a fresh key on a machine that has none, that key cannot
+    authenticate a chain written under the real key, every HMAC tag would fail,
+    and a plain missing-key setup error would be reported as tamper
+    (issue #2639).
+
+    It lives here rather than inside one command module so the next read-only
+    ``verify`` shares the fail-closed behaviour instead of copying it -- which
+    is how twenty copies of the *writing* loader accumulated (issue #5095).
+
+    Args:
+        key_path: Optional explicit key location, forwarded unchanged.
+
+    Returns:
+        The raw key bytes suitable for ``hmac.new``.
+
+    Raises:
+        SystemExit: Exit code 3 when no key exists, after printing a distinct
+            ``CANNOT VERIFY`` line so the operator sees a setup problem rather
+            than an integrity failure.
+    """
+    from bernstein.core.security.audit import AuditKeyMissingError, load_audit_key
+
+    try:
+        return load_audit_key(key_path)
+    except AuditKeyMissingError as exc:
+        console.print()
+        console.print(f"[yellow]CANNOT VERIFY[/yellow] -- {exc}")
+        raise SystemExit(3) from exc

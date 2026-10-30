@@ -244,6 +244,25 @@ def test_record_task_merged_tolerates_missing_recorder(tmp_path: Path) -> None:
     record_task_merged(None, task_id="t-8", agent_id=None)
 
 
+def test_record_task_merged_carries_the_merge_commit(tmp_path: Path) -> None:
+    """The row names the git object the merge actually produced (issue #5271)."""
+    journal = EventJournal("run-commit", tmp_path / ".sdd")
+    record_task_merged(journal, task_id="t-9", agent_id="agent-c", merge_commit="deadbeef" * 5)
+
+    events = load_events(journal.path).events
+    assert len(events) == 1
+    assert events[0]["merge_commit"] == "deadbeef" * 5
+
+
+def test_record_task_merged_omits_merge_commit_when_none(tmp_path: Path) -> None:
+    """A merge that found nothing to commit must not fabricate a sha."""
+    journal = EventJournal("run-no-commit", tmp_path / ".sdd")
+    record_task_merged(journal, task_id="t-10", agent_id="agent-c", merge_commit=None)
+
+    events = load_events(journal.path).events
+    assert "merge_commit" not in events[0]
+
+
 def test_reap_and_cleanup_records_task_merged(tmp_path: Path, monkeypatch: Any) -> None:
     """The lifecycle merge seam records task_merged after a successful merge."""
     from types import SimpleNamespace
@@ -254,7 +273,7 @@ def test_reap_and_cleanup_records_task_merged(tmp_path: Path, monkeypatch: Any) 
     monkeypatch.setattr(task_lifecycle, "seal_evidence_on_completion", lambda *_a, **_k: None)
 
     recorder = EventJournal("run-seam", tmp_path / ".sdd")
-    merge_result = SimpleNamespace(success=True, conflicting_files=[])
+    merge_result = SimpleNamespace(success=True, conflicting_files=[], merge_commit="cafef00d" * 5)
     spawner = SimpleNamespace(
         reap_completed_agent=lambda *_a, **_k: merge_result,
         cleanup_worktree=lambda _sid: None,
@@ -284,6 +303,7 @@ def test_reap_and_cleanup_records_task_merged(tmp_path: Path, monkeypatch: Any) 
     assert len(merged) == 1
     assert merged[0]["task_id"] == "t-42"
     assert merged[0]["agent_id"] == "sess-1"
+    assert merged[0]["merge_commit"] == "cafef00d" * 5
 
 
 def test_reap_and_cleanup_skips_merge_receipt_when_merge_skipped(tmp_path: Path, monkeypatch: Any) -> None:
@@ -322,6 +342,47 @@ def test_reap_and_cleanup_skips_merge_receipt_when_merge_skipped(tmp_path: Path,
 
     events = load_events(recorder.path).events
     assert [e for e in events if e.get("event") == EVENT_TASK_MERGED] == []
+
+
+def test_reap_and_cleanup_omits_merge_commit_when_merge_produced_none(tmp_path: Path, monkeypatch: Any) -> None:
+    """A merge that found nothing to commit (branches already identical) must not fabricate a sha."""
+    from types import SimpleNamespace
+
+    from bernstein.core.tasks import task_lifecycle
+
+    monkeypatch.setattr(task_lifecycle, "_close_completed_task", lambda *_a, **_k: None)
+    monkeypatch.setattr(task_lifecycle, "seal_evidence_on_completion", lambda *_a, **_k: None)
+
+    recorder = EventJournal("run-no-commit-seam", tmp_path / ".sdd")
+    merge_result = SimpleNamespace(success=True, conflicting_files=[])  # no merge_commit attribute
+    spawner = SimpleNamespace(
+        reap_completed_agent=lambda *_a, **_k: merge_result,
+        cleanup_worktree=lambda _sid: None,
+    )
+    orch = SimpleNamespace(
+        _spawner=spawner,
+        _workdir=tmp_path,
+        _config=SimpleNamespace(ab_test=False),
+        _recorder=recorder,
+    )
+    session = SimpleNamespace(id="sess-3", status="dead", exit_code=0, task_ids=["t-44"])
+    task = SimpleNamespace(id="t-44", metadata={})
+
+    task_lifecycle._reap_and_cleanup_session(
+        orch,
+        task,
+        session,
+        None,
+        janitor_passed=True,
+        skip_merge=False,
+        _completion_data=None,
+        cache_diff_lines=0,
+    )
+
+    events = load_events(recorder.path).events
+    merged = [e for e in events if e.get("event") == EVENT_TASK_MERGED]
+    assert len(merged) == 1
+    assert "merge_commit" not in merged[0]
 
 
 # ---------------------------------------------------------------------------
@@ -641,3 +702,65 @@ def test_plan_graph_full_deterministic_across_replays(tmp_path: Path) -> None:
     board_b = project_board(events_b)
     assert canonical_board_bytes(board_a) == canonical_board_bytes(board_b)
     assert board_hash(board_a) == board_hash(board_b)
+
+
+def test_task_merged_carries_merge_commit(tmp_path: Path) -> None:
+    """record_task_merged writes merge_commit, salvaged_commit, and reason into journal."""
+    journal = EventJournal("run-m1", tmp_path / ".sdd")
+    record_task_merged(
+        journal,
+        task_id="T-10",
+        agent_id="agent-10",
+        merge_commit="abc1234567",
+        salvaged_commit="def7654321",
+        reason="orphan_no_signals",
+    )
+    events = load_events(journal.path).events
+    assert len(events) == 1
+    row = events[0]
+    assert row["event"] == EVENT_TASK_MERGED
+    assert row["task_id"] == "T-10"
+    assert row["agent_id"] == "agent-10"
+    assert row["merge_commit"] == "abc1234567"
+    assert row["salvaged_commit"] == "def7654321"
+    assert row["reason"] == "orphan_no_signals"
+
+
+def test_review_board_projects_salvaged_merge(tmp_path: Path) -> None:
+    """Review board projection captures merge_commit, salvaged_commit, and salvage_reason."""
+    events = [
+        {"event": "run_started", "run_id": "r1", "git_branch": "main", "git_sha": "abc"},
+        {"event": "task_claimed", "task_id": "t-salvage", "agent_id": "agent-s"},
+        {
+            "event": EVENT_TASK_MERGED,
+            "task_id": "t-salvage",
+            "agent_id": "agent-s",
+            "merge_commit": "merge-sha-123",
+            "salvaged_commit": "wip-sha-456",
+            "reason": "dead_agent",
+        },
+    ]
+    board = project_board(events)
+    assert _column_of(board, "t-salvage") == "merged"
+    merged_cards = board["columns"]["merged"]
+    card = next(c for c in merged_cards if c["task_id"] == "t-salvage")
+    assert card["merge_commit"] == "merge-sha-123"
+    assert card["salvaged_commit"] == "wip-sha-456"
+    assert card["salvage_reason"] == "dead_agent"
+
+
+def test_rederive_accepts_merge_commit_field(tmp_path: Path) -> None:
+    """Rederive/replay cleanly accepts task_merged rows with merge_commit fields."""
+    journal = EventJournal("run-rederive-test", tmp_path / ".sdd")
+    journal.record("run_started", run_id="run-rederive-test", git_branch="main", git_sha="abc1234", config_hash="cfg")
+    journal.record(
+        EVENT_TASK_MERGED,
+        task_id="t-1",
+        agent_id="agent-1",
+        merge_commit="sha999",
+        salvaged_commit="wip888",
+        reason="dead_agent",
+    )
+    events = load_events(journal.path).events
+    assert len(events) == 2
+    assert events[1]["merge_commit"] == "sha999"

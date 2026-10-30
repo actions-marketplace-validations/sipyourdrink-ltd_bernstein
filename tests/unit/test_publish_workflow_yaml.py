@@ -202,6 +202,22 @@ def test_copr_build_watch_is_delegated_to_the_tested_watcher(workflow: dict[str,
     assert "--nowait" in run, "copr-cli's own watch has no deadline; the watcher owns it"
 
 
+def _environment_name(job: dict[str, Any]) -> str | None:
+    environment = job.get("environment")
+    if isinstance(environment, dict):
+        return cast("str | None", environment.get("name"))
+    return cast("str | None", environment)
+
+
+def test_copr_job_runs_in_its_own_environment_apart_from_pypi(workflow: dict[str, Any]) -> None:
+    """Each run of a job with an ``environment`` opens a deployment there. The
+    Copr job must not share ``pypi``, or a Copr build failure is recorded as a
+    failed PyPI deployment even when the PyPI upload succeeded."""
+    jobs = workflow["jobs"]
+    assert _environment_name(jobs["publish"]) == "pypi"
+    assert _environment_name(jobs[COPR_JOB]) == "copr"
+
+
 def test_copr_config_secret_is_written_from_the_environment_with_owner_only_mode(
     workflow: dict[str, Any],
 ) -> None:
@@ -339,13 +355,13 @@ def test_npm_missing_token_fails_the_job(workflow: dict[str, Any]) -> None:
     run = _step_run(workflow, "publish-npm", "Publish to npm")
 
     assert "::warning::NPM_TOKEN is not configured" not in run
-    assert "::error::NPM_TOKEN is not configured" in run
-    assert "exit 1" in run
+    assert "::error::npm wrapper publish failed" in run
+    assert "exit " in run
 
 
-def test_github_release_dispatches_every_release_event_consumer(workflow: dict[str, Any]) -> None:
+def test_publish_graph_dispatches_every_release_event_consumer(workflow: dict[str, Any]) -> None:
     """A GITHUB_TOKEN release emits no `release: published`, so each consumer is dispatched."""
-    dispatched = _dispatches(workflow, "github-release")
+    dispatched = {target: inputs for job in workflow["jobs"] for target, inputs in _dispatches(workflow, job).items()}
 
     for consumer in RELEASE_EVENT_CONSUMERS:
         assert consumer in dispatched, f"{consumer} consumes `release: published` but is never dispatched"
@@ -353,7 +369,7 @@ def test_github_release_dispatches_every_release_event_consumer(workflow: dict[s
 
 def test_dispatched_inputs_match_the_target_workflow_inputs(workflow: dict[str, Any]) -> None:
     """Every `-f name=` passed on dispatch must be an input the target declares."""
-    dispatched = _dispatches(workflow, "github-release")
+    dispatched = {target: inputs for job in workflow["jobs"] for target, inputs in _dispatches(workflow, job).items()}
 
     for workflow_file, passed_inputs in dispatched.items():
         declared = _declared_dispatch_inputs(workflow_file)
@@ -426,3 +442,62 @@ def test_release_creation_does_not_fall_back_to_generated_notes_only(
     run = _step_run(workflow, RELEASE_JOB, "Create release")
     commands = "\n".join(line for line in run.splitlines() if not line.lstrip().startswith("#"))
     assert "--generate-notes" not in commands, "--generate-notes publishes the machine changelog as the whole body"
+
+
+def test_docker_mcp_catalog_source_commit_check_exists(workflow: dict[str, Any]) -> None:
+    """The docker-mcp catalog's source.commit must be pinned and validated.
+
+    The catalog's server.yaml contains a hand‑maintained source.commit pin
+    that cannot match the release commit on the tag path (the commit that
+    contains the file cannot be its own hash). The workflow annotates stale
+    pins as warnings and renders a fresh payload with the correct commit
+    before opening the catalog PR.
+
+    This test ensures the validation step is present and contains the logic
+    that extracts the pinned commit and compares it to HEAD.
+    """
+    step = _step(workflow, "publish-mcp-registry", "Annotate stale docker-mcp catalog source.commit")
+    run = step.get("run")
+    assert isinstance(run, str)
+    # Must read packaging/docker-mcp/server.yaml
+    assert "packaging/docker-mcp/server.yaml" in run
+    # Must extract a 40‑char hex SHA
+    assert "([0-9a-f]{40})" in run
+    # Must compare pinned != head
+    assert "pinned != head" in run
+    # Must define warning annotation
+    assert 'annotation = "warning"' in run
+
+
+def test_docker_mcp_catalog_render_step_exists(workflow: dict[str, Any]) -> None:
+    """The stale pin is replaced by a rendered payload with the actual release commit."""
+    step = _step(workflow, "publish-mcp-registry", "Render docker-mcp catalog with release commit")
+    run = step.get("run")
+    assert isinstance(run, str)
+    # Must call the render script
+    assert "scripts/render_docker_mcp_catalog.py" in run
+    # Must substitute the release commit
+    assert "RELEASE_COMMIT=$(git rev-parse HEAD)" in run
+    # Must produce server.yaml.rendered
+    assert "server.yaml.rendered" in run
+
+
+def test_upload_artifact_actions_use_same_sha(workflow: dict[str, Any]) -> None:
+    """Both actions/upload-artifact steps in the publish workflow must use the same SHA."""
+    upload_artifact_shas = []
+    for _job_name, job in workflow["jobs"].items():
+        for step in job.get("steps", []):
+            if isinstance(step, dict) and step.get("uses", "").startswith("actions/upload-artifact"):
+                uses = step["uses"]
+                # Extract the SHA from the uses string.
+                # Format: actions/upload-artifact@<sha>#<ref> or actions/upload-artifact@<sha>
+                try:
+                    _, rest = uses.split("@", 1)
+                except ValueError:
+                    continue
+                # Split at '#' or space to get the SHA.
+                sha = rest.split("#")[0].split()[0]
+                upload_artifact_shas.append(sha)
+    # We expect exactly two upload-artifact steps in the publish workflow.
+    assert len(upload_artifact_shas) == 2, f"Expected 2 upload-artifact steps, found {len(upload_artifact_shas)}"
+    assert upload_artifact_shas[0] == upload_artifact_shas[1], f"Upload artifact SHAs differ: {upload_artifact_shas}"

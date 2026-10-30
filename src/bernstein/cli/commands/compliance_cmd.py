@@ -21,6 +21,7 @@ from typing import cast
 import click
 
 from bernstein.compliance.eu_ai_act import ComplianceEngine, bernstein_descriptor
+from bernstein.core.compliance.ai_rmf import PACK_KIND_AI_RMF, build_ai_rmf_pack
 from bernstein.core.compliance.pack import (
     build_incident_pack,
     build_oversight_pack,
@@ -35,6 +36,8 @@ from bernstein.core.compliance_policies import (
     PolicySeverity,
     evaluate_all,
     evaluate_framework,
+    observe_audit_retention_days,
+    summarise_evidence_coverage,
 )
 from bernstein.core.eu_ai_act import summarize_assessments
 
@@ -300,6 +303,69 @@ def list_policies(framework: str | None, as_json: bool) -> None:
     click.echo(f"\nTotal: {len(policies)} policies")
 
 
+@compliance_group.command("coverage")
+@click.option(
+    "--workdir",
+    default=".",
+    show_default=True,
+    type=click.Path(path_type=Path),
+    help="Project root (parent of .sdd/).",
+)
+@click.option("--json-output", "as_json", is_flag=True, help="Print coverage summary as JSON instead of a table.")
+def coverage_command(workdir: Path, as_json: bool) -> None:
+    """Report compliance coverage per control, per enabled framework.
+
+    For each control in the chain, reports:
+      * evidenced-from-the-chain (present)
+      * partially-evidenced with the missing input named (type missing)
+      * not evidenceable by this install (unsupported)
+
+    Returns zero if the install has full coverage; non-zero otherwise.
+
+    The report maps each registered policy to the chain events that satisfy it.
+    A control is:
+      - ``evidenced``  — at least one chain event satisfies the required behaviour,
+      - ``partially-evidenced`` — the artefact kind is present but no entry matches
+        the required behaviour suffix, and the reason names the specific missing input,
+      - ``not_evidenceable`` — the control is not registered and the install cannot
+        evidence it.
+    """
+    from bernstein.core.compliance.coverage import (
+        assess_control_coverage,
+        format_coverage_report,
+    )
+    from bernstein.core.lineage.store import LineageStore
+
+    # Load the lineage log
+    store = LineageStore(workdir / ".sdd" / "lineage")
+    entries = list(store.read_log())
+    lineage_entries = [entry for entry, _ in entries]
+
+    # Assess control coverage against the chain
+    results = assess_control_coverage(lineage_entries)
+
+    if as_json:
+        import json
+
+        payload = [
+            {
+                "policy_id": r.policy_id,
+                "control_id": r.control_id,
+                "status": r.status.value,
+                "evidence_summary": r.evidence_summary,
+                "missing_inputs": r.missing_inputs,
+                "reason": r.reason,
+            }
+            for r in results
+        ]
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    # Format and display the report
+    report = format_coverage_report(results)
+    click.echo(report)
+
+
 @compliance_group.command("check")
 @click.option(
     "--framework",
@@ -352,10 +418,14 @@ def check_policies(
     """Evaluate compliance policies against the current runtime configuration.
 
     Pass --<flag> / --no-<flag> options to describe the current state of your
-    deployment.  The command exits non-zero if any failing policy meets the
-    severity threshold set by --fail-on (default: critical).
+    deployment.  Those flags are operator declarations: results resting on
+    them are reported as declared, not as evidenced.  Audit retention is not a
+    flag - it is read off the audit segments under WORKDIR.  The command exits
+    non-zero if any failing policy meets the severity threshold set by
+    --fail-on (default: critical).
     """
     inp = PolicyInput(
+        audit_retention_days=observe_audit_retention_days(workdir / ".sdd" / "audit"),
         audit_logging=audit_logging,
         audit_hmac_chain=audit_hmac_chain,
         sandbox_enabled=sandbox_enabled,
@@ -396,6 +466,8 @@ def check_policies(
         "none": 99,
     }
 
+    coverage = summarise_evidence_coverage(results)
+
     if as_json:
         click.echo(
             json.dumps(
@@ -404,6 +476,7 @@ def check_policies(
                         "total": len(results),
                         "passing": len(passing),
                         "failing": len(failing),
+                        "evidence": coverage.to_dict(),
                     },
                     "results": [r.to_dict() for r in results],
                 },
@@ -413,6 +486,7 @@ def check_policies(
     else:
         click.echo(f"Compliance check: {len(results)} policies evaluated")
         click.echo(f"  Passing: {len(passing)}   Failing: {len(failing)}")
+        click.echo(f"  Evidenced: {coverage.evidenced}   Operator-declared: {coverage.operator_asserted}")
         click.echo("")
         if failing:
             click.echo("FAILURES:")
@@ -454,6 +528,74 @@ def export_rego(framework: str, output_dir: Path | None, workdir: Path) -> None:
     dest = output_dir or (workdir / ".sdd" / "compliance" / "rego" / fw.value)
     paths = CompliancePolicyLibrary().export_rego(fw, dest_dir=dest)
     click.echo(f"Exported {len(paths)} Rego policies to: {dest}")
+
+
+# ---------------------------------------------------------------------------
+# `bernstein compliance decisions` - decision provenance for gated actions
+# ---------------------------------------------------------------------------
+
+
+@compliance_group.command("decisions")
+@click.option(
+    "--audit-dir",
+    default=".sdd/audit",
+    show_default=True,
+    type=click.Path(path_type=Path),
+    help="Directory holding the HMAC-chained audit log.",
+)
+@click.option("--json-output", "as_json", is_flag=True, help="Emit the closed-schema records as JSON.")
+def decisions(audit_dir: Path, as_json: bool) -> None:
+    """Report decision provenance for every approval-gated action.
+
+    One record per settled approval card: who approved it, what tool call it
+    authorised, the intent and blast-radius estimate they were shown, and the
+    two audit-chain events each field was taken from.
+
+    The report is emitted only when the chain verifies and only for cards the
+    approval-card verifier could fully reconstruct. A decision-provenance
+    report drawn from a chain that failed verification would be an ordinary
+    claims document, which is what this command exists to replace, so a failed
+    verdict prints the errors and exits non-zero instead.
+    """
+    from bernstein.core.approval.card_verify import verify_approval_card_events
+    from bernstein.core.compliance.decision_record import (
+        build_decision_records,
+        render_decision_records,
+    )
+    from bernstein.core.security.audit import (
+        AuditKeyMissingError,
+        AuditKeyPermissionError,
+        load_audit_key,
+    )
+    from bernstein.core.security.audit_chain import AuditChainStore
+
+    try:
+        key = load_audit_key()
+    except (AuditKeyMissingError, AuditKeyPermissionError) as exc:
+        raise click.ClickException(f"cannot authenticate audit rows: {exc}") from exc
+
+    # One locked snapshot: the rows projected below are exactly the rows the
+    # verdict covers. Verifying and querying separately would let an append
+    # land in between, so the report could carry a decision the verification
+    # never saw.
+    chain = AuditChainStore(audit_dir, key=key)
+    chain_ok, chain_errors, events = chain.verify_and_query(include_archived=True)
+    if not chain_ok:
+        for error in chain_errors:
+            click.echo(f"audit chain verification failed: {error}", err=True)
+        raise SystemExit(1)
+
+    result = verify_approval_card_events(events)
+    if not result.ok:
+        for error in [*result.errors, *result.verifier_errors]:
+            click.echo(f"approval card verification failed: {error}", err=True)
+        raise SystemExit(1)
+
+    records = build_decision_records(result)
+    if as_json:
+        click.echo(json.dumps([record.to_dict() for record in records], indent=2, sort_keys=False))
+        return
+    click.echo(render_decision_records(records))
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +678,7 @@ def pack_group() -> None:
       retention   chain-continuity evidence for a window (Article 12(3)).
       incident    serious-incident report from a run (Article 73).
       oversight   human-oversight evidence from receipts (Article 14).
+      ai-rmf      NIST AI RMF Core evidence for all four functions.
     """
 
 
@@ -787,3 +930,119 @@ def pack_incident(
         operator_key_path=resolved_key,
     )
     click.echo(f"Incident pack written to: {out_path} ({len(gaps)} evidence gap(s))")
+
+
+@pack_group.command("ai-rmf")
+@click.option("--since", required=True, help="Window start date (YYYY-MM-DD, inclusive).")
+@click.option("--until", required=True, help="Window end date (YYYY-MM-DD, inclusive).")
+@click.option("--org", required=True, help="Organisation name (printed on the cover page).")
+@click.option("--output", required=True, type=click.Path(path_type=Path), help="Destination .zip path.")
+@click.option(
+    "--workdir",
+    default=".",
+    show_default=True,
+    type=click.Path(path_type=Path),
+    help="Project root (used to locate lineage and the NIST mapping).",
+)
+@click.option("--lineage-dir", default=None, type=click.Path(path_type=Path), help="Override lineage directory.")
+@click.option(
+    "--agent-cards-dir",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Override Agent Cards directory.",
+)
+@click.option(
+    "--mapping",
+    default=None,
+    type=click.Path(path_type=Path),
+    help=(
+        "NIST AI RMF mapping markdown. Defaults to docs/compliance/nist-ai-rmf-mapping.md "
+        "under --workdir, which exists in a source checkout only; an installed package "
+        "must pass this explicitly."
+    ),
+)
+@click.option("--operator-key", default=None, type=click.Path(path_type=Path), help="Override operator signing key.")
+def pack_ai_rmf(
+    since: str,
+    until: str,
+    org: str,
+    output: Path,
+    workdir: Path,
+    lineage_dir: Path | None,
+    agent_cards_dir: Path | None,
+    mapping: Path | None,
+    operator_key: Path | None,
+) -> None:
+    """Build one NIST AI RMF evidence pack for GOVERN, MAP, MEASURE, and MANAGE.
+
+    Covered subcategories carry the chain entries that match their mechanism.
+    A window with no matching entries is still a valid sealed pack and does
+    not claim those rows were evidenced. Generative AI Profile actions are
+    recorded on the same subcategory rows.
+    """
+    since_date, until_date = _window_dates(since, until)
+    resolved_lineage = lineage_dir or (workdir / ".sdd" / "lineage")
+    resolved_cards = agent_cards_dir or (workdir / ".sdd" / "agents")
+    resolved_key = _require_operator_key(operator_key, workdir)
+    mapping_path = mapping or (workdir / "docs" / "compliance" / "nist-ai-rmf-mapping.md")
+    if not mapping_path.is_file():
+        raise click.ClickException(f"NIST AI RMF mapping not found at {mapping_path}.")
+
+    out_path = build_ai_rmf_pack(
+        since=since_date,
+        until=until_date,
+        org=org,
+        lineage_dir=resolved_lineage,
+        agent_cards_dir=resolved_cards,
+        mapping_path=mapping_path,
+        output_path=output,
+        operator_key_path=resolved_key,
+    )
+    click.echo(f"AI RMF pack written to: {out_path} (kind={PACK_KIND_AI_RMF})")
+
+
+# ---------------------------------------------------------------------------
+# `bernstein compliance controls` - Central control registry inspection
+# ---------------------------------------------------------------------------
+
+
+@compliance_group.command("controls")
+@click.option(
+    "--framework",
+    default=None,
+    help="Filter by compliance framework (eu_ai_act, owasp_asi, owasp_skills, nist_ai_rmf, iso_42001, finos_aigf).",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["text", "json", "markdown"], case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+def controls_command(framework: str | None, output_format: str) -> None:
+    """List the registered compliance controls and their framework mappings."""
+    from bernstein.compliance.controls import get_default_registry
+
+    registry = get_default_registry()
+    controls = registry.list_controls(framework=framework)
+    if framework and not controls:
+        # A typo must not read as "no controls for this framework".
+        known = sorted({k for c in registry.list_controls() for k in c.references})
+        click.echo(f"No control references framework {framework!r}; known frameworks: {', '.join(known)}", err=True)
+
+    if output_format == "json":
+        click.echo(json.dumps([c.to_dict() for c in controls], indent=2))
+        return
+
+    if output_format == "markdown":
+        click.echo(registry.to_markdown_table(framework=framework))
+        return
+
+    # Text table format
+    click.echo(f"{'Control ID':<14} {'Category':<14} {'Frameworks':<28} Title")
+    click.echo("─" * 95)
+    for c in controls:
+        fw_list = ", ".join(c.references.keys())
+        click.echo(f"{c.control_id:<14} {c.category:<14} {fw_list:<28} {c.title}")
+    click.echo(f"\nTotal: {len(controls)} controls")

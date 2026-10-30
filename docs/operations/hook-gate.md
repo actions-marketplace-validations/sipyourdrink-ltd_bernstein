@@ -93,6 +93,15 @@ order, and only a call none of these settle reaches the operator:
 | Always-allow list | A matching tool+args pattern proceeds without asking. |
 | Otherwise | Enqueued as a pending approval; the hook blocks. |
 
+The classifier deny-list covers shell writes into the control plane
+(`.sdd/`, `.bernstein/`): redirects (`>`, `>>`, `>|`, `&>`, `N>`) and
+file-writing tools (`cp`, `mv`, `tee`, `install`, `rsync`, `sed -i`, ...)
+are denied whether the target is relative, `./`-prefixed, absolute or quoted.
+A redirect or write target containing a `..` segment is denied as well: an
+agent works in a worktree under `.sdd/worktrees/<session>/`, so a path that
+climbs out of it reaches the control plane without naming it, and the
+classifier has no working directory to prove otherwise.
+
 While a call is pending it is visible to all three resolution surfaces, which
 share one queue under `.sdd/runtime/approvals`:
 
@@ -104,6 +113,27 @@ bernstein approve --tool           # CLI
 
 ...plus the TUI `ApprovalPanel`, which polls the same queue. Resolving through
 any of them releases the same pending.
+
+### Who resolved it
+
+Every resolution names a principal: an identifier, how it was authenticated,
+and the session or grant it acted under. There is no default, so a surface
+that cannot name the decider cannot resolve.
+
+| Surface | Identifier | Authentication method |
+|---|---|---|
+| HTTP with scoped tokens configured | the token's principal | `scoped-token` |
+| HTTP with no tokens configured (loopback posture) | `dashboard-operator` | `loopback` |
+| CLI and TUI | `os-user:<name>` | `local-shell` |
+| TTL expiry, sweeper, policy deny, classifier auto-decision | `system:<component>` | `server-internal` |
+
+An HTTP request that presents no valid token while scoped tokens *are*
+configured is refused with `401` rather than resolved against an unnamed
+caller. The `system:` namespace is reserved: a human principal may not use it
+and a server-internal one must, so a decision the software made cannot be read
+as a person's. The principal is written to the resolution sentinel under
+`.sdd/runtime/approvals` and to the `human_approval_decision` audit-chain
+event, whose actor is the principal's identifier.
 
 The agent observes the decision as the hook's exit code: an allow (or an
 always-allow promotion) lets the call proceed, a reject refuses it with the

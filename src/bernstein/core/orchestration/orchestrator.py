@@ -29,6 +29,7 @@ import signal
 import threading
 import time
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
@@ -48,10 +49,12 @@ from bernstein.core.agent_recycling import (
 from bernstein.core.agent_signals import AgentSignalManager
 from bernstein.core.agents.context_attachments import CONTEXT_FILES_ATTACHED_EVENT
 from bernstein.core.agents.injected_skills_event import SKILLS_INJECTED_EVENT
+from bernstein.core.agents.stop_reaper import reap_stop_requests
 from bernstein.core.approval import ApprovalGate, ApprovalMode
 from bernstein.core.bandit_router import BanditRouter
 from bernstein.core.batch_api import ProviderBatchManager
 from bernstein.core.bulletin import BulletinBoard, BulletinMessage, SignalActionFailure
+from bernstein.core.circuit_breaker import check_budget_violations
 from bernstein.core.cluster import NodeHeartbeatClient
 from bernstein.core.config.run_overlay import effective_mtime
 from bernstein.core.context import refresh_knowledge_base
@@ -108,6 +111,11 @@ from bernstein.core.orchestration.controller_state import (
     save as _save_controller_state,
 )
 from bernstein.core.orchestration.evolution import EvolutionCoordinator
+
+# The no-adapter message lives in ``preflight`` so the CLI can print it without
+# importing this module; it is re-exported here because this is where the
+# orchestrator subprocess raises it and where callers have always imported it.
+from bernstein.core.orchestration.preflight import NO_ADAPTER_CONFIGURED as NO_ADAPTER_CONFIGURED
 from bernstein.core.orchestration.run_stall import (
     ACTIVE_UNFINISHED_STATUSES,
     STUCK_TASK_FAIL_REASON,
@@ -171,6 +179,7 @@ from bernstein.core.task_lifecycle import (
     collect_completion_data,
     evict_degraded_sessions,
     maybe_retry_task,
+    note_queued_retries,
     prepare_speculative_warm_pool,
     process_completed_tasks,
     retry_or_fail_task,
@@ -184,34 +193,19 @@ from bernstein.core.workflow import WorkflowExecutor, load_workflow
 from bernstein.evolution.governance import AdaptiveGovernor
 from bernstein.evolution.risk import RiskScorer
 
-_BERNSTEIN_YAML = "bernstein.yaml"
-
-#: What an operator is told when no adapter resolves. Every flag it names has to
-#: be a flag of the ``bernstein`` command, because that is what the reader typed
-#: and what they will check against ``bernstein --help``. This module's own
-#: ``--adapter`` argparse flag belongs to the orchestrator subprocess and is not
-#: reachable from there; naming it sent readers looking for an option that does
-#: not exist (#3526). ``tests/unit/test_adapter_fatal_message.py`` resolves each
-#: flag here against the registered CLI, so the text cannot drift back.
-NO_ADAPTER_CONFIGURED = (
-    "FATAL: no adapter configured. Bernstein does not default to Claude - "
-    f"pass --cli (e.g. --cli codex), set BERNSTEIN_ADAPTER, or set 'cli' in {_BERNSTEIN_YAML}. "
-    "Run 'bernstein integrations list --installed' to see which adapters resolve here."
-)
-
 # Preserve underscore-prefixed aliases so existing test imports keep working
 _compute_total_spent = compute_total_spent
 _total_spent_cache = total_spent_cache
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
     from bernstein.core.backlog_parser import ParsedBacklogTask
     from bernstein.core.container import ContainerConfig
     from bernstein.core.permission_mode import PermissionMode
     from bernstein.core.protocols.cluster.mesh_coordinator import MeshCoordinator
-    from bernstein.core.quality_gates import QualityGatesConfig
+    from bernstein.core.quality.quality_gates import QualityGatesConfig
     from bernstein.core.security.sandbox import SandboxRuntime
     from bernstein.core.spawner import AgentSpawner
     from bernstein.evolution.loop import EvolutionLoop
@@ -345,6 +339,72 @@ _complete_task = complete_task
 _parse_backlog_file = parse_backlog_file
 
 
+def has_terminal_task(tasks_by_status: Mapping[str, list[Task]]) -> bool:
+    """Has any task in this run actually reached a terminal state?
+
+    Step-8b quiescence self-stops only once the answer is yes. The guard exists
+    because a brand-new or empty backlog also reads ``open=0 agents=0`` on tick
+    #1 -- a server that has not ingested its seed task, or a harness driving
+    ``tick()`` against an empty transport -- and self-stopping there would end
+    the orchestrator before it ever did anything.
+
+    ``closed`` counts, and its absence is what #5968 reports. A verified task is
+    archived out of ``done`` into ``closed``, so on a run whose tasks all
+    completed and were archived this answered "nothing has run" on every tick:
+    quiescence logged ``done 0->0, failed 0->0``, the self-stop was never
+    reached, and neither ``run_completed`` nor ``run_quiescence`` was ever
+    journalled. A finished run with no ending.
+
+    ``.get`` for every key so a caller passing a narrower status list -- the
+    parameter ``fetch_all_tasks`` still honours -- gets a false rather than a
+    KeyError.
+    """
+    return bool(tasks_by_status.get("done") or tasks_by_status.get("failed") or tasks_by_status.get("closed"))
+
+
+def has_inflight_task(tasks_by_status: Mapping[str, list[Task]]) -> bool:
+    """Is any task still held by a worker, local or remote?
+
+    Step-8b quiescence read only ``open`` and this orchestrator's own agents.
+    In cluster mode a remote ``bernstein worker`` claims tasks from the same
+    task server, and those claims belong to no local agent: the run read
+    ``open=0 agents=0`` while a remote worker was still running a retry, the
+    orchestrator self-stopped, and when the retry finished the dependents it
+    unblocked had no spawner left. A step for a role the remote worker does
+    not poll then stayed ``open`` for good.
+
+    Read on the settle-window refetch, not the top-of-tick snapshot: a task a
+    dead local agent held is auto-completed by ``reap_dead_agents`` within the
+    tick, so the snapshot still shows it ``claimed`` when it no longer is. A
+    claim held by a dead local agent does not keep the run alive forever
+    either: ``_release_stale_claims`` retries or fails it on a normal tick.
+    """
+    return bool(tasks_by_status.get("claimed") or tasks_by_status.get("in_progress"))
+
+
+def _model_identity(
+    model: str | None,
+    provider: str | None,
+) -> tuple[str | None, str | None]:
+    """Return the ``(model_id, model_provider)`` pair for a spawned session.
+
+    A resolved *provider* always wins. When it is absent and *model* carries
+    a ``namespace/rest`` identifier, the namespace the operator configured is
+    journaled as the provider and the identifier is kept whole as the model id.
+    A bare identifier or an empty namespace on either side is not a provider:
+    neither fact is journaled and export keeps refusing rather than inventing
+    a vendor name.
+    """
+    if provider is not None:
+        return model, provider
+    if model is None:
+        return None, None
+    namespace, sep, rest = model.partition("/")
+    if sep and namespace and rest:
+        return model, namespace
+    return None, None
+
+
 class ShutdownInProgress(RuntimeError):
     """Raised when a spawn is attempted after shutdown has started."""
 
@@ -386,6 +446,7 @@ class Orchestrator:
         notifier: NotificationManager | None = None,
         quality_gate_config: QualityGatesConfig | None = None,
         formal_verification_config: Any | None = None,
+        data_class: str | None = None,
     ) -> None:
         self._config = config
         self._spawner = spawner
@@ -402,6 +463,7 @@ class Orchestrator:
         self._cluster_config = cluster_config
         self._quality_gate_config: QualityGatesConfig | None = quality_gate_config
         self._gate_coalescer: QualityGateCoalescer = QualityGateCoalescer()
+        self._data_class: str | None = data_class
         # Formal verification gate is invoked by task_lifecycle._run_verification_gates
         # only when OrchestratorConfig.formal_verification_enabled is True. Default
         # remains False so deployments without Z3/Lean4 installed are unaffected.
@@ -416,7 +478,6 @@ class Orchestrator:
         )
         self._agents: dict[str, AgentSession] = {}
         self._lock_manager = FileLockManager(workdir)
-        self._file_ownership: dict[str, str] = {}  # filepath -> agent_id (legacy alias; use _lock_manager)
         from bernstein.core.loop_detector import LoopDetector
 
         self._loop_detector = LoopDetector()
@@ -715,6 +776,7 @@ class Orchestrator:
         from bernstein.core.cost_anomaly import CostAnomalyDetector
 
         self._anomaly_detector = CostAnomalyDetector(config.cost_anomaly, workdir)
+        self._stop_spawning: bool = False
 
         # Context degradation detector: flags agents whose cross-model review
         # verdicts decline (N consecutive rejects).  Degraded sessions are
@@ -875,10 +937,54 @@ class Orchestrator:
         # orchestrator, so the hook is applied here via a setter.
         if hasattr(self._spawner, "set_merge_queue"):
             self._spawner.set_merge_queue(self._merge_queue)
+        if hasattr(self._spawner, "set_file_ownership_provider"):
+            self._spawner.set_file_ownership_provider(lambda: dict(self._file_ownership))
         if hasattr(self._spawner, "set_quality_gate_config"):
             self._spawner.set_quality_gate_config(self._quality_gate_config)
         if hasattr(self._spawner, "set_run_id"):
             self._spawner.set_run_id(self._run_id)
+        if hasattr(self._spawner, "set_max_agent_runtime_s"):
+            self._spawner.set_max_agent_runtime_s(config.max_agent_runtime_s)
+
+        # Run-root identity (#5047): one parentless identity per run, the issuer
+        # every top-level agent's delegation hop names. Parentless, so it records
+        # no hop of its own -- an empty chain is not a broken chain -- but it
+        # gives the first real hop a parent to be graded against. Without it,
+        # top-level agents have no issuer, no hop is recorded, and a single-level
+        # run still verifies as "no receipts".
+        #
+        # Scope is left unconstrained on both axes rather than snapshotted. A
+        # run's task set is not bounded at start: tasks are fetched per tick and
+        # created during the run, so a snapshot taken here would make every task
+        # created later a widening on its own agent's hop and fail verification
+        # for a run that did nothing wrong. ``None`` is the widest value on every
+        # DelegationScope axis, so an unconstrained root is exactly "the whole
+        # run" and is a valid ceiling for any child. This codebase has no
+        # run-level file allowlist, so that axis is unconstrained for the same
+        # reason.
+        self._run_root_identity_id = ""
+        try:
+            from bernstein.core.identity.agent_jwt import AgentIdentityStore
+
+            _root_store = AgentIdentityStore(workdir / ".sdd" / "auth")
+            _root_identity, _ = _root_store.create_identity(
+                f"run-root-{run_id}",
+                "manager",
+                metadata={"source": "orchestrator", "run_id": run_id, "run_root": "true"},
+            )
+            self._run_root_identity_id = _root_identity.id
+        except Exception as _root_exc:
+            # Degrades to the pre-#5047 behaviour: no root means no issuer, so
+            # no hop is recorded and `delegation verify` reports "no receipts".
+            # Loud, because a run that silently stops being verifiable is the
+            # thing this change exists to prevent.
+            logger.warning(
+                "Run-root identity not minted for %s: %s. Delegation receipts will not be recorded for this run.",
+                run_id,
+                sanitize_log(str(_root_exc)),
+            )
+        if hasattr(self._spawner, "set_run_root_identity_id"):
+            self._spawner.set_run_root_identity_id(self._run_root_identity_id)
 
         # Convergence guard: blocks spawn waves when merge queue, active
         # agent count, error rate, or spawn rate exceed safe thresholds.
@@ -890,8 +996,11 @@ class Orchestrator:
         # Reset error budget AND metric collector each run - stale failure
         # data from prior runs must not throttle a fresh run's agent capacity.
         self._slo_tracker = SLOTracker()
-        # Clear prior-run task metrics so error budget starts at 0/0
+        # Clear prior-run task metrics so error budget starts at 0/0, and
+        # prior-run agents so a stale agent (with a role from another run's
+        # spawner) never reaches this run's retrospective agent summary.
         get_collector().reset_task_metrics()
+        get_collector().reset_agent_metrics()
         self._runbook_engine = RunbookEngine()
         self._incident_manager = IncidentManager()
         self._consecutive_failures: int = 0
@@ -960,6 +1069,7 @@ class Orchestrator:
                 model=None,
                 workflow_name=_wf_name,
                 workflow_definition_hash=_wf_hash,
+                run_root_identity_id=self._run_root_identity_id,
             )
             save_manifest(self._manifest, workdir / ".sdd")
         except Exception:
@@ -1076,6 +1186,12 @@ class Orchestrator:
         # Track signals for ``_log_summary`` / future CLI surfaces; capped
         # to keep memory bounded under long-lived runs.
         self._llm_watcher_signals: collections.deque[Any] = collections.deque(maxlen=64)
+
+        # Clear deliberate-stop marker from any previous run (issue #6089 slice 1).
+        _marker_path = self._workdir / ".sdd" / "runtime" / "spawner-deliberate-stop"
+        if _marker_path.exists():
+            with contextlib.suppress(OSError):
+                _marker_path.unlink()
 
     # -- Hot-reload source detection -----------------------------------------
 
@@ -1375,6 +1491,7 @@ class Orchestrator:
             run_id=self._run_id,
             day_key=day_key,
             knob_matrix=knob_matrix,
+            default_adapter=str(getattr(self._spawner, "default_adapter_name", None) or ""),
         )
         entries = SpendLedger.load_entries(self._spend_ledger.path)
         outcome = evaluate_run_dispatch(
@@ -1609,11 +1726,19 @@ class Orchestrator:
         #    Gated behind _run_normal - no need to scan 300 files every tick.
         if _run_normal:
             try:
-                from bernstein.core.roadmap_runtime import emit_roadmap_wave
+                from bernstein.core.roadmap_runtime import emit_roadmap_wave_outcome
 
-                emitted = emit_roadmap_wave(self._workdir)
-                if emitted:
-                    logger.info("Emitted %d roadmap ticket(s) into backlog/open", len(emitted))
+                outcome = emit_roadmap_wave_outcome(self._workdir)
+                if outcome.emitted:
+                    logger.info("Emitted %d roadmap ticket(s) into backlog/open", len(outcome.emitted))
+                elif outcome.scenarios_found:
+                    # Scenarios exist and produced nothing. Saying so is the
+                    # whole point of #5573: the old code returned an empty
+                    # list here and an operator who had written scenarios saw
+                    # no difference from having written none.
+                    logger.warning("roadmap wave emitted nothing (%s): %s", outcome.reason, outcome.detail)
+                else:
+                    logger.debug("roadmap wave emitted nothing (%s): %s", outcome.reason, outcome.detail)
             except (OSError, ValueError) as exc:
                 logger.warning("roadmap wave emission failed: %s", exc)
 
@@ -1695,7 +1820,15 @@ class Orchestrator:
         # Checking "done" alone re-blocked dependents forever after that
         # transition, so lower-priority independent tasks were claimed ahead
         # of a high-priority task whose dependency had already completed.
-        done_ids = {t.id for t in done_tasks} | {t.id for t in tasks_by_status.get("closed", [])}
+        from bernstein.core.tasks.unreachable import satisfied_dependency_ids
+
+        # Lineage-aware: a retry carries a NEW id, so a dependent's depends_on
+        # still names the original. satisfied_dependency_ids folds
+        # original_task_id/retry_of in, which is what the store's claim check
+        # and blocking_dependency already do; this filter's raw id set was the
+        # one copy that did not, and a successful retry could not unblock its
+        # dependents (finding L, 2026-09-03).
+        done_ids = satisfied_dependency_ids(done_tasks + list(tasks_by_status.get("closed", [])))
         now = time.time()
         open_tasks = [
             t
@@ -1703,6 +1836,7 @@ class Orchestrator:
             if all(dep in done_ids or (t.id, dep) in broken_deps for dep in t.depends_on)
             # Skip tasks with future created_at (retry backoff)
             and t.created_at <= now
+            and not t.metadata.get("administrative_run_id")
         ]
         result.open_tasks = len(open_tasks)
 
@@ -2085,6 +2219,10 @@ class Orchestrator:
 
         # 4b. Use cached failed tasks and maybe retry with escalation
         failed_tasks = tasks_by_status["failed"]
+        note_queued_retries(
+            (task for tasks in tasks_by_status.values() for task in tasks),
+            self._retried_task_ids,
+        )
         for task in failed_tasks:
             if self._maybe_retry_task(task):
                 result.retried.append(task.id)
@@ -2160,6 +2298,12 @@ class Orchestrator:
         # 4d-ii. Token growth monitor: alert on quadratic growth, kill runaway agents
         check_token_growth(self)
 
+        # 4d-ii.a Per-task token budget kill switch: hard-kill agents that
+        # blow through 2x their configured `max_tokens_per_task` budget
+        # (issue #3374). `token_budget` defaults to 0 (disabled) so this is
+        # a no-op for sessions spawned without a scope budget configured.
+        check_budget_violations(self, result)
+
         # 4d-ii.5 Loop and deadlock detection: kill looping agents, break lock cycles
         check_loops_and_deadlocks(self)
 
@@ -2229,6 +2373,12 @@ class Orchestrator:
 
         # 5. Reap dead/stale agents and fail their tasks
         reap_dead_agents(self, result, tasks_by_status)
+
+        # 5a. Cooperative cancel: drive STOP_REQ tasks through the stop ladder.
+        try:
+            reap_stop_requests(self, result, tasks_by_status)
+        except Exception:
+            logger.warning("Stop reaper pass failed; STOP_REQ tasks stay pending", exc_info=True)
 
         # 5b. Retry any pushes that failed in previous ticks (normal cadence)
         if _run_normal:
@@ -2340,10 +2490,10 @@ class Orchestrator:
                 try:
                     _chain_result = TickResult()
                     # Pass both done and failed - process_completed_tasks
-                    # filters to ``_processed_done_tasks`` itself so a
-                    # failed task gets registered the same way as a done
-                    # task. A pure done-only filter here would strand
-                    # failed tasks in the drain tracker.
+                    # registers every task in ``_processed_done_tasks`` and
+                    # runs the post-/complete chain for the done ones only.
+                    # A pure done-only filter here would strand failed tasks
+                    # in the drain tracker.
                     process_completed_tasks(
                         self,
                         _newly_terminal_for_chain.copy(),
@@ -2418,7 +2568,7 @@ class Orchestrator:
             # harness driving tick() directly against an empty transport).
             # Self-stopping in that case would end the orchestrator before
             # it ever does anything.
-            _had_any_terminal_task = bool(refreshed_tasks_by_status["done"] or refreshed_tasks_by_status["failed"])
+            _had_any_terminal_task = has_terminal_task(refreshed_tasks_by_status)
             if not _had_any_terminal_task:
                 logger.debug(
                     "8b quiescence (tick #%d) with zero terminal tasks - not eligible "
@@ -2479,7 +2629,8 @@ class Orchestrator:
                 if settled is not None:
                     settled_open = len(settled["open"])
                     settled_agents = sum(1 for a in self._agents.values() if a.status != "dead")
-                    if settled_open == settled_agents == 0:
+                    settled_inflight = has_inflight_task(settled)
+                    if settled_open == settled_agents == 0 and not settled_inflight:
                         # Hold/release API (supplements the settle-timer
                         # self-stop above): external callers can call
                         # POST /orchestrator/holds to keep this orchestrator
@@ -2525,15 +2676,20 @@ class Orchestrator:
                                 settled_agents,
                             )
                             self._regenerate_final_retrospective(trigger_path="tick-quiescence-self-stop")
+                            # Write deliberate-stop marker for watchdog (issue #6089 slice 1).
+                            _marker_path = self._workdir / ".sdd" / "runtime" / "spawner-deliberate-stop"
+                            with contextlib.suppress(OSError):
+                                _marker_path.write_text("quiescence")
                             self._running = False
                     else:
                         logger.info(
                             "Quiescence NOT confirmed after %.1fs settle window (tick #%d): "
-                            "open=%d agents=%d - run continues",
+                            "open=%d agents=%d in_flight=%s - run continues",
                             _settle_s,
                             self._tick_count,
                             settled_open,
                             settled_agents,
+                            settled_inflight,
                         )
 
         # 9. Log summary
@@ -2675,7 +2831,7 @@ class Orchestrator:
 
         Called from the tick's step-8b quiescence handling, on the branch
         where ``open_tasks == active_agents == 0`` **and** no task reached
-        ``done`` or ``failed``. That branch previously only logged: the
+        ``done``, ``failed`` or ``closed``. That branch previously only logged: the
         self-stop next to it is gated on a terminal task existing, so this
         exact shape - the one where nothing ever finished, which is the one
         an operator most needs terminated and reported - was the single case
@@ -3073,6 +3229,36 @@ class Orchestrator:
         """
         time.sleep(seconds)
 
+    def _record_run_started(self) -> None:
+        """Journal the ``run_started`` event that opens a run.
+
+        Extracted from :meth:`run` so the load-bearing trace-export test can
+        drive the genuine write site against a real recorder (issue #6045).
+        """
+        _run_started_extra: dict[str, object] = {}
+        if self._workflow_executor is not None:
+            _run_started_extra["workflow_name"] = self._workflow_executor.definition.name
+            _run_started_extra["workflow_hash"] = self._workflow_executor.definition_hash
+        if self._data_class is not None:
+            _run_started_extra["data_class"] = self._data_class
+        self._recorder.record(
+            "run_started",
+            run_id=self._run_id,
+            max_agents=self._config.max_agents,
+            budget_usd=self._config.budget_usd,
+            git_sha=self._replay_metadata.git_sha,
+            git_branch=self._replay_metadata.git_branch,
+            config_hash=self._replay_metadata.config_hash,
+            # Issue #6045: the trust-record emitter requires a ``gate_config``
+            # on some event and hashes it with RFC 8785. Journal the resolved
+            # configuration once at run start as a plain JSON-able dict. When
+            # no gate configuration was resolved, the fact stays absent and
+            # export keeps refusing honestly rather than defaulting a policy
+            # that never ran.
+            gate_config=self._quality_gate_config.to_dict() if self._quality_gate_config is not None else None,
+            **_run_started_extra,
+        )
+
     def run(self) -> None:
         """Run the orchestrator loop until stopped.
 
@@ -3097,20 +3283,10 @@ class Orchestrator:
         # longer exist.  Must happen after the server is confirmed reachable but
         # before the first tick.
         self._reconcile_claimed_tasks()
-        _run_started_extra: dict[str, object] = {}
-        if self._workflow_executor is not None:
-            _run_started_extra["workflow_name"] = self._workflow_executor.definition.name
-            _run_started_extra["workflow_hash"] = self._workflow_executor.definition_hash
-        self._recorder.record(
-            "run_started",
-            run_id=self._run_id,
-            max_agents=self._config.max_agents,
-            budget_usd=self._config.budget_usd,
-            git_sha=self._replay_metadata.git_sha,
-            git_branch=self._replay_metadata.git_branch,
-            config_hash=self._replay_metadata.config_hash,
-            **_run_started_extra,
-        )
+        self._record_run_started()
+        # The owner record names the ``run_started`` row itself: recovery
+        # verifies it against the journal's first event, so it is published
+        # before any other row is appended.
         try:
             from bernstein.core.orchestration.run_closure_owner import write_spawner_run_owner
 
@@ -3122,6 +3298,27 @@ class Orchestrator:
             )
         except OSError as exc:
             logger.warning("Run owner record not written for %s: %s", self._run_id, sanitize_log(str(exc)))
+        # Record the skill and plugin set this install actually resolved,
+        # once per run and before the first agent spawns. `bernstein skills`
+        # and `bernstein plugins` report the declaration; a path override, a
+        # stale cache or an import that raised makes the loaded set differ,
+        # and the difference is what "what could this agent do?" needs months
+        # later. The run receipt recomputes the set digest from these rows
+        # and binds it into its signed subject. A resolution surface that
+        # cannot answer must not take the run down, so failure is logged.
+        try:
+            from bernstein.core.security.loaded_extension_set import record_run_extension_set
+
+            _extension_set = record_run_extension_set(self._recorder, self._workdir)
+            logger.debug(
+                "Recorded loaded extension set %s (%d loaded, %d not loaded)",
+                _extension_set.digest[:23],
+                len(_extension_set.loaded()),
+                len(_extension_set.not_loaded()),
+            )
+        except Exception:
+            logger.exception("Loaded extension set not recorded (non-fatal) - continuing startup")
+
         # WAL recovery: detect uncommitted entries from crashed previous runs.
         # Must run after WAL writer is initialized (in __init__) so that
         # acknowledgement entries are written to the current run's WAL.
@@ -3183,7 +3380,7 @@ class Orchestrator:
                 chain=self._provider_audit_chain,
                 run_id=self._run_id,
                 graph_digest=graph_digest_val,
-                graph_version=SCHEDULE_PROJECTION_REV,
+                graph_version=SCHEDULE_PROJECTION_REV,  # type: ignore[arg-type]  # version string
                 source_file_count=source_count,
                 indexed_file_count=indexed_count,
                 unparsed_file_count=unparsed_count,
@@ -3323,6 +3520,7 @@ class Orchestrator:
         )
         self._mark_finalization_started()
         try:
+            self._record_run_quiescence()
             self._seal_journal_into_lineage_spine()
             if self._otel_stream is not None:
                 self._otel_stream.finalize()
@@ -3334,6 +3532,45 @@ class Orchestrator:
             self._recorder.path,
             self._recorder.fingerprint()[:16] + "...",
         )
+
+    def _record_run_quiescence(self) -> None:
+        """Record whether every process the run started had exited.
+
+        Appended *before* the seal, so the sealed head and the run receipt
+        cover the answer rather than being written over an unanswered
+        question. A tool process that outlived its wrapper can still write
+        into a worktree or the integration branch after the seal; this row is
+        what makes that visible in the record instead of invisible (#5272).
+
+        Never raises: a run that already completed must not fail because its
+        quiescence could not be established. A failure to check is recorded as
+        a failure to check.
+        """
+        try:
+            from bernstein.core.orchestration.quiescence import check_quiescence
+
+            groups = self._spawner.session_process_groups() if hasattr(self._spawner, "session_process_groups") else {}
+            report = check_quiescence(groups)
+        except Exception:
+            logger.warning("run_quiescence check failed", exc_info=True)
+            self._recorder.record(
+                "run_quiescence",
+                run_id=self._run_id,
+                verified=False,
+                residual=[],
+                method="check_failed",
+                checked=0,
+            )
+            return
+
+        if report.residual:
+            logger.warning(
+                "run %s sealed with %d process group(s) still alive: %s",
+                self._run_id,
+                len(report.residual),
+                ", ".join(f"{g.session_id}:{g.pgid}" for g in report.residual),
+            )
+        self._recorder.record("run_quiescence", run_id=self._run_id, **report.to_dict())
 
     def _seal_journal_into_lineage_spine(self) -> None:
         """Wire the journal head into the f01 lineage spine (issue #2293).
@@ -3465,6 +3702,7 @@ class Orchestrator:
         attestation aid and must not fail a run that already completed.
         """
         try:
+            from bernstein.core.persistence.file_locks import LockTimeout
             from bernstein.core.security.audit_chain import AuditChainStore
             from bernstein.core.security.intent_capsule import seal_capsules_bound_to_run
 
@@ -3476,6 +3714,12 @@ class Orchestrator:
             )
             if sealed:
                 logger.info("Sealed %d intent capsule(s) for run %s", len(sealed), self._run_id)
+        except LockTimeout:
+            logger.warning(
+                "Failed to acquire lock to seal intent capsules for run %s: timeout. "
+                "The receipt will not be written. Check for stale lock files.",
+                self._run_id,
+            )
         except Exception as exc:
             logger.warning("Failed to seal intent capsules: %s", sanitize_log(str(exc)))
 
@@ -4178,6 +4422,16 @@ class Orchestrator:
         else:
             logger.info("Anomaly [%s]: %s", signal.rule, signal.message)
 
+    def resume_spawning(self) -> None:
+        """Clear the anomaly-detector stop-spawning flag to allow new agent spawns.
+
+        The cost-anomaly detector sets this flag when burn rate crosses the
+        stop threshold.  Call this once the operator has acknowledged the
+        anomaly and wishes to resume the run.
+        """
+        self._stop_spawning = False
+        logger.info("Spawning resumed by operator call")
+
     def _run_liveness_watchdog(self) -> None:
         """Run one liveness-watchdog pass over current adapter sessions.
 
@@ -4631,10 +4885,29 @@ class Orchestrator:
     def _release_file_ownership(self, agent_id: str) -> None:
         """Release all files owned by the given agent."""
         self._lock_manager.release(agent_id)
-        # Always clean the legacy dict so code that reads _file_ownership directly stays consistent
-        to_remove = [fp for fp, owner in self._file_ownership.items() if owner == agent_id]
-        for fp in to_remove:
-            del self._file_ownership[fp]
+
+    @property
+    def _file_ownership(self) -> Mapping[str, str]:
+        """Read-only projection of :attr:`_lock_manager` for legacy callers.
+
+        Returns a ``{file_path: agent_id}`` mapping built from the lock
+        manager's current snapshot.  The orchestrator no longer maintains a
+        parallel store; every claim/release goes through
+        :class:`FileLockManager`, and this property is the single projection
+        of that authoritative state.
+
+        The mapping is wrapped in a :class:`~types.MappingProxyType` so a
+        write fails loudly.  Returning a plain ``dict`` built per access made
+        ``orch._file_ownership[path] = agent`` mutate a temporary that was
+        discarded on the next line - no exception, no claim, and the caller
+        went on believing it owned the file.  That is how this landed:
+        ``test_check_file_overlap_detects_active_agent`` seeded ownership
+        that way, the claim evaporated, and the failure surfaced three
+        frames later as ``assert False is True`` on an untouched assertion.
+        A proxy raises ``TypeError`` at the write instead, naming the line
+        that has to move to :meth:`FileLockManager.acquire`.
+        """
+        return MappingProxyType({lock.file_path: lock.agent_id for lock in self._lock_manager.all_locks()})
 
     def _release_task_to_session(self, task_ids: list[str]) -> None:
         """Remove reverse-index entries for the given task IDs."""
@@ -4784,10 +5057,21 @@ class Orchestrator:
             if agent_dead:
                 # Agent confirmed gone — reclaim immediately, no timeout wait.
                 try:
-                    self._retry_or_fail_task(
-                        task.id,
-                        reason=("Dead agent: claimed task held by agent no longer tracked (or confirmed dead)"),
-                    )
+                    if task.id in self._retried_task_ids:
+                        # Claimed again after its retry was queued: retry_or_fail_task
+                        # skips a task it has already retried, which left this claim,
+                        # and the files it owns, held by no one.
+                        fail_task(
+                            self._client,
+                            self._config.server_url,
+                            task.id,
+                            reason="Dead agent: claim released; this task's retry is already queued",
+                        )
+                    else:
+                        self._retry_or_fail_task(
+                            task.id,
+                            reason=("Dead agent: claimed task held by agent no longer tracked (or confirmed dead)"),
+                        )
                     released += 1
                     logger.warning(
                         "Immediately reclaimed task %s (%s) from dead/gone agent",
@@ -4979,10 +5263,12 @@ class Orchestrator:
     def _check_file_overlap(self, batch: list[Task]) -> bool:
         """Return True if any file in *batch* is currently owned by an active agent.
 
-        Checks both the in-memory ``_file_ownership`` dict (cross-referenced
-        against live agent status) and the persistent ``_lock_manager`` (for
-        crash-recovery locks held across process restarts).  Dead agents do not
-        block new batches even if they appear in the ownership index.
+        Reads from the persistent :class:`FileLockManager`, which is the
+        single source of truth for file ownership (the legacy
+        ``_file_ownership`` attribute is now a projection of it).  Dead
+        agents do not block new batches even if a stale lock entry still
+        names them; ``FileLockManager`` will expire such entries via its TTL
+        on the next call.
         """
         all_files = [f for task in batch for f in task.owned_files]
         if not all_files:
@@ -4992,21 +5278,9 @@ class Orchestrator:
         lock_timestamps: dict[str, float] = {}
         conflict = False
 
-        # In-memory ownership check - filters out dead agents explicitly.
-        for fpath in all_files:
-            owner_id = self._file_ownership.get(fpath)
-            if owner_id:
-                session = self._agents.get(owner_id)
-                if session and session.status == "working":
-                    logger.debug(
-                        "File %s owned by active agent %s, deferring batch",
-                        fpath,
-                        owner_id,
-                    )
-                    held_by[fpath] = owner_id
-                    conflict = True
-
-        # Persistent lock check (survives crashes via FileLockManager TTL).
+        # Single authoritative ownership check: FileLockManager is the source
+        # of truth. The dead-agent filter previously done against the legacy
+        # dict is implicit here because the lock manager expires stale entries.
         conflicts = self._lock_manager.check_conflicts(all_files)
         if conflicts:
             for fpath, lock in conflicts:
@@ -5909,12 +6183,37 @@ class Orchestrator:
             if session is None:
                 continue
             self._record_mutation_capability_once(session)
+            model = session.model_config.model if session.model_config else None
+            # Issue #6064: ``model_provider`` must name the model's vendor,
+            # not the CLI adapter that carried the spawn. A declared vendor
+            # wins; without one, the #6063 namespace fallback applies only to
+            # sessions that resolved no provider at all. A CLI/adapter or
+            # router provider name is a routing fact, not a vendor, so it is
+            # never journaled as ``model_provider`` - export refuses that hop
+            # by agent id rather than inventing a vendor name.
+            if session.model_vendor:
+                model_id: str | None = model
+                model_provider: str | None = session.model_vendor
+            elif session.provider is None:
+                model_id, model_provider = _model_identity(model, None)
+            else:
+                model_id, model_provider = None, None
+            model_facts: dict[str, str] = {}
+            if model_id is not None:
+                model_facts["model_id"] = model_id
+            if model_provider is not None:
+                model_facts["model_provider"] = model_provider
             self._recorder.record(
                 "agent_spawned",
                 agent_id=session.id,
                 role=session.role,
-                model=session.model_config.model if session.model_config else None,
+                model=model,
                 provider=session.provider,
+                # Issue #6045: the trust-record emitter reads model_id /
+                # model_provider, not model / provider. Journal the resolved
+                # facts under the emitter's names additively; the existing keys
+                # stay for the other run-journal readers that depend on them.
+                **model_facts,
                 task_ids=session.task_ids,
                 agent_source=session.agent_source,
                 # Issue #4908: record the resolved endpoint identity
@@ -6483,6 +6782,31 @@ def _resolve_spawner_adapter_name(
     return seed_value or None
 
 
+def _stand_down_watchdog(workdir: Path, reason: str) -> None:
+    """Tell the recovery watchdog this process is exiting for good and must not be respawned.
+
+    The watchdog restarts the orchestrator whenever its pidfile is not alive,
+    because for a crash that is the right default. A startup configuration
+    failure is the opposite case: the next launch reads the same flags, the same
+    environment and the same seed, so it fails the same way. Without this marker
+    the watchdog relaunches it every poll and the run sits there looking live
+    (#6126). The marker is the same one a quiescence self-stop writes, so
+    ``bootstrap._watchdog_check_process`` already honours it, and it is cleared
+    again when the next run starts.
+
+    Best-effort: a marker that cannot be written leaves the watchdog's ordinary
+    restart budget as the backstop, which is the behaviour before this existed.
+
+    Args:
+        workdir: Project root that holds ``.sdd/runtime``.
+        reason: Short tag, surfaced in the watchdog log when it declines to restart.
+    """
+    marker = workdir / ".sdd" / "runtime" / "spawner-deliberate-stop"
+    with contextlib.suppress(OSError):
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(reason)
+
+
 if __name__ == "__main__":
     import argparse
     import sys
@@ -6699,6 +7023,7 @@ if __name__ == "__main__":
             # not list sends the reader looking for something that is not there
             # (#3526).
             logger.error("%s", NO_ADAPTER_CONFIGURED)
+            _stand_down_watchdog(workdir, "no-adapter-configured")
             sys.exit(1)
 
         # Run-level model: ``--model`` flag (threaded from ``bernstein run
@@ -6730,6 +7055,7 @@ if __name__ == "__main__":
             adapter_inst = get_adapter(adapter_name)
         if not adapter_inst:
             logger.error("No adapter found (tried: %s)", adapter_name)
+            _stand_down_watchdog(workdir, "adapter-not-found")
             sys.exit(1)
 
         # Create TierAwareRouter from providers.yaml if available
@@ -7108,6 +7434,9 @@ if __name__ == "__main__":
             # Context policy configuration (loads from bernstein.yaml context: section)
             context_policy_config=getattr(seed, "context", None) if seed else None,
         )
+        _tier_adapters = getattr(seed, "tier_adapters", None) if seed else None
+        if _tier_adapters:
+            spawner.set_tier_adapters(_tier_adapters)
         run_config_budget_usd: float | None = None
         dry_run = False
         approval_mode = "auto"
@@ -7159,6 +7488,17 @@ if __name__ == "__main__":
 
         # Resolve cluster-aware settings from env vars + seed config
         server_url = os.environ.get("BERNSTEIN_SERVER_URL", f"http://127.0.0.1:{args.port}")
+        # Publish the run's own port to the agent environment. Without this, an
+        # agent told to POST its completion resolves the base URL through
+        # ``_resolve_task_server_url`` / ``resolve_server_url``, both of which fall
+        # back to the historical 8052 -- ``--port N`` reached neither. The agent
+        # then hit whatever answered 8052 (another run's server), got 401, and the
+        # log scanner failed the task as auth_error. BERNSTEIN_SERVER_URL is
+        # allow-listed into the agent env (adapters/env_isolation.py:142), so
+        # setting it here is what makes the prompt's {base}, the claude adapter's
+        # hook URL and the worktree CLI all name the same server. setdefault, so an
+        # operator-supplied cluster URL still wins.
+        os.environ.setdefault("BERNSTEIN_SERVER_URL", server_url)
         auth_token = os.environ.get("BERNSTEIN_AUTH_TOKEN")
 
         # Build cluster config: env vars take precedence over seed file
@@ -7271,6 +7611,7 @@ if __name__ == "__main__":
                 notifier=notifier,
                 quality_gate_config=seed.quality_gates if seed else None,
                 formal_verification_config=seed.formal_verification if seed else None,
+                data_class=seed.data_class if seed else None,
             )
 
             def _signal_handler(signum: int, _frame: object) -> None:

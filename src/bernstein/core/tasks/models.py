@@ -10,7 +10,6 @@ from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
 from bernstein.core import defaults as _defaults
-from bernstein.core.defaults import AGENT
 from bernstein.core.tasks.artifacts import ArtifactSpec
 
 if TYPE_CHECKING:
@@ -54,7 +53,7 @@ def _default_planning_window_s() -> float:
 
 
 def _default_max_agent_runtime_s() -> int:
-    """Return the current canonical agent wall-clock kill starting value.
+    """Return the current canonical agent runtime floor value.
 
     Reads from :mod:`bernstein.core.defaults` each call (same pattern as
     :func:`_default_poll_interval_s`) so that ``tuning.orchestrator.
@@ -196,6 +195,9 @@ class TaskStatus(Enum):
     BLOCKED = "blocked"
     WAITING_FOR_SUBTASKS = "waiting_for_subtasks"
     CANCELLED = "cancelled"
+    # cancel requested while a worker is still running; resolved to CANCELLED after the reaper observes the worker
+    # group gone.
+    STOP_REQ = "stop_req"
     ORPHANED = "orphaned"  # Agent crashed mid-task; pending crash recovery
     SUSPENDED = "suspended"  # Operator-parked mid-session; infra released, resumable from an attested receipt (#2552)
     PENDING_APPROVAL = "pending_approval"  # Completed; awaiting human approval before taking effect
@@ -203,6 +205,20 @@ class TaskStatus(Enum):
     BLOCKED_BY_ABANDON = "blocked_by_abandon"  # Downstream task waiting on an abandoned dependency (#1350)
     BLOCKED_BY_FAILED_DEP = "blocked_by_failed_dep"  # Downstream task whose dependency ended unsuccessfully (#3452)
     REFUSED = "refused"  # Worker reported a typed refusal via the completion contract (#2244)
+
+
+class DispatchTier(StrEnum):
+    """Backend tier for multi-backend task dispatch (#6554).
+
+    Assigned by the decomposer or explicitly by the plan.
+    The dispatcher selects the backend adapter matching the task's tier.
+    """
+
+    LOCAL = "local"
+    EDGE = "edge"
+    SEARCH = "search"
+    RESEARCH = "research"
+    SANDBOX = "sandbox"
 
 
 class TaskType(Enum):
@@ -271,6 +287,21 @@ class UpgradeProposalDetails:
     performance_impact: str = ""
 
 
+CompletionSignalType = Literal[
+    "path_exists",
+    "glob_exists",
+    "test_passes",
+    "file_contains",
+    "llm_review",
+    "llm_judge",
+    "schema_valid",
+    "criteria_match",
+    "hash_stable",
+    "figures_grounded",
+    "absence_verified",
+]
+
+
 @dataclass(frozen=True)
 class CompletionSignal:
     """Janitor signal for automatic task verification.
@@ -289,21 +320,22 @@ class CompletionSignal:
     record and every material number in the body to be declared in the sidecar.
     Its ``value`` is the severity - ``""``/``"strict"`` (an unanchored figure
     fails completion) or ``"warn"`` (downgrade for exploratory work).
+
+    ``absence_verified`` (issue #3650) is the only absence-shaped type: every
+    other one asserts that something is present, so a task whose real result is
+    "no occurrences found" had no way to state that as a checkable claim. Its
+    ``value`` is the ``tool_call_id`` of the call that reported the absence, and
+    it passes only when that call's recorded coverage payload (issue #3769)
+    hash-matches the lineage coverage entry anchored to the same
+    ``tool_call_id`` (issue #3770) and describes a complete, exit-checked walk.
+    Its evaluator is
+    :func:`bernstein.core.quality.absence_coverage.verify_anchored_absence_claim`.
     """
 
-    type: Literal[
-        "path_exists",
-        "glob_exists",
-        "test_passes",
-        "file_contains",
-        "llm_review",
-        "llm_judge",
-        "schema_valid",
-        "criteria_match",
-        "hash_stable",
-        "figures_grounded",
-    ]
-    value: str  # path, glob pattern, test command, search string, review instruction, criterion payload, or severity
+    type: CompletionSignalType
+    # path, glob, test command, search string, review instruction,
+    # criterion payload, severity, or tool_call_id
+    value: str
 
 
 @dataclass(frozen=True)
@@ -512,6 +544,7 @@ class Task:
     repo: str | None = None  # Target repo in a multi-repo workspace
     depends_on_repo: str | None = None  # Cross-repo dependency source repo, used with depends_on task IDs
     # Manager-specified routing hints (override auto-routing when set)
+    dispatch_tier: DispatchTier = DispatchTier.LOCAL
     model: str | None = None  # "opus", "sonnet", "haiku"
     effort: str | None = None  # "max", "high", "medium", "low"
     cli: str | None = None  # adapter override; "claude", "opencode", "codex", … (per-step)
@@ -644,6 +677,7 @@ class Task:
             "cell_id": self.cell_id,
             "repo": self.repo,
             "depends_on_repo": self.depends_on_repo,
+            "dispatch_tier": self.dispatch_tier.value,
             "model": self.model,
             "effort": self.effort,
             "cli": self.cli,
@@ -777,6 +811,7 @@ class Task:
             cell_id=raw.get("cell_id"),
             repo=raw.get("repo"),
             depends_on_repo=raw.get("depends_on_repo"),
+            dispatch_tier=DispatchTier(raw["dispatch_tier"]) if "dispatch_tier" in raw else DispatchTier.LOCAL,
             model=raw.get("model"),
             effort=raw.get("effort"),
             cli=raw.get("cli"),
@@ -1179,6 +1214,11 @@ class AgentSession:
     exit_code: int | None = None  # Process exit code once known; None while still running
     cell_id: str | None = None  # Which cell this agent belongs to
     provider: str | None = None  # Provider selected by TierAwareRouter
+    #: Model vendor declared by the adapter that fronts the models it runs
+    #: (e.g. ``"anthropic"``, ``"openai"``). Distinct from ``provider``,
+    #: which is the CLI/adapter identifier. Empty means the adapter declares
+    #: no single vendor; the trust-record exporter then refuses this hop.
+    model_vendor: str = ""
     agent_source: str = "built-in"  # "catalog", "agency", or "built-in"
     timeout_s: int | None = None  # Per-agent wall-clock timeout; None = use OrchestratorConfig default
     timeout_timer: Any | None = None  # Armed watchdog timer, stashed at spawn for re-arm on extension (#4571)
@@ -1254,6 +1294,8 @@ class AgentSession:
     endpoint_model: str = ""  # model served
     endpoint_base_url: str = ""  # normalized base_url (no secrets)
     endpoint_profile_name: str = ""  # local_endpoints profile name
+    # process group id recorded at spawn; None when the session has no local process group of its own.
+    pgid: int | None = None
 
 
 class IsolationMode(StrEnum):
@@ -1610,19 +1652,26 @@ class OrchestratorConfig:
     smtp: SmtpConfig | None = None
     # Unified with AGENT.heartbeat_stale_s. Previously 900s; now defaults to 120s.
     # Deployments that explicitly relied on the 900s value must set this field explicitly.
-    heartbeat_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_stale_s))
+    # Read THROUGH the module, like the ORCHESTRATOR-derived fields below: a name
+    # captured with ``from bernstein.core.defaults import AGENT`` is a snapshot
+    # taken at import, and ``defaults.override`` (how bernstein.yaml's ``tuning:``
+    # block lands) rebinds the module attribute instead of mutating the frozen
+    # instance. Measured 2026-09-03: with ``heartbeat_starting_timeout_s: 900``
+    # configured, this config still resolved 300 - so a judge slow to its first
+    # heartbeat kept the shipped window and could be reaped mid-first-turn.
+    heartbeat_timeout_s: int = field(default_factory=lambda: int(_defaults.AGENT.heartbeat_stale_s))
     # Time-to-first-turn cap for agents still in the `starting` phase. Kept
     # separate from (and larger than) ``heartbeat_timeout_s`` so a slow/free
     # model that takes >120s to its first turn is not reaped mid-work while a
     # non-heartbeat adapter has only its spawn-time heartbeat on disk (issue
     # #3012). Overridable via ``tuning.agent.heartbeat_starting_timeout_s``.
-    heartbeat_starting_timeout_s: int = field(default_factory=lambda: int(AGENT.heartbeat_starting_timeout_s))
+    heartbeat_starting_timeout_s: int = field(default_factory=lambda: int(_defaults.AGENT.heartbeat_starting_timeout_s))
     heartbeat_enabled: bool = True
-    # Derived from ORCHESTRATOR.max_agent_runtime_s (canonical) so
-    # ``tuning.orchestrator.max_agent_runtime_s`` overrides the starting
-    # wall-clock kill deadline (agents need time for complex tasks; this
-    # self-extends up to a 5400s hard cap while heartbeating, see
-    # core/agents/agent_lifecycle.py - this is only the starting value).
+    # Derived from ORCHESTRATOR.max_agent_runtime_s (canonical). Values above
+    # the shipped 1800s default raise shorter scope/XL starting deadlines;
+    # values at or below the default never shorten those buckets. Heartbeat
+    # self-extension still tops out at 5400s, but does not clamp a longer
+    # initial deadline (see core/agents/agent_lifecycle.py).
     max_agent_runtime_s: int = field(default_factory=_default_max_agent_runtime_s)
     # Derived from ORCHESTRATOR.stalled_manager_threshold_s (canonical) so
     # ``tuning.orchestrator.stalled_manager_threshold_s`` overrides actually
@@ -2147,7 +2196,15 @@ class TriggerConfig:
 
 @dataclass
 class TriggerFireRecord:
-    """Audit record written when a trigger fires and creates a task."""
+    """Audit record written when a trigger fires and creates a task.
+
+    ``produced`` says whether the fire found real work. A routine that runs and
+    finds nothing is still recorded -- an operator needs to see that it ran --
+    but it does not reset the cooldown clock, because a check with an empty
+    result is otherwise indistinguishable from one that never happened
+    (issue #5113). Defaults to ``True`` so a record written before the field
+    existed, and every caller that does not pass it, means what it always did.
+    """
 
     trigger_name: str
     source: str
@@ -2155,6 +2212,7 @@ class TriggerFireRecord:
     task_id: str
     dedup_key: str
     event_summary: str = ""
+    produced: bool = True
 
 
 @dataclass(frozen=True)

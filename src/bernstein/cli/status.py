@@ -110,10 +110,14 @@ def _build_task_table(tasks: list[dict[str, Any]]) -> Table:
     table.add_column("Status", min_width=14)
     table.add_column("Priority", justify="right")
     table.add_column("Agent", min_width=12)
+    table.add_column("Adapter", min_width=10)
+    table.add_column("Model", min_width=12)
 
     for t in sorted(tasks, key=_task_sort_key):
         raw_status = str(t.get("status", "open"))
         color = STATUS_COLORS.get(raw_status, "white")
+        adapter = str(t.get("adapter") or t.get("cli") or "[dim]\u2014[/dim]")
+        model = str(t.get("model") or "[dim]\u2014[/dim]")
         table.add_row(
             str(t.get("id", "\u2014")),
             str(t.get("title", "\u2014")),
@@ -121,6 +125,8 @@ def _build_task_table(tasks: list[dict[str, Any]]) -> Table:
             f"[{color}]{raw_status}[/{color}]",
             str(t.get("priority", 2)),
             str(t.get("assigned_agent") or "[dim]\u2014[/dim]"),
+            adapter,
+            model,
         )
     return table
 
@@ -492,7 +498,7 @@ def _render_agent_section(con: Console, agents: list[dict[str, Any]]) -> None:
     con.print()
     if agents:
         agent_table = AgentStatusTable()
-        con.print(agent_table.render(agents))
+        con.print(agent_table.render(agents))  # type: ignore[arg-type]
     else:
         con.print("[dim]No active agents.[/dim]")
 
@@ -559,7 +565,7 @@ def render_status(
         con.print(alert_lines)
 
     _render_task_section(con, tasks, vc)
-    _render_agent_section(con, agents)
+    _render_agent_section(con, agents)  # type: ignore[arg-type]
     _render_cost_section(con, total_cost, per_role, vc)
 
     if vc.show_model_details:

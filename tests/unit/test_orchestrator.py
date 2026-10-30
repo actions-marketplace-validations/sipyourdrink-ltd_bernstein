@@ -7,6 +7,8 @@ import json
 import logging
 import subprocess
 import time
+from collections.abc import Iterator
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -49,6 +51,29 @@ if TYPE_CHECKING:
     from bernstein.core.bulletin import BulletinBoard
 
 # --- Helpers ---
+
+
+@pytest.fixture(autouse=True)
+def _join_test_owned_executors(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Join every real pool this test creates, including a failed initializer's.
+
+    These tests call tick/helpers directly rather than running the production
+    run-loop's drain. Register cleanup at construction so direct constructors
+    and factory calls share ownership. Passed-in clients remain borrowed.
+    """
+    initialize = Orchestrator.__init__
+    with ExitStack() as resources:
+
+        def initialize_owned(self: Orchestrator, *args: Any, **kwargs: Any) -> None:
+            try:
+                initialize(self, *args, **kwargs)
+            finally:
+                executor = getattr(self, "_executor", None)
+                if executor is not None:
+                    resources.callback(executor.shutdown, wait=True, cancel_futures=True)
+
+        monkeypatch.setattr(Orchestrator, "__init__", initialize_owned)
+        yield
 
 
 def _make_task(
@@ -1677,7 +1702,15 @@ class TestRunStop:
         stream.finalize.side_effect = finalize_with_run_event
         orch.run()
 
-        assert [row["event"] for row in rows] == ["run_started", "tick_start", "run_completed"]
+        assert [row["event"] for row in rows] == [
+            "run_started",
+            "loaded_extension_set",
+            "tick_start",
+            "run_completed",
+            # Appended before the seal so the sealed head and the run receipt
+            # cover whether execution had actually stopped (#5272).
+            "run_quiescence",
+        ]
         stream.finalize.assert_called_once_with()
         chain = AuditChainStore(tmp_path / ".sdd" / "audit")
         closure = project_run_closure(chain, orch._run_id)
@@ -1999,8 +2032,10 @@ class TestFileOwnership:
         adapter.is_alive.return_value = False  # process died
         orch = _build_orchestrator(tmp_path, transport, adapter=adapter)
 
-        # Pre-populate ownership
-        orch._file_ownership["src/main.py"] = "backend-owner"
+        # Pre-claim through the lock manager, which is the only writer of
+        # ownership: `_file_ownership` is a read-only projection of it, so an
+        # assignment here would raise rather than seed anything.
+        orch._lock_manager.acquire(["src/main.py"], agent_id="backend-owner", task_id="T-own", task_title="owns main")
         session = AgentSession(
             id="backend-owner",
             role="backend",
@@ -2068,7 +2103,13 @@ class TestFileOwnership:
         )
         orch = _build_orchestrator(tmp_path, transport, adapter=adapter, config=config)
 
-        orch._file_ownership["src/owned.py"] = "backend-stale"
+        # Use lock_manager to acquire ownership (property is now read-only)
+        orch._lock_manager.acquire(
+            ["src/owned.py"],
+            agent_id="backend-stale",
+            task_id="T-stale",
+            task_title="Stale task",
+        )
         session = AgentSession(
             id="backend-stale",
             role="backend",
@@ -2099,6 +2140,35 @@ class TestFileOwnership:
         orch.tick()
 
         assert "src/owned.py" not in orch._file_ownership
+        from bernstein.core.persistence.file_locks import FileLockManager
+
+        assert FileLockManager(tmp_path).all_locks() == []
+
+    def test_spawn_prompt_includes_file_lock_manager_ownership(self, tmp_path: Path) -> None:
+        """A prompt reads ownership from the orchestrator's lock manager."""
+        task = _make_task(id="T-spawn", role="backend")
+        adapter = _mock_adapter()
+        orch = _build_orchestrator(
+            tmp_path,
+            _mock_transport({"GET /tasks": httpx.Response(200, json=[_task_as_dict(task)])}),
+            adapter=adapter,
+        )
+        # The tick releases locks no live session holds, so the owner is a live session.
+        owner = AgentSession(id="qa-owner", role="qa", pid=7, task_ids=["T-owner"])
+        owner.status = "working"
+        owner.heartbeat_ts = time.time()
+        orch._agents[owner.id] = owner
+        orch._lock_manager.acquire(
+            ["src/locked.py"],
+            agent_id="qa-owner",
+            task_id="T-owner",
+            task_title="Owns locked file",
+        )
+
+        orch.tick()
+
+        prompt = adapter.spawn.call_args.kwargs["prompt"]
+        assert "src/locked.py (by qa-owner)" in prompt
 
 
 # --- Feature 3: Metrics Emission ---
@@ -3133,9 +3203,16 @@ class TestDeadAgentFileOwnershipEdgeCases:
         adapter.is_alive.return_value = False
         orch = _build_orchestrator(tmp_path, transport, adapter=adapter)
 
-        # Pre-claim two files for the dying agent
-        orch._file_ownership["src/main.py"] = "backend-dying"
-        orch._file_ownership["src/utils.py"] = "backend-dying"
+        # Pre-claim two files for the dying agent, through the lock manager --
+        # the projection is read-only. Assigning into it used to seed nothing
+        # at all, which made the post-condition below vacuously true: the
+        # entries were "released" because they had never been claimed.
+        orch._lock_manager.acquire(
+            ["src/main.py", "src/utils.py"],
+            agent_id="backend-dying",
+            task_id="T-dying",
+            task_title="owns two files",
+        )
 
         session = AgentSession(
             id="backend-dying",
@@ -3152,7 +3229,9 @@ class TestDeadAgentFileOwnershipEdgeCases:
         assert "src/main.py" not in orch._file_ownership
         assert "src/utils.py" not in orch._file_ownership
 
-    def test_file_overlap_cleared_after_dead_agent_allows_respawn(self, tmp_path: Path) -> None:
+    def test_file_overlap_cleared_after_dead_agent_allows_respawn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Spawn is blocked while an agent owns a file; after it dies the next tick spawns."""
         task1 = _make_task(id="T-owner", role="backend")
         task1.owned_files = ["src/shared.py"]
@@ -4054,6 +4133,37 @@ def test_per_task_timeout_medium_bucket(tmp_path: Path) -> None:
     assert sessions, "Expected one agent to be spawned"
     session = sessions[0]
     assert session.timeout_s == 1800
+
+
+def test_raised_max_agent_runtime_floor_reaches_spawn_timeout(tmp_path: Path) -> None:
+    """A raised runtime floor is applied before the adapter watchdog is armed."""
+    task = _make_task(id="T-floor", scope="small", complexity="low")
+    task_dict = _task_as_dict(task)
+    transport = _mock_transport(
+        {
+            "GET /tasks?status=open": httpx.Response(200, json=[task_dict]),
+            "GET /tasks?status=done": httpx.Response(200, json=[]),
+            "GET /tasks?status=failed": httpx.Response(200, json=[]),
+            "GET /status": httpx.Response(200, json={"open": 1, "done": 0}),
+            f"POST /tasks/{task.id}/claim": httpx.Response(200, json={}),
+        }
+    )
+    cfg = OrchestratorConfig(
+        max_agents=6,
+        poll_interval_s=1,
+        max_agent_runtime_s=5400,
+        max_tasks_per_agent=1,
+        server_url="http://testserver",
+    )
+    adapter = _mock_adapter()
+    orch = _build_orchestrator(tmp_path, transport, adapter=adapter, config=cfg)
+
+    orch.tick()
+
+    sessions = list(orch._agents.values())
+    assert sessions
+    assert sessions[0].timeout_s == 5400
+    assert adapter.spawn.call_args.kwargs["timeout_seconds"] == 5400
 
 
 def test_reap_uses_per_session_timeout(tmp_path: Path) -> None:
@@ -6361,7 +6471,10 @@ def test_record_live_costs_enforces_max_cost_per_agent(tmp_path: Path) -> None:
     orch._release_task_to_session = MagicMock()
     orch._record_provider_health = MagicMock()
 
-    with patch("bernstein.core.orchestrator.retry_or_fail_task") as mock_retry:
+    with (
+        patch("bernstein.core.orchestrator.retry_or_fail_task") as mock_retry,
+        patch("bernstein.core.agents.heartbeat._reap_session_heartbeat_loop"),
+    ):
         orch._record_live_costs()
 
     assert session.id in orch._cost_cap_killed_agents
@@ -6495,7 +6608,8 @@ def test_record_live_costs_accumulates_from_tokens_sidecar(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    orch._record_live_costs()
+    with patch("bernstein.core.agents.heartbeat._reap_session_heartbeat_loop"):
+        orch._record_live_costs()
     expected = estimate_cost("sonnet", 3000, 2000)
     assert expected > 0
     status = orch._cost_tracker.status()
@@ -6503,13 +6617,15 @@ def test_record_live_costs_accumulates_from_tokens_sidecar(tmp_path: Path) -> No
     assert status.spent_usd == pytest.approx(expected)
 
     # Delta-safe: a second tick over the same sidecar adds nothing.
-    orch._record_live_costs()
+    with patch("bernstein.core.agents.heartbeat._reap_session_heartbeat_loop"):
+        orch._record_live_costs()
     assert orch._cost_tracker.status().spent_usd == pytest.approx(expected)
 
     # New sidecar rows increment by exactly the newly-priced delta.
     with sidecar.open("a", encoding="utf-8") as fh:
         fh.write('{"ts": 3.0, "in": 500, "out": 250}\n')
-    orch._record_live_costs()
+    with patch("bernstein.core.agents.heartbeat._reap_session_heartbeat_loop"):
+        orch._record_live_costs()
     expected_total = estimate_cost("sonnet", 3500, 2250)
     assert orch._cost_tracker.status().spent_usd == pytest.approx(expected_total)
 
@@ -6529,7 +6645,8 @@ def test_record_live_costs_falls_back_to_session_tokens(tmp_path: Path) -> None:
     session.tokens_used = 4000
     orch._agents[session.id] = session
 
-    orch._record_live_costs()
+    with patch("bernstein.core.agents.heartbeat._reap_session_heartbeat_loop"):
+        orch._record_live_costs()
     assert orch._cost_tracker.status().spent_usd == pytest.approx(estimate_cost("sonnet", 4000, 0))
 
 
@@ -6938,3 +7055,15 @@ class TestCostPolicyDispatchWiring:
 
         assert result.cost_dispatch_halt is None
         assert len(result.spawned) == 1
+
+
+def test_administrative_members_are_not_spawned(tmp_path: Path) -> None:
+    """Manual container members stay claimable without automatic agent creation."""
+    task = _make_task(id="T-manual")
+    task.metadata["administrative_run_id"] = "admin-" + "a" * 32
+    transport = _mock_transport({"GET /tasks?status=open": httpx.Response(200, json=[task.to_dict()])})
+    adapter = _mock_adapter()
+    orch = _build_orchestrator(tmp_path, transport, adapter=adapter)
+    result = orch.tick()
+    assert result.spawned == []
+    adapter.spawn.assert_not_called()

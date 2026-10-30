@@ -8,25 +8,35 @@ import copy
 import inspect
 import json
 import logging
+import os
 import re
 import shutil
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
 
-from bernstein.adapters.base import DEFAULT_TIMEOUT_SECONDS, RateLimitError, SpawnError, SpawnResult
+from bernstein.adapters.base import (
+    DEFAULT_TIMEOUT_SECONDS,
+    AdapterCooldownError,
+    RateLimitError,
+    SpawnError,
+    SpawnResult,
+)
 from bernstein.adapters.plugin_sdk import (
     SAMPLING_PARAM_KEYS,
     SamplingParamsRefusal,
     ensure_sampling_params_supported,
 )
-from bernstein.adapters.registry import adapter_name_for_provider, get_adapter
+from bernstein.adapters.registry import adapter_name_for_provider, get_adapter, registry_name_for
 from bernstein.adapters.skills_injector import inject_skills
 from bernstein.agents.registry import AgentRegistry, get_registry
-from bernstein.bridges.base import AgentState, BridgeError, RuntimeBridge, SpawnRequest
+from bernstein.bridges.base import AgentState, AgentStatus, BridgeError, RuntimeBridge, SpawnRequest
+from bernstein.core import defaults as _defaults
 from bernstein.core.agents import project_context as _project_context
 from bernstein.core.agents.adapter_health import AdapterHealthMonitor
 from bernstein.core.agents.attachment_dispatch import (
@@ -101,9 +111,10 @@ from bernstein.core.agents.spawner_worktree import (
 from bernstein.core.agents.spawner_worktree import (
     prune_orphan_worktrees as _prune_orphan_worktrees,
 )
+from bernstein.core.config import platform_compat
 from bernstein.core.context import TaskContextBuilder
 from bernstein.core.context_recommendations import RecommendationEngine
-from bernstein.core.defaults import SPAWN
+from bernstein.core.defaults import SDD_SERVER_PORT, SPAWN
 from bernstein.core.evidence.run_artifacts import record_persistent_agent_step
 from bernstein.core.lessons import gather_lessons_for_context
 from bernstein.core.lifecycle import transition_agent
@@ -126,6 +137,12 @@ from bernstein.core.prometheus import (
 from bernstein.core.router import ProviderHealthStatus, RouterError, TierAwareRouter
 from bernstein.core.sandbox import DockerSandbox, spawn_in_sandbox
 from bernstein.core.sandbox.selector import SandboxSelectionError
+from bernstein.core.security.executor_admission import (
+    AdmissionDecision,
+    AdmissionPolicy,
+    AdmissionPolicyError,
+    AdmissionSubject,
+)
 from bernstein.core.tasks.artifact_completion import needs_git_worktree
 from bernstein.core.team_state import TeamStateStore
 from bernstein.core.traces import AgentTrace, TraceStore, new_trace
@@ -136,7 +153,7 @@ from bernstein.templates.renderer import TemplateError, render_role_prompt
 
 if TYPE_CHECKING:
     import subprocess
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from bernstein.adapters.base import CLIAdapter
     from bernstein.agents.catalog import CatalogAgent, CatalogRegistry
@@ -179,6 +196,49 @@ _read_cached = _project_context.read_cached
 # whole daily log. Module-level (not per-spawner) so multiple spawner
 # instances in one process share the same critical section.
 _SANDBOX_AUDIT_LOCK = threading.Lock()
+
+
+@dataclass
+class _SessionExecution:
+    """Ephemeral identity of one dispatch, independent of mutable registries."""
+
+    session: AgentSession
+    in_process: bool
+    pgid: int | None
+    request: Callable[[], None]
+    observe: Callable[[], bool]
+    cleanup: Callable[[], None]
+    completed: bool = False
+
+
+def _in_process_observer(spawner: Any, session: AgentSession) -> Callable[[], bool] | None:
+    """Resolve a real thread handle; synthetic pid values never identify a process."""
+    record = getattr(spawner, "_session_executions", {}).get(session.id)
+    if record is not None:
+        if record.session is not session:
+            return lambda: True  # stale session has no authority over its replacement
+        return record.observe if record.in_process else None
+    in_process = getattr(spawner, "_in_process", None)
+    if not isinstance(in_process, InProcessAgent):
+        return None
+    handle = in_process.active_sessions.get(session.id)
+    return handle.thread.is_alive if handle is not None else None
+
+
+def _leader_pgid(pid: int | None) -> int | None:
+    """Return a process group only when the spawned process leads it safely."""
+    if pid is None:
+        return None
+    if platform_compat.IS_WINDOWS:
+        return pid if pid > 0 else None
+    if os.name != "posix" or pid <= 1:
+        return None
+    try:
+        if os.getpgid(pid) == pid and pid != os.getpgrp():
+            return pid
+    except OSError:
+        return None
+    return None
 
 
 def _list_subdirs_cached(path: Path) -> list[str]:
@@ -265,16 +325,7 @@ def emit_process_reap_receipt(
         )
 
 
-def _sanitise_for_log(value: str) -> str:
-    """Strip CR/LF from ``value`` so attacker-controlled input cannot
-    inject fake log lines.
-
-    Used at every log site that touches data read out of the pending
-    pushes file or subprocess stderr (CodeQL/Sonar py/log-injection
-    S5145). Keep this function cheap and side-effect-free - it is
-    called inside the spawner hot path.
-    """
-    return value.replace("\r", "").replace("\n", "") if value else value
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +431,13 @@ def extract_error_aware_reason(log_text: str, max_chars: int = _FAILURE_REASON_M
 # text is not a boundary: an ungated CLI adapter that ignores the rule writes
 # straight into its cwd (issue #2793).
 _WRITE_BOUNDARY_ROLES = frozenset({"manager"})
+
+# Why a token recorded in a spawn-capability manifest was not part of the
+# chain handed to ``CapabilityRegistry.evaluate_chain``.  The manifest is
+# the artefact an auditor reads, so the held-out set carries its reason
+# rather than leaving it to be inferred from absence (issue #5052).
+_HELD_OUT_OUTER_ENVELOPE = "outer-envelope"
+_HELD_OUT_UNDECLARED = "undeclared-tool"
 
 
 def manager_write_boundary_error(
@@ -637,7 +695,7 @@ def _prompt_with_addendum(prompt: str, system_addendum: str) -> str:
     return f"{prompt}\n\n{system_addendum}"
 
 
-def _resolve_task_server_url() -> str:
+def _resolve_task_server_url(workdir: Path | None = None) -> str:
     """Resolve the base URL agents use to reach the task server.
 
     Remote workers export ``BERNSTEIN_SERVER_URL`` into the agent env before
@@ -645,14 +703,32 @@ def _resolve_task_server_url() -> str:
     agents (``adapters/env_isolation.py``). Reading it here means a completion
     POST from an agent on a worker node reaches the central server instead of
     the worker's own loopback, and it also fixes local runs started on a
-    non-default port. Falls back to the historical local default when unset.
+    non-default port.
+
+    When the env var is unset, read the run's own ``.sdd/runtime/server.port``
+    before falling back to 8052. The agent spawns into a worktree whose own
+    ``.sdd`` has no port file, so the CLI's cwd-relative lookup
+    (``cli/helpers.py:resolve_server_url``) missed it and the prompt told the
+    agent to POST to 8052 - another run's server, which answered 401 and got
+    the task failed as auth_error. ``workdir`` is the operator checkout, where
+    ``persist_server_port`` actually wrote the port.
     """
     import os
 
-    return os.environ.get("BERNSTEIN_SERVER_URL", "http://127.0.0.1:8052").rstrip("/")
+    configured = os.environ.get("BERNSTEIN_SERVER_URL")
+    if configured:
+        return configured.rstrip("/")
+    if workdir is not None:
+        try:
+            port = int((workdir / SDD_SERVER_PORT).read_text().strip())
+            if 1 <= port <= 65535:
+                return f"http://127.0.0.1:{port}"
+        except (OSError, ValueError):
+            pass
+    return "http://127.0.0.1:8052"
 
 
-def _render_auth_section(token_path: Path) -> str:
+def _render_auth_section(token_path: Path, workdir: Path | None = None) -> str:
     """Return authentication instructions to inject into every agent's prompt.
 
     The token file path is referenced by path rather than embedding the raw
@@ -671,7 +747,7 @@ def _render_auth_section(token_path: Path) -> str:
         Markdown block instructing the agent to authenticate all requests.
     """
     absolute = token_path if token_path.is_absolute() else token_path.resolve(strict=False)
-    base = _resolve_task_server_url()
+    base = _resolve_task_server_url(workdir)
     return (
         "\n## Task Server Authentication\n"
         "Your agent token is stored at this absolute path (do NOT print or "
@@ -1100,6 +1176,7 @@ def _render_prompt_with_receipt(
     meta_messages: list[str] | None = None,
     max_turns: int | None = None,
     mailbox_section: str = "",
+    file_ownership: dict[str, str] | None = None,
     model: str = "",
     context_policy: Any = None,
 ) -> tuple[str, ContextReceipt]:
@@ -1213,6 +1290,12 @@ def _render_prompt_with_receipt(
         "AVAILABLE_ROLES": available_roles,
         "INSTRUCTIONS": instructions,
         "SPECIALISTS": specialist_block,
+        # The task server this run started, for the role templates that show
+        # curl calls against it. The manager's system prompt wrote 8052, so a
+        # run on a dynamically allocated port handed the manager task-creation
+        # commands aimed at a port nothing listened on, or at another run's
+        # server (#5964).
+        "SERVER_URL": _resolve_task_server_url(workdir),
     }
 
     # Use catalog system prompt when available (Agency specialist prompt),
@@ -1289,6 +1372,18 @@ def _render_prompt_with_receipt(
         named_sections.append(("rich_context", f"\n{rich_context}\n"))
     if file_scope_context:
         named_sections.append(("file_scope", deduplicate_section(f"\n## File-scope context\n{file_scope_context}\n")))
+    # Task context pack (#4522): what this repository's own history already
+    # records about the files this task owns - co-change neighbours, the tests
+    # that landed with them, the nearest AGENTS.md, and the tests the gate has
+    # quarantined. Off unless the operator sets the flag, and an empty pack
+    # renders to nothing, so the prompt is byte-identical without it. The
+    # section's content hash in the receipt below is the run record for the
+    # pack this spawn consumed.
+    from bernstein.core.tasks.context_pack import PACK_SECTION_LABEL, render_pack_section
+
+    context_pack_section = render_pack_section(workdir, [path for task in tasks for path in task.owned_files])
+    if context_pack_section:
+        named_sections.append((PACK_SECTION_LABEL, context_pack_section))
     # Parent context inheritance: inject parent's context summary
     # when a task was created from decomposing a larger parent task.
     parent_ctx_parts = [t.parent_context for t in tasks if t.parent_context]
@@ -1321,6 +1416,16 @@ def _render_prompt_with_receipt(
     # every adapter type receives byte-identical context.
     if mailbox_section and mailbox_section.strip():
         named_sections.append(("mailbox", deduplicate_section(mailbox_section)))
+    file_ownership_section = ""
+    if file_ownership:
+        other_files = {path: owner for path, owner in file_ownership.items() if owner != session_id}
+        if other_files:
+            lines = ["\n## Files currently being edited by other agents (do NOT modify):"]
+            lines.extend(f"- {path} (by {owner})" for path, owner in sorted(other_files.items()))
+            lines.append(
+                "\nIf you need changes in these files, post a bulletin requesting the owning agent to make them.\n"
+            )
+            file_ownership_section = "\n".join(lines)
     try:
         rec_engine = RecommendationEngine(workdir)
         rec_engine.build()
@@ -1472,6 +1577,9 @@ def _render_prompt_with_receipt(
     else:
         policy = {}
 
+    if file_ownership_section:
+        named_sections.append(("file ownership", file_ownership_section))
+
     receipt = build_context_receipt(named_sections, policy=policy)
 
     # Spawn-time prompt budget check (#4377). This is the prompt the adapter
@@ -1606,6 +1714,7 @@ class AgentSpawner:
         # pin must never be overridden by model-name substring inference --
         # see :meth:`_infer_adapter_name_for_provider` (#2751).
         self._adapter_pinned = adapter_pinned
+        self._tier_adapters: dict[str, str] = {}
         # Run-level model (e.g. from ``bernstein run --model``), threaded in by
         # the orchestrator from the CLI flag / seed config. Used to coerce
         # Claude tier names (opus/sonnet/haiku) emitted by the heuristic
@@ -1613,15 +1722,52 @@ class AgentSpawner:
         # understands - see ``_coerce_model_for_non_claude_adapter``.
         self._default_model = default_model
         self._resource_limits = resource_limits
+        # Bare spawners (for example worker-only entry points) start from the
+        # current tuning-backed orchestrator value. Orchestrator owners wire
+        # their concrete config after construction via set_max_agent_runtime_s.
+        self._max_agent_runtime_s = int(_defaults.ORCHESTRATOR.max_agent_runtime_s)
         self._adapter_cache: dict[str, CLIAdapter] = {}
+        self._templates_dir = templates_dir
+        self._workdir = workdir
+        # The run-level adapter is seeded into the cache below without ever
+        # going through _get_adapter_by_name's cache-miss path, so it has to
+        # receive the host-isolation declaration here too -- otherwise the
+        # later cache hit in _get_adapter_by_name skips applying it, and a
+        # declared container tier never reaches this adapter (#5341, #5314).
+        # `is True`, not truthiness: test doubles built on MagicMock answer
+        # every attribute with a truthy mock and would record a declaration
+        # for an adapter that owns no vendor sandbox.
+        if getattr(adapter, "consumes_host_isolation", False) is True:
+            self._apply_host_isolation(adapter.name(), adapter)
+        # Resolved BEFORE the CachingAdapter wrap. ``registry_name_for`` matches
+        # on the registered class or instance, and ``CachingAdapter`` is not
+        # itself registered, so asking the wrapper answers ``None`` for an
+        # adapter that is in fact registered.
+        self._adapter_registry_name = registry_name_for(adapter)
         if enable_caching:
             from bernstein.adapters.caching_adapter import CachingAdapter
 
             adapter = CachingAdapter(adapter, workdir)
         self._adapter = adapter
+        # Two keys for one instance. The spawn path asks for an adapter by its
+        # registry key (see ``_infer_adapter_name_for_provider``), while older
+        # call sites and unregistered adapters still ask by display name --
+        # and 44 of the 53 registered adapters have a display name that is not
+        # their key (``agy`` displays as "Antigravity"). Seeding only the
+        # display name makes every registry-key lookup miss, and the miss path
+        # in ``_get_adapter_by_name`` silently builds a SECOND instance from
+        # the registry: the run-level instance the caller injected is dropped
+        # along with its host-isolation declaration and its CachingAdapter
+        # wrap, and an injected adapter that is not in the registry at all
+        # (test doubles, third-party adapters) fails the spawn outright.
+        #
+        # Keyed by identity, never by folding a display name back to a key:
+        # display names and registry keys are separate namespaces, and a
+        # name-string fold silently picks whichever adapter happens to own
+        # the folded string.
         self._adapter_cache[self._adapter.name()] = self._adapter
-        self._templates_dir = templates_dir
-        self._workdir = workdir
+        if self._adapter_registry_name is not None:
+            self._adapter_cache[self._adapter_registry_name] = self._adapter
         self._registry = agent_registry or get_registry(
             definitions_dir=workdir / ".sdd" / "agents" / "definitions",
             auto_reload=True,
@@ -1657,7 +1803,10 @@ class AgentSpawner:
         self._workspace = workspace
         self._bulletin = bulletin
         self._context_builder = TaskContextBuilder(workdir)
+        self._file_ownership_provider: Callable[[], dict[str, str]] | None = None
+        self._cost_anomaly_spawn_observer: Callable[[list[Task], ModelConfig], None] | None = None
         self._procs: dict[str, subprocess.Popen[bytes] | None] = {}
+        self._session_executions: dict[str, _SessionExecution] = {}
         # Per-session baseline of operator-checkout untracked paths, captured
         # at manager/planning spawn so the reap-time sweep can quarantine any
         # stray write that escaped the worktree cwd (issue #2793).
@@ -1801,13 +1950,45 @@ class AgentSpawner:
     def _identity_store(self) -> Any:
         """Return the AgentIdentityStore, creating it on first access."""
         if self._identity_store_instance is None:
-            from bernstein.core.agents.agent_identity import AgentIdentityStore
+            from bernstein.core.identity.agent_jwt import AgentIdentityStore
 
             auth_dir = self._workdir / ".sdd" / "auth"
             self._identity_store_instance = AgentIdentityStore(auth_dir)
         return self._identity_store_instance
 
-    def _issue_agent_token(self, session_id: str, role: str, task_ids: list[str]) -> Path:
+    def _audit_spawn_refused_unreceipted(self, session_id: str, issuer: str, reason: str) -> None:
+        """Record that a spawn was refused because its delegation was unreceipted.
+
+        Best-effort by design: the refusal itself is already carried by the
+        exception that is about to propagate, so a failure to write the audit row
+        must not mask it or replace it with a second, less informative error.
+        """
+        try:
+            from bernstein.core.security.audit_chain import EVENT_SPAWN_REFUSED_UNRECEIPTED, AuditChainStore
+            from bernstein.core.security.sanitize import sanitize_log
+
+            AuditChainStore(self._workdir / ".sdd" / "audit").log(
+                event_type=EVENT_SPAWN_REFUSED_UNRECEIPTED,
+                actor="spawner",
+                resource_type="agent_session",
+                resource_id=session_id,
+                details={
+                    "run_id": getattr(self, "_run_id", ""),
+                    "issuer": issuer,
+                    "reason": sanitize_log(reason),
+                },
+            )
+        except Exception as exc:  # intentional-broad-except: audit mirroring must never mask the refusal
+            logger.warning("Spawn-refusal audit row not written for %s: %s", session_id, type(exc).__name__)
+
+    def _issue_agent_token(
+        self,
+        session_id: str,
+        role: str,
+        task_ids: list[str],
+        *,
+        parent_identity_id: str | None = None,
+    ) -> Path:
         """Issue a short-lived task-scoped JWT and write it to a 0600 token file.
 
         The token file path is recorded in ``_agent_token_files`` for cleanup
@@ -1826,17 +2007,27 @@ class AgentSpawner:
             session_id: The agent session ID (used as identity ID).
             role: The agent's role.
             task_ids: Task IDs the agent is authorised to act on.
+            parent_identity_id: The delegating identity: the spawning agent's
+                identity for a nested spawn, otherwise the run root.  Minting
+                with it records one delegation hop (#5047); ``None`` records
+                none, which is the pre-#5047 behaviour.
 
         Returns:
             Absolute path to the written token file.
+
+        Raises:
+            DelegationWriteError: the delegation hop could not be recorded.
+                Deliberately not caught here: the caller fails the spawn closed
+                on this type alone.
         """
         import os
 
         _, raw_token = self._identity_store.create_identity(
             session_id,
             role,
+            parent_identity_id=parent_identity_id,
             task_ids=task_ids,
-            metadata={"source": "spawner"},
+            metadata={"source": "spawner", "run_id": getattr(self, "_run_id", "")},
         )
 
         # ``resolve(strict=False)`` returns an absolute path even when the
@@ -2037,9 +2228,21 @@ class AgentSpawner:
         """
         self._merge_queue = merge_queue
 
+    def set_file_ownership_provider(self, provider: Callable[[], dict[str, str]]) -> None:
+        """Provide the lock-manager ownership snapshot used in spawn prompts."""
+        self._file_ownership_provider = provider
+
     def set_quality_gate_config(self, config: Any) -> None:
         """Wire in the orchestrator's :class:`QualityGatesConfig` (#4393)."""
         self._quality_gate_config = config
+
+    def set_tier_adapters(self, mapping: dict[str, str]) -> None:
+        """Map DispatchTier values to adapter (cli) names for tier-aware routing (#6554)."""
+        self._tier_adapters = dict(mapping)
+
+    def set_max_agent_runtime_s(self, max_agent_runtime_s: int) -> None:
+        """Wire in the orchestrator's upward-only runtime floor."""
+        self._max_agent_runtime_s = int(max_agent_runtime_s)
 
     def set_run_id(self, run_id: str) -> None:
         """Wire in the orchestrator's run id.
@@ -2048,6 +2251,18 @@ class AgentSpawner:
         rows by run, so without this the rows have no spine to join.
         """
         self._run_id = run_id
+
+    def set_run_root_identity_id(self, identity_id: str) -> None:
+        """Wire in the run-root identity every top-level agent is minted under.
+
+        The orchestrator mints one parentless identity per run and passes its id
+        here (#5047).  It becomes the issuer of each top-level agent's delegation
+        hop, which is what makes the first hop gradable: without it a top-level
+        agent has no parent, no hop is recorded, and a single-level run verifies
+        as "no receipts".  Empty when the run minted no root, in which case the
+        pre-#5047 behaviour stands and nothing is recorded.
+        """
+        self._run_root_identity_id = identity_id
 
     def _merge_and_cleanup_worktree(
         self,
@@ -2258,6 +2473,27 @@ class AgentSpawner:
         declared_only = [t for t in catalog_tools if t in registry.tools]
         decision = registry.evaluate_chain(declared_only)
 
+        # The recorded chain is wider than the evaluated one: the adapter
+        # envelope is never fed to the gate (every adapter row carries all
+        # three capabilities, so it would deny every spawn) and undeclared
+        # catalog tools are dropped for the reason above.  Both omissions
+        # are deliberate, but a reader of the manifest must not have to
+        # infer them from absence - record each held-out token with why it
+        # was held out, and keep the evaluated set byte-equal to the chain
+        # the decision actually saw.
+        held_out: list[dict[str, str]] = []
+        accounted: set[str] = set(declared_only)
+        for token in chain:
+            if token in accounted:
+                continue
+            accounted.add(token)
+            held_out.append(
+                {
+                    "tool": token,
+                    "reason": (_HELD_OUT_OUTER_ENVELOPE if token == adapter_token else _HELD_OUT_UNDECLARED),
+                }
+            )
+
         runtime_dir = self._workdir / ".sdd" / "runtime" / "spawn_capabilities"
         try:
             runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -2266,7 +2502,8 @@ class AgentSpawner:
                 "role": role,
                 "timestamp": datetime.now(UTC).isoformat(),
                 "tools": chain,
-                "evaluated": catalog_tools,
+                "evaluated": list(declared_only),
+                "held_out": held_out,
                 "triggered": sorted(c.value for c in decision.triggered),
                 "allowed": decision.allowed,
                 "reason": decision.reason,
@@ -2350,6 +2587,197 @@ class AgentSpawner:
         except Exception as exc:  # audit must never mask deny - log and move on
             logger.warning(
                 "Could not emit capability_matrix_refusal audit event for %s: %s",
+                session_id,
+                exc,
+            )
+
+    def _enforce_model_registry_gate(
+        self,
+        *,
+        session_id: str,
+        tasks: list[Task],
+        model_config: ModelConfig,
+        provider_name: str | None,
+        adapter: Any,
+        routing_path: str,
+    ) -> None:
+        """Refuse a final model choice that has no live registry admission.
+
+        Every spawn route (router, role policy, operator pin, failover and
+        crash resume) converges on a resolved ``model_config`` just before a
+        process starts; this is the one place the model-registry policy
+        (``BERNSTEIN_MODEL_REGISTRY_ENFORCEMENT``) is consulted for them. With
+        the flag off this is a no-op. With it on, an unadmitted model raises
+        :class:`SpawnError` after the refusal has been appended to the audit
+        chain, so no agent is started.
+
+        The registry provider is the adapter's declared model vendor, else the
+        routed provider name, else the adapter name. The task class is the
+        batch's role.
+
+        Args:
+            session_id: Spawn session identifier (for the error message).
+            tasks: The task batch being spawned.
+            model_config: The resolved model for this attempt.
+            provider_name: Router-selected provider, if any.
+            adapter: The adapter that would run the model.
+            routing_path: Which spawn route is asking, recorded on a refusal.
+
+        Raises:
+            SpawnError: If enforcement is on and the model is not admitted.
+        """
+        from bernstein.core.routing.route_decision import (
+            ModelNotAdmittedError,
+            enforce_model_registry_for_dispatch,
+        )
+
+        vendor = getattr(adapter, "model_vendor", "")
+        provider = (vendor if isinstance(vendor, str) else "") or provider_name or str(adapter.name())
+        try:
+            enforce_model_registry_for_dispatch(
+                workdir=self._workdir,
+                provider=provider,
+                model=model_config.model,
+                task_class=tasks[0].role,
+                routing_path=routing_path,
+                run_id=getattr(self, "_run_id", "") or "",
+                task_id=tasks[0].id,
+            )
+        except ModelNotAdmittedError as exc:
+            logger.error("Refusing spawn %s (role=%s): %s", session_id, tasks[0].role, exc)
+            raise SpawnError(f"model registry refused: {exc}") from exc
+
+    def _enforce_admission_policy(
+        self,
+        *,
+        session_id: str,
+        subject: AdmissionSubject,
+    ) -> None:
+        """Refuse spawns the operator's admission policy does not admit.
+
+        ``bernstein.yaml`` selects an adapter, a model and an endpoint;
+        the optional ``admission:`` block declares which of those a
+        repository may use at all.  The policy is fail closed - a
+        subject matching no allow rule is refused - so widening it is an
+        edit to the config rather than an omission in it.
+
+        The decision is persisted under ``.sdd/runtime/spawn_admission/``
+        for *both* outcomes: an admitted spawn records the rule id that
+        admitted it, so a replay of the same config and the same spawn
+        identity reproduces the same decision.  A refusal additionally
+        emits an ``admission_refusal`` event into the HMAC-chained audit
+        log, mirroring the capability-matrix refusal path above so an
+        auditor reads both classes of blocked spawn from one chain.
+
+        A malformed policy raises rather than admitting: a broken
+        declaration must never read as an absent one.
+
+        Args:
+            session_id: Spawn session identifier (the record's file name
+                and the audit ``resource_id``).
+            subject: The spawn's executor identity.
+
+        Raises:
+            SpawnError: When the policy refuses the subject, or when the
+                declared policy cannot be parsed.
+        """
+        try:
+            policy = AdmissionPolicy.load(self._workdir)
+        except AdmissionPolicyError as exc:
+            logger.error("Refusing spawn %s: invalid admission policy: %s", session_id, exc)
+            raise SpawnError(f"admission policy is invalid: {exc}") from exc
+        if policy is None:
+            return
+
+        decision = policy.evaluate(subject)
+        record = decision.as_record()
+        record["session_id"] = session_id
+        runtime_dir = self._workdir / ".sdd" / "runtime" / "spawn_admission"
+        try:
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / f"{session_id}.json").write_text(
+                json.dumps(record, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("Could not persist admission record for %s: %s", session_id, exc)
+
+        if decision.allowed:
+            return
+
+        logger.error(
+            "Refusing spawn %s (role=%s): %s - subject=%s",
+            session_id,
+            subject.role,
+            decision.reason,
+            subject.as_dict(),
+        )
+        self._emit_admission_refusal_audit_event(session_id=session_id, decision=decision)
+        raise SpawnError(f"admission refused: {decision.reason}")
+
+    def _admission_sandbox_tier(self, isolation_mode: IsolationMode) -> str:
+        """Return the sandbox tier this spawn runs under, for admission.
+
+        Resolution order mirrors what actually confines the agent, most
+        specific first, so an operator's ``sandboxes:`` rule names the
+        boundary rather than a proxy for it:
+
+        1. the bound sandbox backend's name (``docker``, ``e2b``, ...);
+        2. the configured container runtime, when a ``sandbox:`` block is
+           active but no backend object was handed to this spawner;
+        3. otherwise the resolved isolation mode (``container`` /
+           ``worktree`` / ``none``).
+
+        ``bernstein admission check`` derives the same value from the
+        config alone, so the printed decision table matches the gate.
+
+        Args:
+            isolation_mode: Isolation resolved for this spawn.
+
+        Returns:
+            The tier string the policy matches against.
+        """
+        if self._sandbox_backend is not None:
+            return self._sandbox_backend.name
+        if self._sandbox is not None:
+            return str(self._sandbox.runtime)
+        return isolation_mode.value
+
+    def _emit_admission_refusal_audit_event(
+        self,
+        *,
+        session_id: str,
+        decision: AdmissionDecision,
+    ) -> None:
+        """Append an ``admission_refusal`` event to the HMAC audit chain.
+
+        Failures (key permission, disk full) are caught and logged - a
+        missing audit log must never mask the refusal raise.
+
+        Args:
+            session_id: Spawn session identifier (audit ``resource_id``).
+            decision: The refusing :class:`AdmissionDecision`.
+        """
+        try:
+            from bernstein.core.security.audit import AuditLog
+
+            audit = AuditLog(audit_dir=self._workdir / ".sdd" / "audit")
+            audit.log(
+                event_type="admission_refusal",
+                actor="spawner",
+                resource_type="agent_session",
+                resource_id=session_id,
+                details={
+                    "rule_id": decision.rule_id,
+                    "effect": decision.effect,
+                    "reason": decision.reason,
+                    "mode": decision.mode.value,
+                    "subject": decision.subject.as_dict(),
+                },
+            )
+        except Exception as exc:  # audit must never mask deny - log and move on
+            logger.warning(
+                "Could not emit admission_refusal audit event for %s: %s",
                 session_id,
                 exc,
             )
@@ -2638,7 +3066,21 @@ class AgentSpawner:
                 resolved,
             )
             return resolved
-        fallback = self._adapter.name()
+        # ``self._adapter_registry_name``, not ``registry_name_for(self._adapter)``:
+        # under ``enable_caching`` the run-level adapter is wrapped in a
+        # ``CachingAdapter``, which is not itself registered, so re-resolving
+        # here reports a registered adapter as unregistered and falls back to
+        # the display name -- the exact defect this path fixes (#5348).
+        fallback = self._adapter_registry_name
+        if fallback is None:
+            logger.warning(
+                "_infer_adapter_name_for_provider: no registry match for provider_name=%r model=%r; "
+                "adapter %r is not registered",
+                provider_name,
+                model,
+                self._adapter.name(),
+            )
+            return self._adapter.name()
         logger.info(
             "_infer_adapter_name_for_provider: no registry match for provider_name=%r model=%r; "
             "falling back to current adapter %r",
@@ -2681,12 +3123,70 @@ class AgentSpawner:
             return cached
 
         adapter = get_adapter(adapter_name)
+        if getattr(adapter, "consumes_host_isolation", False):
+            self._apply_host_isolation(adapter_name, adapter)
         if self._enable_caching:
             from bernstein.adapters.caching_adapter import CachingAdapter
 
             adapter = CachingAdapter(adapter, self._workdir)
         self._adapter_cache[adapter_name] = adapter
         return adapter
+
+    def _apply_host_isolation(self, adapter_name: str, adapter: CLIAdapter) -> None:
+        """Hand the operator's host-isolation declaration to *adapter* (#5341).
+
+        Only adapters that own a vendor sandbox advertise
+        ``consumes_host_isolation``; everything else is left untouched, so an
+        adapter with nothing to drop neither gains an attribute nor produces a
+        record.
+
+        Runs before the :class:`CachingAdapter` wrap so the attributes land on
+        the adapter that actually builds the argv, and behind the adapter cache
+        so one run records the declaration once per adapter rather than once
+        per spawn.
+
+        A misdeclared tier is reported and then dropped: the resolver raises
+        rather than guess, and the safe interpretation of "we could not read
+        the declaration" is that no isolation was declared, which leaves the
+        vendor sandbox on. Wedging every spawn over a typo in a config key
+        would be the worse failure.
+        """
+        from bernstein.core.config.host_isolation import resolve_host_isolation
+
+        try:
+            declaration = resolve_host_isolation(self._workdir)
+        except ValueError as exc:
+            logger.warning(
+                "host isolation declaration ignored for %s: %s; the vendor sandbox stays on",
+                adapter_name,
+                exc,
+            )
+            return
+
+        adapter.host_isolation = declaration.tier  # type: ignore[attr-defined]
+        adapter.host_isolation_evidence = declaration.evidence  # type: ignore[attr-defined]
+
+        try:
+            from bernstein.core.security.audit_chain import (
+                AuditChainStore,
+                record_host_isolation_declaration,
+            )
+
+            record_host_isolation_declaration(
+                chain=AuditChainStore(self._workdir / ".sdd" / "audit"),
+                run_id=getattr(self, "_run_id", ""),
+                adapter=adapter_name,
+                tier=str(declaration.tier),
+                evidence=declaration.evidence,
+                source=str(declaration.source),
+                vendor_sandbox_dropped=bool(adapter.host_isolation_drops_vendor_sandbox()),  # type: ignore[attr-defined]
+            )
+        except Exception as exc:
+            logger.warning(
+                "host isolation recording failed for %s: %s",
+                adapter_name,
+                type(exc).__name__,
+            )
 
     def _run_bridge_call(self, awaitable: Any) -> Any:
         """Run a bridge coroutine from the sync orchestration path."""
@@ -3070,7 +3570,7 @@ class AgentSpawner:
         """
         if self._runtime_bridge is None:
             return False
-        bridge_status = self._run_bridge_call(
+        bridge_status: AgentStatus = self._run_bridge_call(
             self._runtime_bridge.spawn(
                 SpawnRequest(
                     agent_id=session.id,
@@ -3078,7 +3578,7 @@ class AgentSpawner:
                     command=[],
                     prompt=prompt,
                     workdir=str(spawn_cwd),
-                    timeout_seconds=session.timeout_s or 1800,
+                    timeout_seconds=session.timeout_s or DEFAULT_TIMEOUT_SECONDS,
                     log_path=str(preferred_log_path),
                     role=session.role,
                     model=model_config.model,
@@ -3154,8 +3654,7 @@ class AgentSpawner:
                 else:
                     os.environ[_k] = _prev
 
-    @staticmethod
-    def _resolve_spawn_timeout(tasks: list[Task]) -> int:
+    def _resolve_spawn_timeout(self, tasks: list[Task]) -> int:
         """Resolve the wall-clock timeout bucket for a task batch (#4571).
 
         Delegates to ``_batch_timeout_seconds`` so the value armed on the
@@ -3164,7 +3663,7 @@ class AgentSpawner:
         """
         from bernstein.core.tasks.task_lifecycle import _batch_timeout_seconds
 
-        return _batch_timeout_seconds(tasks)
+        return _batch_timeout_seconds(tasks, self._max_agent_runtime_s)
 
     def _apply_provider_availability(
         self,
@@ -3340,8 +3839,9 @@ class AgentSpawner:
         The default policy is warn: the decision is recorded and the spawn
         proceeds, so an operator sees exactly which adapters would be refused
         before flipping ``BERNSTEIN_ADAPTER_ADMISSION_POLICY=enforce``. Under
-        enforce the refusal raises. ``mock`` and ``generic`` are always exempt
-        so offline work is never blocked.
+        enforce the refusal raises. ``mock`` is the only exempt adapter, so
+        offline work against the test stub is never blocked; ``generic``
+        stopped being exempt in #4752 and is gated like any other adapter.
 
         Placed alongside the security-floor preflight and outside the inner
         spawn ``try`` for the same reason: a refusal is a hard stop, not an
@@ -3478,7 +3978,7 @@ class AgentSpawner:
 
         profile = PROFILES.get(adapter_name)
         tier_decision = getattr(self, "_pending_tier_decision", None)
-        self._pending_tier_decision = None
+        self._pending_tier_decision: dict[str, Any] | None = None
         if profile is None:
             # Untracked adapter: still record an opt-in tier decision if present.
             if tier_decision is not None:
@@ -3706,11 +4206,30 @@ class AgentSpawner:
     ) -> tuple[ModelConfig, str | None, str]:
         """Select provider and model via router or operator config."""
         provider_name: str | None = None
+        # Tier-aware routing (#6554): when a task declares a non-local
+        # dispatch tier and the spawner has a mapping for it, inject the
+        # tier's adapter as a cli override (same mechanism as per-step cli:).
+        # Fallback: unmapped tiers silently fall through to the run-level
+        # adapter (backward compatible — AC3/AC4).
+        dispatch_tier = getattr(tasks[0], "dispatch_tier", None)
+        tier_cli: str | None = None
+        if dispatch_tier is not None and dispatch_tier.value != "local" and self._tier_adapters:
+            tier_cli = self._tier_adapters.get(dispatch_tier.value)
+            if tier_cli:
+                logger.info(
+                    "Tier-aware routing: task %s tier=%s -> adapter %s",
+                    tasks[0].id,
+                    dispatch_tier.value,
+                    tier_cli,
+                )
         # Per-step `cli:` is treated as a synthetic pinned adapter so the
         # router-skip decision matches the role_model_policy cli case.
         effective_role_policy: dict[str, Any] = role_policy.copy()
-        if tasks[0].cli and "cli" not in effective_role_policy:
-            effective_role_policy["cli"] = tasks[0].cli
+        # Tier adapter takes precedence over task.cli but not over
+        # role_model_policy cli (operator always wins).
+        effective_cli = tasks[0].cli or tier_cli
+        if effective_cli and "cli" not in effective_role_policy:
+            effective_role_policy["cli"] = effective_cli
         configured_cli = self._resolve_configured_cli(effective_role_policy.get("cli"))
         use_router = _should_use_router(
             role_policy=effective_role_policy,
@@ -3792,6 +4311,12 @@ class AgentSpawner:
                 logger.warning("Router failed to select provider, using fallback: %s", exc)
         return model_config, provider_name, "heuristic"
 
+    def _notify_cost_anomaly_spawn(self, tasks: list[Task], model_config: ModelConfig) -> None:
+        """Report the resolved model without changing routing or task pins."""
+        observer = getattr(self, "_cost_anomaly_spawn_observer", None)
+        if observer is not None:
+            observer(tasks, model_config)
+
     def _spawn_for_tasks_internal(self, tasks: list[Task], model_override: str | None = None) -> AgentSession:
         """Actual spawn implementation."""
         if self._shutdown_event is not None and self._shutdown_event.is_set():
@@ -3832,7 +4357,7 @@ class AgentSpawner:
                 adapter_name,
                 SPAWN.spawn_failure_cooldown_s - (now - last_fail),
             )
-            raise SpawnError(f"Agent {adapter_name} is in cooldown after recent failure")
+            raise AdapterCooldownError(f"Agent {adapter_name} is in cooldown after recent failure")
         if not self._adapter_health.is_healthy(adapter_name):
             stats = self._adapter_health.get_stats(adapter_name)
             rate = stats.failure_rate if stats is not None else 0.0
@@ -3841,7 +4366,9 @@ class AgentSpawner:
                 adapter_name,
                 rate * 100,
             )
-            raise SpawnError(f"Adapter {adapter_name} is disabled by health monitor (failure rate {rate:.0%})")
+            raise AdapterCooldownError(
+                f"Adapter {adapter_name} is disabled by health monitor (failure rate {rate:.0%})"
+            )
 
         if not tasks:
             raise ValueError("Cannot spawn agent with empty task list")
@@ -4101,6 +4628,7 @@ class AgentSpawner:
             base_config.model,
         )
 
+        self._notify_cost_anomaly_spawn(tasks, model_config)
         provider_for_rate_limit = provider_name or self._adapter.name()
         try:
             self._spawn_rate_limiter.acquire(provider_for_rate_limit)
@@ -4231,6 +4759,7 @@ class AgentSpawner:
                 tasks[0].id,
             )
         else:
+            file_ownership = self._file_ownership_provider() if self._file_ownership_provider is not None else None
             prompt, receipt = _render_prompt_with_receipt(
                 tasks,
                 self._templates_dir,
@@ -4245,6 +4774,7 @@ class AgentSpawner:
                 meta_messages=meta_messages,
                 max_turns=_effective_max_turns,
                 mailbox_section=mailbox_section,
+                file_ownership=file_ownership,
                 model=model_config.model,
                 context_policy=self._context_policy,
             )
@@ -4333,6 +4863,39 @@ class AgentSpawner:
         resolved_endpoint_adapter_name = self._adapter.name()
         resolved_endpoint_model = model_config.model
 
+        # Model-registry gate: the final model choice (router, role policy,
+        # operator pin, override) is fully resolved here and no process has
+        # started yet. A router failover inside the spawn loop below re-checks
+        # whatever model it switches to.
+        _registry_gated: set[tuple[str, str]] = set()
+        _registry_provider_key = provider_name or self._adapter.name()
+        self._enforce_model_registry_gate(
+            session_id=session_id,
+            tasks=tasks,
+            model_config=model_config,
+            provider_name=provider_name,
+            adapter=self._adapter,
+            routing_path="spawner",
+        )
+        _registry_gated.add((_registry_provider_key, model_config.model))
+
+        # Executor admission (#4907).  The gate runs here rather than
+        # beside the lethal-trifecta check above because the executor
+        # identity it judges - adapter, model, endpoint - is only fully
+        # resolved at this point; it is still ahead of every process
+        # start, so a refusal produces no agent.
+        self._enforce_admission_policy(
+            session_id=session_id,
+            subject=AdmissionSubject(
+                role=role,
+                adapter=resolved_endpoint_adapter_name,
+                model=resolved_endpoint_model,
+                endpoint=resolved_endpoint_base_url,
+                sandbox=self._admission_sandbox_tier(isolation_mode),
+                task_type=getattr(tasks[0].task_type, "value", str(tasks[0].task_type)),
+            ),
+        )
+
         session = AgentSession(
             id=session_id,
             role=role,
@@ -4358,11 +4921,32 @@ class AgentSpawner:
         # Zero-trust: issue a short-lived, task-scoped JWT for this agent.
         # The token is written to a 0600 file and its path is injected into
         # the prompt so the agent can include it in task server requests.
-        # We wrap in try/except so auth failures never block spawning.
+        # Auth failures still never block spawning -- with ONE exception, below.
+        #
+        # The delegating identity is the spawning agent's for a nested spawn and
+        # the run root otherwise; minting under it records the delegation hop
+        # (#5047). Empty means no root was minted, and nothing is recorded.
+        from bernstein.core.identity.agent_jwt import DelegationWriteError
+
+        _delegating_identity: str | None = session.parent_id or getattr(self, "_run_root_identity_id", "") or None
         try:
             task_ids_for_scope = [t.id for t in tasks]
-            _token_path = self._issue_agent_token(session_id, role, task_ids_for_scope)
-            prompt = prompt + _render_auth_section(_token_path)
+            _token_path = self._issue_agent_token(
+                session_id,
+                role,
+                task_ids_for_scope,
+                parent_identity_id=_delegating_identity,
+            )
+            prompt = prompt + _render_auth_section(_token_path, self._workdir)
+        except DelegationWriteError as _deleg_exc:
+            # FAIL CLOSED, and only for this type. A delegation that cannot be
+            # receipted must not spawn: the chain would be short by exactly the
+            # hop a verifier needs, and a hop that was never written is
+            # indistinguishable from one that never happened. Every other
+            # identity failure keeps the log-and-continue behaviour above it.
+            self._audit_spawn_refused_unreceipted(session_id, _delegating_identity or "", str(_deleg_exc))
+            logger.error("Spawn refused for %s: delegation hop not recorded: %s", session_id, _deleg_exc)
+            raise
         except Exception as _token_exc:
             # Only the session_id and exception are logged.
             # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
@@ -4427,9 +5011,23 @@ class AgentSpawner:
             # state baked into a pre-warmed worktree (cached prompt prefixes,
             # half-installed deps, leftover indexes) cannot leak across the
             # restart boundary.
-            warm_entry = (
-                self._warm_pool.claim_slot(role) if self._warm_pool is not None and not fresh_restart_on_retry else None
-            )
+            warm_pool = self._warm_pool
+            warm_entry = warm_pool.claim_slot(role) if warm_pool is not None and not fresh_restart_on_retry else None
+            # A slot with no worktree is not provisioned. `prepare_speculative_warm_pool`
+            # (core/tasks/task_lifecycle.py) adds slots with `worktree_path=""`, and
+            # `Path("")` is the orchestrator's cwd, i.e. the repository root: the agent
+            # then runs at the root, switches the operator checkout to `agent/<session>`
+            # and merges back into whatever branch that leaves checked out. Release the
+            # slot and take the cold path, which the warm-pool design calls the safe
+            # default.
+            if warm_pool is not None and warm_entry is not None and not warm_entry.worktree_path:
+                logger.warning(
+                    "Warm pool slot %s for role=%s has no worktree; releasing it and spawning cold",
+                    warm_entry.slot_id,
+                    role,
+                )
+                warm_pool.release_slot(warm_entry.slot_id)
+                warm_entry = None
             if warm_entry is not None:
                 spawn_cwd = Path(warm_entry.worktree_path)
                 self._worktree_paths[session_id] = spawn_cwd
@@ -4447,10 +5045,15 @@ class AgentSpawner:
                     self._worktree_paths[session_id] = spawn_cwd
                     self._worktree_roots[session_id] = worktree_repo_root
                 except WorktreeError as exc:
-                    raise SpawnError(
-                        f"Cannot create workspace for agent {session_id}: {exc}. "
-                        "Fix: run 'bernstein stop' then restart, or delete .sdd/worktrees/ manually"
-                    ) from exc
+                    logger.warning(
+                        "Worktree creation failed for session %s (%s), falling back to main workdir: %s",
+                        session_id,
+                        exc,
+                        self._workdir,
+                    )
+                    spawn_cwd = self._workdir
+                    self._worktree_paths[session_id] = self._workdir
+                    self._worktree_roots[session_id] = worktree_repo_root
 
         # Leak guard (issue #2996): from here to the success return, any
         # exception that escapes this spawn - a sampling-params refusal, a
@@ -4625,6 +5228,7 @@ class AgentSpawner:
                 if _bridge_sampling_keys:
                     raise SamplingParamsRefusal(self._runtime_bridge.name(), _bridge_sampling_keys)
                 try:
+                    self._notify_cost_anomaly_spawn(tasks, model_config)
                     remote_spawned = self._spawn_via_runtime_bridge(
                         session=session,
                         prompt=prompt,
@@ -4684,6 +5288,25 @@ class AgentSpawner:
                     except Exception as exc:
                         attempt_errors.append(f"{adapter_name}: {exc}")
                         break
+
+                    # A failover that switched provider/model after the gate
+                    # above must pass the registry too: refuse rather than
+                    # start a model nobody admitted.
+                    _registry_key = (provider_name or self._adapter.name(), model_config.model)
+                    if _registry_key not in _registry_gated:
+                        try:
+                            self._enforce_model_registry_gate(
+                                session_id=session_id,
+                                tasks=tasks,
+                                model_config=model_config,
+                                provider_name=provider_name,
+                                adapter=target_adapter,
+                                routing_path="spawner_failover",
+                            )
+                        except SpawnError:
+                            self._release_warm_pool_slot(session_id)
+                            raise
+                        _registry_gated.add(_registry_key)
 
                     # Fail loudly when sampling/endpoint overrides are
                     # requested for an adapter that does not declare the
@@ -4782,9 +5405,12 @@ class AgentSpawner:
 
                     try:
                         # Apply OS-level resource limits to non-sandboxed spawns.
+                        self._notify_cost_anomaly_spawn(tasks, model_config)
                         target_adapter.set_resource_limits(self._resource_limits)
                         spawn_start = time.perf_counter()
-                        if self._in_process is not None and self._backend == AgentBackend.IN_PROCESS:
+                        spawned_in_process = self._in_process is not None and self._backend == AgentBackend.IN_PROCESS
+                        if spawned_in_process:
+                            assert self._in_process is not None
                             # In-process: run the adapter's subprocess via
                             # a thread inside the current Python process
                             fake_pid, actual_log_path = self._in_process.run(
@@ -4793,6 +5419,7 @@ class AgentSpawner:
                                 model_config=model_config,
                                 session_id=session_id,
                                 mcp_config=attempt_mcp,
+                                timeout_seconds=session.timeout_s or DEFAULT_TIMEOUT_SECONDS,
                             )
                             result = SpawnResult(pid=fake_pid, log_path=actual_log_path)
                         elif self._sandbox_session_routing_active():
@@ -4914,6 +5541,7 @@ class AgentSpawner:
                             session.provider = adapter_name
                         else:
                             session.provider = None
+                        session.model_vendor = getattr(target_adapter, "model_vendor", "") or ""
                         session.model_config = model_config
                         break
                     except RateLimitError as exc:
@@ -5041,6 +5669,7 @@ class AgentSpawner:
             # Post-spawn session setup
             if result is not None:
                 session.pid = result.pid
+                session.pgid = None if spawned_in_process else _leader_pgid(result.pid)
                 session.abort_reason = result.abort_reason
                 session.abort_detail = result.abort_detail
                 session.finish_reason = result.finish_reason
@@ -5064,6 +5693,9 @@ class AgentSpawner:
                     from bernstein.core.agents.agent_ipc import register_stdin_pipe
 
                     register_stdin_pipe(session_id, proc_stdin)
+
+            if not remote_spawned and session.container_id is None and session.id not in self._sandbox_exec_handles:
+                self._capture_session_execution(session, in_process=spawned_in_process, adapter=target_adapter)
 
             # Create and persist the initial trace
             # Serialize task fields to JSON-safe types (convert Enums to their values)
@@ -5296,6 +5928,7 @@ class AgentSpawner:
         # same gate or a sovereign run could resume an agent after the posture
         # drifted. A hard stop (``PostureDriftRefusal``), same as the main path.
         self._preflight_posture_drift()
+        resume_adapter = self._adapter
 
         # Build resume context prefix
         files_list = "\n".join(f"  - {f}" for f in changed_files) if changed_files else "  (none)"
@@ -5338,8 +5971,20 @@ class AgentSpawner:
                 max_tokens=model_config.max_tokens,
                 is_batch=model_config.is_batch,
             )
+        self._notify_cost_anomaly_spawn(tasks, model_config)
         role = tasks[0].role
         session_id = f"{role}-resume-{uuid.uuid4().hex[:8]}"
+
+        # Resume goes straight to ``resume_adapter``; gate its model like the
+        # fresh-spawn path does, before any process starts.
+        self._enforce_model_registry_gate(
+            session_id=session_id,
+            tasks=tasks,
+            model_config=model_config,
+            provider_name=None,
+            adapter=resume_adapter,
+            routing_path="spawner_resume",
+        )
 
         meta_messages = ["This is a crash recovery session. Continue from where the previous agent left off."]
 
@@ -5348,7 +5993,7 @@ class AgentSpawner:
         # exactly the kind of short, tightly-budgeted resume where a model
         # exploring instead of finishing is most costly.
         #
-        # Resume spawns go straight to ``self._adapter`` (no provider
+        # Resume spawns go straight to ``resume_adapter`` (no provider
         # routing below), so the env/tuning fallback - which only the
         # openai_agents runner enforces - applies only when that adapter
         # is the openai_agents one. See the matching gate and rationale in
@@ -5357,7 +6002,7 @@ class AgentSpawner:
         if _resume_max_turns is None:
             from bernstein.adapters.openai_agents import OpenAIAgentsAdapter
 
-            if isinstance(self._adapter, OpenAIAgentsAdapter):
+            if isinstance(resume_adapter, OpenAIAgentsAdapter):
                 try:
                     from bernstein.adapters.openai_agents_runner import _resolve_max_turns
 
@@ -5397,12 +6042,14 @@ class AgentSpawner:
             role=role,
             task_ids=[t.id for t in tasks],
             model_config=model_config,
+            model_vendor=getattr(resume_adapter, "model_vendor", "") or "",
             status="starting",
+            timeout_s=self._resolve_spawn_timeout(tasks),
             context_receipt=receipt.to_dict()["entries"],
             # Endpoint identity fields (issue #4908) - resume resolves the
             # same way the primary spawn path does: role policy overrides
             # the adapter and model that actually serve this spawn.
-            endpoint_adapter_name=self._adapter.name(),
+            endpoint_adapter_name=resume_adapter.name(),
             endpoint_model=model_config.model,
             endpoint_base_url=_policy_preview.get("base_url", ""),
             endpoint_profile_name=_policy_preview.get("endpoint", ""),
@@ -5434,7 +6081,7 @@ class AgentSpawner:
         # Same task-identity forwarding as the primary spawn path: a resumed
         # agent must attribute its output to the task it continues.
         _resume_extra: dict[str, Any] = {}
-        _resume_params = inspect.signature(self._adapter.spawn).parameters
+        _resume_params = inspect.signature(resume_adapter.spawn).parameters
         if "task_id" in _resume_params:
             _resume_extra["task_id"] = tasks[0].id
         if "task_title" in _resume_params:
@@ -5442,11 +6089,11 @@ class AgentSpawner:
         if _resume_attachments is not None:
             if "multimodal_context" not in _resume_params:
                 raise AttachmentDispatchError(
-                    f"adapter {self._adapter.name()!r} cannot carry attachments on resume: its "
+                    f"adapter {resume_adapter.name()!r} cannot carry attachments on resume: its "
                     "spawn() does not accept multimodal_context."
                 )
             _resume_extra["multimodal_context"] = _resume_attachments
-        # Issue #3565: a resumed agent goes straight to ``self._adapter``
+        # Issue #3565: a resumed agent goes straight to ``resume_adapter``
         # (no ``_spawn_for_tasks_internal``), so it used to skip the
         # response-style resolution that path performs and the resumed
         # process never received ``system_addendum`` - the channel that
@@ -5468,17 +6115,52 @@ class AgentSpawner:
                 f"Response-style profile {_resume_style.style!r} for role {role!r} "
                 f"(source={_resume_style.source}) cannot be rendered on resume: {exc}"
             ) from exc
-        result = self._adapter.spawn(
-            prompt=prompt,
-            workdir=worktree_path,
-            model_config=model_config,
-            session_id=session_id,
-            timeout_seconds=session.timeout_s or DEFAULT_TIMEOUT_SECONDS,
-            task_scope=resume_scope,
-            system_addendum=_resume_addendum,
-            **_resume_extra,
-        )
+        # The resumed agent continues the replaced agent's worktree under this
+        # session's own name: the merge, the merge gates and cleanup look for
+        # a session's work at ``.sdd/worktrees/<session_id>`` on
+        # ``agent/<session_id>``, so a worktree left under the old name would
+        # be gated against the repository root and merged from a branch that
+        # does not exist. Everything above read the worktree under its old
+        # name (the attachment pin is that path), so the hand-over happens
+        # only now, and is undone if the agent does not start so the next
+        # resume still finds the worktree where it was preserved.
+        preserved_path = worktree_path
+        owner = next((m for m in self._worktree_managers.values() if m.owns(preserved_path)), None)
+        if owner is not None:
+            try:
+                worktree_path = owner.adopt(preserved_path, session_id)
+            except WorktreeError as exc:
+                raise SpawnError(
+                    f"Cannot hand preserved worktree {preserved_path} to resume session {session_id}: {exc}"
+                ) from exc
+        try:
+            result = resume_adapter.spawn(
+                prompt=prompt,
+                workdir=worktree_path,
+                model_config=model_config,
+                session_id=session_id,
+                timeout_seconds=session.timeout_s or DEFAULT_TIMEOUT_SECONDS,
+                task_scope=resume_scope,
+                system_addendum=_resume_addendum,
+                **_resume_extra,
+            )
+        except BaseException:
+            if owner is not None and worktree_path != preserved_path:
+                try:
+                    owner.adopt(worktree_path, preserved_path.name)
+                except WorktreeError as undo_exc:
+                    logger.error(
+                        "Resume session %s did not start and its worktree %s could not be handed back to %s: %s",
+                        session_id,
+                        worktree_path,
+                        preserved_path,
+                        undo_exc,
+                    )
+            raise
+        if owner is not None:
+            self._worktree_roots[session_id] = owner.repo_root
         session.pid = result.pid
+        session.pgid = _leader_pgid(result.pid)
         session.abort_reason = result.abort_reason
         session.abort_detail = result.abort_detail
         session.finish_reason = result.finish_reason
@@ -5494,12 +6176,14 @@ class AgentSpawner:
         if result.proc is not None:
             self._procs[session_id] = result.proc  # type: ignore[assignment]
 
+        self._capture_session_execution(session, in_process=False, adapter=resume_adapter)
+
         # Track worktree so reap_completed_agent can merge+clean up
         self._worktree_paths[session_id] = worktree_path
 
         # Record persistent-agent step for each task if adapter is persistent
         for _t in tasks:
-            record_persistent_agent_step(self._workdir / ".sdd", _t.id, self._adapter.name())
+            record_persistent_agent_step(self._workdir / ".sdd", _t.id, resume_adapter.name())
 
         return session
 
@@ -5544,18 +6228,9 @@ class AgentSpawner:
         """
         assert self._container_mgr is not None
 
-        # Build environment for the container from the adapter's filtered env
-        from bernstein.adapters.env_isolation import build_filtered_env
+        from bernstein.core.agents.spawner_env import build_spawner_env
 
-        adapter_name = adapter.name().lower()
-        extra_keys: list[str] = []
-        if "claude" in adapter_name:
-            extra_keys.append("ANTHROPIC_API_KEY")
-        elif "gemini" in adapter_name:
-            extra_keys.extend(["GOOGLE_API_KEY", "GEMINI_API_KEY"])
-        elif "codex" in adapter_name:
-            extra_keys.append("OPENAI_API_KEY")
-        container_env = build_filtered_env(extra_keys)
+        container_env = build_spawner_env(adapter.name())
 
         # Write the prompt to a temp file inside the workspace so the
         # container can read it
@@ -5638,6 +6313,7 @@ class AgentSpawner:
                 model_config=model_config,
                 session_id=session_id,
                 mcp_config=mcp_config,
+                timeout_seconds=session.timeout_s or DEFAULT_TIMEOUT_SECONDS,
                 task_scope=task_scope,
                 system_addendum=system_addendum,
             )
@@ -5682,17 +6358,10 @@ class AgentSpawner:
         """
         assert self._sandbox is not None
 
-        from bernstein.adapters.env_isolation import build_filtered_env
+        from bernstein.core.agents.spawner_env import build_spawner_env
 
         adapter_name = adapter.name().lower()
-        extra_keys: list[str] = []
-        if "claude" in adapter_name:
-            extra_keys.append("ANTHROPIC_API_KEY")
-        elif "gemini" in adapter_name:
-            extra_keys.extend(["GOOGLE_API_KEY", "GEMINI_API_KEY"])
-        elif "codex" in adapter_name:
-            extra_keys.append("OPENAI_API_KEY")
-        sandbox_env = build_filtered_env(extra_keys)
+        sandbox_env = build_spawner_env(adapter_name)
 
         prompt_file = spawn_cwd / ".sdd" / "runtime" / "prompts" / f"{session_id}.md"
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
@@ -5758,6 +6427,7 @@ class AgentSpawner:
                 model_config=model_config,
                 session_id=session_id,
                 mcp_config=mcp_config,
+                timeout_seconds=session.timeout_s or DEFAULT_TIMEOUT_SECONDS,
                 task_scope=task_scope,
                 system_addendum=system_addendum,
             )
@@ -5829,7 +6499,7 @@ class AgentSpawner:
             # falls back to the direct adapter spawn, mirroring the
             # ContainerError fallback in _spawn_in_sandbox.
             try:
-                sbx_session = self._provision_sandbox_session(session_id)
+                sbx_session = self._provision_sandbox_session(session_id, task_ids=session.task_ids)
             except Exception as exc:
                 explicit_runtime = self._explicit_container_runtime()
                 if explicit_runtime is not None:
@@ -5882,6 +6552,7 @@ class AgentSpawner:
                     model_config=model_config,
                     session_id=session_id,
                     mcp_config=mcp_config,
+                    timeout_seconds=session.timeout_s or DEFAULT_TIMEOUT_SECONDS,
                     system_addendum=system_addendum,
                 )
             owned = True
@@ -6040,7 +6711,7 @@ class AgentSpawner:
         """
         return AgentSpawner._explicit_container_runtime() is not None
 
-    def _provision_sandbox_session(self, session_id: str) -> SandboxSession:
+    def _provision_sandbox_session(self, session_id: str, *, task_ids: Sequence[str] = ()) -> SandboxSession:
         """Provision a dedicated sandbox session for one spawn (issue #2162).
 
         One session per agent means one container per agent: an exec
@@ -6051,6 +6722,9 @@ class AgentSpawner:
             session_id: Agent session identifier, recorded in the audit
                 event for correlation. The backend allocates its own
                 sandbox session id.
+            task_ids: Tasks this spawn runs. Recorded in the create event
+                so a session that is never destroyed can be traced to the
+                task that owned it (``bernstein sandbox leaks``, #5112).
 
         Returns:
             The freshly created :class:`SandboxSession`.
@@ -6081,6 +6755,7 @@ class AgentSpawner:
                 "image": self._sandbox_options.get("image"),
                 "backend": backend_name,
                 "agent_session_id": session_id,
+                "task_ids": list(task_ids),
             },
         )
         self._check_task_server_reachability(sbx_session)
@@ -6437,13 +7112,38 @@ class AgentSpawner:
             session.exit_code = container_mgr.get_exit_code(handle)
         return alive
 
+    def session_process_groups(self) -> dict[str, int | None]:
+        """Return each live session's process group id, for a quiescence check.
+
+        Adapters spawn with ``start_new_session=True``, so the stored
+        ``Popen.pid`` is the group id. A session with no stored process
+        contributes ``None``: there is nothing to probe, which is different
+        from a group that was probed and found empty (#5272).
+        """
+        return {session_id: (proc.pid if proc is not None else None) for session_id, proc in self._procs.items()}
+
     def _check_alive_process(self, session: AgentSession) -> bool | None:
-        """Check liveness via stored subprocess. Returns None if no proc stored."""
+        """Check liveness via stored subprocess. Returns None if no proc stored.
+
+        Adapters spawn with ``start_new_session=True``, so the wrapper leads
+        its own process group (pgid == pid) and a grandchild it forks (the
+        real CLI tool, or a fork of it) can survive the wrapper's own exit.
+        Polling only the wrapper reports the session dead the moment it
+        exits even when the group is not empty, letting
+        ``drain_before_cleanup`` seal the run's journal while a grandchild
+        is still writing to the worktree. Report alive until the whole
+        group is gone, matching the group-aware check already used on the
+        escalation-kill path (``process_group_alive``, issue #2643).
+        """
         proc = self._procs.get(session.id)
         if proc is None:
             return None
         exit_code = proc.poll()
         if exit_code is not None:
+            from bernstein.core.config.platform_compat import process_group_alive
+
+            if process_group_alive(proc.pid):
+                return True
             session.exit_code = exit_code
             return False
         return True
@@ -6492,6 +7192,9 @@ class AgentSpawner:
         Returns:
             True if the process is alive, False otherwise.
         """
+        execution = self._session_executions.get(session.id)
+        if execution is not None:
+            return execution.observe() if execution.session is session else True
         if session.runtime_backend == "openclaw":
             return self._check_alive_openclaw(session)
 
@@ -6508,6 +7211,161 @@ class AgentSpawner:
         if session.pid is None:
             return False
         return self._adapter.is_alive(session.pid)
+
+    def _capture_session_execution(self, session: AgentSession, *, in_process: bool, adapter: CLIAdapter) -> None:
+        """Capture an actual dispatch once; record identity acts as its epoch."""
+        owner = self._in_process
+        handle = owner.active_sessions.get(session.id) if in_process and owner is not None else None
+        proc = self._procs.get(session.id)
+        pid, pgid = session.pid, session.pgid
+
+        def current() -> bool:
+            return self._session_executions.get(session.id) is record
+
+        def request() -> None:
+            if not current() or record.completed:
+                return
+            if in_process:
+                if handle is not None and owner is not None:
+                    # Set the captured handle even after registry retirement.
+                    handle.stop_requested = True
+                    registered = owner.active_sessions.get(session.id)
+                    if registered is None or registered is handle:
+                        owner.stop(session.id)
+            elif pid is not None:
+                receipt = adapter.kill(pid)
+                emit_process_reap_receipt(self._workdir, session.id, receipt, reason="stop_requested")
+
+        def observe() -> bool:
+            if not current():
+                return True  # stale callbacks cannot confirm another dispatch
+            if record.completed:
+                return False
+            if in_process:
+                return handle.thread.is_alive() if handle is not None else True
+            if proc is not None:
+                code = proc.poll()
+                if code is not None:
+                    session.exit_code = code
+                if pgid is not None:
+                    return platform_compat.process_group_alive(pgid)
+                return code is None
+            if pgid is not None:
+                return platform_compat.process_group_alive(pgid)
+            return adapter.is_alive(pid) if pid is not None else True
+
+        def cleanup() -> None:
+            if in_process and handle is not None and owner is not None:
+                session.exit_code = handle.exit_code
+                owner._cleanup_observed(session.id, handle)
+            if proc is not None and self._procs.get(session.id) is proc:
+                self._procs.pop(session.id)
+
+        record = _SessionExecution(session, in_process, pgid, request, observe, cleanup)
+        self._session_executions[session.id] = record
+
+    def _cooperative_group_sender(self, session: AgentSession) -> Callable[[int, int], bool]:
+        """Bind every escalation signal to the captured dispatch and group."""
+        record = self._session_executions.get(session.id)
+
+        def send(pgid: int, sig: int) -> bool:
+            if (
+                record is None
+                or self._session_executions.get(session.id) is not record
+                or record.session is not session
+                or record.completed
+                or record.in_process
+                or record.pgid != pgid
+            ):
+                return False
+            return platform_compat.kill_process_group(pgid, sig)
+
+        return send
+
+    def _cooperative_stop_finalizer(self, session: AgentSession) -> Callable[[], None]:
+        """Pin finalization to the same dispatch epoch as stop observation."""
+        record = self._session_executions.get(session.id)
+
+        def finalize() -> None:
+            if self._session_executions.get(session.id) is not record:
+                raise RuntimeError("Cannot finalize a replaced execution")
+            self._finalize_cooperative_stop(session)
+
+        return finalize
+
+    def _finalize_cooperative_stop(self, session: AgentSession) -> None:
+        """Retire observed-dead execution metadata without targeting any process."""
+        record = self._session_executions.get(session.id)
+        if record is not None:
+            if record.session is not session:
+                raise RuntimeError("Cannot finalize a replaced execution")
+            if record.completed:
+                return
+            if record.observe():
+                raise RuntimeError("Cannot finalize a live execution")
+            record.cleanup()
+        if session.timeout_timer is not None:
+            session.timeout_timer.cancel()
+        from bernstein.core.agents.agent_ipc import unregister_stdin_pipe
+
+        unregister_stdin_pipe(session.id)
+        self._transition_to_dead(session, "stop confirmed", "execution observed dead by cooperative reaper")
+        if record is not None:
+            record.completed = True
+            # Retain identity, discard strong execution handles and callbacks.
+            record.request = lambda: None
+            record.observe = lambda: False
+            record.cleanup = lambda: None
+
+    def _cooperative_stop_callbacks(self, session: AgentSession) -> tuple[Callable[[], None], Callable[[], bool]]:
+        """Bind stop intent and observation to this session's actual execution handle."""
+        execution = self._session_executions.get(session.id)
+        if execution is not None:
+            if execution.session is session:
+                return execution.request, execution.observe
+            return lambda: None, lambda: True
+        in_process = self._in_process
+        observe_thread = _in_process_observer(self, session)
+        if observe_thread is not None:
+            # Keep the real thread observable even if unrelated legacy cleanup
+            # removes its registry entry. A stop request never joins or cleans it.
+            assert in_process is not None
+            return lambda: in_process.stop(session.id), observe_thread
+
+        local_process = (
+            session.runtime_backend == "local"
+            and session.container_id is None
+            and session.id not in self._sandbox_exec_handles
+        )
+        if local_process:
+            if session.id in self._procs or session.pgid is not None:
+                self._capture_session_execution(session, in_process=False, adapter=self._adapter)
+                execution = self._session_executions[session.id]
+                return execution.request, execution.observe
+            # Missing provenance must not turn a possible synthetic identifier
+            # into an OS target, nor turn an unknown worker into observed death.
+            if session.pid is None or (
+                in_process is not None and session.id not in self._procs and session.pgid is None
+            ):
+                return lambda: None, lambda: True
+
+            def request_process_stop() -> None:
+                assert session.pid is not None
+                receipt = self._adapter.kill(session.pid)
+                emit_process_reap_receipt(self._workdir, session.id, receipt, reason="stop_requested")
+
+            def process_alive() -> bool:
+                observed = self._check_alive_process(session)
+                if observed is not None:
+                    return observed
+                if session.pgid is not None:
+                    return platform_compat.process_group_alive(session.pgid)
+                assert session.pid is not None
+                return self._adapter.is_alive(session.pid)
+
+            return request_process_stop, process_alive
+        # Preserve existing policies for remote/container/sandbox runtimes.
+        return lambda: self.kill(session), lambda: self.check_alive(session)
 
     def kill(self, session: AgentSession) -> None:
         """Terminate the agent process and mark session dead.

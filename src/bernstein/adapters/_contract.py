@@ -684,15 +684,6 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
         dangerous_mode=DangerousModeStrategy.CLI_FLAG,
         event_channel=EventChannel.STREAM_JSON,
     ),
-    # Antigravity is the upstream rename of the Gemini CLI binary
-    # (transition deadline 2026-06-18 for free / Pro / Ultra). Same
-    # strategy on every axis - it is the same adapter, only the
-    # discovered binary name differs.
-    "antigravity": AdapterStrategy(
-        resume=ResumeStrategy.UNSUPPORTED,
-        dangerous_mode=DangerousModeStrategy.CLI_FLAG,
-        event_channel=EventChannel.STREAM_JSON,
-    ),
     # agy is the successor CLI for the discontinued non-enterprise hosted
     # gemini backend; separate adapter (single binary, print mode, sandbox
     # pinned) -- see docs/adapters/agy.md. Dangerous mode is
@@ -701,6 +692,14 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     # has --conversation <id> resume, but native reattach is not wired
     # yet, so resume stays declared unsupported (fresh-session fallback).
     "agy": AdapterStrategy(
+        resume=ResumeStrategy.UNSUPPORTED,
+        dangerous_mode=DangerousModeStrategy.CLI_FLAG,
+        event_channel=EventChannel.TEXT_SIGNALS,
+    ),
+    # "antigravity" is the product name of the same CLI and a second
+    # registry key for AgyAdapter, so it shares the agy strategy on every
+    # axis.
+    "antigravity": AdapterStrategy(
         resume=ResumeStrategy.UNSUPPORTED,
         dangerous_mode=DangerousModeStrategy.CLI_FLAG,
         event_channel=EventChannel.TEXT_SIGNALS,
@@ -715,7 +714,13 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
         event_channel=EventChannel.STREAM_JSON,
         session_state=SessionState.PERSISTENT_AGENT,
     ),
-    # Codex drives unattended via its sandbox/full-auto flag.
+    # Codex drives unattended via its sandbox flag: ``--sandbox
+    # workspace-write`` pins the posture, hence CLI_FLAG. The adapter reads
+    # this row to pick the sandbox argv, and ALWAYS_ON is the only value that
+    # selects ``--dangerously-bypass-approvals-and-sandbox`` instead -- for a
+    # runner that already isolates the process, where the bubblewrap-backed
+    # vendor sandbox cannot start at all. Leave this row as CLI_FLAG: an
+    # operator opts into the bypass per adapter instance, not repo-wide.
     "codex": AdapterStrategy(dangerous_mode=DangerousModeStrategy.CLI_FLAG),
     # Everyone else - no native resume, text-signal channel. Dangerous-mode
     # default is ``UNSUPPORTED`` until an adapter declares otherwise.
@@ -735,6 +740,7 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     # branch, so it declares ``artifact`` output (#3110): completion is the
     # signed lineage receipt and the commit check never fires for it.
     "computer_use": AdapterStrategy(event_channel=EventChannel.POLL_PTY, output_mode=OutputMode.ARTIFACT),
+    "skyvern": AdapterStrategy(event_channel=EventChannel.POLL_PTY, output_mode=OutputMode.ARTIFACT),
     "cody": AdapterStrategy(),
     "composio": AdapterStrategy(event_channel=EventChannel.HOOKS),
     "continue": AdapterStrategy(),
@@ -744,6 +750,10 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     "devin_terminal": AdapterStrategy(event_channel=EventChannel.POLL_PTY),
     "droid": AdapterStrategy(),
     "forge": AdapterStrategy(),
+    # garak runs a probe suite and its unit of work is the scan report, not a
+    # commit, so it declares ``artifact``: the run completes when the report
+    # lands and the commit check never fires for it.
+    "garak": AdapterStrategy(output_mode=OutputMode.ARTIFACT),
     "generic": AdapterStrategy(),
     # Goose emits NDJSON under --output-format stream-json whose events carry
     # tokens/cost_usd and an error event (the authoritative failure signal;
@@ -755,6 +765,16 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
         dangerous_mode=DangerousModeStrategy.ENV_VAR,
     ),
     "gptme": AdapterStrategy(),
+    # gpt-researcher is a deep-research agent: it reads sources and writes a report, and
+    # its unit of work is that report bound to its source list by digest
+    # (deep_research_artifact), not a commit. The report stays in the run directory; nothing
+    # publishes it to a task's artifact path, so this row does not declare ``artifact``.
+    # No native resume; runs unattended.
+    "gpt_researcher": AdapterStrategy(
+        resume=ResumeStrategy.UNSUPPORTED,
+        dangerous_mode=DangerousModeStrategy.UNSUPPORTED,
+        event_channel=EventChannel.TEXT_SIGNALS,
+    ),
     # Hermes is driven through its one-shot mode, which auto-bypasses approvals
     # rather than exposing a flag to do so - the CLI is unattended by
     # construction there, so the axis is always-on, not unsupported. Declaring
@@ -808,13 +828,19 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     "ollama": AdapterStrategy(),
     "open_interpreter": AdapterStrategy(),
     # Resume and dangerous mode are backed by flags ``opencode.py`` passes:
-    # ``--continue`` and ``--auto`` plus an explicit permission policy. The
-    # event channel stays ``text-signals``: the CLI does emit NDJSON under
-    # ``--format json``, but nothing consumes it yet, and declaring a channel
-    # no parser reads would claim a surface that does not exist.
+    # ``--continue`` and ``--auto`` plus an explicit permission policy.
+    # ``event_channel`` names what the upstream CLI emits (see the enum's own
+    # docstring and docs/adapters/capability_contract.md), not what Bernstein
+    # currently parses -- the same reading ``cursor`` above is declared under
+    # despite having no dedicated stream parser either (#3676). ``opencode.py``
+    # already passes ``--format json``, under which the CLI emits NDJSON, so
+    # this is ``stream-json`` today even though nothing consumes those events
+    # yet; that consumption is separate follow-up work, not a reason to
+    # misdeclare the upstream surface.
     "opencode": AdapterStrategy(
         resume=ResumeStrategy.FLAG,
         dangerous_mode=DangerousModeStrategy.CLI_FLAG,
+        event_channel=EventChannel.STREAM_JSON,
     ),
     "openhands": AdapterStrategy(),
     "pi": AdapterStrategy(),
@@ -836,6 +862,16 @@ STRATEGY_MATRIX: dict[str, AdapterStrategy] = {
     "q_dev": AdapterStrategy(),
     "qwen": AdapterStrategy(),
     "ralphex": AdapterStrategy(),
+    # Tongyi DeepResearch is a deep-research agent: it reads sources and writes a report, and
+    # its unit of work is that report bound to its source list by digest
+    # (deep_research_artifact), not a commit. The report stays in the run directory; nothing
+    # publishes it to a task's artifact path, so this row does not declare ``artifact``.
+    # No native resume; runs unattended.
+    "tongyi_deepresearch": AdapterStrategy(
+        resume=ResumeStrategy.UNSUPPORTED,
+        dangerous_mode=DangerousModeStrategy.UNSUPPORTED,
+        event_channel=EventChannel.TEXT_SIGNALS,
+    ),
 }
 
 
@@ -1205,12 +1241,20 @@ _SYSTEM_PROMPT_ADDENDUM_ADAPTERS: frozenset[str] = frozenset(
 #: model. The base ``CLIAdapter.spawn`` contract permits this fallback.
 _PROMPT_APPEND_ADDENDUM_ADAPTERS: frozenset[str] = frozenset(
     {
+        "codex",
         "devin_terminal",
+        "gemini",
+        # The deep-research adapters write the addendum after the task text
+        # into the runner's prompt file (DeepResearchAdapter.spawn).
+        "gpt_researcher",
         "junie",
         "muse",
+        "opencode",
         "python_runtime",
         "q_dev",
+        "qwen",
         "ralphex",
+        "tongyi_deepresearch",
     }
 )
 

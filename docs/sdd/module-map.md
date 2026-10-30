@@ -8,6 +8,7 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 
 | File                        | Purpose |
 |-----------------------------|---------|
+| `administrative_runs.py`    | Administrative containers projected from the existing authenticated audit chain |
 | `compat_redirect_ledger.py` | Compatibility ledger for legacy ``bernstein.core`` redirects |
 | `credential_scoping.py`     | Agent credential scope minimization for least-privilege API keys |
 | `dataclass_helpers.py`      | Helpers for preserving dataclass instance types through updates |
@@ -15,16 +16,21 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 | `diff_paths.py`             | Which repository-relative paths a unified diff touches |
 | `finding_verify.py`         | FindingVerifyReceipt - lineage-attested receipts for finding verify results |
 | `instrumentation.py`        | Wave-3 per-agent instrumentation: LLM calls, tool calls, and conversation history |
+| `log_safe.py`               | Bound and de-fang an arbitrary value before it becomes part of a log record |
 | `parallel_admission.py`     | Parallel-execution admission from a code graph (#3237, scope step 3) |
 | `path_scope.py`             | Which repository-relative paths fall outside a set of globs |
+| `registry_guard.py`         | Shared duplicate-registration guard for the registry classes under ``bernstein`` |
 | `run_auth_token.py`         | Persist and read the auto-generated run Bearer token (issue #2794) |
 | `streaming_merge.py`        | Streaming task results for long-running agents (incremental merge) |
+| `verify_dispatch.py`        | Kind-detecting dispatcher for a single ``bernstein verify <artefact>`` entry point (#5103) |
+| `verify_result.py`          | The one shape an offline verification answers in |
 | `admission/`                | Named resource pools with lease-backed admission (#2544) |
-| `agents/`                   | agents sub-package |
+| `agents/`                   | Agent discovery and bounded registered detector execution (``detector_runtime.py``) |
 | `approval/`                 | Interactive tool-call approval (op-002) |
 | `autofix/`                  | Bernstein autofix daemon - auto-repair CI failures on Bernstein PRs |
 | `autoheal/`                 | Auto-heal v2 subpackage |
 | `chat/`                     | Chat-control bridges for driving Bernstein agents from messaging apps |
+| `checks/`                   | Audit check contract, registry, and producer adapters (#5072) |
 | `communication/`            | communication sub-package |
 | `compliance/`               | Compliance subpackage |
 | `config/`                   | Config: seed parsing, config management, settings, feature gates |
@@ -39,6 +45,7 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 | `evidence/`                 | Verification evidence bundles (issue #2362) |
 | `fleet/`                    | Fleet dashboard - supervise multiple Bernstein projects in one view |
 | `git/`                      | git sub-package |
+| `govern/`                   | Governance planning and declared probe execution (``probe_runtime.py``) |
 | `grpc_gen/`                 | Generated gRPC stubs - run ``scripts/generate_proto.sh`` to populate |
 | `handoff/`                  | Session handoff between terminal and chat/dashboard surfaces (op-005) |
 | `identity/`                 | Install-rev identity module - passive, operator-decodable install fingerprint |
@@ -47,7 +54,7 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 | `knowledge/`                | knowledge sub-package |
 | `lifecycle/`                | Lifecycle-hooks subsystem |
 | `lineage/`                  | Lineage v1 - Sigstore-style per-artefact transparency log |
-| `memory/`                   | memory sub-package - persistent memory stores |
+| `memory/`                   | Persistent memory stores and tamper-evident MemoryChain provenance |
 | `notifications/`            | Outbound notification subsystem (release 1.9) |
 | `observability/`            | observability sub-package |
 | `orchestration/`            | orchestration sub-package |
@@ -58,6 +65,7 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 | `preview/`                  | ``bernstein preview`` - sandboxed dev-server with public tunnel link |
 | `protocols/`                | protocols sub-package |
 | `quality/`                  | quality sub-package |
+| `receipts/`                 | One receipt protocol for every receipt kind the project emits |
 | `replay/`                   | Deterministic replay package for Bernstein agent runs |
 | `review/`                   | Per-adapter perspective assignment and chain coordination for reviews |
 | `review_responder/`         | PR review responder - react to inline review comments on Bernstein PRs |
@@ -81,108 +89,124 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 | `trackers/`                 | Tracker adapter subsystem |
 | `trigger_sources/`          | Trigger source adapters - normalize raw events into TriggerEvent |
 | `tunnels/`                  | Tunnel provider abstraction and registry |
+| `verifier/`                 | Sub-package: audit_receipt_verifier |
 | `volunteer/`                | Volunteer-workers substrate: opt-in project policy and its trust anchor |
 | `workflows/`                | Declarative YAML workflow manifests |
 | `worktrees/`                | Worktree inventory and garbage-collection helpers |
 
 ### `src/bernstein/adapters/` - CLI agent adapters
 
-| File                        | Purpose |
-|-----------------------------|---------|
-| `_contract.py`              | Adapter contract loader and capability checker |
-| `acp_channel.py`            | Adapter-side binding for the ACP event channel (#2522) |
-| `admission.py`              | Receipt-gated adapter admission with signed refusal receipts (#2610) |
-| `advisories.py`             | Adapter minimum-safe-version advisories (supply-chain posture) |
-| `agy.py`                    | Antigravity CLI (``agy``) adapter |
-| `aichat.py`                 | AIChat CLI adapter |
-| `aider.py`                  | Aider CLI adapter |
-| `amp.py`                    | Amp CLI adapter |
-| `auggie.py`                 | Auggie (Augment Code) CLI adapter |
-| `autohand.py`               | Autohand Code CLI adapter |
-| `base.py`                   | Base adapter for CLI coding agents |
-| `caching_adapter.py`        | Caching wrapper for CLI adapters to enable prompt prefix deduplication and response reuse |
-| `canary.py`                 | Adapter conformance canary matrix (issue #2368) |
-| `capability_profile.py`     | Declarative adapter capability profiles and the profile factory |
-| `charm.py`                  | Charm Crush CLI adapter |
-| `claude.py`                 | Claude Code CLI adapter |
-| `claude_agents.py`          | Build per-task Claude Code subagent definitions for the --agents flag |
-| `claude_cache_control.py`   | Anthropic API cache-control block builder for the Claude Code adapter |
-| `claude_exit_codes.py`      | Map Claude Code exit codes to Bernstein AbortReason/TransitionReason |
-| `claude_mcp_loader.py`      | MCP config loading and merging for the Claude Code adapter |
-| `claude_routine.py`         | Claude Code Routine adapter - offloads tasks to Anthropic cloud via /fire API |
-| `claude_stream_parser.py`   | Parse Claude Code --output-format stream-json events |
-| `claude_wrapper_script.py`  | Inline wrapper script source + assembly for the Claude Code adapter |
-| `cline.py`                  | Cline CLI adapter |
-| `clm.py`                    | CLM sovereign LLM adapter - drives a customer-side CLM gateway |
-| `clm_tls_launcher.py`       | mTLS launcher for the CLM adapter |
-| `codebuff.py`               | Codebuff CLI adapter |
-| `codex.py`                  | OpenAI Codex CLI adapter |
-| `codex_cloudflare.py`       | Codex adapter driving Cloudflare's first-party sandbox bridge (issue #2969) |
-| `cody.py`                   | Sourcegraph Cody CLI adapter |
-| `composio.py`               | Composio Agent Orchestrator (``ao``) CLI adapter |
-| `computer_use.py`           | Browser / computer-use adapter family (#2606) |
-| `conformance.py`            | Adapter tool contract conformance suite harness |
-| `continue_dev.py`           | Continue.dev CLI adapter |
-| `copilot.py`                | GitHub Copilot CLI adapter |
-| `council_runner.py`         | Task-level "council of agents" runner |
-| `cursor.py`                 | Cursor Agent CLI adapter |
-| `devin_terminal.py`         | Devin for Terminal (Cognition) CLI adapter |
-| `draft.py`                  | Drafting helper for adapter capability profiles |
-| `droid.py`                  | Droid (Factory AI) CLI adapter |
-| `env_isolation.py`          | Environment variable isolation for spawned agents |
-| `floor_refresh.py`          | Adapter security-floor refresh pipeline with signed update receipts (#2515) |
-| `forge.py`                  | Forge CLI adapter |
-| `gemini.py`                 | Google Gemini / Antigravity CLI adapter |
-| `generic.py`                | Generic CLI adapter for arbitrary coding agent CLIs |
-| `gitleaks.py`               | Deterministic Gitleaks scanner adapter and SARIF normalization |
-| `goose.py`                  | Goose CLI adapter for Bernstein |
-| `goose_stream_parser.py`    | Parse Goose ``--output-format stream-json`` events |
-| `gptme.py`                  | gptme CLI adapter |
-| `hermes.py`                 | Hermes Agent (Nous Research) CLI adapter |
-| `holmesgpt.py`              | HolmesGPT adapter for Bernstein |
-| `hook_gate_render.py`       | Render in-process verification-gate hooks for capable adapters (issue #2360) |
-| `http_429_classifier.py`    | Data-driven classifier for HTTP 429 responses |
-| `iac.py`                    | Infrastructure-as-Code (Terraform/Pulumi) adapter for Bernstein |
-| `junie.py`                  | JetBrains Junie CLI adapter |
-| `kilo.py`                   | Kilo CLI adapter (Stackblitz) |
-| `kimchi.py`                 | Kimchi CLI adapter (#3100) |
-| `kimi.py`                   | Kimi CLI adapter |
-| `kiro.py`                   | Kiro CLI adapter |
-| `letta_code.py`             | Letta Code CLI adapter |
-| `manager.py`                | Manager adapter - spawns the internal Python ManagerAgent orchestrator |
-| `mistral.py`                | Mistral Vibe CLI adapter |
-| `mock.py`                   | Mock CLI adapter for zero-API-key demos and testing |
-| `muse.py`                   | Muse Code CLI adapter for Bernstein |
-| `ollama.py`                 | Ollama / OpenAI-compatible local LLM adapter - run coding agents without cloud API keys |
-| `onboarding.py`             | Probe CLI evidence, record a supervised golden transcript, and replay held-out invocations |
-| `open_interpreter.py`       | Open Interpreter CLI adapter |
-| `openai_agents.py`          | OpenAI Agents SDK v2 adapter |
-| `openai_agents_builtins.py` | Opt-in builtin tools for the OpenAI Agents runner |
-| `openai_agents_runner.py`   | Python entrypoint that runs an OpenAI Agents SDK session |
-| `opencode.py`               | OpenCode CLI adapter |
-| `openhands.py`              | OpenHands CLI adapter |
-| `pi.py`                     | Pi (pi-coding-agent) CLI adapter |
-| `plandex.py`                | Plandex CLI adapter |
-| `plugin_sdk.py`             | Adapter plugin SDK for third-party agent integration |
-| `python_runtime.py`         | Generic Python-invoked agent-runtime adapter (#2959) |
-| `python_runtime_runner.py`  | Runner script for the generic Python-invoked agent-runtime adapter (#2959) |
-| `q_dev.py`                  | AWS Q Developer CLI adapter (binary: ``q``) |
-| `qwen.py`                   | Qwen CLI adapter for OpenAI compatible models |
-| `ralphex.py`                | Ralphex (umputun/ralphex) CLI adapter |
-| `registry.py`               | Adapter registry - look up CLI adapters by name |
-| `report.py`                 | Adapter conformance + capability report |
-| `rovo.py`                   | Atlassian Rovo Dev CLI adapter |
-| `scanner.py`                | Scanner adapter contract (issue #3617, slice 2 of #2953) |
-| `scanner_conformance.py`    | Scanner adapter conformance suite harness |
-| `scanner_finding.py`        | Scanner Finding dataclass |
-| `scanner_registry.py`       | Scanner registry - look up scanner adapters by name |
-| `security_floor.py`         | Adapter security-floor spawn preflight with signed refusal receipts (#2515) |
-| `session_id.py`             | Deterministic session-id binding for adapter replay isolation |
-| `skills_injector.py`        | Inject per-task Claude Code skills into the worktree before spawn |
-| `strict_schema.py`          | Strict structured-output validation and user-owned-field protection |
-| `use_cases.py`              | Per-adapter metadata for the ``bernstein integrations list`` command |
-| `ci/`                       | CI system adapters for log parsing and failure extraction |
-| `digest/`                   | Tool output digesters registry and ruleset models |
+| File                            | Purpose |
+|---------------------------------|---------|
+| `_contract.py`                  | Adapter contract loader and capability checker |
+| `acp_channel.py`                | Adapter-side binding for the ACP event channel (#2522) |
+| `admission.py`                  | Receipt-gated adapter admission with signed refusal receipts (#2610) |
+| `advisories.py`                 | Adapter minimum-safe-version advisories (supply-chain posture) |
+| `agy.py`                        | Antigravity CLI (``agy``) adapter |
+| `aichat.py`                     | AIChat CLI adapter |
+| `aider.py`                      | Aider CLI adapter |
+| `amp.py`                        | Amp CLI adapter |
+| `auggie.py`                     | Auggie (Augment Code) CLI adapter |
+| `autohand.py`                   | Autohand Code CLI adapter |
+| `bandit.py`                     | Deterministic Bandit scanner adapter and SARIF normalization |
+| `base.py`                       | Base adapter for CLI coding agents |
+| `caching_adapter.py`            | Caching wrapper for CLI adapters to enable prompt prefix deduplication and response reuse |
+| `canary.py`                     | Adapter conformance canary matrix (issue #2368) |
+| `capability_profile.py`         | Declarative adapter capability profiles and the profile factory |
+| `charm.py`                      | Charm Crush CLI adapter |
+| `checkov.py`                    | Deterministic Checkov IaC scanner adapter and SARIF normalization |
+| `claude.py`                     | Claude Code CLI adapter |
+| `claude_agents.py`              | Build per-task Claude Code subagent definitions for the --agents flag |
+| `claude_cache_control.py`       | Anthropic API cache-control block builder for the Claude Code adapter |
+| `claude_exit_codes.py`          | Map Claude Code exit codes to Bernstein AbortReason/TransitionReason |
+| `claude_mcp_loader.py`          | MCP config loading and merging for the Claude Code adapter |
+| `claude_routine.py`             | Claude Code Routine adapter - offloads tasks to Anthropic cloud via /fire API |
+| `claude_stream_parser.py`       | Parse Claude Code --output-format stream-json events |
+| `claude_wrapper_script.py`      | Inline wrapper script source + assembly for the Claude Code adapter |
+| `cline.py`                      | Cline CLI adapter |
+| `clm.py`                        | CLM sovereign LLM adapter - drives a customer-side CLM gateway |
+| `clm_tls_launcher.py`           | mTLS launcher for the CLM adapter |
+| `codebuff.py`                   | Codebuff CLI adapter |
+| `codex.py`                      | OpenAI Codex CLI adapter |
+| `codex_cloudflare.py`           | Codex adapter driving Cloudflare's first-party sandbox bridge (issue #2969) |
+| `cody.py`                       | Sourcegraph Cody CLI adapter |
+| `composio.py`                   | Composio Agent Orchestrator (``ao``) CLI adapter |
+| `computer_use.py`               | Browser / computer-use adapter family (#2606) |
+| `conformance.py`                | Adapter tool contract conformance suite harness |
+| `continue_dev.py`               | Continue.dev CLI adapter |
+| `copilot.py`                    | GitHub Copilot CLI adapter |
+| `council_runner.py`             | Task-level "council of agents" runner |
+| `crew_ingest.py`                | Ingest adapter for role-and-crew agent runtimes (#4965) |
+| `cursor.py`                     | Cursor Agent CLI adapter |
+| `deep_research.py`              | Shared machinery for the deep-research adapters |
+| `deep_research_artifact.py`     | On-disk layout of one deep-research run |
+| `devin_terminal.py`             | Devin for Terminal (Cognition) CLI adapter |
+| `draft.py`                      | Drafting helper for adapter capability profiles |
+| `droid.py`                      | Droid (Factory AI) CLI adapter |
+| `env_isolation.py`              | Environment variable isolation for spawned agents |
+| `floor_refresh.py`              | Adapter security-floor refresh pipeline with signed update receipts (#2515) |
+| `forge.py`                      | Forge CLI adapter |
+| `garak.py`                      | Garak adversarial probe adapter |
+| `gemini.py`                     | Google Gemini CLI adapter |
+| `generic.py`                    | Generic CLI adapter for arbitrary coding agent CLIs |
+| `gitleaks.py`                   | Deterministic Gitleaks scanner adapter and SARIF normalization |
+| `goose.py`                      | Goose CLI adapter for Bernstein |
+| `goose_stream_parser.py`        | Parse Goose ``--output-format stream-json`` events |
+| `gpt_researcher.py`             | gpt-researcher adapter for Bernstein |
+| `gpt_researcher_runner.py`      | Standalone runner for gpt-researcher, launched by path |
+| `gptme.py`                      | gptme CLI adapter |
+| `hermes.py`                     | Hermes Agent (Nous Research) CLI adapter |
+| `holmesgpt.py`                  | HolmesGPT adapter for Bernstein |
+| `hook_gate_render.py`           | Render in-process verification-gate hooks for capable adapters (issue #2360) |
+| `http_429_classifier.py`        | Data-driven classifier for HTTP 429 responses |
+| `iac.py`                        | Infrastructure-as-Code (Terraform/Pulumi) adapter for Bernstein |
+| `junie.py`                      | JetBrains Junie CLI adapter |
+| `kilo.py`                       | Kilo CLI adapter (Kilo Code) |
+| `kimchi.py`                     | Kimchi CLI adapter (#3100) |
+| `kimi.py`                       | Kimi CLI adapter |
+| `kiro.py`                       | Kiro CLI adapter |
+| `letta_code.py`                 | Letta Code CLI adapter |
+| `manager.py`                    | Manager adapter - spawns the internal Python ManagerAgent orchestrator |
+| `mistral.py`                    | Mistral Vibe CLI adapter |
+| `mock.py`                       | Mock CLI adapter for zero-API-key demos and testing |
+| `muse.py`                       | Muse Code CLI adapter for Bernstein |
+| `nmap.py`                       | Transcript-anchored Nmap scanner adapter and XML normalization |
+| `ollama.py`                     | Ollama / OpenAI-compatible local LLM adapter - run coding agents without cloud API keys |
+| `onboarding.py`                 | Probe CLI evidence, record a supervised golden transcript, and replay held-out invocations |
+| `open_interpreter.py`           | Open Interpreter CLI adapter |
+| `openai_agents.py`              | OpenAI Agents SDK v2 adapter |
+| `openai_agents_builtins.py`     | Opt-in builtin tools for the OpenAI Agents runner |
+| `openai_agents_runner.py`       | Python entrypoint that runs an OpenAI Agents SDK session |
+| `opencode.py`                   | OpenCode CLI adapter |
+| `openhands.py`                  | OpenHands CLI adapter |
+| `pi.py`                         | Pi (pi-coding-agent) CLI adapter |
+| `plandex.py`                    | Plandex CLI adapter |
+| `plugin_sdk.py`                 | Adapter plugin SDK for third-party agent integration |
+| `python_runtime.py`             | Generic Python-invoked agent-runtime adapter (#2959) |
+| `python_runtime_runner.py`      | Runner script for the generic Python-invoked agent-runtime adapter (#2959) |
+| `q_dev.py`                      | AWS Q Developer CLI adapter (binary: ``q``) |
+| `qwen.py`                       | Qwen CLI adapter for OpenAI compatible models |
+| `ralphex.py`                    | Ralphex (umputun/ralphex) CLI adapter |
+| `registry.py`                   | Adapter registry - look up CLI adapters by name |
+| `report.py`                     | Adapter conformance + capability report |
+| `rovo.py`                       | Atlassian Rovo Dev CLI adapter |
+| `scanner.py`                    | Scanner adapter contract (issue #3617, slice 2 of #2953) |
+| `scanner_conformance.py`        | Scanner adapter conformance suite harness |
+| `scanner_finding.py`            | Scanner Finding dataclass |
+| `scanner_registry.py`           | Scanner registry - look up scanner adapters by name |
+| `security_floor.py`             | Adapter security-floor spawn preflight with signed refusal receipts (#2515) |
+| `semgrep.py`                    | Deterministic Semgrep scanner adapter and SARIF normalization |
+| `session_id.py`                 | Deterministic session-id binding for adapter replay isolation |
+| `skills_injector.py`            | Inject per-task Claude Code skills into the worktree before spawn |
+| `skyvern.py`                    | Skyvern adapter: drives an existing Skyvern server over HTTP |
+| `strict_schema.py`              | Strict structured-output validation and user-owned-field protection |
+| `tongyi_deepresearch.py`        | Tongyi DeepResearch adapter for Bernstein |
+| `tongyi_deepresearch_runner.py` | Standalone runner for Tongyi DeepResearch, launched by path |
+| `trivy.py`                      | Feed-pinned Trivy scanner adapter and SARIF normalization |
+| `use_cases.py`                  | Per-adapter metadata for the ``bernstein integrations list`` command |
+| `ci/`                           | CI system adapters for log parsing and failure extraction |
+| `digest/`                       | Tool output digesters registry and ruleset models |
+| `directory/`                    | Directory provisioning adapters |
 
 ### `src/bernstein/agents/` - agent catalog & discovery
 
@@ -236,32 +260,33 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 
 ### `src/bernstein/evolution/` - self-evolution engine
 
-| File                       | Purpose |
-|----------------------------|---------|
-| `_shared.py`               | Shared constants, data classes, and helpers for the evolution loop modules |
-| `admission.py`             | Empirical-confidence admission gate for upgrade proposals |
-| `aggregator.py`            | Metrics aggregation with EWMA, CUSUM, BOCPD, and Goodhart defenses |
-| `applicator.py`            | Change applicator - execute upgrades via file modification |
-| `benchmark.py`             | Tiered benchmark runner for evolution validation |
-| `circuit.py`               | CircuitBreaker - halt evolution when safety conditions are violated |
-| `creative.py`              | Creative evolution pipeline - visionary → analyst → production gate |
-| `data_collector.py`        | Metric record types and file-based metrics collection for the evolution system |
-| `detector.py`              | Opportunity detection from aggregated metrics |
-| `gate.py`                  | ApprovalGate and EvalGate - risk-stratified routing for evolution proposals |
-| `governance.py`            | Adaptive governance for the evolution system |
-| `invariants.py`            | InvariantsGuard - hash-lock safety-critical files |
-| `loop.py`                  | Autoresearch evolution loop - continuous self-improvement via experiment cycles |
-| `observability_signals.py` | Read ``bernstein doctor observe`` snapshots into evolution signals |
-| `oscillation_guard.py`     | Oscillation guard for prompt-evolution proposals |
-| `predicted_delta.py`       | Predicted-delta gate for prompt-evolution proposals |
-| `proposal_scorer.py`       | Proposal risk scoring and routing classification |
-| `proposals.py`             | Upgrade proposal generation |
-| `report.py`                | Evolution observability - history table and static report generation |
-| `report_generator.py`      | Analysis result types, statistical helpers, and Goodhart's Law defenses |
-| `risk.py`                  | Strategic Risk Score (SRS) computation for evolution proposals |
-| `sandbox.py`               | SandboxValidator - isolated testing of evolution proposals |
-| `types.py`                 | Shared types for the evolution system |
-| `upgrade_targets.py`       | Category-to-target-file mapping shared by the upgrade executor and task spawn |
+| File                        | Purpose |
+|-----------------------------|---------|
+| `_shared.py`                | Shared constants, data classes, and helpers for the evolution loop modules |
+| `admission.py`              | Empirical-confidence admission gate for upgrade proposals |
+| `aggregator.py`             | Metrics aggregation with EWMA, CUSUM, BOCPD, and Goodhart defenses |
+| `applicator.py`             | Change applicator - execute upgrades via file modification |
+| `benchmark.py`              | Tiered benchmark runner for evolution validation |
+| `change_contract_replay.py` | Replay service for ReplayContract — verifiable offline replay of governance decisions |
+| `circuit.py`                | CircuitBreaker - halt evolution when safety conditions are violated |
+| `creative.py`               | Creative evolution pipeline - visionary → analyst → production gate |
+| `data_collector.py`         | Metric record types and file-based metrics collection for the evolution system |
+| `detector.py`               | Opportunity detection from aggregated metrics |
+| `gate.py`                   | ApprovalGate and EvalGate - risk-stratified routing for evolution proposals |
+| `governance.py`             | Adaptive governance for the evolution system |
+| `invariants.py`             | InvariantsGuard - hash-lock safety-critical files |
+| `loop.py`                   | Autoresearch evolution loop - continuous self-improvement via experiment cycles |
+| `observability_signals.py`  | Read ``bernstein doctor observe`` snapshots into evolution signals |
+| `oscillation_guard.py`      | Oscillation guard for prompt-evolution proposals |
+| `predicted_delta.py`        | Predicted-delta gate for prompt-evolution proposals |
+| `proposal_scorer.py`        | Proposal risk scoring and routing classification |
+| `proposals.py`              | Upgrade proposal generation |
+| `report.py`                 | Evolution observability - history table and static report generation |
+| `report_generator.py`       | Analysis result types, statistical helpers, and Goodhart's Law defenses |
+| `risk.py`                   | Strategic Risk Score (SRS) computation for evolution proposals |
+| `sandbox.py`                | SandboxValidator - isolated testing of evolution proposals |
+| `types.py`                  | Shared types for the evolution system |
+| `upgrade_targets.py`        | Category-to-target-file mapping shared by the upgrade executor and task spawn |
 
 ### `src/bernstein/eval/` - evaluation harness
 
@@ -279,6 +304,7 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 | `incident_synthesizer.py`          | Convert dead-letter and post-mortem incidents into regression eval cases |
 | `judge.py`                         | LLM judge - evaluate code quality of agent-produced changes |
 | `metrics.py`                       | Custom eval metrics - each metric is a dataclass with a compute method |
+| `model_drift.py`                   | Model drift probe: signed, chain-anchored observations (issue #5041) |
 | `pentest_consensus.py`             | Consensus aggregation for the multi-adapter pentest fan-out |
 | `pentest_runner.py`                | Driver that runs the ``security-pentest`` scenario end-to-end |
 | `pentest_scorer.py`                | Precision and recall scorer for security pentest eval scenario |
@@ -388,6 +414,7 @@ Full per-file module map. `AGENTS.md`'s own "Module map" section links here inst
 | `server.py`           | Bernstein MCP server |
 | `signal_paths.py`     | Containment barrier for the MCP shutdown-signal path |
 | `streaming.py`        | In-flight tool-call tracking with cancellation and partial-result preservation |
+| `tool_surface.py`     | Tool surface risk scoring and capability receipts for MCP servers |
 | `resources/`          | MCP resource registrars for Bernstein |
 | `tool_schemas/`       | tool_schemas/ sub-package |
 

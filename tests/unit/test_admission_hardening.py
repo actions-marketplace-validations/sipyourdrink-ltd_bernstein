@@ -123,12 +123,12 @@ def test_absent_keypair_generates_a_matched_pair(tmp_path: Path) -> None:
     eng = AdmissionEngine(sdd_dir=sdd)
     assert eng.private_key_pem and eng.public_key_pem
     # The generated pair must actually match: a signed receipt verifies.
-    from bernstein.core.admission.receipts import verify_receipt
+    from bernstein.core.admission.receipts import verify_admission_receipt
 
     seal = eng.seal_tag_conformance(
         task_id="T1", worker_id="w1", declared_tags=("docs-only",), changed_paths=("docs/x.md",)
     )
-    ok, reason = verify_receipt(seal, public_key_pem=eng.public_key_pem)
+    ok, reason = verify_admission_receipt(seal, public_key_pem=eng.public_key_pem)
     assert ok, reason
 
 
@@ -253,6 +253,29 @@ def test_no_src_dotdot_escape_is_a_violation() -> None:
 
     # A path that dodges the ``src/`` prefix via traversal must still be flagged.
     assert check_conformance(("no-src",), ("build/../src/secret.py",))
+
+
+def test_a_dotfile_keeps_its_leading_dot_in_the_prefix_check() -> None:
+    """A tag contract compares directory names, and ``.github`` is one.
+
+    ``lstrip("./")`` removed every leading ``.`` and ``/``, so a changed
+    ``.docs/leak.md`` normalised to ``docs/leak.md`` and satisfied the
+    ``docs-only`` allow-prefix from a directory the contract never named.
+    """
+    from bernstein.core.admission.tags import check_conformance
+
+    assert check_conformance(("docs-only",), (".docs/leak.md",))
+    assert check_conformance(("tests-only",), (".tests/leak.py",))
+    # And a real dotfile outside the allow-list stays a violation, as before.
+    assert check_conformance(("docs-only",), (".github/workflows/ci.yml",))
+
+
+def test_a_redundant_leading_dot_slash_is_still_conformant() -> None:
+    """``./docs/guide.md`` names the same file as ``docs/guide.md``."""
+    from bernstein.core.admission.tags import check_conformance
+
+    assert check_conformance(("docs-only",), ("./docs/guide.md",)) == ()
+    assert check_conformance(("tests-only",), ("tests/./unit/test_x.py",)) == ()
 
 
 # ---------------------------------------------------------------------------

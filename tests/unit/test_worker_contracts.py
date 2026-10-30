@@ -108,6 +108,49 @@ class TestParseCompletion:
             parse_terminal_payload(_completion_payload(files_changed=["src/foo.py", ""]))
         assert exc_info.value.path == "$.files_changed[1]"
 
+    def test_a_verification_with_no_receipt_is_refused(self) -> None:
+        """The defect: a claim that a command ran and passed, recorded nowhere.
+
+        Before the cross-field rule, this parsed. A completion asserting
+        `pytest -q` exited 0 and a completion backed by a receipt serialized
+        identically, so the orchestrator releasing a dependent task could not
+        tell them apart.
+        """
+        payload = _completion_payload()
+        del payload["receipt_ref"]
+        with pytest.raises(ContractViolation) as exc_info:
+            parse_terminal_payload(payload)
+        assert exc_info.value.path == "$.receipt_ref"
+
+    def test_an_explicit_null_receipt_is_refused_the_same_way(self) -> None:
+        """Omission and an explicit null are the same claim."""
+        with pytest.raises(ContractViolation) as exc_info:
+            parse_terminal_payload(_completion_payload(receipt_ref=None))
+        assert exc_info.value.path == "$.receipt_ref"
+
+    def test_a_verification_with_a_receipt_parses(self) -> None:
+        """The shape the rule exists to admit."""
+        result = parse_terminal_payload(_completion_payload())
+        assert result.verification is not None
+        assert result.receipt_ref == "sha256:abc123"
+
+    def test_a_completion_with_neither_field_parses(self) -> None:
+        """Not every task runs a verification, and that stays valid."""
+        payload = _completion_payload()
+        del payload["verification"]
+        del payload["receipt_ref"]
+        result = parse_terminal_payload(payload)
+        assert result.verification is None
+        assert result.receipt_ref is None
+
+    def test_a_receipt_without_a_verification_parses(self) -> None:
+        """The rule is one-directional: a receipt may name work of another shape."""
+        payload = _completion_payload()
+        del payload["verification"]
+        result = parse_terminal_payload(payload)
+        assert result.verification is None
+        assert result.receipt_ref == "sha256:abc123"
+
     def test_verification_requires_command(self) -> None:
         with pytest.raises(ContractViolation) as exc_info:
             parse_terminal_payload(_completion_payload(verification={"exit_code": 0}))
@@ -127,6 +170,48 @@ class TestParseCompletion:
         result = parse_terminal_payload(_completion_payload(verification=None))
         assert isinstance(result, WorkerCompletion)
         assert result.verification is None
+
+    def test_payload_without_exports_is_backward_compatible(self) -> None:
+        payload = _completion_payload()
+        result = parse_terminal_payload(payload)
+        assert isinstance(result, WorkerCompletion)
+        assert result.exports == ()
+        assert result.to_dict() == payload
+
+    def test_exports_entry_round_trips(self) -> None:
+        exports = [{"path": "dist/report.json", "content_hash": "sha256:" + "a" * 64}]
+        result = parse_terminal_payload(_completion_payload(exports=exports))
+        assert isinstance(result, WorkerCompletion)
+        assert result.to_dict()["exports"] == exports
+
+    def test_exports_content_hash_must_be_canonical_sha256(self) -> None:
+        exports = [{"path": "dist/report.json", "content_hash": "not-a-content-hash"}]
+        with pytest.raises(ContractViolation) as exc_info:
+            parse_terminal_payload(_completion_payload(exports=exports))
+        assert exc_info.value.path == "$.exports[0].content_hash"
+
+    def test_exports_entry_rejects_unknown_field(self) -> None:
+        exports = [
+            {
+                "path": "dist/report.json",
+                "content_hash": "sha256:" + "a" * 64,
+                "size": 42,
+            }
+        ]
+        with pytest.raises(ContractViolation) as exc_info:
+            parse_terminal_payload(_completion_payload(exports=exports))
+        assert exc_info.value.path == "$.exports[0].size"
+
+    def test_exports_distinguish_different_content_at_same_path(self) -> None:
+        first = parse_terminal_payload(
+            _completion_payload(exports=[{"path": "src/foo.py", "content_hash": "sha256:" + "a" * 64}])
+        )
+        second = parse_terminal_payload(
+            _completion_payload(exports=[{"path": "src/foo.py", "content_hash": "sha256:" + "b" * 64}])
+        )
+        assert isinstance(first, WorkerCompletion)
+        assert isinstance(second, WorkerCompletion)
+        assert first.to_dict() != second.to_dict()
 
     def test_unknown_top_level_field_rejected(self) -> None:
         with pytest.raises(ContractViolation) as exc_info:

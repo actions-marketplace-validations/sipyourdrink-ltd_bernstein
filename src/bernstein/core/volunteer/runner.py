@@ -111,12 +111,14 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlparse
 
 from bernstein.adapters._contract import AuthBasis
 from bernstein.core.git.worktree import WorktreeError, WorktreeManager
-from bernstein.core.integrations.tickets import TicketParseError, fetch_ticket
+from bernstein.core.integrations.tickets import fetch_ticket
+from bernstein.core.volunteer.adapter_selection import discover_local_endpoint, select_adapter_for_volunteer
 from bernstein.core.volunteer.claim import (
     DEFAULT_CLAIM_STALENESS,
     build_claim_body,
@@ -135,8 +137,6 @@ from bernstein.core.volunteer.sandbox_profile import (
 from bernstein.core.volunteer.wall_clock import run_under_wall_clock
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from bernstein.core.volunteer.claim import ClaimClient, SkipReason
     from bernstein.core.volunteer.manifest import VolunteerManifest
     from bernstein.core.volunteer.sandbox_profile import VolunteerSandboxProfile
@@ -215,6 +215,10 @@ class ClaimedTask:
             prompt file, after the caller's sanitizer has seen it.
         issue_body: Untrusted text, same route.
         ref: Branch or tag to clone, or ``None`` for the project's default.
+        role: The task role (for example ``"backend"``), or ``None`` when the
+            caller does not know it.  Local-first adapter selection needs it;
+            without a role the run is never switched to a local adapter.
+            Declared after ``ref`` so positional callers keep their meaning.
     """
 
     repo_url: str
@@ -222,6 +226,7 @@ class ClaimedTask:
     issue_title: str
     issue_body: str
     ref: str | None = None
+    role: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +449,7 @@ def run_claimed_task(
     claim_staleness: timedelta = DEFAULT_CLAIM_STALENESS,
     now: Callable[[], datetime] | None = None,
     adapter_id: str | None = None,
+    project_root: Path | None = None,
 ) -> TaskOutcome:
     """Run one claimed task inside the volunteer sandbox.
 
@@ -483,7 +489,14 @@ def run_claimed_task(
             tests.  Defaults to :func:`datetime.now` in UTC.
         adapter_id: Optional adapter identifier.  When supplied, the runner
             validates the adapter's auth_basis and refuses volunteer tasks
-            whose auth_basis is incompatible with volunteer mode.
+            whose auth_basis is incompatible with volunteer mode.  When
+            omitted and the task names a role, a certified local endpoint
+            configured through ``OPENAI_BASE_URL`` selects the registered
+            local adapter.  The selected id feeds the auth-basis gate; the
+            process that runs is still the one ``agent_argv`` builds.
+        project_root: The donor's project root, where ``bernstein doctor
+            --endpoint`` stores certification receipts.  Defaults to the
+            current working directory.  Distinct from ``workspace``.
 
     Returns:
         :class:`TaskDiff` when the agent produced a patch, otherwise
@@ -511,23 +524,43 @@ def run_claimed_task(
             manifest_sha256=manifest_sha256,
         )
 
-    run_budget = profile_budget(profile, budget)
     refuse = _refusal_factory(manifest_sha256=manifest_sha256, profile=profile)
 
     url_problem = repo_url_problem(task.repo_url)
     if url_problem is not None:
         return refuse(RefusalStage.REPO_URL, "unsupported_repo_url", url_problem)
 
-    # Provider-terms preflight: a volunteer task runs on a stranger's machine
-    # with no credentials of its own, so it may only run behind an adapter that
-    # authenticates in a way compatible with that boundary.  Subscription OAuth
-    # ties the run to a paid account the donor does not possess, and an unknown
-    # basis means no contract has pinned what authentication the adapter needs,
-    # so neither is safe here.  API key and local are fine: the former carries
-    # no session entitlement and the latter needs no remote auth at all.
+    # Adapter selection and the provider-terms preflight both run before the
+    # claim comment is posted, so a task this host would refuse never leaves a
+    # public side effect behind.
+    #
+    # When no adapter is explicitly chosen and a certified local endpoint
+    # exists for this role, the registered local adapter is selected.  The
+    # explicit choice always wins and then no endpoint is probed.  Receipts are
+    # looked up under the donor's project root (where ``doctor --endpoint``
+    # writes them), never under the per-task scratch workspace.
+    if not adapter_id and task.role:
+        local_endpoint = discover_local_endpoint(os.environ)
+        adapter_id = select_adapter_for_volunteer(
+            role=task.role,
+            explicit_adapter=adapter_id,
+            workdir=project_root if project_root is not None else Path.cwd(),
+            local_endpoint=local_endpoint,
+        )
+
+    # A volunteer task runs on a stranger's machine with no credentials of its
+    # own, so it may only run behind an adapter that authenticates in a way
+    # compatible with that boundary.  Subscription OAuth ties the run to a paid
+    # account the donor does not possess, and an unknown basis means no
+    # contract has pinned what authentication the adapter needs, so neither is
+    # safe here.  API key and local are fine: the former carries no session
+    # entitlement and the latter needs no remote auth at all.  The gate sees the
+    # final adapter id, selected or explicit.
     auth_problem = _validate_volunteer_auth_basis(adapter_id)
     if auth_problem is not None:
         return refuse(RefusalStage.AGENT, "provider_terms_unavailable", auth_problem)
+
+    run_budget = profile_budget(profile, budget)
 
     # --- claim etiquette: read the issue, skip a duplicate, post a claim ------
     # Best-effort and coordinator-free: a gh failure yields no state and the run
@@ -574,8 +607,10 @@ def run_claimed_task(
                 url = f"{url.rstrip('/')}/issues/{task.issue_number}"
             payload = fetch_ticket(url)
             comments = list(payload.comments) if payload.comments else None
-        except (TicketParseError, Exception):
-            # Best-effort: failure to fetch comments is not a run failure
+        # `except (TicketParseError, Exception)` read as if only a parse
+        # failure was caught; Exception subsumes it, so this always caught
+        # everything. intentional-broad-except: comments are enrichment.
+        except Exception:
             comments = None
 
     workspace.mkdir(parents=True, exist_ok=True)
@@ -852,7 +887,17 @@ def repo_url_problem(repo_url: str) -> str | None:
         return "the repository URL is empty"
     if url.startswith("-"):
         return f"the repository URL {url!r} would be read as a command-line option"
-    scheme = urlparse(url).scheme
+    try:
+        scheme = urlparse(url).scheme
+    except ValueError as exc:
+        # urlsplit refuses a bracketed-IPv6 netloc carrying userinfo
+        # ("http://[::1]@evil.com/x.git") and an unclosed or stray bracket. A
+        # repo_url arrives on a claimed task, so this input is not ours: a
+        # URL the parser will not read is one this function cannot clear,
+        # and saying so is the whole contract. Letting the ValueError out
+        # would leave the caller with a traceback instead of the refusal it
+        # is waiting to record.
+        return f"the repository URL {url!r} cannot be parsed: {exc}"
     if not scheme:
         # No scheme at all is a local filesystem path.  ``git clone ./x`` and
         # ``git clone /srv/x`` are both ordinary and both harmless: there is no
